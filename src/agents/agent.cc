@@ -163,61 +163,62 @@ core::Result<std::string> DefaultAgent::build_system_prompt() const {
         for (const auto& rule : config_.identity.rules) {
             ss << "- " << rule << "\n";
         }
-//     }
-//     
-//     // Add skills section
-//     if (skill_manager_) {
-//         auto skills_list = skill_manager_->list_skills();
-//         
-//         // Apply skill filter
-//         std::vector<std::string> filtered_skills;
-//         if (config_.skills.empty()) {
-//             // No filter, use all
-//             filtered_skills = skills_list;
-//         } else {
-//             // Apply filter
-//             for (const auto& skill_id : skills_list) {
-//                 bool allowed = false;
-//                 for (const auto& pattern : config_.skills) {
-//                     if (pattern == "*" || pattern == skill_id) {
-//                         allowed = true;
-//                         break;
-//                     }
-//                     // Simple wildcard matching
-//                     if (pattern.back() == '*') {
-//                         std::string prefix = pattern.substr(0, pattern.size() - 1);
-//                         if (skill_id.substr(0, prefix.size()) == prefix) {
-//                             allowed = true;
-//                             break;
-//                         }
-//                     }
-//                 }
-//                 if (allowed) {
-//                     filtered_skills.push_back(skill_id);
-//                 }
-//             }
-//         }
-//         
-//         if (!filtered_skills.empty()) {
-//             ss << "\n<skills>\n";
-//             ss << "You have access to the following skills:\n\n";
-//             
-//             for (const auto& skill_id : filtered_skills) {
-//                 auto skill_result = skill_manager_->get_skill(skill_id);
-//                 if (skill_result.is_ok()) {
-//                     auto& skill = skill_result.value;
-//                     ss << "## " << skill->meta.name << "\n";
-//                     ss << skill->meta.description << "\n";
-//                     
-//                     if (!skill->meta.usage.empty()) {
-//                         ss << "\nUsage:\n```\n" << skill->meta.usage << "\n```\n";
-//                     }
-//                     
-//                     ss << "\n";
-//                 }
-//             }
-//             
-//             ss << "</skills>\n";
+    }
+    
+    // Add skills section
+    if (skill_manager_) {
+        auto skills_list = skill_manager_->list();
+        
+        // Apply skill filter
+        std::vector<std::string> filtered_skills;
+        if (config_.skills.empty()) {
+            // No filter, use all
+            filtered_skills = skills_list;
+        } else {
+            // Apply filter
+            for (const auto& skill_name : skills_list) {
+                bool allowed = false;
+                for (const auto& pattern : config_.skills) {
+                    if (pattern == "*" || pattern == skill_name) {
+                        allowed = true;
+                        break;
+                    }
+                    // Simple wildcard matching
+                    if (!pattern.empty() && pattern.back() == '*') {
+                        std::string prefix = pattern.substr(0, pattern.size() - 1);
+                        if (skill_name.substr(0, std::min(prefix.size(), skill_name.size())) == prefix) {
+                            allowed = true;
+                            break;
+                        }
+                    }
+                }
+                if (allowed) {
+                    filtered_skills.push_back(skill_name);
+                }
+            }
+        }
+        
+        if (!filtered_skills.empty()) {
+            ss << "\n<skills>\n";
+            ss << "You have access to the following skills:\n\n";
+            
+            for (const auto& skill_name : filtered_skills) {
+                auto skill_result = skill_manager_->get(skill_name);
+                if (skill_result.is_ok()) {
+                    const auto& skill = skill_result.value;
+                    ss << "## " << skill.name << "\n";
+                    ss << skill.description << "\n";
+                    
+                    // Add skill content (markdown body)
+                    if (!skill.content.empty()) {
+                        ss << "\n" << skill.content << "\n";
+                    }
+                    
+                    ss << "\n";
+                }
+            }
+            
+            ss << "</skills>\n";
         }
     }
     
@@ -237,107 +238,107 @@ core::Result<std::string> DefaultAgent::build_system_prompt() const {
 }
 
 core::Result<std::string> DefaultAgent::call_llm(
-//     const std::string& system_prompt,
-//     const std::string& user_message,
-//     const std::string& run_id
-// ) {
-//     // 创建LLM配置
-//     llm::LLMConfig llm_config;
-//     llm_config.provider = config_.model.provider;
-//     llm_config.model = config_.model.model;
-//     llm_config.api_key = config_.model.api_key;
-//     llm_config.endpoint = config_.model.endpoint;
-//     llm_config.max_tokens = config_.model.max_tokens;
-//     llm_config.temperature = config_.model.temperature;
-//     llm_config.context_window = config_.model.context_tokens;
-//     
-//     // 创建LLM客户端
-//     auto llm_client = llm::LLMClientFactory::create(llm_config);
-//     
-//     // 创建工具管理器
-//     tools::ToolContext tool_context;
-//     tool_context.workspace_dir = config_.workspace;
-//     tool_context.agent_id = config_.id;
-//     tool_context.session_key = "";  // 从run_context获取
-//     
-//     auto tool_manager = tools::ToolManager::create(tool_context);
-//     
-//     // 注册内置工具
-//     tools::BuiltinTools::register_all(*tool_manager, tool_context);
-//     
-//     // 创建ReAct配置
-//     ReActConfig react_config;
-//     react_config.max_iterations = 15;
-//     react_config.early_stopping_method = "force";
-//     react_config.handle_parsing_errors = true;
-//     
-//     // 创建ReAct执行器
-//     ReActExecutor executor(llm_client, tool_manager, react_config);
-//     
-//     // 设置系统prompt
-//     executor.set_system_prompt(system_prompt);
-//     
-//     // 设置回调 - 发送事件
-//     ReActCallbacks callbacks;
-//     callbacks.on_action_start = [this, run_id](const AgentAction& action) {
-//         // 发送工具执行开始事件
-//         core::JsonValue event_data = core::JsonValue::object();
-//         event_data["tool"] = action.tool;
-//         event_data["input"] = action.tool_input.as_string();
-//         
-//         AgentEvent event;
-//         auto ctx = get_run_context(run_id);
-//         if (ctx) {
-//             event.run_id = run_id;
-//             event.seq = ctx->next_seq++;
-//             event.stream = AgentEventStream::Tool;
-//             event.timestamp_ms = current_timestamp_ms();
-//             event.session_key = ctx->session_key;
-//             event.data = event_data;
-//             
-//             emit_event(event);
-//         }
-//     };
-//     
-//     callbacks.on_step = [this, run_id](const AgentStep& step) {
-//         // 发送步骤完成事件
-//         core::JsonValue event_data = core::JsonValue::object();
-//         event_data["action"] = step.action.tool;
-//         event_data["observation"] = step.observation;
-//         
-//         AgentEvent event;
-//         auto ctx = get_run_context(run_id);
-//         if (ctx) {
-//             event.run_id = run_id;
-//             event.seq = ctx->next_seq++;
-//             event.stream = AgentEventStream::Assistant;
-//             event.timestamp_ms = current_timestamp_ms();
-//             event.session_key = ctx->session_key;
-//             event.data = event_data;
-//             
-//             emit_event(event);
-//         }
-//     };
-//     
-//     executor.set_callbacks(callbacks);
-//     
-//     // 执行ReAct循环
-//     std::map<std::string, std::string> inputs;
-//     inputs["input"] = user_message;
-//     
-//     auto result = executor.run(inputs);
-//     
-//     if (result.is_err()) {
-//         return core::Result<std::string>::Err(result.error);
-//     }
-//     
-//     // 提取最终答案
-//     auto& finish = result.value;
-//     if (finish.return_values.count("output")) {
-//         return core::Result<std::string>::Ok(
-//             finish.return_values.at("output").as_string()
-//         );
-//     }
+    const std::string& system_prompt,
+    const std::string& user_message,
+    const std::string& run_id
+) {
+    // 创建LLM配置
+    llm::LLMConfig llm_config;
+    llm_config.provider = config_.model.provider;
+    llm_config.model = config_.model.model;
+    llm_config.api_key = config_.model.api_key;
+    llm_config.endpoint = config_.model.endpoint;
+    llm_config.max_tokens = config_.model.max_tokens;
+    llm_config.temperature = config_.model.temperature;
+    llm_config.context_window = config_.model.context_tokens;
+    
+    // 创建LLM客户端
+    auto llm_client = llm::LLMClientFactory::create(llm_config);
+    
+    // 创建工具管理器
+    tools::ToolContext tool_context;
+    tool_context.workspace_dir = config_.workspace;
+    tool_context.agent_id = config_.id;
+    tool_context.session_key = "";  // 从run_context获取
+    
+    auto tool_manager = tools::ToolManager::create(tool_context);
+    
+    // 注册内置工具
+    tools::BuiltinTools::register_all(*tool_manager, tool_context);
+    
+    // 创建ReAct配置
+    ReActConfig react_config;
+    react_config.max_iterations = 15;
+    react_config.early_stopping_method = "force";
+    react_config.handle_parsing_errors = true;
+    
+    // 创建ReAct执行器
+    ReActExecutor executor(llm_client, tool_manager, react_config);
+    
+    // 设置系统prompt
+    executor.set_system_prompt(system_prompt);
+    
+    // 设置回调 - 发送事件
+    ReActCallbacks callbacks;
+    callbacks.on_action_start = [this, run_id](const AgentAction& action) {
+        // 发送工具执行开始事件
+        core::JsonValue event_data = core::JsonValue::object();
+        event_data["tool"] = action.tool;
+        event_data["input"] = action.tool_input.as_string();
+        
+        AgentEvent event;
+        auto ctx = get_run_context(run_id);
+        if (ctx) {
+            event.run_id = run_id;
+            event.seq = ctx->next_seq++;
+            event.stream = AgentEventStream::Tool;
+            event.timestamp_ms = current_timestamp_ms();
+            event.session_key = ctx->session_key;
+            event.data = event_data;
+            
+            emit_event(event);
+        }
+    };
+    
+    callbacks.on_step = [this, run_id](const AgentStep& step) {
+        // 发送步骤完成事件
+        core::JsonValue event_data = core::JsonValue::object();
+        event_data["action"] = step.action.tool;
+        event_data["observation"] = step.observation;
+        
+        AgentEvent event;
+        auto ctx = get_run_context(run_id);
+        if (ctx) {
+            event.run_id = run_id;
+            event.seq = ctx->next_seq++;
+            event.stream = AgentEventStream::Assistant;
+            event.timestamp_ms = current_timestamp_ms();
+            event.session_key = ctx->session_key;
+            event.data = event_data;
+            
+            emit_event(event);
+        }
+    };
+    
+    executor.set_callbacks(callbacks);
+    
+    // 执行ReAct循环
+    std::map<std::string, std::string> inputs;
+    inputs["input"] = user_message;
+    
+    auto result = executor.run(inputs);
+    
+    if (result.is_err()) {
+        return core::Result<std::string>::Err(result.error);
+    }
+    
+    // 提取最终答案
+    auto& finish = result.value;
+    if (finish.return_values.count("output")) {
+        return core::Result<std::string>::Ok(
+            finish.return_values.at("output").as_string()
+        );
+    }
     
     return core::Result<std::string>::Ok(finish.log);
 }
