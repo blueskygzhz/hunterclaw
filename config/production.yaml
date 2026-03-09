@@ -1,0 +1,404 @@
+# ============================================================================
+# HunterClaw 生产环境配置
+# ============================================================================
+# 版本: 0.1.0
+# 环境: Production
+# 更新: 2026-03-09
+
+# ============================================================================
+# 网关服务器配置
+# ============================================================================
+gateway:
+  # 监听地址
+  host: "0.0.0.0"
+  port: 8080
+  
+  # TLS配置 (生产环境必须启用)
+  tls:
+    enabled: true
+    cert_file: "/etc/hunterclaw/ssl/server.crt"
+    key_file: "/etc/hunterclaw/ssl/server.key"
+    ca_file: "/etc/hunterclaw/ssl/ca.crt"  # 可选: 客户端证书验证
+  
+  # 认证配置
+  auth:
+    enabled: true
+    type: "bearer_token"  # bearer_token, api_key, oauth2
+    token_header: "Authorization"
+    
+    # API Token白名单 (使用环境变量 HUNTERCLAW_API_TOKENS)
+    # 格式: "token1,token2,token3"
+    allowed_tokens_env: "HUNTERCLAW_API_TOKENS"
+  
+  # CORS配置
+  cors:
+    enabled: true
+    allowed_origins:
+      - "https://console.hunterclaw.io"
+      - "https://*.example.com"
+    allowed_methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+    allowed_headers: ["Authorization", "Content-Type", "X-Request-ID"]
+    max_age: 3600
+  
+  # 超时配置
+  timeouts:
+    read_timeout_ms: 30000
+    write_timeout_ms: 30000
+    idle_timeout_ms: 120000
+  
+  # 连接限制
+  limits:
+    max_connections: 10000
+    max_requests_per_second: 1000
+    max_request_size_mb: 10
+
+# ============================================================================
+# Agent 默认配置
+# ============================================================================
+agents:
+  default:
+    # LLM配置
+    model:
+      provider: "openai"  # 或 openai-compatible, anthropic
+      api_base: "${OPENAI_API_BASE:-https://api.openai.com/v1}"
+      api_key_env: "OPENAI_API_KEY"
+      model_name: "gpt-4-turbo-preview"
+      temperature: 0.7
+      max_tokens: 4096
+      timeout_ms: 60000
+    
+    # ReAct引擎配置
+    react:
+      enabled: true
+      max_iterations: 15
+      max_tool_calls_per_iteration: 3
+      stop_on_error: false
+      verbose: false
+    
+    # 工具配置
+    tools:
+      enabled: true
+      builtin_tools:
+        - "exec"        # 命令执行 (需要Sandbox)
+        - "read_file"   # 文件读取
+        - "write_file"  # 文件写入
+        - "list_dir"    # 目录列举
+        - "search"      # 文件搜索
+      
+      # 工具执行限制
+      limits:
+        max_execution_time_ms: 30000
+        max_output_size_kb: 1024
+        requires_approval: true  # 生产环境建议启用
+    
+    # Skill配置
+    skills:
+      enabled: true
+      skill_paths:
+        - "/var/lib/hunterclaw/skills"
+        - "/usr/share/hunterclaw/skills"
+      
+      # 加载策略
+      load:
+        mode: "lazy"  # eager, lazy
+        cache_enabled: true
+      
+      # 安装限制
+      install:
+        allow_install: false  # 生产环境禁止动态安装
+        allowed_repos: []
+    
+    # Memory配置
+    memory:
+      enabled: true
+      provider: "sqlite"  # sqlite, postgres, memos_cloud
+      
+      # SQLite配置
+      sqlite:
+        db_path: "/var/lib/hunterclaw/memory/default.db"
+        max_size_mb: 1024
+      
+      # Memory搜索配置
+      search:
+        enabled: true
+        context_window: 10
+        min_score: 0.7
+        max_results: 20
+      
+      # Embedding配置
+      embedding:
+        provider: "openai"  # openai, ollama, sentence-transformers
+        model: "text-embedding-3-small"
+        dimensions: 1536
+        api_key_env: "OPENAI_API_KEY"
+    
+    # Sandbox配置
+    sandbox:
+      enabled: true
+      type: "docker"  # docker, kubernetes, none
+      
+      # Docker配置
+      docker:
+        image: "python:3.11-slim"
+        network: "sandbox-network"
+        cpu_limit: "2.0"
+        memory_limit: "2g"
+        disk_limit: "10g"
+        timeout_ms: 300000  # 5分钟
+        
+        # 安全配置
+        security:
+          drop_capabilities: ["ALL"]
+          read_only_root: true
+          no_new_privileges: true
+          seccomp_profile: "default"
+        
+        # 网络策略 (Egress Sidecar)
+        network_policy:
+          enabled: true
+          allowed_domains:
+            - "api.openai.com"
+            - "*.example.com"
+          blocked_ips:
+            - "169.254.169.254"  # 云元数据
+            - "10.0.0.0/8"       # 内网
+          max_bandwidth_mbps: 100
+    
+    # 工作空间配置
+    workspace:
+      root_dir: "/var/lib/hunterclaw/workspaces"
+      max_size_mb: 5120  # 5GB
+      auto_cleanup: true
+      cleanup_after_hours: 24
+
+# ============================================================================
+# Channel 配置
+# ============================================================================
+channels:
+  # 飞书Channel
+  feishu:
+    enabled: false  # 按需启用
+    plugin_path: "/usr/lib/hunterclaw/channels/libhunterclaw_channel_feishu.so"
+    
+    config:
+      app_id_env: "FEISHU_APP_ID"
+      app_secret_env: "FEISHU_APP_SECRET"
+      encrypt_key_env: "FEISHU_ENCRYPT_KEY"
+      verification_token_env: "FEISHU_VERIFICATION_TOKEN"
+      
+      # 路由配置
+      routing:
+        default_agent: "default"
+        keyword_based: false
+  
+  # Telegram Channel (示例)
+  telegram:
+    enabled: false
+    plugin_path: "/usr/lib/hunterclaw/channels/libhunterclaw_channel_telegram.so"
+    
+    config:
+      bot_token_env: "TELEGRAM_BOT_TOKEN"
+  
+  # Slack Channel (示例)
+  slack:
+    enabled: false
+    plugin_path: "/usr/lib/hunterclaw/channels/libhunterclaw_channel_slack.so"
+    
+    config:
+      bot_token_env: "SLACK_BOT_TOKEN"
+
+# ============================================================================
+# 插件系统配置
+# ============================================================================
+plugins:
+  # 插件搜索路径
+  search_paths:
+    - "/usr/lib/hunterclaw/plugins"
+    - "/var/lib/hunterclaw/plugins"
+  
+  # 自动加载入口
+  autoload:
+    - name: "sqlite_memory"
+      type: "memory"
+      path: "/usr/lib/hunterclaw/plugins/libsqlite_memory.so"
+
+# ============================================================================
+# 日志配置
+# ============================================================================
+logging:
+  # 日志级别
+  level: "info"  # trace, debug, info, warn, error, critical
+  
+  # 日志输出
+  outputs:
+    - type: "file"
+      path: "/var/log/hunterclaw/hunterclaw.log"
+      max_size_mb: 100
+      max_files: 10
+      rotation: "daily"
+    
+    - type: "console"
+      enabled: false  # 生产环境关闭控制台输出
+  
+  # 结构化日志
+  format: "json"  # json, text
+  
+  # 审计日志
+  audit:
+    enabled: true
+    path: "/var/log/hunterclaw/audit.log"
+    log_requests: true
+    log_tool_calls: true
+
+# ============================================================================
+# 监控配置
+# ============================================================================
+monitoring:
+  # Prometheus Metrics
+  metrics:
+    enabled: true
+    port: 9090
+    path: "/metrics"
+  
+  # 健康检查
+  health:
+    enabled: true
+    port: 8081
+    path: "/health"
+  
+  # 追踪配置
+  tracing:
+    enabled: true
+    provider: "jaeger"  # jaeger, zipkin, otlp
+    endpoint: "http://jaeger:14268/api/traces"
+    sample_rate: 0.1  # 10%采样率
+
+# ============================================================================
+# 性能配置
+# ============================================================================
+performance:
+  # 线程池
+  thread_pool:
+    min_threads: 4
+    max_threads: 32
+    queue_size: 1000
+  
+  # 缓存配置
+  cache:
+    enabled: true
+    max_size_mb: 512
+    ttl_seconds: 3600
+  
+  # 连接池
+  connection_pool:
+    max_idle_connections: 100
+    max_open_connections: 500
+    connection_timeout_ms: 5000
+
+# ============================================================================
+# 安全配置
+# ============================================================================
+security:
+  # 请求签名验证
+  request_signing:
+    enabled: true
+    algorithm: "HMAC-SHA256"
+    secret_env: "HUNTERCLAW_SIGNING_SECRET"
+  
+  # 速率限制
+  rate_limiting:
+    enabled: true
+    global:
+      requests_per_second: 1000
+      burst: 2000
+    per_user:
+      requests_per_second: 10
+      burst: 20
+  
+  # IP白名单
+  ip_whitelist:
+    enabled: false
+    allowed_ips: []
+  
+  # 内容安全
+  content_filtering:
+    enabled: true
+    max_input_length: 10000
+    blocked_patterns:
+      - "(?i)(password|secret|api[_-]?key)"  # 敏感信息
+
+# ============================================================================
+# 数据库配置 (用于Session持久化等)
+# ============================================================================
+database:
+  type: "sqlite"  # sqlite, postgres, mysql
+  
+  # SQLite配置
+  sqlite:
+    path: "/var/lib/hunterclaw/db/hunterclaw.db"
+    max_open_conns: 10
+  
+  # PostgreSQL配置 (可选)
+  postgres:
+    host: "${DB_HOST:-localhost}"
+    port: 5432
+    database: "hunterclaw"
+    user_env: "DB_USER"
+    password_env: "DB_PASSWORD"
+    ssl_mode: "require"
+
+# ============================================================================
+# 高可用配置
+# ============================================================================
+ha:
+  # 多实例部署
+  cluster:
+    enabled: false
+    node_id: "${HOSTNAME}"
+    discovery:
+      type: "etcd"  # etcd, consul, redis
+      endpoints:
+        - "http://etcd:2379"
+  
+  # 会话持久化
+  session_persistence:
+    enabled: true
+    backend: "redis"  # redis, database
+    redis:
+      host: "${REDIS_HOST:-localhost}"
+      port: 6379
+      password_env: "REDIS_PASSWORD"
+      db: 0
+
+# ============================================================================
+# 备份配置
+# ============================================================================
+backup:
+  enabled: true
+  schedule: "0 2 * * *"  # 每天凌晨2点
+  retention_days: 30
+  
+  targets:
+    - type: "database"
+      path: "/var/backups/hunterclaw/db"
+    - type: "workspace"
+      path: "/var/backups/hunterclaw/workspaces"
+    - type: "config"
+      path: "/var/backups/hunterclaw/config"
+
+# ============================================================================
+# 环境变量说明
+# ============================================================================
+# 必需环境变量:
+#   OPENAI_API_KEY           - OpenAI API密钥
+#   HUNTERCLAW_API_TOKENS    - API访问令牌 (逗号分隔)
+#
+# 可选环境变量:
+#   OPENAI_API_BASE          - OpenAI API端点
+#   FEISHU_APP_ID            - 飞书应用ID
+#   FEISHU_APP_SECRET        - 飞书应用密钥
+#   FEISHU_ENCRYPT_KEY       - 飞书加密密钥
+#   FEISHU_VERIFICATION_TOKEN - 飞书验证令牌
+#   DB_HOST, DB_USER, DB_PASSWORD - 数据库配置
+#   REDIS_HOST, REDIS_PASSWORD    - Redis配置
+#   HUNTERCLAW_SIGNING_SECRET     - 请求签名密钥

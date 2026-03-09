@@ -1,0 +1,219 @@
+{
+  "gateway": {
+    "host": "127.0.0.1",
+    "port": 18789,
+    "tls": {
+      "enabled": false,
+      "cert_path": "",
+      "key_path": ""
+    },
+    "auth": {
+      "password": "${HUNTERCLAW_PASSWORD}",
+      "tokens": ["${HUNTERCLAW_TOKEN}"],
+      "device_auth_enabled": true
+    },
+    "max_connections": 10000,
+    "max_payload_bytes": 26214400,
+    "heartbeat_interval_ms": 30000,
+    "verbose": false,
+    "allow_remote": false
+  },
+  
+  "skills": {
+    "limits": {
+      "max_candidates_per_root": 300,
+      "max_skills_loaded_per_source": 200,
+      "max_skills_in_prompt": 150,
+      "max_skills_prompt_chars": 30000,
+      "max_skill_file_bytes": 256000
+    },
+    "load": {
+      "extra_dirs": [
+        "~/custom-skills"
+      ],
+      "watch": true,
+      "watch_debounce_ms": 500
+    },
+    "install": {
+      "prefer_brew": true,
+      "node_manager": "pnpm"
+    },
+    "allow_bundled": [
+      "github",
+      "weather",
+      "calculator"
+    ]
+  },
+  
+  "agents": [
+    {
+      "id": "default",
+      "default": true,
+      "name": "Default Agent",
+      "workspace": "~/hunterclaw-workspace",
+      "agent_dir": "~/.hunterclaw/agents/default",
+      
+      "model": {
+        "provider": "anthropic",
+        "model": "claude-3-5-sonnet-20241022",
+        "api_key": "${ANTHROPIC_API_KEY}",
+        "endpoint": "",
+        "max_tokens": 4096,
+        "temperature": 0.7,
+        "context_tokens": 200000,
+        "fallback_models": [
+          "claude-3-sonnet-20240229",
+          "gpt-4-turbo-preview"
+        ]
+      },
+      
+      "skills": ["*"],
+      
+      "memory_search": {
+        "enabled": false,
+        "endpoint": "",
+        "api_key": "",
+        "providers": {}
+      },
+      
+      "human_delay": {
+        "enabled": false,
+        "min_delay_ms": 100,
+        "max_delay_ms": 500
+      },
+      
+      "heartbeat": {
+        "enabled": true,
+        "interval_ms": 30000
+      },
+      
+      "identity": {
+        "name": "HunterClaw Assistant",
+        "role": "AI Programming Assistant",
+        "persona": "Professional, helpful, and concise",
+        "rules": [
+          "Always explain your reasoning",
+          "Ask for clarification when needed",
+          "Provide code examples when helpful"
+        ]
+      },
+      
+      "group_chat": {
+        "enabled": false,
+        "mention_trigger": "@agent",
+        "auto_respond": false
+      },
+      
+      "subagents": {
+        "enabled": false,
+        "max_concurrent": 3,
+        "timeout_seconds": 300,
+        "allowed_types": ["code-explorer", "code-reviewer"]
+      },
+      
+      "sandbox": {
+        "mode": "none",
+        "image": "",
+        "env": {},
+        "mounts": [],
+        "cpu_limit": 0,
+        "memory_limit_mb": 0
+      },
+      
+      "tools": {
+        "enabled": ["bash", "file", "search"],
+        "disabled": [],
+        "tool_configs": {}
+      },
+      
+      "thinking_level": "normal",
+      "verbose_level": "normal",
+      "timeout_seconds": 600
+    },
+    
+    {
+      "id": "code-agent",
+      "default": false,
+      "name": "Code Specialist",
+      "workspace": "~/hunterclaw-workspace",
+      
+      "model": {
+        "provider": "anthropic",
+        "model": "claude-3-5-sonnet-20241022",
+        "api_key": "${ANTHROPIC_API_KEY}",
+        "max_tokens": 4096,
+        "temperature": 0.7,
+        "context_tokens": 200000
+      },
+      
+      "skills": [
+        "bash",
+        "git",
+        "npm",
+        "python",
+        "docker"
+      ],
+      
+      "identity": {
+        "name": "Code Expert",
+        "role": "Senior Software Engineer",
+        "persona": "Technical, precise, and thorough"
+      },
+      
+      "thinking_level": "high",
+      "verbose_level": "verbose",
+      "timeout_seconds": 900
+    },
+    
+    {
+      "id": "research-agent",
+      "default": false,
+      "name": "Research Assistant",
+      "workspace": "~/hunterclaw-workspace",
+      
+      "model": {
+        "provider": "openai",
+        "model": "gpt-4-turbo-preview",
+        "api_key": "${OPENAI_API_KEY}",
+        "max_tokens": 4096,
+        "temperature": 0.8,
+        "context_tokens": 128000
+      },
+      
+      "skills": [
+        "web-search",
+        "browser",
+        "arxiv",
+        "wikipedia"
+      ],
+      
+      "memory_search": {
+        "enabled": true,
+        "endpoint": "https://memory.api.example.com",
+        "api_key": "${MEMORY_API_KEY}"
+      },
+      
+      "identity": {
+        "name": "Research Bot",
+        "role": "Research Assistant",
+        "persona": "Curious, thorough, and analytical"
+      },
+      
+      "thinking_level": "high",
+      "timeout_seconds": 1200
+    }
+  ],
+  
+  "plugins": {
+    "telegram": {
+      "enabled": true,
+      "config": {
+        "api_token": "${TELEGRAM_BOT_TOKEN}",
+        "polling_interval_ms": 1000
+      }
+    }
+  },
+  
+  "workspace_dir": "~/hunterclaw-workspace",
+  "config_dir": "~/.hunterclaw"
+}

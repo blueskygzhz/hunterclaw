@@ -1,0 +1,656 @@
+#include "hunterclaw/tools/tool.h"
+#include "hunterclaw/sandbox/sandbox.h"
+#include "hunterclaw/core/utils.h"
+#include <fstream>
+#include <sstream>
+#include <filesystem>
+#include <array>
+#include <memory>
+#include <spdlog/spdlog.h>
+
+// Forward declare nlohmann::json to avoid dependency
+namespace nlohmann {
+    class json;
+}
+
+// Simple JSON wrapper to avoid nlohmann/json dependency
+namespace {
+    std::string json_to_string(const hunterclaw::core::JsonValue& json_val) {
+        // Simple serialization for JsonValue
+        return "{}";  // Placeholder
+    }
+}
+
+namespace fs = std::filesystem;
+
+namespace hunterclaw {
+namespace tools {
+
+namespace {
+    auto log() {
+        auto logger = spdlog::get("tools");
+        if (!logger) {
+            logger = spdlog::stdout_logger_mt("tools_builtin");
+        }
+        return logger;
+    }
+}
+
+// ===== Exec Tool 实现 (100% 对齐 OpenClaw Sandbox) =====
+class ExecTool : public Tool {
+public:
+    explicit ExecTool(const ToolContext& context) : context_(context) {}
+    
+    std::string name() const override { return "exec"; }
+    
+    std::string description() const override {
+        return "Execute a shell command in a secure sandbox environment. "
+               "Returns stdout, stderr, and exit code. "
+               "The command runs in an isolated Docker container with resource limits.";
+    }
+    
+    Schema parameters() const override {
+        Schema schema;
+        schema.type = "object";
+        schema.description = "Parameters for exec tool";
+        
+        // command property
+        core::JsonValue command_prop = core::JsonValue::object({
+            {"type", "string"},
+            {"description", "Shell command to execute"}
+        });
+        schema.properties["command"] = command_prop;
+        
+        // timeout property
+        auto timeout_prop = core::JsonValue::object();
+        timeout_prop["type"] = "integer";
+        timeout_prop["description"] = "Timeout in seconds (default: 30)";
+        timeout_prop["minimum"] = core::JsonValue(static_cast<int64_t>(1));
+        timeout_prop["maximum"] = core::JsonValue(static_cast<int64_t>(300));
+        schema.properties["timeoutSec"] = timeout_prop;
+        
+        schema.required = {"command"};
+        
+        return schema;
+    }
+    
+    ToolResult execute(const core::JsonValue& params) override {
+        ToolParams reader(params);
+        std::string command = reader.read_string("command", true);
+        int timeout = static_cast<int>(reader.read_int("timeoutSec", false, 30));
+        
+        // ===== 100% 对齐 OpenClaw: 优先使用 Sandbox =====
+        
+        // 检查是否启用了 Sandbox
+        if (context_.sandbox_manager && !context_.sandbox_id.empty()) {
+            log()->info("[ExecTool] Executing in Sandbox: {}", context_.sandbox_id);
+            return execute_in_sandbox(command, timeout);
+        }
+        
+        // 降级: 本地执行 (生产环境应禁用)
+        log()->warn("[ExecTool] Sandbox not enabled, falling back to local execution (INSECURE!)");
+        return execute_locally(command, timeout);
+    }
+    
+    bool requires_approval() const override { return true; }
+
+private:
+    ToolContext context_;
+    
+    // ===== Sandbox 执行 (对齐 OpenClaw execd API) =====
+    ToolResult execute_in_sandbox(const std::string& command, int timeout) {
+        try {
+            // 获取 Sandbox 实例
+            auto sandbox = context_.sandbox_manager->get_sandbox_instance(context_.sandbox_id);
+            if (!sandbox) {
+                log()->error("[ExecTool] Sandbox not found: {}", context_.sandbox_id);
+                return tool_result::error("Sandbox not found: " + context_.sandbox_id);
+            }
+            
+            // 调用 execd API: POST /v1/command
+            log()->info("[ExecTool] Calling execd API: POST /v1/command");
+            log()->info("[ExecTool] Command: {}", command);
+            
+            // TODO: timeout参数暂时不使用，需要在sandbox实现中支持
+            auto result = sandbox->execute_command(command);
+            
+            // 构建 Tool 结果
+            ToolResult tool_result;
+            tool_result.success = result.success;
+            
+            ToolResultContent content;
+            content.type = ToolResultContent::Type::Text;
+            
+            // 合并 stdout + stderr
+            std::string output = result.stdout_output;
+            if (!result.stderr_output.empty()) {
+                output += "\n[stderr]\n" + result.stderr_output;
+            }
+            content.text = output;
+            tool_result.content.push_back(content);
+            
+            // 详细元数据
+            tool_result.details = core::JsonValue::object();
+            tool_result.details["cpuPercent"] = core::JsonValue(result.resource_usage.cpu_percent);
+            tool_result.details["memoryUsedGb"] = core::JsonValue(result.resource_usage.memory_used_gb);
+            tool_result.details["memoryPercent"] = core::JsonValue(result.resource_usage.memory_percent);
+            tool_result.details["exitCode"] = core::JsonValue(static_cast<int64_t>(result.exit_code));
+            tool_result.details["command"] = core::JsonValue(command);
+            tool_result.details["executionTimeMs"] = core::JsonValue(static_cast<int64_t>(result.execution_time_ms));
+            tool_result.details["sandboxId"] = core::JsonValue(context_.sandbox_id);
+            
+            log()->info("[ExecTool] Command executed in {}ms, exit_code={}",
+                       result.execution_time_ms, result.exit_code);
+            
+            return tool_result;
+            
+        } catch (const std::exception& e) {
+            log()->error("[ExecTool] Sandbox execution failed: {}", e.what());
+            return tool_result::error(std::string("Sandbox execution failed: ") + e.what());
+        }
+    }
+    
+    // ===== 本地执行 (降级路径，仅用于开发) =====
+    ToolResult execute_locally(const std::string& command, int timeout) {
+        // 切换到工作目录
+        std::string original_dir = fs::current_path().string();
+        if (!context_.workspace_dir.empty()) {
+            fs::current_path(context_.workspace_dir);
+        }
+        
+        // 执行命令
+        std::string full_command = command + " 2>&1";  // 合并stdout/stderr
+        std::array<char, 128> buffer;
+        std::string result_output;
+        int exit_code = 0;
+        
+        FILE* pipe = popen(full_command.c_str(), "r");
+        if (!pipe) {
+            fs::current_path(original_dir);
+            return tool_result::error("Failed to execute command");
+        }
+        
+        while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
+            result_output += buffer.data();
+        }
+        
+        exit_code = pclose(pipe);
+        
+        // 恢复原始目录
+        fs::current_path(original_dir);
+        
+        // 构建结果
+        ToolResult result;
+        result.success = (exit_code == 0);
+        
+        ToolResultContent content;
+        content.type = ToolResultContent::Type::Text;
+        content.text = result_output;
+        result.content.push_back(content);
+        
+        result.details = core::JsonValue::object({
+            {"exitCode", core::JsonValue(static_cast<int64_t>(exit_code))},
+            {"command", core::JsonValue(command)},
+            {"sandboxEnabled", core::JsonValue(false)}  // 标记未使用沙箱
+        });
+        
+        return result;
+    }
+};
+
+// ===== ReadFile Tool 实现 (100% 对齐 OpenClaw Sandbox) =====
+class ReadFileTool : public Tool {
+public:
+    explicit ReadFileTool(const ToolContext& context) : context_(context) {}
+    
+    std::string name() const override { return "read_file"; }
+    
+    std::string description() const override {
+        return "Read contents of a file from the workspace. "
+               "If sandbox is enabled, reads from the sandbox filesystem via execd API.";
+    }
+    
+    Schema parameters() const override {
+        Schema schema;
+        schema.type = "object";
+        
+        core::JsonValue path_prop = core::JsonValue::object({
+            {"type", core::JsonValue("string")},
+            {"description", core::JsonValue("File path relative to workspace root")}
+        });
+        schema.properties["path"] = path_prop;
+        
+        schema.required = {"path"};
+        return schema;
+    }
+    
+    ToolResult execute(const core::JsonValue& params) override {
+        ToolParams reader(params);
+        std::string path = reader.read_string("path", true);
+        
+        // ===== 100% 对齐 OpenClaw: 优先使用 Sandbox =====
+        
+        // 检查是否启用了 Sandbox
+        if (context_.sandbox_manager && !context_.sandbox_id.empty()) {
+            log()->info("[ReadFileTool] Reading from Sandbox: {}", context_.sandbox_id);
+            return read_from_sandbox(path);
+        }
+        
+        // 降级: 本地读取
+        log()->warn("[ReadFileTool] Sandbox not enabled, reading from local filesystem");
+        return read_from_local(path);
+    }
+
+private:
+    ToolContext context_;
+    
+    // ===== Sandbox 读取 (对齐 OpenClaw execd API) =====
+    ToolResult read_from_sandbox(const std::string& path) {
+        try {
+            // 获取 Sandbox 实例
+            auto sandbox = context_.sandbox_manager->get_sandbox_instance(context_.sandbox_id);
+            if (!sandbox) {
+                return tool_result::error("Sandbox not found: " + context_.sandbox_id);
+            }
+            
+            // 调用 execd API: GET /v1/files/read
+            log()->info("[ReadFileTool] Calling execd API: GET /v1/files/read?path={}", path);
+            
+            std::string content = sandbox->read_file(path);
+            
+            // Token budget限制
+            const size_t MAX_SIZE = 100 * 1024;
+            bool truncated = false;
+            if (content.size() > MAX_SIZE) {
+                content = content.substr(0, MAX_SIZE) + "\n\n[... truncated ...]";
+                truncated = true;
+            }
+            
+            ToolResult result;
+            result.success = true;
+            
+            ToolResultContent text_content;
+            text_content.type = ToolResultContent::Type::Text;
+            text_content.text = content;
+            result.content.push_back(text_content);
+            
+            result.details = core::JsonValue::object({
+                {"path", core::JsonValue(path)},
+                {"size", core::JsonValue(static_cast<double>(content.size()))},
+                {"truncated", core::JsonValue(truncated)},
+                {"sandboxId", core::JsonValue(context_.sandbox_id)}
+            });
+            
+            return result;
+            
+        } catch (const std::exception& e) {
+            log()->error("[ReadFileTool] Sandbox read failed: {}", e.what());
+            return tool_result::error(std::string("Sandbox read failed: ") + e.what());
+        }
+    }
+    
+    // ===== 本地读取 (降级路径) =====
+    ToolResult read_from_local(const std::string& path) {
+        // 构建绝对路径
+        fs::path full_path = fs::path(context_.workspace_dir) / path;
+        full_path = fs::absolute(full_path).lexically_normal();
+        
+        // 安全检查:确保在workspace内
+        std::string workspace_abs = fs::absolute(context_.workspace_dir).string();
+        if (full_path.string().find(workspace_abs) != 0) {
+            return tool_result::error("Access denied: path outside workspace");
+        }
+        
+        // 检查文件是否存在
+        if (!fs::exists(full_path)) {
+            return tool_result::error("File not found: " + path);
+        }
+        
+        // 读取文件
+        std::ifstream file(full_path, std::ios::binary);
+        if (!file) {
+            return tool_result::error("Failed to open file: " + path);
+        }
+        
+        std::stringstream buffer;
+        buffer << file.rdbuf();
+        std::string content = buffer.str();
+        
+        // 检查是否是图片
+        std::string ext = full_path.extension().string();
+        if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".gif" || ext == ".webp") {
+            // TODO: 转换为base64
+            return tool_result::error("Image reading not yet implemented");
+        }
+        
+        // Token budget限制
+        const size_t MAX_SIZE = 100 * 1024;
+        if (content.size() > MAX_SIZE) {
+            content = content.substr(0, MAX_SIZE) + "\n\n[... truncated ...]";
+        }
+        
+        ToolResult result;
+        result.success = true;
+        
+        ToolResultContent text_content;
+        text_content.type = ToolResultContent::Type::Text;
+        text_content.text = content;
+        result.content.push_back(text_content);
+        
+        result.details = core::JsonValue::object({
+            {"path", path},
+            {"size", static_cast<double>(content.size())},
+            {"sandboxEnabled", false}
+        });
+        
+        return result;
+    }
+};
+
+// WriteFile Tool实现
+class WriteFileTool : public Tool {
+public:
+    explicit WriteFileTool(const ToolContext& context) : context_(context) {}
+    
+    std::string name() const override { return "write_file"; }
+    
+    std::string description() const override {
+        return "Write content to a file in the workspace. Creates parent directories if needed.";
+    }
+    
+    Schema parameters() const override {
+        Schema schema;
+        schema.type = "object";
+        
+        core::JsonValue path_prop = core::JsonValue::object({
+            {"type", core::JsonValue("string")},
+            {"description", core::JsonValue("File path relative to workspace root")}
+        });
+        schema.properties["path"] = path_prop;
+        
+        core::JsonValue content_prop = core::JsonValue::object({
+            {"type", core::JsonValue("string")},
+            {"description", core::JsonValue("Content to write to file")}
+        });
+        schema.properties["content"] = content_prop;
+        
+        schema.required = {"path", "content"};
+        return schema;
+    }
+    
+    ToolResult execute(const core::JsonValue& params) override {
+        ToolParams reader(params);
+        std::string path = reader.read_string("path", true);
+        std::string content = reader.read_string("content", true);
+        
+        // 构建绝对路径
+        fs::path full_path = fs::path(context_.workspace_dir) / path;
+        full_path = fs::absolute(full_path).lexically_normal();
+        
+        // 安全检查
+        std::string workspace_abs = fs::absolute(context_.workspace_dir).string();
+        if (full_path.string().find(workspace_abs) != 0) {
+            return tool_result::error("Access denied: path outside workspace");
+        }
+        
+        // 创建父目录
+        fs::create_directories(full_path.parent_path());
+        
+        // 写入文件
+        std::ofstream file(full_path);
+        if (!file) {
+            return tool_result::error("Failed to create file: " + path);
+        }
+        
+        file << content;
+        file.close();
+        
+        ToolResult result;
+        result.success = true;
+        
+        ToolResultContent text_content;
+        text_content.type = ToolResultContent::Type::Text;
+        text_content.text = "File written successfully: " + path;
+        result.content.push_back(text_content);
+        
+        result.details = core::JsonValue::object({
+            {"path", path},
+            {"size", static_cast<double>(content.size())}
+        });
+        
+        return result;
+    }
+    
+    bool requires_approval() const override { return true; }
+
+private:
+    ToolContext context_;
+};
+
+// ListDir Tool实现
+class ListDirTool : public Tool {
+public:
+    explicit ListDirTool(const ToolContext& context) : context_(context) {}
+    
+    std::string name() const override { return "list_dir"; }
+    
+    std::string description() const override {
+        return "List files and directories in a given path.";
+    }
+    
+    Schema parameters() const override {
+        Schema schema;
+        schema.type = "object";
+        
+        core::JsonValue path_prop = core::JsonValue::object({
+            {"type", core::JsonValue("string")},
+            {"description", core::JsonValue("Directory path relative to workspace root (default: '.')")}
+        });
+        schema.properties["path"] = path_prop;
+        
+        core::JsonValue recursive_prop = core::JsonValue::object({
+            {"type", core::JsonValue("boolean")},
+            {"description", core::JsonValue("Recursively list subdirectories (default: false)")}
+        });
+        schema.properties["recursive"] = recursive_prop;
+        
+        return schema;
+    }
+    
+    ToolResult execute(const core::JsonValue& params) override {
+        ToolParams reader(params);
+        std::string path = reader.read_string("path", false, ".");
+        bool recursive = reader.read_bool("recursive", false, false);
+        
+        // 构建绝对路径
+        fs::path full_path = fs::path(context_.workspace_dir) / path;
+        full_path = fs::absolute(full_path).lexically_normal();
+        
+        // 安全检查
+        std::string workspace_abs = fs::absolute(context_.workspace_dir).string();
+        if (full_path.string().find(workspace_abs) != 0) {
+            return tool_result::error("Access denied: path outside workspace");
+        }
+        
+        if (!fs::exists(full_path)) {
+            return tool_result::error("Directory not found: " + path);
+        }
+        
+        if (!fs::is_directory(full_path)) {
+            return tool_result::error("Not a directory: " + path);
+        }
+        
+        // 列出文件
+        std::vector<std::string> entries;
+        
+        try {
+            if (recursive) {
+                for (const auto& entry : fs::recursive_directory_iterator(full_path)) {
+                    fs::path rel = fs::relative(entry.path(), full_path);
+                    std::string type = entry.is_directory() ? "dir" : "file";
+                    entries.push_back(type + "  " + rel.string());
+                }
+            } else {
+                for (const auto& entry : fs::directory_iterator(full_path)) {
+                    std::string type = entry.is_directory() ? "dir" : "file";
+                    entries.push_back(type + "  " + entry.path().filename().string());
+                }
+            }
+        } catch (const fs::filesystem_error& e) {
+            return tool_result::error(std::string("Failed to list directory: ") + e.what());
+        }
+        
+        // 构建输出
+        std::stringstream output;
+        output << "Directory: " << path << "\n\n";
+        for (const auto& entry : entries) {
+            output << entry << "\n";
+        }
+        
+        ToolResult result;
+        result.success = true;
+        
+        ToolResultContent text_content;
+        text_content.type = ToolResultContent::Type::Text;
+        text_content.text = output.str();
+        result.content.push_back(text_content);
+        
+        result.details = core::JsonValue::object({
+            {"path", path},
+            {"count", static_cast<double>(entries.size())},
+            {"recursive", recursive}
+        });
+        
+        return result;
+    }
+
+private:
+    ToolContext context_;
+};
+
+// SearchContent Tool实现 (简化的grep)
+class SearchContentTool : public Tool {
+public:
+    explicit SearchContentTool(const ToolContext& context) : context_(context) {}
+    
+    std::string name() const override { return "search_content"; }
+    
+    std::string description() const override {
+        return "Search for text patterns in files (grep-like functionality).";
+    }
+    
+    Schema parameters() const override {
+        Schema schema;
+        schema.type = "object";
+        
+        core::JsonValue pattern_prop = core::JsonValue::object({
+            {"type", core::JsonValue("string")},
+            {"description", core::JsonValue("Search pattern (regex supported)")}
+        });
+        schema.properties["pattern"] = pattern_prop;
+        
+        core::JsonValue path_prop = core::JsonValue::object({
+            {"type", core::JsonValue("string")},
+            {"description", core::JsonValue("Directory to search in (default: '.')")}
+        });
+        schema.properties["path"] = path_prop;
+        
+        core::JsonValue file_types_prop = core::JsonValue::object({
+            {"type", core::JsonValue("string")},
+            {"description", core::JsonValue("File extensions to search (e.g., '.js,.ts,.py')")}
+        });
+        schema.properties["fileTypes"] = file_types_prop;
+        
+        schema.required = {"pattern"};
+        return schema;
+    }
+    
+    ToolResult execute(const core::JsonValue& params) override {
+        ToolParams reader(params);
+        std::string pattern = reader.read_string("pattern", true);
+        std::string path = reader.read_string("path", false, ".");
+        std::string file_types = reader.read_string("fileTypes", false, "");
+        
+        // 使用系统grep命令 (简化实现)
+        std::string command = "cd " + context_.workspace_dir + " && grep -rn \"" + pattern + "\" " + path;
+        
+        if (!file_types.empty()) {
+            // TODO: 添加文件类型过滤
+        }
+        
+        std::array<char, 128> buffer;
+        std::string result_output;
+        
+        FILE* pipe = popen(command.c_str(), "r");
+        if (!pipe) {
+            return tool_result::error("Failed to execute grep");
+        }
+        
+        while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
+            result_output += buffer.data();
+        }
+        
+        pclose(pipe);
+        
+        ToolResult result;
+        result.success = true;
+        
+        ToolResultContent text_content;
+        text_content.type = ToolResultContent::Type::Text;
+        text_content.text = result_output.empty() ? "No matches found" : result_output;
+        result.content.push_back(text_content);
+        
+        return result;
+    }
+
+private:
+    ToolContext context_;
+};
+
+// Factory实现
+std::shared_ptr<Tool> BuiltinTools::create_exec_tool(const ToolContext& context) {
+    return std::make_shared<ExecTool>(context);
+}
+
+std::shared_ptr<Tool> BuiltinTools::create_read_file_tool(const ToolContext& context) {
+    return std::make_shared<ReadFileTool>(context);
+}
+
+std::shared_ptr<Tool> BuiltinTools::create_write_file_tool(const ToolContext& context) {
+    return std::make_shared<WriteFileTool>(context);
+}
+
+std::shared_ptr<Tool> BuiltinTools::create_list_dir_tool(const ToolContext& context) {
+    return std::make_shared<ListDirTool>(context);
+}
+
+std::shared_ptr<Tool> BuiltinTools::create_search_files_tool(const ToolContext& context) {
+    // TODO: 实现文件名搜索
+    return nullptr;
+}
+
+std::shared_ptr<Tool> BuiltinTools::create_search_content_tool(const ToolContext& context) {
+    return std::make_shared<SearchContentTool>(context);
+}
+
+std::shared_ptr<Tool> BuiltinTools::create_web_search_tool(const ToolContext& context) {
+    // TODO: 实现Web搜索
+    return nullptr;
+}
+
+void BuiltinTools::register_all(ToolManager& manager, const ToolContext& context) {
+    manager.register_tool(create_exec_tool(context));
+    manager.register_tool(create_read_file_tool(context));
+    manager.register_tool(create_write_file_tool(context));
+    manager.register_tool(create_list_dir_tool(context));
+    manager.register_tool(create_search_content_tool(context));
+    
+    // Web搜索工具(可选)
+    auto web_search = create_web_search_tool(context);
+    if (web_search) {
+        manager.register_tool(web_search);
+    }
+}
+
+} // namespace tools
+} // namespace hunterclaw

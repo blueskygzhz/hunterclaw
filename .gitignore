@@ -1,0 +1,70 @@
+# Build directories
+build/
+bin/
+lib/
+dist/
+
+# Compiled files
+*.o
+*.so
+*.a
+*.dylib
+*.dll
+*.exe
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+build_*.log
+compile_*.log
+
+# Temporary files
+*.tmp
+*.bak
+*.orig
+.cache/
+
+# Credentials
+*.key
+*.pem
+config.yaml
+!config.example.yaml
+.env
+.env.local
+
+# Test outputs
+test_results/
+coverage/
+*.gcov
+*.gcda
+*.gcno
+
+# Documentation build
+docs/_build/
+docs/site/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Node
+node_modules/
+package-lock.json
+yarn.lock

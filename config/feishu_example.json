@@ -1,0 +1,64 @@
+{
+  "feishu": {
+    "enabled": true,
+    "default_account": "default",
+    
+    "accounts": {
+      "default": {
+        "app_id": "cli_xxxxxxxxxxxxxxxx",
+        "app_secret": "your_app_secret_here",
+        "encrypt_key": "your_encrypt_key_here",
+        "verification_token": "your_verification_token_here",
+        
+        "domain": "feishu",
+        
+        "connection_mode": "websocket",
+        
+        "webhook_path": "/feishu/webhook",
+        "webhook_host": "0.0.0.0",
+        "webhook_port": 8089,
+        
+        "dm_policy": "open",
+        "group_policy": "open",
+        "allow_from": [],
+        
+        "enable_message_dedup": true,
+        "dedup_window_seconds": 300,
+        "enable_inbound_debounce": true,
+        "debounce_delay_ms": 500,
+        
+        "enable_broadcast": false,
+        "max_reconnect_attempts": 10
+      },
+      
+      "海外账号示例": {
+        "app_id": "cli_xxxxxxxxxxxxxxxx",
+        "app_secret": "your_lark_app_secret",
+        "encrypt_key": "",
+        "verification_token": "",
+        
+        "domain": "lark",
+        
+        "connection_mode": "websocket",
+        
+        "dm_policy": "allowlist",
+        "group_policy": "allowlist",
+        "allow_from": [
+          "ou_xxxxxxxxxxxxxxxx",
+          "oc_xxxxxxxxxxxxxxxx"
+        ]
+      }
+    }
+  },
+  
+  "_comments": {
+    "domain": "可选值: feishu (国内), lark (海外), 或自定义域名",
+    "connection_mode": "可选值: websocket (推荐，无需公网IP), webhook (需要公网IP和端口)",
+    "dm_policy": "私聊策略: open (接受所有), pairing (需要配对), allowlist (仅白名单)",
+    "group_policy": "群聊策略: open (接受所有), allowlist (仅白名单), disabled (禁用)",
+    "allow_from": "白名单ID列表（用户ID或群组ID）",
+    "enable_message_dedup": "是否启用消息去重，防止重复处理同一消息",
+    "enable_inbound_debounce": "是否启用消息防抖合并，快速连续的消息会被合并",
+    "enable_broadcast": "广播模式：一条消息可分发给多个agent处理"
+  }
+}

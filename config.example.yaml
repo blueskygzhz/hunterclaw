@@ -1,0 +1,168 @@
+# HunterClaw Configuration Example
+# This file format is 100% compatible with OpenClaw config.yaml
+
+# Gateway Server Configuration (OpenClaw compatible)
+gateway:
+  host: "127.0.0.1"      # Bind address (OpenClaw default)
+  port: 18789            # WebSocket port (OpenClaw default)
+  verbose: false         # Verbose logging
+  allowRemote: false     # Allow non-localhost connections
+  
+  # TLS/SSL (optional)
+  tls:
+    enabled: false
+    certPath: "/path/to/cert.pem"
+    keyPath: "/path/to/key.pem"
+
+# Authentication Configuration (OpenClaw compatible)
+auth:
+  # Password authentication
+  password: "${HUNTERCLAW_PASSWORD}"  # Or use env var
+  
+  # Token-based authentication (list)
+  tokens:
+    - "${HUNTERCLAW_TOKEN}"
+    - "another-token-here"
+  
+  # Device pairing (OpenClaw pairing system)
+  deviceAuthEnabled: true
+
+# Skills Configuration (OpenClaw compatible)
+skills:
+  # Allow specific bundled skills
+  allowBundled:
+    - git
+    - github
+    - weather
+    - docker
+  
+  # Loading configuration
+  load:
+    # Additional skill directories
+    extraDirs:
+      - "~/custom-skills"
+      - "/opt/company-skills"
+    
+    # Watch for changes (hot reload)
+    watch: true
+    watchDebounceMs: 500
+  
+  # Limits (OpenClaw compatible)
+  limits:
+    maxCandidatesPerRoot: 300
+    maxSkillsLoadedPerSource: 200
+    maxSkillsInPrompt: 150
+    maxSkillsPromptChars: 30000
+    maxSkillFileBytes: 256000
+  
+  # Installation preferences
+  install:
+    preferBrew: true          # Prefer Homebrew on macOS/Linux
+    nodeManager: "pnpm"       # npm, pnpm, yarn, bun
+
+# Channels Configuration (OpenClaw compatible)
+channels:
+  # Telegram Channel
+  telegram:
+    default:
+      enabled: true
+      token: "${TELEGRAM_BOT_TOKEN}"
+      dmPolicy: "pairing"     # pairing | open | closed
+      allowFrom:
+        - "your-telegram-id"
+      
+  # Discord Channel (example, not yet implemented)
+  discord:
+    default:
+      enabled: false
+      token: "${DISCORD_BOT_TOKEN}"
+      dmPolicy: "pairing"
+      allowFrom: []
+  
+  # Slack Channel (example, not yet implemented)
+  slack:
+    default:
+      enabled: false
+      token: "${SLACK_BOT_TOKEN}"
+      dmPolicy: "pairing"
+      allowFrom: []
+
+# Plugins Configuration (HunterClaw specific)
+plugins:
+  enabled: true
+  autoload: true
+  
+  # Plugin search paths (C++ dynamic libraries)
+  searchPaths:
+    - "/usr/local/lib/hunterclaw/plugins"
+    - "~/.hunterclaw/plugins"
+    - "./plugins"
+  
+  # Plugin-specific configuration
+  entries:
+    telegram:
+      enabled: true
+      priority: 10
+    
+    discord:
+      enabled: false
+      priority: 20
+
+# Workspace Configuration
+workspace:
+  # Workspace directory (contains .agents/, skills/, etc.)
+  dir: "."
+  
+  # Config directory (HunterClaw data)
+  configDir: "~/.hunterclaw"
+
+# Rate Limiting (HunterClaw specific)
+rateLimiting:
+  enabled: true
+  maxAttempts: 20
+  windowMs: 60000          # 1 minute
+  exemptLoopback: true     # Don't rate limit localhost
+
+# Advanced Options (HunterClaw specific)
+advanced:
+  # Threading
+  workerThreads: 8         # Worker thread pool size (0 = auto)
+  
+  # Connection pool
+  maxConnections: 10000
+  maxPayloadBytes: 26214400  # 25MB
+  
+  # Heartbeat
+  heartbeatIntervalMs: 30000  # 30s
+  
+  # Logging
+  logLevel: "info"         # trace, debug, info, warn, error, fatal
+  logFile: "~/.hunterclaw/logs/gateway.log"
+  logRotate: true
+  logMaxSizeBytes: 10485760  # 10MB
+  logMaxFiles: 5
+
+# Environment Variables (referenced above)
+# Set these before starting HunterClaw:
+#
+# export HUNTERCLAW_PASSWORD="your-secure-password"
+# export HUNTERCLAW_TOKEN="your-auth-token"
+# export TELEGRAM_BOT_TOKEN="your-telegram-bot-token"
+# export DISCORD_BOT_TOKEN="your-discord-bot-token"
+# export SLACK_BOT_TOKEN="your-slack-bot-token"
+
+# OpenClaw Compatibility Notes:
+# =============================
+# 1. This config format is 100% compatible with OpenClaw
+# 2. All OpenClaw config fields are supported
+# 3. HunterClaw adds optional extensions (plugins.searchPaths, advanced.*)
+# 4. You can use your existing OpenClaw config.yaml with minimal changes
+# 5. Environment variable expansion works identically (${VAR_NAME})
+#
+# Migration from OpenClaw:
+# ========================
+# 1. Copy your OpenClaw config.yaml
+# 2. Replace 'openclaw' references with 'hunterclaw' in env vars (optional)
+# 3. Add plugin search paths if using custom plugins
+# 4. Channels that aren't implemented yet will be ignored (no error)
+# 5. Skills work identically - no changes needed!
