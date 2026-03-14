@@ -61,8 +61,12 @@ Result<void> ManagedRun::Spawn(const SpawnInput& input) {
   
   // 创建子进程
   SubprocessOptions options;
-  options.command = input.command;
-  options.args = input.args;
+  if (!input.argv.empty()) {
+    options.command = input.argv[0];
+    if (input.argv.size() > 1) {
+      options.args = std::vector<std::string>(input.argv.begin() + 1, input.argv.end());
+    }
+  }
   options.cwd = input.cwd;
   options.env = input.env;
   options.capture_stdout = true;
@@ -76,7 +80,7 @@ Result<void> ManagedRun::Spawn(const SpawnInput& input) {
   }
   
   // 设置信号桥接
-  if (config_.forward_signals && subprocess_->GetPid()) {
+  if (config_.forward_signals && subprocess_->pid()) {
     SignalBridgeConfig bridge_config;
     bridge_config.forward_signals = {
         SignalType::SIGINT,
@@ -85,7 +89,7 @@ Result<void> ManagedRun::Spawn(const SpawnInput& input) {
     };
     
     signal_bridge_ = std::make_unique<SignalBridge>(
-        *subprocess_->GetPid(),
+        *subprocess_->pid(),
         bridge_config);
     signal_bridge_->Activate();
   }
@@ -99,10 +103,9 @@ Result<void> ManagedRun::Spawn(const SpawnInput& input) {
     record.run_id = run_id_;
     record.scope_key = scope_key_;
     record.state = state_;
-    record.started_at = started_at_;
-    record.pid = subprocess_->GetPid();
-    record.command = input.command;
-    record.args = input.args;
+    record.started_at_ms = started_at_;
+    record.pid = subprocess_->pid();
+    // Note: RunRecord doesn't have command/args fields in core::supervisor_types.h
     
     config_.callbacks.on_start(record);
   }
@@ -133,13 +136,13 @@ Result<void> ManagedRun::Cancel(TerminationReason reason) {
   UpdateState(RunState::Exiting);
   
   // 终止进程树
-  if (subprocess_->GetPid()) {
+  if (subprocess_->pid()) {
     KillTreeOptions options;
-    options.force = (reason == TerminationReason::Timeout ||
-                     reason == TerminationReason::IdleTimeout);
+    options.force = (reason == TerminationReason::OverallTimeout ||
+                     reason == TerminationReason::NoOutputTimeout);
     options.grace_period_ms = options.force ? 1000 : 3000;
     
-    auto result = KillProcessTree(*subprocess_->GetPid(), options);
+    auto result = KillProcessTree(*subprocess_->pid(), options);
     if (!result.ok()) {
       return result;
     }
@@ -255,7 +258,7 @@ void ManagedRun::TimeoutWatchdog() {
     if (config_.global_timeout_ms > 0) {
       int64_t elapsed = now - started_at_;
       if (elapsed > config_.global_timeout_ms) {
-        Cancel(TerminationReason::Timeout);
+        Cancel(TerminationReason::OverallTimeout);
         break;
       }
     }
@@ -264,7 +267,7 @@ void ManagedRun::TimeoutWatchdog() {
     if (config_.idle_timeout_ms > 0) {
       int64_t idle = now - last_output_at_;
       if (idle > config_.idle_timeout_ms) {
-        Cancel(TerminationReason::IdleTimeout);
+        Cancel(TerminationReason::NoOutputTimeout);
         break;
       }
     }
