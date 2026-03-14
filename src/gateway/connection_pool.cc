@@ -199,18 +199,18 @@ void ConnectionPool::unsubscribe(uint64_t subscription_id) {
     
     auto it = subscriptions_.find(subscription_id);
     if (it != subscriptions_.end()) {
-        spdlog::debug("[ConnectionPool] Unsubscribed (id: {})", subscription_id);
+        auto logger = spdlog::get("connection_pool");
+        if (logger) {
+            logger->debug("[ConnectionPool] Unsubscribed (id: {})", subscription_id);
+        }
         subscriptions_.erase(it);
     }
 }
 
-            spdlog::error("[ConnectionPool] Subscriber callback error: {}", e.what());
-        }
-    }
-}
-
-bool ConnectionPool::match_event_pattern(
-    const std::string& event,
+// TODO: 删除孤立的代码片段
+/*
+// bool ConnectionPool::match_event_pattern(
+//     const std::string& event,
     const std::string& pattern
 ) const {
     // 简单的通配符匹配: "agent.*" 匹配 "agent.text", "agent.tool_call" 等
@@ -227,6 +227,7 @@ bool ConnectionPool::match_event_pattern(
     // 精确匹配
     return event == pattern;
 }
+*/
 
 } // namespace gateway
 } // namespace hunterclaw

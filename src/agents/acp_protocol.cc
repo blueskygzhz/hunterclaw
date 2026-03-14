@@ -474,19 +474,22 @@ core::Result<void> AcpProtocol::validate_meta(const SessionAcpMeta& meta) {
         }
         
         if (path.find("..") != std::string::npos) {
-            return core::Result<void>::err("memory_override contains '..' (path traversal)");
+            return Error<void>("memory_override contains '..' (path traversal)");
         }
         
         try {
             if (!std::filesystem::exists(path)) {
-                spdlog::warn("[AcpProtocol] memory_override path does not exist: {}", path);
+                auto logger = spdlog::get("acp_protocol");
+                if (logger) {
+                    logger->warn("[AcpProtocol] memory_override path does not exist: {}", path);
+                }
             }
         } catch (const std::exception& e) {
-            return core::Result<void>::err(std::string("memory_override path check failed: ") + e.what());
+            return Error<void>(std::string("memory_override path check failed: ") + e.what());
         }
     }
     
-    return core::Result<void>::ok();
+    return OkVoid();
 }
 
 AcpMessage AcpProtocol::create_message(
