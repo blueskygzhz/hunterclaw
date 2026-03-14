@@ -6,8 +6,21 @@ namespace hunterclaw {
 namespace sessions {
 
 namespace {
-    auto log() {
-        static auto logger = spdlog::default_logger();
+    // Helper to get logger - returns global default logger
+    inline std::shared_ptr<spdlog::logger> log() {
+        static auto logger = []() {
+            auto l = spdlog::get("hunterclaw");
+            if (!l) {
+                // Create a simple stdout logger if none exists
+                try {
+                    l = spdlog::stdout_color_mt("hunterclaw");
+                } catch (...) {
+                    // If it already exists, get it
+                    l = spdlog::get("hunterclaw");
+                }
+            }
+            return l;
+        }();
         return logger;
     }
     
