@@ -4,6 +4,22 @@
 
 namespace hunterclaw::tools {
 
+namespace {
+
+// 获取 Tools logger
+auto get_logger() {
+    static auto logger = []() {
+        auto log = spdlog::get("tools");
+        if (!log) {
+            log = spdlog::stdout_logger_mt("tools");
+        }
+        return log;
+    }();
+    return logger;
+}
+
+} // namespace
+
 void ResultProcessingPipeline::add_processor(const std::string& name, ResultProcessor processor) {
     processors_.push_back({name, processor});
 }
@@ -35,11 +51,7 @@ namespace builtin_processors {
 
 ResultProcessor create_image_sanitizer(const ImageSanitizerConfig&) {
     return [](const ToolResult& result) {
-        static auto logger = spdlog::get("tools");
-        if (!logger) {
-            logger = spdlog::stdout_logger_mt("tools");
-        }
-        logger->warn("Image sanitizer not implemented");
+        get_logger()->warn("Image sanitizer not implemented");
         return result;
     };
 }

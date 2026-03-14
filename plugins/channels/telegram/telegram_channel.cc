@@ -1,7 +1,7 @@
 #include "hunterclaw/channels/channel.h"
 #include "hunterclaw/plugins/plugin.h"
+#include "hunterclaw/infra/http_client.h"
 #include <nlohmann/json.hpp>
-#include <curl/curl.h>
 #include <thread>
 #include <chrono>
 
@@ -38,6 +38,9 @@ public:
         if (token_.empty()) {
             return core::Result<bool>::Err("Telegram token not configured");
         }
+        
+        // Create HTTP client
+        http_client_ = infra::HttpClient::create();
         
         ctx_.log_info("Starting Telegram adapter for account: " + ctx.account.account_id);
         
@@ -101,8 +104,9 @@ public:
     }
     
     core::Result<bool> send_file(const std::string& to, const std::string& file_path) override {
-        // TODO: Implement file upload
-        return core::Result<bool>::Err("File upload not yet implemented");
+        // TODO: Implement multipart/form-data upload using native HTTP client
+        // For now, use sendDocument with file_id if available
+        return core::Result<bool>::Err("File upload not yet implemented with native HTTP client");
     }
     
     bool is_connected() const override {
@@ -123,6 +127,7 @@ private:
     std::atomic<bool> is_running_{false};
     std::thread polling_thread_;
     int64_t last_update_id_ = 0;
+    infra::HttpClient::Ptr http_client_;
     
     // ========================================================================
     // Telegram API Calls
@@ -145,45 +150,31 @@ private:
     core::Result<json> call_api(const std::string& method, const json& payload) {
         std::string url = "https://api.telegram.org/bot" + token_ + "/" + method;
         
-        CURL* curl = curl_easy_init();
-        if (!curl) {
-            return core::Result<json>::Err("Failed to initialize CURL");
+        // Prepare request options
+        infra::HttpRequestOptions options;
+        options.timeout_ms = 10000;  // 10 seconds
+        options.headers["Content-Type"] = "application/json";
+        options.body = payload.dump();
+        
+        // Make request
+        auto http_response = http_client_->post(url, options);
+        if (!http_response.is_ok()) {
+            return core::Result<json>::Err("HTTP request failed: " + http_response.error);
         }
         
-        std::string response_data;
-        std::string payload_str = payload.dump();
-        
-        struct curl_slist* headers = nullptr;
-        headers = curl_slist_append(headers, "Content-Type: application/json");
-        
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload_str.c_str());
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_data);
-        
-        CURLcode res = curl_easy_perform(curl);
-        curl_slist_free_all(headers);
-        curl_easy_cleanup(curl);
-        
-        if (res != CURLE_OK) {
-            return core::Result<json>::Err(curl_easy_strerror(res));
+        if (!http_response.value.ok) {
+            return core::Result<json>::Err("HTTP " + std::to_string(http_response.value.status_code));
         }
         
         try {
-            json response_json = json::parse(response_data);
+            json response_json = json::parse(http_response.value.body);
             if (!response_json["ok"].get<bool>()) {
                 return core::Result<json>::Err(response_json["description"].get<std::string>());
             }
             return core::Result<json>::Ok(response_json["result"]);
         } catch (const std::exception& e) {
-            return core::Result<json>::Err(e.what());
+            return core::Result<json>::Err(std::string("JSON parse error: ") + e.what());
         }
-    }
-    
-    static size_t write_callback(void* contents, size_t size, size_t nmemb, void* userp) {
-        ((std::string*)userp)->append((char*)contents, size * nmemb);
-        return size * nmemb;
     }
     
     // ========================================================================
@@ -279,3 +270,7 @@ public:
 // ============================================================================
 
 HUNTERCLAW_REGISTER_PLUGIN(TelegramChannelPlugin)
+
+// Auto-register Telegram adapter to registry
+#include "hunterclaw/channels/registry.h"
+HUNTERCLAW_REGISTER_CHANNEL_ADAPTER(TelegramChannelAdapter, "telegram")

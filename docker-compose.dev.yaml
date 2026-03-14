@@ -1,0 +1,167 @@
+version: '3.8'
+
+# ============================================================================
+# HunterClaw 开发环境 Docker Compose 配置
+# ============================================================================
+# 用于本地开发和调试，包含完整的开发工具链和热重载支持
+# ============================================================================
+
+services:
+  # ==========================================================================
+  # 开发容器 (主要工作环境)
+  # ==========================================================================
+  hunterclaw-dev:
+    image: hunterclaw/hunterclaw:0.1.0-dev
+    container_name: hunterclaw-dev
+    hostname: hunterclaw-dev
+    
+    # 开发模式：使用交互式终端
+    stdin_open: true
+    tty: true
+    
+    ports:
+      - "8080:8080"    # Gateway HTTP/HTTPS
+      - "8081:8081"    # Health Check
+      - "9090:9090"    # Prometheus Metrics
+      - "5678:5678"    # GDB Remote Debug
+    
+    environment:
+      # OpenAI 配置 (从宿主机环境变量读取)
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_API_BASE=${OPENAI_API_BASE:-https://api.openai.com/v1}
+      
+      # HunterClaw 配置
+      - HUNTERCLAW_API_TOKENS=${HUNTERCLAW_API_TOKENS:-dev_token_12345}
+      - HUNTERCLAW_SIGNING_SECRET=${HUNTERCLAW_SIGNING_SECRET:-dev_secret}
+      
+      # 开发模式
+      - HUNTERCLAW_ENV=development
+      - LOG_LEVEL=debug
+      
+      # 数据库配置 (开发环境使用 SQLite)
+      - DB_TYPE=sqlite
+      - DB_PATH=/var/lib/hunterclaw/db/hunterclaw.db
+      
+      # 调试选项
+      - ASAN_OPTIONS=detect_leaks=1
+      - UBSAN_OPTIONS=print_stacktrace=1
+    
+    volumes:
+      # 挂载源代码 (支持实时修改)
+      - ./:/workspace:cached
+      
+      # 挂载构建缓存 (加速编译)
+      - hunterclaw_build_cache:/workspace/build
+      
+      # 挂载数据目录
+      - hunterclaw_dev_data:/var/lib/hunterclaw
+      - hunterclaw_dev_logs:/var/log/hunterclaw
+      
+      # 挂载配置文件
+      - ./config/development.yaml:/etc/hunterclaw/config.yaml:ro
+      
+      # 共享宿主机的 Git 配置 (可选)
+      - ~/.gitconfig:/home/developer/.gitconfig:ro
+      - ~/.ssh:/home/developer/.ssh:ro
+    
+    working_dir: /workspace
+    
+    networks:
+      - dev_network
+    
+    # 开发模式：保持容器运行
+    command: /bin/bash
+    
+    # 资源限制 (开发环境较宽松)
+    deploy:
+      resources:
+        limits:
+          cpus: '8'
+          memory: 16G
+        reservations:
+          cpus: '2'
+          memory: 4G
+    
+    # 健康检查 (开发模式可选)
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /workspace/build/hunterclaw-gateway || exit 1"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ==========================================================================
+  # Redis (开发环境 - 可选)
+  # ==========================================================================
+  redis-dev:
+    image: redis:7-alpine
+    container_name: hunterclaw-redis-dev
+    
+    ports:
+      - "6379:6379"
+    
+    volumes:
+      - redis_dev_data:/data
+    
+    networks:
+      - dev_network
+    
+    # 开发环境不需要密码
+    command: redis-server --appendonly yes
+    
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # ==========================================================================
+  # PostgreSQL (开发环境 - 可选)
+  # ==========================================================================
+  postgres-dev:
+    image: postgres:15-alpine
+    container_name: hunterclaw-postgres-dev
+    
+    ports:
+      - "5432:5432"
+    
+    environment:
+      - POSTGRES_DB=hunterclaw_dev
+      - POSTGRES_USER=developer
+      - POSTGRES_PASSWORD=dev123456
+      - POSTGRES_INITDB_ARGS=--encoding=UTF8
+    
+    volumes:
+      - postgres_dev_data:/var/lib/postgresql/data
+    
+    networks:
+      - dev_network
+    
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U developer"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+# ============================================================================
+# 网络配置
+# ============================================================================
+networks:
+  dev_network:
+    driver: bridge
+    name: hunterclaw_dev_network
+
+# ============================================================================
+# 卷配置
+# ============================================================================
+volumes:
+  hunterclaw_build_cache:
+    driver: local
+  hunterclaw_dev_data:
+    driver: local
+  hunterclaw_dev_logs:
+    driver: local
+  redis_dev_data:
+    driver: local
+  postgres_dev_data:
+    driver: local

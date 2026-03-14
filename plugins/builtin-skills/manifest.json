@@ -1,0 +1,43 @@
+{
+  "$schema": "https://hunterclaw.dev/schemas/plugin-manifest.json",
+  "id": "builtin-skills",
+  "name": "Builtin Skills",
+  "version": "1.0.0",
+  "kind": "skills",
+  "description": "System builtin skills (Bundled + Managed)",
+  "author": "HunterClaw Team",
+  "homepage": "https://hunterclaw.dev",
+  
+  "skills": [],
+  
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "bundled_dir": {
+        "type": "string",
+        "description": "Bundled skills directory",
+        "default": "~/.hunterclaw/skills-bundled"
+      },
+      "openclaw_dir": {
+        "type": "string",
+        "description": "OpenClaw skills directory (compatibility)",
+        "default": "~/.openclaw/skills"
+      },
+      "managed_dir": {
+        "type": "string",
+        "description": "Managed skills directory",
+        "default": "~/.hunterclaw/skills"
+      },
+      "watch": {
+        "type": "boolean",
+        "description": "Enable hot reload",
+        "default": true
+      }
+    }
+  },
+  
+  "enabled": true,
+  "main": "libbuiltin_skills_plugin.so",
+  
+  "_comment": "This plugin loads system builtin skills from predefined directories"
+}

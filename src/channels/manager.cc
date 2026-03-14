@@ -1,4 +1,5 @@
 #include "hunterclaw/channels/manager.h"
+#include "hunterclaw/channels/registry.h"
 #include "hunterclaw/core/utils.h"
 #include <thread>
 #include <chrono>
@@ -15,6 +16,62 @@ namespace {
             logger = spdlog::stdout_logger_mt("channels");
         }
         return logger;
+    }
+    
+    // ✅ 健康评估结果 (对齐 OpenClaw: ChannelHealth)
+    struct ChannelHealthResult {
+        bool healthy;
+        std::string reason;
+    };
+    
+    // ✅ 重启事件记录 (对齐 OpenClaw: RestartEvent)
+    struct RestartEvent {
+        int64_t at;  // 重启时间戳 (ms)
+    };
+    
+    // ✅ 重启记录 (对齐 OpenClaw: RestartRecord)
+    struct RestartRecord {
+        int64_t last_restart_at;
+        std::vector<RestartEvent> restarts_this_hour;
+    };
+    
+    // ✅ 健康评估函数 (100% 对齐 OpenClaw: evaluateChannelHealth)
+    ChannelHealthResult evaluate_channel_health(
+        const ChannelAccountSnapshot& runtime,
+        ChannelId channel_id,
+        int64_t now_ms,
+        const ChannelHealthMonitorConfig& config
+    ) {
+        // 1. 未启用 → 健康 (跳过)
+        if (!runtime.enabled) {
+            return {true, "disabled"};
+        }
+        
+        // 2. 未配置 → 健康 (跳过)
+        if (!runtime.configured) {
+            return {true, "not configured"};
+        }
+        
+        // 3. 运行中但未连接 → 检查连接宽限期 (对齐 channelConnectGraceMs)
+        if (runtime.running && !runtime.connected) {
+            if (runtime.last_start_at.has_value()) {
+                int64_t elapsed = now_ms - runtime.last_start_at.value();
+                if (elapsed < config.timing.channel_connect_grace_ms) {
+                    return {true, "connecting"};  // ✅ 在宽限期内,允许启动
+                }
+            }
+            return {false, "disconnected"};  // ❌ 超过宽限期仍未连接
+        }
+        
+        // 4. 已连接但消息过期 → 不健康 (对齐 staleEventThresholdMs)
+        if (runtime.connected && runtime.last_message_at.has_value()) {
+            int64_t idle = now_ms - runtime.last_message_at.value();
+            if (idle > config.timing.stale_event_threshold_ms) {
+                return {false, "stale"};  // ❌ 消息过期,需要重启
+            }
+        }
+        
+        return {true, "ok"};  // ✅ 一切正常
     }
 }
 
@@ -57,6 +114,15 @@ public:
         // Get or create channel store
         auto& store = get_store(channel_id);
         
+        // ✅ 从 Registry 加载 Adapter (对齐 OpenClaw: getChannelPlugin())
+        if (!store.adapter) {
+            store.adapter = ChannelPluginRegistry::instance().create_adapter(std::string(channel_id));
+            if (!store.adapter) {
+                return core::Result<void>::Err("Channel adapter not found: " + std::string(channel_id));
+            }
+            log()->info("Loaded channel adapter: {}", channel_id);
+        }
+        
         // Check if already running
         {
             std::lock_guard<std::mutex> lock(stores_mutex_);
@@ -77,28 +143,81 @@ public:
             reset_restart_attempts(channel_id, effective_account_id);
         }
         
-        // Update status
+        // Update status (Phase 1: Starting)
         ChannelAccountSnapshot snapshot;
         snapshot.account_id = effective_account_id;
         snapshot.enabled = true;
         snapshot.configured = true;
         snapshot.running = true;
-        snapshot.connected = false;
+        snapshot.connected = false;  // ← 启动中,尚未连接
+        snapshot.status = ChannelAccountStatus::Starting;
         snapshot.last_start_at = core::utils::now().time_since_epoch().count();
         
         set_runtime(channel_id, effective_account_id, snapshot);
         
-        // Start channel task (would launch actual channel adapter here)
-        // For now, just mark as connected after a delay
-        std::thread([this, channel_id, effective_account_id]() {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-            
-            auto snapshot = get_runtime(channel_id, effective_account_id);
-            snapshot.connected = true;
-            snapshot.last_message_at = core::utils::now().time_since_epoch().count();
-            set_runtime(channel_id, effective_account_id, snapshot);
-            
-            log()->info("Channel {} account {} connected", channel_id, effective_account_id);
+        // ✅ 创建 abort signal (对齐 OpenClaw: new AbortController())
+        auto abort = std::make_shared<std::atomic<bool>>(false);
+        {
+            std::lock_guard<std::mutex> lock(stores_mutex_);
+            store.aborts[effective_account_id] = abort;
+        }
+        
+        // ✅ 启动 Channel 异步任务 (对齐 OpenClaw: await startAccount(...))
+        std::thread([this, channel_id, effective_account_id, adapter = store.adapter, abort]() {
+            try {
+                // 构建 ChannelContext (对齐 OpenClaw startAccount params)
+                ChannelContext ctx;
+                ctx.account.account_id = effective_account_id;
+                ctx.account.channel_id = std::string(channel_id);
+                ctx.abort_signal = abort;
+                
+                // 设置日志回调
+                ctx.log_info = [channel_id, effective_account_id](const std::string& log) {
+                    ::hunterclaw::channels::log()->info("[{}/{}] {}", channel_id, effective_account_id, log);
+                };
+                ctx.log_error = [channel_id, effective_account_id](const std::string& log) {
+                    ::hunterclaw::channels::log()->error("[{}/{}] {}", channel_id, effective_account_id, log);
+                };
+                
+                // 设置消息接收回调 (TODO: 连接到 ReactEngine)
+                ctx.on_message_received = [this, channel_id, effective_account_id](const ChannelMessage& msg) {
+                    ::hunterclaw::channels::log()->debug("Received message from {} in channel {}", msg.from, channel_id);
+                    // TODO: Forward to ReactEngine
+                    
+                    // 更新 last_message_at
+                    update_runtime_fields(channel_id, effective_account_id, [](auto& s) {
+                        s.last_message_at = core::utils::now().time_since_epoch().count();
+                    });
+                };
+                
+                // ✅ 调用 Adapter 的 start_account (对齐 OpenClaw: await startAccount({ ... }))
+                auto result = adapter->start_account(ctx);
+                
+                if (result.is_err()) {
+                    log()->error("Channel {} account {} failed to start: {}", 
+                                 channel_id, effective_account_id, result.error);
+                    
+                    update_runtime_fields(channel_id, effective_account_id, [&result](auto& s) {
+                        s.running = false;
+                        s.connected = false;
+                        s.status = ChannelAccountStatus::Error;
+                        s.last_error = result.error;
+                    });
+                } else {
+                    log()->info("Channel {} account {} started successfully", 
+                                channel_id, effective_account_id);
+                }
+            } catch (const std::exception& e) {
+                log()->error("Channel {} account {} exception: {}", 
+                             channel_id, effective_account_id, e.what());
+                
+                update_runtime_fields(channel_id, effective_account_id, [&e](auto& s) {
+                    s.running = false;
+                    s.connected = false;
+                    s.status = ChannelAccountStatus::Error;
+                    s.last_error = e.what();
+                });
+            }
         }).detach();
         
         return core::Result<void>::Ok();
@@ -135,12 +254,13 @@ public:
             manually_stopped_.insert(key);
         }
         
-        // Update runtime status
-        auto snapshot = get_runtime(channel_id, effective_account_id);
-        snapshot.running = false;
-        snapshot.connected = false;
-        snapshot.last_stop_at = core::utils::now().time_since_epoch().count();
-        set_runtime(channel_id, effective_account_id, snapshot);
+        // ✅ 原子性更新状态
+        update_runtime_fields(channel_id, effective_account_id, [](auto& s) {
+            s.running = false;
+            s.connected = false;
+            s.status = ChannelAccountStatus::Stopped;
+            s.last_stop_at = core::utils::now().time_since_epoch().count();
+        });
         
         // Abort any running tasks
         auto& store = get_store(channel_id);
@@ -157,12 +277,14 @@ public:
     core::Result<void> mark_channel_logged_out(ChannelId channel_id, const std::string& account_id) {
         std::string effective_account_id = account_id.empty() ? "default" : account_id;
         
-        auto snapshot = get_runtime(channel_id, effective_account_id);
-        snapshot.configured = false;
-        snapshot.running = false;
-        snapshot.connected = false;
-        snapshot.last_error = "Logged out";
-        set_runtime(channel_id, effective_account_id, snapshot);
+        // ✅ 原子性更新状态
+        update_runtime_fields(channel_id, effective_account_id, [](auto& s) {
+            s.configured = false;
+            s.running = false;
+            s.connected = false;
+            s.status = ChannelAccountStatus::Stopped;
+            s.last_error = "Logged out";
+        });
         
         return core::Result<void>::Ok();
     }
@@ -273,6 +395,17 @@ private:
         channel_stores_[std::string(channel_id)].runtimes[account_id] = snapshot;
     }
     
+    // ✅ 原子性字段更新 (避免 read-modify-write 并发问题,100% 对齐 OpenClaw)
+    void update_runtime_fields(
+        ChannelId channel_id,
+        const std::string& account_id,
+        std::function<void(ChannelAccountSnapshot&)> updater
+    ) {
+        std::lock_guard<std::mutex> lock(stores_mutex_);
+        auto& snapshot = channel_stores_[std::string(channel_id)].runtimes[account_id];
+        updater(snapshot);
+    }
+    
     // ========== Auto Restart Logic (100% 对齐 OpenClaw) ==========
     
     void schedule_auto_restart(ChannelId channel_id, const std::string& account_id, int attempt) {
@@ -302,7 +435,9 @@ private:
         std::thread([this, channel_id, account_id, attempt, delay_ms]() {
             std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
             
-            auto result = start_channel(channel_id, account_id, {.preserve_restart_attempts = true});
+            StartChannelOptions opts;
+            opts.preserve_restart_attempts = true;
+            auto result = start_channel(channel_id, account_id, opts);
             if (result.is_err()) {
                 log()->error("Auto-restart failed for channel {} account {}: {}",
                              channel_id, account_id, result.error);
@@ -354,35 +489,89 @@ private:
     
     void check_channel_health(ChannelId channel_id) {
         auto& store = channel_stores_[std::string(channel_id)];
+        auto now_ms = core::utils::now().time_since_epoch().count() / 1000000;
         
         for (const auto& [account_id, runtime] : store.runtimes) {
-            // Skip if not enabled or not configured
-            if (!runtime.enabled || !runtime.configured) {
-                continue;
-            }
+            std::string key = std::string(channel_id) + ":" + account_id;
             
-            // Check if connection is stale
-            auto now_ms = core::utils::now().time_since_epoch().count() / 1000000;
-            
-            if (runtime.last_message_at.has_value()) {
-                int64_t idle_ms = now_ms - runtime.last_message_at.value();
-                if (idle_ms > health_config_.timing.stale_event_threshold_ms) {
-                    log()->warn("Channel {} account {} has stale connection ({} ms idle)",
-                                channel_id, account_id, idle_ms);
-                    // Consider restarting
+            // ✅ 1. 跳过手动停止的 Channel (对齐 OpenClaw: isManuallyStopped)
+            {
+                std::lock_guard<std::mutex> lock(manually_stopped_mutex_);
+                if (manually_stopped_.find(key) != manually_stopped_.end()) {
+                    continue;  // 尊重用户意图,不自动重启
                 }
             }
             
-            // Check if disconnected but should be running
-            if (runtime.running && !runtime.connected) {
-                int64_t attempts = 0;
-                {
-                    std::lock_guard<std::mutex> lock(restart_attempts_mutex_);
-                    std::string key = std::string(channel_id) + ":" + account_id;
-                    attempts = restart_attempts_[key];
+            // ✅ 2. 评估健康状态 (对齐 OpenClaw: evaluateChannelHealth)
+            auto health = evaluate_channel_health(runtime, channel_id, now_ms, health_config_);
+            
+            if (health.healthy) {
+                continue;  // 健康,无需处理
+            }
+            
+            // ✅ 3. 冷却期检查 (对齐 OpenClaw: cooldownMs)
+            {
+                std::lock_guard<std::mutex> lock(restart_records_mutex_);
+                auto record_it = restart_records_.find(key);
+                
+                if (record_it != restart_records_.end()) {
+                    int64_t cooldown_ms = health_config_.cooldown_cycles * health_config_.check_interval_ms;
+                    int64_t last_restart_elapsed = now_ms - record_it->second.last_restart_at;
+                    
+                    if (last_restart_elapsed <= cooldown_ms) {
+                        continue;  // 在冷却期内,跳过重启
+                    }
+                }
+            }
+            
+            // ✅ 4. 重启频率限制 (对齐 OpenClaw: maxRestartsPerHour)
+            std::vector<RestartEvent> restarts_this_hour;
+            {
+                std::lock_guard<std::mutex> lock(restart_records_mutex_);
+                auto record_it = restart_records_.find(key);
+                
+                if (record_it != restart_records_.end()) {
+                    for (const auto& event : record_it->second.restarts_this_hour) {
+                        int64_t event_elapsed = now_ms - event.at;
+                        if (event_elapsed < 60 * 60 * 1000) {  // 1 小时内
+                            restarts_this_hour.push_back(event);
+                        }
+                    }
                 }
                 
-                schedule_auto_restart(channel_id, account_id, attempts);
+                if (restarts_this_hour.size() >= static_cast<size_t>(health_config_.max_restarts_per_hour)) {
+                    log()->warn("Channel {} account {} hit restart limit ({} restarts/hour)",
+                                channel_id, account_id, restarts_this_hour.size());
+                    continue;  // 超过频率限制,跳过重启
+                }
+            }
+            
+            // ✅ 5. 执行重启 (对齐 OpenClaw)
+            log()->info("Channel {} account {} restarting (reason: {})",
+                        channel_id, account_id, health.reason);
+            
+            // 如果正在运行,先停止
+            if (runtime.running) {
+                stop_channel(channel_id, account_id);
+            }
+            
+            // 重置重启尝试计数
+            reset_restart_attempts(channel_id, account_id);
+            
+            // 启动 Channel
+            StartChannelOptions opts;
+            opts.force = false;
+            opts.preserve_restart_attempts = false;
+            start_channel(channel_id, account_id, opts);
+            
+            // ✅ 6. 记录重启事件 (对齐 OpenClaw: restartRecords.set)
+            {
+                std::lock_guard<std::mutex> lock(restart_records_mutex_);
+                restarts_this_hour.push_back({now_ms});
+                RestartRecord record;
+                record.last_restart_at = now_ms;
+                record.restarts_this_hour = std::move(restarts_this_hour);
+                restart_records_[key] = record;
             }
         }
     }
@@ -397,6 +586,10 @@ private:
     
     mutable std::mutex restart_attempts_mutex_;
     std::map<std::string, int> restart_attempts_;
+    
+    // ✅ 重启记录追踪 (对齐 OpenClaw: restartRecords)
+    mutable std::mutex restart_records_mutex_;
+    std::map<std::string, RestartRecord> restart_records_;
     
     std::thread health_monitor_thread_;
     std::atomic<bool> health_monitor_running_{false};

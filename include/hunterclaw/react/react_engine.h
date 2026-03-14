@@ -1,16 +1,24 @@
 #pragma once
 
 #include "hunterclaw/core/json.h"
-#include "hunterclaw/tools/tool_manager.h"
+#include "hunterclaw/core/thread_pool.h"
+#include "hunterclaw/tools/tool.h"  // ToolManager is defined in tool.h
 #include "hunterclaw/llm/llm_client.h"
+#include "hunterclaw/llm/provider.h"  // For Response, ToolCall, Usage
 #include <string>
 #include <vector>
 #include <memory>
 #include <functional>
 #include <chrono>
+#include <future>
 
 namespace hunterclaw {
 namespace react {
+
+// 类型别名,方便使用
+using LLMMessage = hunterclaw::llm::LLMMessage;
+using LLMResponse = hunterclaw::llm::GenerateResponse;
+using LLMToolCall = hunterclaw::llm::ToolCall;
 
 // 对齐 OpenClaw 的 ReAct 模式实现
 // 参考: openclaw-analysis/src/agents/pi-embedded-subscribe.ts
@@ -83,6 +91,9 @@ struct StreamCallbacks {
     std::function<void()> on_start;
     std::function<void()> on_end;
     std::function<void(const std::string& error)> on_error;
+    
+    // 🎯 OpenClaw 对齐: 用于直连推送的 session_id
+    std::string session_id;
 };
 
 // ReAct 配置
@@ -122,28 +133,37 @@ struct ReactConfig {
     // 工具执行配置
     bool parallel_tool_calls = false;  // 是否并行执行工具
     bool verbose_tool_output = true;   // 是否显示详细工具输出
+    int thread_pool_size = 4;          // 全局线程池大小 (0=auto)
 };
 
 // ReAct 引擎 - 对齐 OpenClaw
 class ReactEngine {
 public:
+    // ✅ 使用 LLMClient (向后兼容)
     static std::shared_ptr<ReactEngine> create(
         std::shared_ptr<tools::ToolManager> tool_manager,
         std::shared_ptr<llm::LLMClient> llm_client,
         const ReactConfig& config = ReactConfig{}
     );
     
+    // ✅ 直接使用 Provider (推荐)
+    static std::shared_ptr<ReactEngine> create_with_provider(
+        std::shared_ptr<tools::ToolManager> tool_manager,
+        std::shared_ptr<llm::Provider> provider,
+        const ReactConfig& config = ReactConfig{}
+    );
+    
     // 执行 ReAct 循环
     ReactResult run(
         const std::string& user_input,
-        const std::vector<llm::Message>& history = {},
+        const std::vector<LLMMessage>& history = {},
         const StreamCallbacks& callbacks = {}
     );
     
     // 异步执行
     std::future<ReactResult> run_async(
         const std::string& user_input,
-        const std::vector<llm::Message>& history = {},
+        const std::vector<LLMMessage>& history = {},
         const StreamCallbacks& callbacks = {}
     );
     
@@ -161,29 +181,43 @@ private:
         const ReactConfig& config
     );
     
+    // ✅ Provider 构造函数
+    ReactEngine(
+        std::shared_ptr<tools::ToolManager> tool_manager,
+        std::shared_ptr<llm::Provider> provider,
+        const ReactConfig& config
+    );
+    
     // 内部执行循环
     ReactResult execute_loop(
         const std::string& user_input,
-        const std::vector<llm::Message>& history,
+        const std::vector<LLMMessage>& history,
         const StreamCallbacks& callbacks
     );
     
-    // 处理 LLM 响应
-    struct LLMResponse {
+    // 处理 LLM 响应 (内部使用的简化结构)
+    struct LLMResponseData {
         std::string text;
-        std::vector<llm::ToolCall> tool_calls;
+        std::vector<LLMToolCall> tool_calls;
         std::string reasoning;
-        llm::Usage usage;
+        
+        // Token usage (对应 GenerateResponse 的字段)
+        int input_tokens = 0;
+        int output_tokens = 0;
+        int cache_read_tokens = 0;
+        int cache_write_tokens = 0;
     };
     
-    LLMResponse call_llm(
-        const std::vector<llm::Message>& messages,
-        const StreamCallbacks& callbacks
+    // ✅ call_llm 支持 tools 参数 (对齐 OpenClaw)
+    LLMResponseData call_llm(
+        const std::vector<LLMMessage>& messages,
+        const StreamCallbacks& callbacks,
+        const std::vector<llm::ToolDefinition>& tools = {}
     );
     
     // 执行工具调用
     std::map<std::string, tools::ToolResult> execute_tools(
-        const std::vector<llm::ToolCall>& tool_calls,
+        const std::vector<LLMToolCall>& tool_calls,
         const StreamCallbacks& callbacks
     );
     
@@ -199,13 +233,56 @@ private:
     // 分块处理
     std::vector<std::string> chunk_text(const std::string& text);
     
+    // ✅ 严格对齐 OpenClaw 的流式处理机制
+    // 参考: openclaw-analysis/src/agents/pi-embedded-subscribe.ts
+    
+    // 双缓冲区状态 (对齐 OpenClaw)
+    struct StreamingState {
+        std::string delta_buffer;           // 原始累积 (含 <thinking>)
+        std::string block_buffer;           // 过滤后累积 (发送用)
+        std::string last_block_reply_text;  // 上次发送的块 (去重)
+        bool suppress_block_chunks = false; // 动态抑制标志
+        
+        // Messaging tool 冲突检测
+        std::vector<std::string> messaging_tool_sent_texts;
+        std::vector<std::string> messaging_tool_sent_texts_normalized;
+        
+        void reset() {
+            delta_buffer.clear();
+            block_buffer.clear();
+            last_block_reply_text.clear();
+            suppress_block_chunks = false;
+            messaging_tool_sent_texts.clear();
+            messaging_tool_sent_texts_normalized.clear();
+        }
+    };
+    
+    // 发送块回复 (带去重和冲突检测)
+    void emit_block_chunk(const std::string& text, const StreamCallbacks& callbacks);
+    
+    // 刷新块回复缓冲区
+    void flush_block_reply_buffer(const StreamCallbacks& callbacks);
+    
+    // 辅助函数
+    std::string normalize_text_for_comparison(const std::string& text);
+    bool is_messaging_tool_duplicate(const std::string& normalized_text);
+    std::string strip_thinking_tags(const std::string& text);
+    std::string trim_end(const std::string& text);
+    
     std::shared_ptr<tools::ToolManager> tool_manager_;
-    std::shared_ptr<llm::LLMClient> llm_client_;
+    std::shared_ptr<llm::LLMClient> llm_client_;  // 向后兼容
+    std::shared_ptr<llm::Provider> provider_;     // ✅ 直接 Provider 支持
     ReactConfig config_;
     
     // 运行状态
     std::atomic<bool> cancelled_{false};
     std::chrono::steady_clock::time_point start_time_;
+    
+    // ✅ 流式处理状态 (对齐 OpenClaw)
+    StreamingState streaming_state_;
+    
+    // ✅ 全局线程池 (用于并行工具执行)
+    static std::shared_ptr<core::ThreadPool>& get_thread_pool();
 };
 
 } // namespace react

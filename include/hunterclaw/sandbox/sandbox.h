@@ -321,6 +321,7 @@ private:
     
     std::string build_docker_run_command();
     SandboxResult execute_docker_command(const std::string& command);
+    void apply_network_policy();  // 应用网络策略 (iptables)
 };
 
 // Process Sandbox实现 (简化版,使用cgroups)

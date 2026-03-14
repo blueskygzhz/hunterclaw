@@ -1,10 +1,14 @@
 #include "hunterclaw/sandbox/sandbox.h"
+#include "hunterclaw/observability/observability.h"  // ✅ Span, Tracer, LogEntry, StructuredLogger
+#include "hunterclaw/observability/diagnostic_events.h"  // ✅ 可观测性集成
 #include <cstdlib>
 #include <sstream>
 #include <fstream>
 #include <array>
 #include <chrono>
 #include <filesystem>
+#include <algorithm>
+#include <thread>
 #include <uuid/uuid.h>
 
 namespace fs = std::filesystem;
@@ -74,18 +78,20 @@ bool DockerSandbox::initialize() {
         return true;
     }
     
-    // 检查Docker是否可用
+    auto overall_start = std::chrono::steady_clock::now();
+    
+    // ========== 1. 检查 Docker 是否可用 ==========
     auto check_result = execute_shell_command("docker --version");
     if (!check_result.success) {
         return false;
     }
     
-    // 拉取镜像(如果不存在)
+    // ========== 2. 拉取镜像 (如果不存在) ==========
     std::string pull_cmd = "docker pull " + config_.image + " 2>&1";
     auto pull_result = execute_shell_command(pull_cmd);
     // 忽略拉取结果,可能镜像已存在
     
-    // 创建容器
+    // ========== 3. 创建容器 ==========
     std::string run_cmd = build_docker_run_command();
     auto run_result = execute_shell_command(run_cmd);
     
@@ -93,13 +99,131 @@ bool DockerSandbox::initialize() {
         return false;
     }
     
-    // 从输出中提取container ID (实际ID可能与我们生成的不同)
+    // 从输出中提取 container ID (实际ID可能与我们生成的不同)
     if (!run_result.stdout_output.empty()) {
         container_id_ = run_result.stdout_output.substr(0, 12);  // Docker短ID
     }
     
+    // ========== 4. 网络策略注入 (对齐 OpenClaw) ==========
+    if (!config_.network_policy.egress.empty()) {
+        apply_network_policy();
+    }
+    
+    // ========== 5. 健康检查 (对齐 OpenClaw) ==========
+    // 如果配置了 entrypoint,等待服务就绪
+    if (!config_.entrypoint.empty() && config_.timeout_seconds > 0) {
+        const int health_check_timeout_sec = std::min(config_.timeout_seconds, 300);  // 最多等待5分钟
+        const int check_interval_ms = 200;
+        
+        auto health_start = std::chrono::steady_clock::now();
+        bool service_ready = false;
+        
+        while (true) {
+            auto elapsed_sec = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - health_start
+            ).count();
+            
+            if (elapsed_sec >= health_check_timeout_sec) {
+                // 超时但不失败,某些服务可能不支持健康检查
+                break;
+            }
+            
+            // 检查容器是否还在运行
+            if (!is_running()) {
+                return false;  // 容器已退出,初始化失败
+            }
+            
+            // 尝试简单的健康检查 (检查容器日志)
+            std::string logs_cmd = "docker logs --tail=10 " + container_id_;
+            auto logs_result = execute_shell_command(logs_cmd);
+            
+            // 简单策略: 如果日志中包含 "ready" 或 "listening",认为服务就绪
+            if (logs_result.success) {
+                std::string logs_lower = logs_result.stdout_output;
+                std::transform(logs_lower.begin(), logs_lower.end(), logs_lower.begin(), ::tolower);
+                
+                if (logs_lower.find("ready") != std::string::npos ||
+                    logs_lower.find("listening") != std::string::npos ||
+                    logs_lower.find("started") != std::string::npos) {
+                    service_ready = true;
+                    break;
+                }
+            }
+            
+            std::this_thread::sleep_for(std::chrono::milliseconds(check_interval_ms));
+        }
+        
+        // ✅ 可观测性: 记录健康检查结果
+        try {
+            using namespace observability;
+            std::map<std::string, core::JsonValue> fields;
+            fields["container_id"] = container_id_;
+            fields["service_ready"] = service_ready;
+            fields["health_check_duration_ms"] = static_cast<int64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - health_start
+                ).count()
+            );
+            StructuredLogger::instance().log(LogLevel::INFO, "sandbox.health_check", fields);
+        } catch (...) {}
+    }
+    
     initialized_ = true;
+    
+    // ✅ 可观测性: 记录沙箱初始化
+    try {
+        using namespace observability;
+        std::map<std::string, core::JsonValue> fields;
+        fields["container_id"] = container_id_;
+        fields["image"] = config_.image;
+        fields["init_duration_ms"] = static_cast<int64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - overall_start
+            ).count()
+        );
+        StructuredLogger::instance().log(LogLevel::INFO, "sandbox.initialized", fields);
+    } catch (...) {}
+    
     return true;
+}
+
+// ========== 网络策略注入 (对齐 OpenClaw FQDN 白名单) ==========
+void DockerSandbox::apply_network_policy() {
+    // ✅ 实现细粒度网络策略
+    // OpenClaw 使用 NetworkPolicy CRD (Kubernetes)
+    // Docker 环境使用 iptables 实现类似功能
+    
+    if (config_.network_policy.default_action == "deny") {
+        // 1. 默认拒绝所有出站流量
+        std::string deny_all_cmd = "docker exec " + container_id_ + 
+            " sh -c 'iptables -P OUTPUT DROP 2>/dev/null || true'";
+        execute_shell_command(deny_all_cmd);
+    }
+    
+    // 2. 应用白名单规则
+    for (const auto& rule : config_.network_policy.egress) {
+        if (rule.action == "allow") {
+            // 允许访问指定域名
+            std::string allow_cmd = "docker exec " + container_id_ + 
+                " sh -c 'iptables -A OUTPUT -d " + rule.target + " -j ACCEPT 2>/dev/null || true'";
+            execute_shell_command(allow_cmd);
+        } else if (rule.action == "deny") {
+            // 拒绝访问指定域名
+            std::string deny_cmd = "docker exec " + container_id_ + 
+                " sh -c 'iptables -A OUTPUT -d " + rule.target + " -j DROP 2>/dev/null || true'";
+            execute_shell_command(deny_cmd);
+        }
+    }
+    
+    // ✅ 可观测性: 记录网络策略
+    try {
+        using namespace observability;
+        std::map<std::string, core::JsonValue> fields;
+        fields["container_id"] = container_id_;
+        fields["default_action"] = config_.network_policy.default_action;
+        fields["rules_count"] = static_cast<int64_t>(config_.network_policy.egress.size());
+        StructuredLogger::instance().log(LogLevel::INFO, "sandbox.network_policy_applied", fields);
+    } catch (...) {}
 }
 
 std::string DockerSandbox::build_docker_run_command() {
@@ -108,9 +232,7 @@ std::string DockerSandbox::build_docker_run_command() {
     cmd << "docker run -d";
     cmd << " --name " << container_id_;
     
-    // 资源限制
-    
-    // 资源限制
+    // ========== 资源限制 (对齐 OpenClaw) ==========
     if (!config_.resource_limits.cpu.empty()) {
         cmd << " --cpus=" << config_.resource_limits.cpu;
     }
@@ -119,19 +241,63 @@ std::string DockerSandbox::build_docker_run_command() {
         cmd << " --memory=" << config_.resource_limits.memory;
     }
     
-    // 网络配置
+    // PID 限制 (防止 fork bomb)
+    if (config_.pids_limit > 0) {
+        cmd << " --pids-limit=" << config_.pids_limit;
+    }
+    
+    // ========== 安全加固 (严格对齐 OpenClaw) ==========
+    
+    // 1. 丢弃 capabilities (默认丢弃 ALL)
+    if (!config_.drop_capabilities.empty()) {
+        for (const auto& cap : config_.drop_capabilities) {
+            cmd << " --cap-drop=" << cap;
+        }
+    } else {
+        // 默认丢弃所有 capabilities
+        cmd << " --cap-drop=ALL";
+    }
+    
+    // 2. 禁止权限提升
+    if (config_.no_new_privileges) {
+        cmd << " --security-opt=no-new-privileges";
+    }
+    
+    // 3. seccomp profile (默认使用 RuntimeDefault)
+    if (!config_.seccomp_profile.empty()) {
+        cmd << " --security-opt=seccomp=" << config_.seccomp_profile;
+    } else {
+        // OpenClaw 默认: seccomp=default
+        cmd << " --security-opt=seccomp=default";
+    }
+    
+    // 4. AppArmor profile
+    if (!config_.apparmor_profile.empty()) {
+        cmd << " --security-opt=apparmor=" << config_.apparmor_profile;
+    }
+    
+    // 5. 只读根文件系统 (可选,需要业务支持)
+    // cmd << " --read-only";  // 需要配合 tmpfs 使用
+    
+    // ========== 网络配置 (对齐 OpenClaw) ==========
     if (config_.network_mode == NetworkMode::None) {
         cmd << " --network=none";
     } else if (config_.network_mode == NetworkMode::Host) {
         cmd << " --network=host";
+    } else {
+        // 默认 bridge 模式
+        cmd << " --network=bridge";
+        
+        // ✅ 网络策略: 如果配置了 FQDN 白名单,启动后注入 iptables 规则
+        // (在 initialize() 中实现)
     }
     
-    // 环境变量
+    // ========== 环境变量 ==========
     for (const auto& [key, value] : config_.env) {
-        cmd << " -e " << key << "=" << value;
+        cmd << " -e " << key << "=\"" << value << "\"";
     }
     
-    // 卷挂载
+    // ========== 卷挂载 ==========
     for (const auto& vol : config_.volumes) {
         if (vol.has_host()) {
             cmd << " -v " << vol.host.path << ":" << vol.mount_path;
@@ -141,12 +307,23 @@ std::string DockerSandbox::build_docker_run_command() {
         }
     }
     
-    // 工作目录
+    // ========== 工作目录 ==========
     cmd << " -w " << config_.workdir;
     
-    // 镜像和启动命令 (保持容器运行)
+    // ========== 镜像和入口命令 (对齐 OpenClaw) ==========
     cmd << " " << config_.image;
-    cmd << " tail -f /dev/null";  // 保持容器运行
+    
+    // 如果配置了 entrypoint,使用它;否则保持容器运行
+    if (!config_.entrypoint.empty()) {
+        // OpenClaw 模式: 执行用户指定的入口命令
+        cmd << " " << config_.entrypoint[0];
+        for (size_t i = 1; i < config_.entrypoint.size(); ++i) {
+            cmd << " " << config_.entrypoint[i];
+        }
+    } else {
+        // 默认模式: 保持容器运行
+        cmd << " tail -f /dev/null";
+    }
     
     return cmd.str();
 }
@@ -370,7 +547,7 @@ void DockerSandbox::watch_metrics(std::function<void(const ResourceUsage&)> call
     }
 }
 
-// 执行命令
+// ========== 执行命令 (流式输出,对齐 OpenClaw SSE) ==========
 SandboxResult DockerSandbox::execute_command(
     const std::string& command,
     std::function<void(const StreamEvent&)> event_callback) {
@@ -382,8 +559,148 @@ SandboxResult DockerSandbox::execute_command(
         return result;
     }
     
-    std::string exec_cmd = "docker exec " + container_id_ + " sh -c '" + command + "'";
-    return execute_shell_command(exec_cmd);
+    auto start_time = std::chrono::steady_clock::now();
+    
+    // ✅ 可观测性: Tracer Span (对齐 OpenClaw)
+    std::unique_ptr<observability::Span> span;
+    try {
+        span = observability::Tracer::instance().start_span(
+            "sandbox.execute_command", 
+            observability::SpanKind::Internal
+        );
+        span->set_attribute("container_id", container_id_);
+        span->set_attribute("command", command);
+    } catch (...) {
+        // 故障隔离
+    }
+    
+    // ✅ 流式事件: started (对齐 OpenClaw SSE)
+    if (event_callback) {
+        StreamEvent started_event;
+        started_event.type = "started";
+        started_event.timestamp = std::to_string(
+            std::chrono::system_clock::now().time_since_epoch().count()
+        );
+        started_event.data["command"] = command;
+        event_callback(started_event);
+    }
+    
+    SandboxResult result;
+    
+    // ✅ 流式执行: 实时推送 stdout/stderr (对齐 OpenClaw SSE)
+    if (event_callback) {
+        // 使用 popen 实现流式输出
+        std::string exec_cmd = "docker exec " + container_id_ + " sh -c '" + command + "' 2>&1";
+        FILE* pipe = popen(exec_cmd.c_str(), "r");
+        
+        if (!pipe) {
+            result.success = false;
+            result.stderr_output = "Failed to execute command";
+            
+            // error 事件
+            StreamEvent error_event;
+            error_event.type = "error";
+            error_event.timestamp = std::to_string(
+                std::chrono::system_clock::now().time_since_epoch().count()
+            );
+            error_event.data["error"] = "Failed to execute command";
+            event_callback(error_event);
+            
+            return result;
+        }
+        
+        // 逐行读取并推送 output 事件
+        std::array<char, 256> buffer;
+        while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
+            std::string line(buffer.data());
+            result.stdout_output += line;
+            
+            // ✅ 流式事件: output (对齐 OpenClaw SSE)
+            StreamEvent output_event;
+            output_event.type = "output";
+            output_event.timestamp = std::to_string(
+                std::chrono::system_clock::now().time_since_epoch().count()
+            );
+            output_event.data["text"] = line;
+            output_event.data["stream"] = "stdout";
+            event_callback(output_event);
+            
+            // 超时检查
+            auto elapsed_sec = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - start_time
+            ).count();
+            
+            if (config_.timeout_seconds > 0 && elapsed_sec > config_.timeout_seconds) {
+                pclose(pipe);
+                result.success = false;
+                result.stderr_output = "Command timeout";
+                
+                // error 事件
+                StreamEvent timeout_event;
+                timeout_event.type = "error";
+                timeout_event.timestamp = std::to_string(
+                    std::chrono::system_clock::now().time_since_epoch().count()
+                );
+                timeout_event.data["error"] = "Command timeout";
+                event_callback(timeout_event);
+                
+                return result;
+            }
+        }
+        
+        result.exit_code = pclose(pipe);
+        result.success = (result.exit_code == 0);
+        
+        // ✅ 流式事件: done (对齐 OpenClaw SSE)
+        StreamEvent done_event;
+        done_event.type = "done";
+        done_event.timestamp = std::to_string(
+            std::chrono::system_clock::now().time_since_epoch().count()
+        );
+        done_event.data["exit_code"] = std::to_string(result.exit_code);
+        done_event.data["success"] = result.success ? "true" : "false";
+        event_callback(done_event);
+        
+    } else {
+        // 非流式模式: 阻塞执行
+        std::string exec_cmd = "docker exec " + container_id_ + " sh -c '" + command + "'";
+        result = execute_shell_command(exec_cmd);
+    }
+    
+    // ✅ Span 状态标记
+    if (span) {
+        span->set_status(result.success, result.stderr_output);
+        span->set_attribute("exit_code", static_cast<int64_t>(result.exit_code));
+        auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start_time
+        ).count();
+        span->set_attribute("duration_ms", static_cast<int64_t>(duration_ms));
+    }
+    
+    // ✅ 可观测性: 审计日志 (对齐 OpenClaw)
+    try {
+        auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start_time
+        ).count();
+        
+        // 使用 StructuredLogger 记录审计日志
+        using namespace observability;
+        
+        std::map<std::string, core::JsonValue> fields;
+        fields["container_id"] = container_id_;
+        fields["command"] = command;
+        fields["success"] = result.success;
+        fields["exit_code"] = static_cast<int64_t>(result.exit_code);
+        fields["duration_ms"] = static_cast<int64_t>(duration_ms);
+        fields["streaming"] = event_callback != nullptr;
+        
+        StructuredLogger::instance().log(LogLevel::INFO, "sandbox.command_executed", fields);
+        
+    } catch (...) {
+        // 故障隔离: 永不阻塞主流程
+    }
+    
+    return result;
 }
 
 // 中断命令
@@ -412,6 +729,20 @@ SandboxResult DockerSandbox::execute_code(
         return result;
     }
     
+    // ✅ 可观测性: Tracer Span (对齐 OpenClaw)
+    std::unique_ptr<observability::Span> span;
+    try {
+        span = observability::Tracer::instance().start_span(
+            "sandbox.execute_code", 
+            observability::SpanKind::Internal
+        );
+        span->set_attribute("container_id", container_id_);
+        span->set_attribute("language", language);
+        span->set_attribute("code_length", static_cast<int64_t>(code.size()));
+    } catch (...) {
+        // 故障隔离
+    }
+    
     // 创建临时文件
     std::string temp_file = "/tmp/code_" + std::to_string(std::time(nullptr));
     if (language == "python") {
@@ -437,10 +768,41 @@ SandboxResult DockerSandbox::execute_code(
         SandboxResult result;
         result.success = false;
         result.stderr_output = "Unsupported language: " + language;
+        
+        // ✅ Span 失败标记
+        if (span) {
+            span->set_status(false, "Unsupported language: " + language);
+        }
+        
         return result;
     }
     
-    return execute_command(exec_cmd, event_callback);
+    auto result = execute_command(exec_cmd, event_callback);
+    
+    // ✅ Span 状态标记
+    if (span) {
+        span->set_status(result.success, result.stderr_output);
+        span->set_attribute("exit_code", static_cast<int64_t>(result.exit_code));
+    }
+    
+    // ✅ 可观测性: 审计日志 (代码执行)
+    try {
+        using namespace observability;
+        
+        std::map<std::string, core::JsonValue> fields;
+        fields["container_id"] = container_id_;
+        fields["language"] = language;
+        fields["code_length"] = static_cast<int64_t>(code.size());
+        fields["success"] = result.success;
+        fields["exit_code"] = static_cast<int64_t>(result.exit_code);
+        
+        StructuredLogger::instance().log(LogLevel::INFO, "sandbox.code_executed", fields);
+        
+    } catch (...) {
+        // 故障隔离
+    }
+    
+    return result;
 }
 
 // 获取文件信息

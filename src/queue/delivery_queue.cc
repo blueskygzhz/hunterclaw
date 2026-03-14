@@ -1,10 +1,13 @@
 #include "hunterclaw/queue/delivery_queue.h"
+#include "hunterclaw/observability/diagnostic_events.h"
 #include <fstream>
 #include <sstream>
 #include <random>
 #include <chrono>
 #include <filesystem>
+#include <regex>
 #include <nlohmann/json.hpp>
+#include <mutex>
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -246,6 +249,19 @@ core::Result<std::string> FileDeliveryQueue::enqueue(
         return core::Result<std::string>::Err(result.error);
     }
     
+    // ✅ 可观测性事件: MessageQueuedEvent (对齐 OpenClaw)
+    try {
+        using namespace observability;
+        MessageQueuedEvent event;
+        event.message_id = delivery.id;
+        event.channel = target.channel;
+        event.queue_depth = 0; // TODO: track actual queue depth
+        event.priority = 0; // 默认优先级
+        DiagnosticEventBus::instance().emit(std::make_shared<MessageQueuedEvent>(event));
+    } catch (const std::exception& e) {
+        // 可观测性失败不应该影响核心功能
+    }
+    
     return core::Result<std::string>::Ok(delivery.id);
 }
 
@@ -254,7 +270,29 @@ core::Result<bool> FileDeliveryQueue::ack(const std::string& delivery_id) {
         std::string file_path = get_queue_file_path(delivery_id);
         
         if (fs::exists(file_path)) {
+            // 读取delivery信息用于事件
+            auto delivery_result = read_delivery(file_path);
+            uint64_t enqueued_at = 0;
+            int retry_count = 0;
+            if (delivery_result.is_ok()) {
+                enqueued_at = delivery_result.value.enqueued_at;
+                retry_count = delivery_result.value.retry_count;
+            }
+            
             fs::remove(file_path);
+            
+            // ✅ 可观测性事件: DeliverySuccessEvent (对齐 OpenClaw)
+            try {
+                using namespace observability;
+                uint64_t duration_ms = current_timestamp_ms() - enqueued_at;
+                DeliverySuccessEvent event;
+                event.delivery_id = delivery_id;
+                event.channel = delivery_result.is_ok() ? delivery_result.value.target.channel : "";
+                event.to = delivery_result.is_ok() ? delivery_result.value.target.to : "";
+                event.retry_count = retry_count;
+                event.duration_ms = duration_ms;
+                DiagnosticEventBus::instance().emit(std::make_shared<DeliverySuccessEvent>(event));
+            } catch (...) {}
         }
         
         return core::Result<bool>::Ok(true);
@@ -280,6 +318,21 @@ core::Result<bool> FileDeliveryQueue::fail(
     delivery.last_attempt_at = current_timestamp_ms();
     delivery.last_error = error;
     
+    // ✅ 可观测性事件: DeliveryFailureEvent (对齐 OpenClaw)
+    try {
+        using namespace observability;
+        bool is_permanent = is_permanent_delivery_error(error);
+        
+        DeliveryFailureEvent event;
+        event.delivery_id = delivery_id;
+        event.channel = delivery.target.channel;
+        event.to = delivery.target.to;
+        event.retry_count = delivery.retry_count;
+        event.error_message = error;
+        event.is_permanent = is_permanent;
+        DiagnosticEventBus::instance().emit(std::make_shared<DeliveryFailureEvent>(event));
+    } catch (...) {}
+    
     // Check if max retries exceeded
     if (delivery.retry_count >= MAX_RETRIES) {
         // Move to failed directory
@@ -291,12 +344,39 @@ core::Result<bool> FileDeliveryQueue::fail(
             ofs.close();
             
             fs::remove(file_path);
+            
+            // ✅ 可观测性事件: DeliveryMaxRetriesExceeded (对齐 OpenClaw)
+            try {
+                using namespace observability;
+                DeliveryFailureEvent event;
+                event.delivery_id = delivery_id;
+                event.channel = delivery.target.channel;
+                event.to = delivery.target.to;
+                event.retry_count = delivery.retry_count;
+                event.error_message = "Max retries exceeded: " + error;
+                event.is_permanent = true;
+                DiagnosticEventBus::instance().emit(std::make_shared<DeliveryFailureEvent>(event));
+            } catch (...) {}
+            
             return core::Result<bool>::Ok(true);
         } catch (const std::exception& e) {
             return core::Result<bool>::Err("Failed to move to failed dir: " + 
                                            std::string(e.what()));
         }
     }
+    
+    // ✅ 可观测性事件: DeliveryRetryScheduled (对齐 OpenClaw)
+    try {
+        using namespace observability;
+        int backoff_ms = get_backoff_ms(delivery.retry_count);
+        DeliveryRetryEvent event;
+        event.delivery_id = delivery_id;
+        event.retry_count = delivery.retry_count;
+        event.max_retries = MAX_RETRIES;
+        event.backoff_ms = backoff_ms;
+        event.next_retry_ms = current_timestamp_ms() + backoff_ms;
+        DiagnosticEventBus::instance().emit(std::make_shared<DeliveryRetryEvent>(event));
+    } catch (...) {}
     
     // Update queue entry with new retry count
     return write_delivery(delivery);
@@ -324,6 +404,28 @@ int FileDeliveryQueue::get_backoff_ms(int retry_count) const {
         return BACKOFF_MS[3]; // Use max backoff
     }
     return BACKOFF_MS[retry_count - 1];
+}
+
+bool FileDeliveryQueue::is_permanent_delivery_error(const std::string& error) const {
+    // Permanent error patterns (aligned with OpenClaw)
+    static const std::vector<std::regex> PERMANENT_ERROR_PATTERNS = {
+        std::regex("no conversation reference found", std::regex::icase),
+        std::regex("chat not found", std::regex::icase),
+        std::regex("user not found", std::regex::icase),
+        std::regex("bot was blocked by the user", std::regex::icase),
+        std::regex("forbidden: bot was kicked", std::regex::icase),
+        std::regex("chat_id is empty", std::regex::icase),
+        std::regex("recipient is not a valid", std::regex::icase),
+        std::regex("outbound not configured for channel", std::regex::icase),
+        std::regex("ambiguous discord recipient", std::regex::icase),
+    };
+    
+    for (const auto& pattern : PERMANENT_ERROR_PATTERNS) {
+        if (std::regex_search(error, pattern)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 core::Result<std::vector<QueuedDelivery>> FileDeliveryQueue::load_pending() {

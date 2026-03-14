@@ -52,6 +52,13 @@ std::string format_timestamp(const Timestamp& ts) {
     return ss.str();
 }
 
+// Get current timestamp in milliseconds
+int64_t current_timestamp_ms() {
+    auto now_time = std::chrono::system_clock::now();
+    auto duration = now_time.time_since_epoch();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
+}
+
 // Check if file exists
 bool file_exists(const std::string& path) {
     struct stat buffer;

@@ -1,144 +1,94 @@
 #pragma once
 
+#include "hunterclaw/memory/provider.h"  // 🎯 使用统一的 provider 定义
 #include "hunterclaw/plugins/plugin.h"
 #include "hunterclaw/core/result.h"
-#include <string>
-#include <vector>
-#include <map>
-#include <memory>
-#include <chrono>
 
 namespace hunterclaw {
 namespace memory {
 
-// 前向声明
-struct MemoryRecord;
-struct SearchOptions;
-struct MemoryStats;
-
 /**
- * Memory Provider 接口 (100% 对齐 OpenClaw)
- * 
- * 提供统一的记忆存储和检索接口，支持多种后端实现：
- * - 本地 SQLite
- * - 云端服务 (MemOS Cloud, Supabase, etc.)
- * - 自定义实现
- */
-class MemoryProvider {
-public:
-    virtual ~MemoryProvider() = default;
-    
-    /**
-     * 添加记忆
-     * @param content 记忆内容
-     * @param metadata 元数据 (可选)
-     * @return 记忆 ID
-     */
-    virtual core::Result<std::string> add_memory(
-        const std::string& content,
-        const std::map<std::string, std::string>& metadata = {}
-    ) = 0;
-    
-    /**
-     * 搜索相关记忆
-     * @param query 查询文本
-     * @param options 搜索选项
-     * @return 记忆记录列表 (按相关性降序)
-     */
-    virtual core::Result<std::vector<MemoryRecord>> search_memories(
-        const std::string& query,
-        const SearchOptions& options = {}
-    ) = 0;
-    
-    /**
-     * 删除记忆
-     * @param id 记忆 ID
-     * @return 是否成功
-     */
-    virtual core::Result<bool> remove_memory(const std::string& id) = 0;
-    
-    /**
-     * 更新记忆
-     * @param id 记忆 ID
-     * @param content 新内容
-     * @param metadata 新元数据 (可选)
-     * @return 是否成功
-     */
-    virtual core::Result<bool> update_memory(
-        const std::string& id,
-        const std::string& content,
-        const std::map<std::string, std::string>& metadata = {}
-    ) = 0;
-    
-    /**
-     * 清空所有记忆
-     */
-    virtual core::Result<void> clear_memories() = 0;
-    
-    /**
-     * 获取记忆统计
-     */
-    virtual core::Result<MemoryStats> get_stats() = 0;
-    
-    /**
-     * Provider ID (唯一标识)
-     */
-    virtual std::string id() const = 0;
-    
-    /**
-     * Provider 名称 (显示名称)
-     */
-    virtual std::string name() const = 0;
-};
-
-/**
- * 记忆记录 (对齐 OpenClaw Memory Interface)
- */
-struct MemoryRecord {
-    std::string id;                     // 记忆 ID
-    std::string content;                // 记忆内容
-    std::map<std::string, std::string> metadata;  // 元数据
-    std::vector<float> embedding;       // 向量 (可选)
-    double score = 0.0;                 // 相关性得分 (0-1)
-    std::chrono::system_clock::time_point created_at;   // 创建时间
-    std::chrono::system_clock::time_point updated_at;   // 更新时间
-};
-
-/**
- * 搜索选项 (对齐 OpenClaw SearchOptions)
- */
-struct SearchOptions {
-    int limit = 10;                     // 最大结果数
-    double min_score = 0.7;             // 最小相关性得分
-    std::map<std::string, std::string> filters;  // 元数据过滤器
-    bool include_embedding = false;     // 是否包含向量
-};
-
-/**
- * 记忆统计 (对齐 OpenClaw MemoryStats)
- */
-struct MemoryStats {
-    int total_memories = 0;             // 总记忆数
-    size_t total_size = 0;              // 总大小 (字节)
-    std::chrono::system_clock::time_point last_updated;  // 最后更新时间
-};
-
-/**
- * Memory Plugin 接口 (100% 对齐 OpenClaw)
+ * 🎯 100% 对齐 OpenClaw: Memory Plugin 接口
  * 
  * Memory Plugin 是提供 MemoryProvider 实现的插件。
+ * 插件系统允许第三方扩展为 Agent 提供长期记忆能力。
  * 
- * 示例:
- * - SQLiteMemoryPlugin (本地存储)
- * - MemOSCloudPlugin (云端存储)
- * - SupabaseMemoryPlugin (Supabase PGVector)
+ * OpenClaw 官方 Memory Plugin 示例:
+ * - MemOS Cloud Plugin (https://github.com/MemTensor/MemOS-Cloud-OpenClaw-Plugin)
+ * - SQLite Memory Plugin (内置)
+ * - Supabase Memory Plugin (社区)
+ * 
+ * 插件清单示例 (.plugin.json):
+ * {
+ *   "id": "sqlite-memory",
+ *   "name": "SQLite Memory",
+ *   "version": "1.0.0",
+ *   "type": "memory",
+ *   "author": "HunterClaw Team",
+ *   "description": "Local SQLite-based memory storage",
+ *   "main": "libsqlite_memory_plugin.so",
+ *   "config": {
+ *     "db_path": {"type": "string", "default": "./memory.db"},
+ *     "embedding_provider": {"type": "string", "default": "openai"}
+ *   }
+ * }
+ * 
+ * 使用示例:
+ * 
+ * // 1. 实现 MemoryPlugin
+ * class SQLiteMemoryPlugin : public MemoryPlugin {
+ * public:
+ *     Result<bool> init(const PluginContext& ctx) override {
+ *         // 从配置创建 provider
+ *         std::string db_path = ctx.config["db_path"];
+ *         provider_ = std::make_shared<SQLiteMemoryProvider>(db_path);
+ *         
+ *         // 注册到 Registry
+ *         MemoryProviderRegistry::instance().register_provider(id(), provider_);
+ *         return Ok(true);
+ *     }
+ *     
+ *     std::shared_ptr<MemoryProvider> get_provider() override {
+ *         return provider_;
+ *     }
+ *     
+ *     std::string id() const override { return "sqlite-memory"; }
+ *     std::string name() const override { return "SQLite Memory"; }
+ *     std::string version() const override { return "1.0.0"; }
+ *     
+ * private:
+ *     std::shared_ptr<MemoryProvider> provider_;
+ * };
+ * 
+ * // 2. Agent 自动使用
+ * // Agent 配置 (config.yaml):
+ * // agents:
+ * //   default:
+ * //     memory:
+ * //       enabled: true
+ * //       provider: "sqlite-memory"  # 插件 ID
+ * //       config:
+ * //         contextWindow: 10
+ * //         minScore: 0.7
+ * 
+ * // Agent 运行时:
+ * auto agent = Agent::create(config);
+ * agent->process_message("记住我最喜欢的颜色是蓝色");
+ * // → 自动存储到 memory provider
+ * 
+ * agent->process_message("我喜欢什么颜色?");
+ * // → 自动召回: "你最喜欢的颜色是蓝色"
  */
 class MemoryPlugin : public plugins::Plugin {
 public:
     virtual ~MemoryPlugin() = default;
     
     /**
-     * 获取 Memory Provider 实例
+     * 🎯 OpenClaw 核心 API: 获取 Memory Provider 实例
+     * 
+     * Plugin 必须在 init() 后返回可用的 Provider。
+     * 
+     * @return MemoryProvider 实例 (非空)
      */
     virtual std::shared_ptr<MemoryProvider> get_provider() = 0;
     
@@ -146,6 +96,55 @@ public:
      * Plugin 类型 (固定为 "memory")
      */
     std::string type() const override { return "memory"; }
+    
+    /**
+     * 🎯 OpenClaw 扩展: 支持热重载
+     * 
+     * Memory Plugin 可以选择性支持热重载。
+     * 如果支持，Plugin Manager 可以在运行时更新插件。
+     */
+    bool supports_hot_reload() const override { 
+        return false;  // 默认不支持
+    }
+};
+
+// ========================================
+// 🎯 对齐 OpenClaw: Plugin 辅助工厂
+// ========================================
+
+/**
+ * Memory Plugin 工厂接口
+ * 
+ * 用于动态创建 Memory Plugin 实例。
+ * 
+ * 示例:
+ * 
+ * class SQLiteMemoryPluginFactory : public MemoryPluginFactory {
+ * public:
+ *     Result<std::shared_ptr<MemoryPlugin>> create(
+ *         const std::map<std::string, std::string>& config
+ *     ) override {
+ *         auto plugin = std::make_shared<SQLiteMemoryPlugin>();
+ *         
+ *         PluginContext ctx;
+ *         ctx.config = config;
+ *         
+ *         auto result = plugin->init(ctx);
+ *         if (!result) {
+ *             return Err(result.error());
+ *         }
+ *         
+ *         return Ok(plugin);
+ *     }
+ * };
+ */
+class MemoryPluginFactory {
+public:
+    virtual ~MemoryPluginFactory() = default;
+    
+    virtual core::Result<std::shared_ptr<MemoryPlugin>> create(
+        const std::map<std::string, std::string>& config
+    ) = 0;
 };
 
 } // namespace memory

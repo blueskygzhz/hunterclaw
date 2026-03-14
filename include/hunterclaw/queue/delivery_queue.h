@@ -7,6 +7,7 @@
 #include <functional>
 #include <optional>
 #include "hunterclaw/core/result.h"
+#include <mutex>
 
 namespace hunterclaw {
 namespace queue {
@@ -145,11 +146,13 @@ private:
     // 辅助方法
     core::Result<bool> ensure_dirs();
     std::string get_queue_file_path(const std::string& delivery_id) const;
+    std::string get_delivered_file_path(const std::string& delivery_id) const;
     std::string get_failed_file_path(const std::string& delivery_id) const;
     core::Result<bool> write_delivery(const QueuedDelivery& delivery);
     core::Result<QueuedDelivery> read_delivery(const std::string& file_path);
     bool should_retry(const QueuedDelivery& delivery) const;
     int get_backoff_ms(int retry_count) const;
+    bool is_permanent_delivery_error(const std::string& error) const;
 };
 
 // Followup 队列 (内存队列,用于消息合并)
@@ -188,7 +191,7 @@ public:
 private:
     QueueSettings settings_;
     std::unordered_map<std::string, std::vector<FollowupRun>> queues_;
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
 };
 
 } // namespace queue

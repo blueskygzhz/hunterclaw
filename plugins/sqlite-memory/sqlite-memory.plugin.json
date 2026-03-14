@@ -1,0 +1,117 @@
+{
+  "id": "sqlite-memory",
+  "name": "SQLite Memory",
+  "version": "1.0.0",
+  "type": "memory",
+  "author": "HunterClaw Team",
+  "description": "Local SQLite-based memory storage with FTS5 full-text search and vector search support. Provides hybrid search, MMR reranking, and temporal decay features.",
+  "license": "MIT",
+  "homepage": "https://github.com/hunterclaw/plugins/sqlite-memory",
+  "main": "libsqlite_memory_plugin.so",
+  "keywords": [
+    "memory",
+    "sqlite",
+    "fts5",
+    "vector-search",
+    "hybrid-search",
+    "embedding"
+  ],
+  "dependencies": {
+    "sqlite3": ">=3.35.0",
+    "sqlite-vec": ">=0.1.0"
+  },
+  "config": {
+    "db_path": {
+      "type": "string",
+      "default": "./memory.db",
+      "description": "SQLite database file path (absolute or relative)",
+      "required": false
+    },
+    "embedding_provider": {
+      "type": "string",
+      "default": "openai",
+      "description": "Embedding provider: openai, ollama, gemini, voyage",
+      "enum": ["openai", "ollama", "gemini", "voyage"],
+      "required": false
+    },
+    "hybrid_search": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable hybrid search (vector + keyword)",
+      "required": false
+    },
+    "vector_weight": {
+      "type": "number",
+      "default": 0.7,
+      "description": "Weight for vector search in hybrid mode (0.0-1.0)",
+      "min": 0.0,
+      "max": 1.0,
+      "required": false
+    },
+    "text_weight": {
+      "type": "number",
+      "default": 0.3,
+      "description": "Weight for keyword search in hybrid mode (0.0-1.0)",
+      "min": 0.0,
+      "max": 1.0,
+      "required": false
+    },
+    "mmr_enabled": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable MMR (Maximal Marginal Relevance) reranking for diversity",
+      "required": false
+    },
+    "mmr_lambda": {
+      "type": "number",
+      "default": 0.7,
+      "description": "MMR lambda parameter (0.0-1.0): higher = more relevance, lower = more diversity",
+      "min": 0.0,
+      "max": 1.0,
+      "required": false
+    },
+    "temporal_decay": {
+      "type": "boolean",
+      "default": false,
+      "description": "Enable temporal decay for old memories",
+      "required": false
+    },
+    "temporal_decay_half_life": {
+      "type": "integer",
+      "default": 30,
+      "description": "Temporal decay half-life in days",
+      "min": 1,
+      "max": 365,
+      "required": false
+    },
+    "auto_vacuum": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable SQLite auto-vacuum to reclaim disk space",
+      "required": false
+    },
+    "cache_size": {
+      "type": "integer",
+      "default": 10000,
+      "description": "SQLite cache size (in pages, negative = KB)",
+      "required": false
+    }
+  },
+  "features": [
+    "Full-text search with FTS5 (BM25 ranking)",
+    "Vector search with cosine similarity",
+    "Hybrid search (weighted combination of vector + keyword)",
+    "MMR reranking for diversity",
+    "Temporal decay for aging memories",
+    "Embedding cache to avoid recomputation",
+    "Incremental indexing",
+    "Metadata filtering",
+    "Session-scoped memory isolation"
+  ],
+  "performance": {
+    "max_memories": "Unlimited (limited by disk space)",
+    "search_latency": "<50ms for 10K memories",
+    "index_latency": "<10ms per memory",
+    "memory_usage": "~100MB for 10K memories (with embeddings)"
+  }
+}

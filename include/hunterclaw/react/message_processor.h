@@ -151,12 +151,12 @@ private:
     void send_ack_reaction(const MessageContext& context);
     
     // 5. 加载会话和历史
-    std::vector<llm::Message> load_history(const MessageContext& context);
+    std::vector<LLMMessage> load_history(const MessageContext& context);
     
     // 6. 执行 ReAct (带循环检测)
     ReactResult execute_react_with_loop_detection(
         const MessageContext& context,
-        const std::vector<llm::Message>& history
+        const std::vector<LLMMessage>& history
     );
     
     // 7. 投递响应
@@ -180,7 +180,7 @@ private:
     // 模型回退
     ReactResult execute_with_fallback(
         const MessageContext& context,
-        const std::vector<llm::Message>& history,
+        const std::vector<LLMMessage>& history,
         std::vector<std::string>& fallback_attempts
     );
     

@@ -1,0 +1,34 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'hunterclaw-production'
+
+scrape_configs:
+  - job_name: 'hunterclaw-gateway'
+    static_configs:
+      - targets: ['hunterclaw:9090']
+        labels:
+          service: 'gateway'
+          environment: 'production'
+  
+  - job_name: 'hunterclaw-daemon'
+    static_configs:
+      - targets: ['hunterclaw-daemon:9090']
+        labels:
+          service: 'daemon'
+          environment: 'production'
+  
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+        labels:
+          instance: 'host-machine'
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+
+rule_files:
+  - '/etc/prometheus/rules/*.yml'

@@ -4,12 +4,24 @@
 
 namespace hunterclaw::skills {
 
+namespace {
+
+// 获取 Skills logger
+auto get_logger() {
+    static auto logger = []() {
+        auto log = spdlog::get("skills");
+        if (!log) {
+            log = spdlog::stdout_logger_mt("skills");
+        }
+        return log;
+    }();
+    return logger;
+}
+
+} // namespace
+
 core::Result<Skill> SkillParser::parse_file(const fs::path&) {
-    static auto logger = spdlog::get("skills");
-    if (!logger) {
-        logger = spdlog::stdout_logger_mt("skills");
-    }
-    logger->warn("SkillParser::parse_file not implemented (requires yaml-cpp)");
+    get_logger()->warn("SkillParser::parse_file not implemented (requires yaml-cpp)");
     
     core::Result<Skill> result;
     result.error = "Not implemented";
@@ -17,11 +29,7 @@ core::Result<Skill> SkillParser::parse_file(const fs::path&) {
 }
 
 core::Result<SkillFrontmatter> SkillParser::parse_frontmatter(const std::string&) {
-    static auto logger = spdlog::get("skills");
-    if (!logger) {
-        logger = spdlog::stdout_logger_mt("skills");
-    }
-    logger->warn("SkillParser::parse_frontmatter not implemented");
+    get_logger()->warn("SkillParser::parse_frontmatter not implemented");
     
     core::Result<SkillFrontmatter> result;
     result.error = "Not implemented";
@@ -29,11 +37,7 @@ core::Result<SkillFrontmatter> SkillParser::parse_frontmatter(const std::string&
 }
 
 core::Result<bool> SkillParser::validate_skill(const Skill&) {
-    static auto logger = spdlog::get("skills");
-    if (!logger) {
-        logger = spdlog::stdout_logger_mt("skills");
-    }
-    logger->warn("SkillParser::validate_skill not implemented");
+    get_logger()->warn("SkillParser::validate_skill not implemented");
     
     core::Result<bool> result;
     result.error = "Not implemented";

@@ -1,0 +1,245 @@
+# ============================================================================
+# HunterClaw 开发环境 Dockerfile
+# ============================================================================
+# 包含完整的开发工具链，适合开发和调试
+# ============================================================================
+
+FROM centos:7
+
+LABEL maintainer="blueskygzhz@github.com"
+LABEL description="HunterClaw Development Environment"
+LABEL version="0.1.0-dev"
+
+# ============================================================================
+# 安装开发工具链
+# ============================================================================
+RUN yum install -y centos-release-scl && \
+    yum install -y \
+        # GCC 11 工具链
+        devtoolset-11-gcc \
+        devtoolset-11-gcc-c++ \
+        devtoolset-11-gdb \
+        devtoolset-11-binutils \
+        # 构建工具
+        cmake3 \
+        make \
+        ninja-build \
+        automake \
+        autoconf \
+        libtool \
+        # 版本控制
+        git \
+        git-lfs \
+        # 网络工具
+        wget \
+        curl \
+        net-tools \
+        iproute \
+        telnet \
+        nc \
+        # 开发库
+        openssl-devel \
+        libcurl-devel \
+        zlib-devel \
+        boost-devel \
+        # 调试工具
+        valgrind \
+        strace \
+        ltrace \
+        lsof \
+        htop \
+        # 编辑器
+        vim \
+        nano \
+        # 其他工具
+        tree \
+        less \
+        which \
+        file \
+        zip \
+        unzip \
+        tar \
+        jq \
+        python3 \
+        python3-pip && \
+    yum clean all
+
+# ============================================================================
+# 创建 cmake 软链接
+# ============================================================================
+RUN ln -sf /usr/bin/cmake3 /usr/bin/cmake
+
+# ============================================================================
+# 配置开发环境
+# ============================================================================
+# 设置 devtoolset-11 为默认编译器
+RUN echo 'source /opt/rh/devtoolset-11/enable' >> /etc/bashrc && \
+    echo 'source /opt/rh/devtoolset-11/enable' >> ~/.bashrc
+
+# 设置环境变量
+ENV PATH="/opt/rh/devtoolset-11/root/usr/bin:${PATH}" \
+    LD_LIBRARY_PATH="/opt/rh/devtoolset-11/root/usr/lib64:${LD_LIBRARY_PATH}" \
+    CC="/opt/rh/devtoolset-11/root/usr/bin/gcc" \
+    CXX="/opt/rh/devtoolset-11/root/usr/bin/g++" \
+    CMAKE_PREFIX_PATH="/usr/local"
+
+# ============================================================================
+# 安装 Python 开发工具
+# ============================================================================
+RUN pip3 install --upgrade pip && \
+    pip3 install \
+        conan \
+        cmake-format \
+        cppcheck \
+        cpplint \
+        clang-format && \
+    pip3 cache purge
+
+# ============================================================================
+# 创建开发用户和目录
+# ============================================================================
+RUN useradd -m -s /bin/bash developer && \
+    mkdir -p \
+        /workspace \
+        /build \
+        /install \
+        /var/lib/hunterclaw/workspaces \
+        /var/lib/hunterclaw/memory \
+        /var/lib/hunterclaw/db \
+        /var/lib/hunterclaw/skills \
+        /var/log/hunterclaw && \
+    chown -R developer:developer \
+        /workspace \
+        /build \
+        /install \
+        /var/lib/hunterclaw \
+        /var/log/hunterclaw
+
+# ============================================================================
+# 配置 Git (容器内使用)
+# ============================================================================
+RUN git config --system user.name "Developer" && \
+    git config --system user.email "developer@hunterclaw.local" && \
+    git config --system core.editor "vim" && \
+    git config --system color.ui auto
+
+# ============================================================================
+# 安装额外的调试工具
+# ============================================================================
+RUN pip3 install \
+        httpie \
+        mycli \
+        redis-tools-py && \
+    pip3 cache purge
+
+# ============================================================================
+# 复制构建脚本（可选）
+# ============================================================================
+COPY deploy/build_minimal.sh /usr/local/bin/build-hunterclaw
+RUN chmod +x /usr/local/bin/build-hunterclaw
+
+# ============================================================================
+# 创建便捷脚本
+# ============================================================================
+RUN cat > /usr/local/bin/dev-build << 'EOF'
+#!/bin/bash
+set -e
+echo "🔨 Building HunterClaw in Debug mode..."
+cd /workspace
+source /opt/rh/devtoolset-11/enable
+cmake -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build -j$(nproc)
+echo "✅ Build complete!"
+ls -lh build/hunterclaw-gateway build/*.so
+EOF
+
+RUN cat > /usr/local/bin/dev-test << 'EOF'
+#!/bin/bash
+set -e
+echo "🧪 Running tests..."
+cd /workspace
+source /opt/rh/devtoolset-11/enable
+if [ -d "build/tests" ]; then
+    cd build/tests && ctest --output-on-failure
+else
+    echo "No tests found. Run 'dev-build' first."
+fi
+EOF
+
+RUN cat > /usr/local/bin/dev-run << 'EOF'
+#!/bin/bash
+echo "🚀 Running HunterClaw Gateway..."
+cd /workspace
+if [ -f "build/hunterclaw-gateway" ]; then
+    LD_LIBRARY_PATH=/workspace/build:$LD_LIBRARY_PATH \
+    ./build/hunterclaw-gateway --config config/development.yaml "$@"
+else
+    echo "❌ Binary not found. Run 'dev-build' first."
+    exit 1
+fi
+EOF
+
+RUN chmod +x /usr/local/bin/dev-* && \
+    chown developer:developer /usr/local/bin/dev-*
+
+# ============================================================================
+# 配置 .bashrc 快捷命令
+# ============================================================================
+RUN cat >> /home/developer/.bashrc << 'EOF'
+
+# HunterClaw 开发环境快捷命令
+alias build='dev-build'
+alias run='dev-run'
+alias test='dev-test'
+alias clean='rm -rf build/ bin/ lib/ && echo "✅ Cleaned"'
+alias rebuild='clean && build'
+
+# 便捷别名
+alias ll='ls -lh'
+alias la='ls -lah'
+alias ..='cd ..'
+alias ...='cd ../..'
+
+# Git 别名
+alias gs='git status'
+alias ga='git add'
+alias gc='git commit'
+alias gp='git push'
+alias gl='git log --oneline -10'
+
+echo ""
+echo "🎯 HunterClaw Development Environment"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "Quick Commands:"
+echo "  build   - Build in debug mode"
+echo "  run     - Run gateway"
+echo "  test    - Run tests"
+echo "  clean   - Clean build artifacts"
+echo "  rebuild - Clean and build"
+echo ""
+echo "Working directory: /workspace"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+EOF
+
+# ============================================================================
+# 设置工作目录和用户
+# ============================================================================
+WORKDIR /workspace
+USER developer
+
+# ============================================================================
+# 暴露端口
+# ============================================================================
+EXPOSE 8080 8081 9090
+
+# ============================================================================
+# 健康检查
+# ============================================================================
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD curl -f http://localhost:8081/health || exit 1
+
+# ============================================================================
+# 默认命令 - 保持容器运行
+# ============================================================================
+CMD ["/bin/bash"]

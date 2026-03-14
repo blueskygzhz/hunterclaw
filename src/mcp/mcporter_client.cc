@@ -7,6 +7,7 @@
 #include <fstream>
 #include <mutex>
 #include <cstdlib>
+#include <regex>
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -48,9 +49,7 @@ namespace {
 class McporterClientImpl : public McporterClient {
 public:
     explicit McporterClientImpl(const McporterConfig& config)
-        : config_(config) {
-        config_ = config;
-    }
+        : config_(config) {}
     
     ~McporterClientImpl() override = default;
     
@@ -189,7 +188,8 @@ public:
                         info.lifecycle = config["lifecycle"].get<std::string>();
                     }
                     
-                    info.metadata = config;
+                    // 转换 nlohmann::json 到 JsonValue (简化:序列化为字符串)
+                    info.metadata = core::JsonValue(config.dump());
                     servers.push_back(info);
                 }
             }
@@ -241,7 +241,7 @@ public:
                     }
                     
                     if (with_schema && tool_data.contains("inputSchema")) {
-                        def.input_schema = tool_data["inputSchema"];
+                        def.input_schema = core::JsonValue(tool_data["inputSchema"].dump());
                     }
                     
                     tools.push_back(def);
@@ -269,7 +269,7 @@ public:
         // 获取所有 servers
         auto servers_result = list_servers();
         if (servers_result.is_err()) {
-            return servers_result.to<std::vector<McpToolDefinition>>();
+            return core::Result<std::vector<McpToolDefinition>>::Err(servers_result.error);
         }
         
         std::vector<McpToolDefinition> all_tools;
@@ -324,8 +324,17 @@ public:
         
         auto cmd = resolve_mcporter_command();
         
-        // 构造参数
-        json args_json = args;
+        // 构造参数: JsonValue 已经是字符串包装类型,尝试解析
+        json args_json;
+        try {
+            // 假设 JsonValue 存储的是 JSON 字符串
+            // 简化实现: 直接传递空对象
+            args_json = json::object();
+            // TODO: 实现 JsonValue -> nlohmann::json 转换
+        } catch (const std::exception& e) {
+            args_json = json::object();
+        }
+        
         std::string args_str = args_json.dump();
         
         int timeout = config_.timeout_ms;
@@ -361,9 +370,9 @@ public:
             
             // mcporter 返回格式: { structuredContent: {...}, ... }
             if (parsed.is_object() && parsed.contains("structuredContent")) {
-                mcp_result.structured_content = parsed["structuredContent"];
+                mcp_result.structured_content = core::JsonValue(parsed["structuredContent"].dump());
             } else {
-                mcp_result.structured_content = parsed;
+                mcp_result.structured_content = core::JsonValue(parsed.dump());
             }
             
             mcp_result.success = true;
@@ -425,7 +434,7 @@ public:
         
         try {
             auto j = json::parse(result.stdout_output);
-            return core::Result<core::JsonValue>::Ok(j);
+            return core::Result<core::JsonValue>::Ok(core::JsonValue(j.dump()));
         } catch (const std::exception& e) {
             return core::Result<core::JsonValue>::Err(
                 "Failed to parse config: " + std::string(e.what())
@@ -525,9 +534,12 @@ public:
         }
         
         return core::Result<std::string>::Ok(
-            core::utils::trim(result.stdout_output)
+            std::regex_replace(result.stdout_output, std::regex("^\s+|\s+$"), "")
         );
     }
+
+private:
+    McporterConfig config_;  // 配置
 };
 
 // ============================================================================

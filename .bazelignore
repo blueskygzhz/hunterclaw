@@ -1,0 +1,33 @@
+# ============================================================================
+# Bazel Ignore File
+# ============================================================================
+
+# CMake build directory
+build
+
+# CMake files
+cmake
+
+# Documentation
+docs
+
+# Deployment files
+deploy
+
+# Distribution files
+dist
+
+# Scripts
+scripts
+
+# Examples (can be built separately if needed)
+examples
+
+# Benchmarks
+benchmarks
+
+# Monitoring
+monitoring
+
+# Config
+config

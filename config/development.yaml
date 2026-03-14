@@ -1,0 +1,129 @@
+# ============================================================================
+# HunterClaw 开发环境配置
+# ============================================================================
+
+# 服务器配置
+server:
+  host: 0.0.0.0
+  port: 8080
+  threads: 4
+  timeout: 120
+
+# 健康检查端口
+health_check:
+  enabled: true
+  port: 8081
+  endpoint: /health
+
+# Metrics 端口
+metrics:
+  enabled: true
+  port: 9090
+  endpoint: /metrics
+
+# 日志配置
+logging:
+  level: debug           # 开发环境使用 debug 级别
+  console: true          # 输出到控制台
+  file:
+    enabled: true
+    path: /var/log/hunterclaw/gateway.log
+    max_size: 100MB
+    max_files: 5
+  format: pretty         # 开发环境使用易读格式
+
+# LLM 配置
+llm:
+  provider: openai
+  api_key: ${OPENAI_API_KEY}
+  base_url: ${OPENAI_API_BASE:-https://api.openai.com/v1}
+  model: gpt-4
+  temperature: 0.7
+  max_tokens: 4096
+  timeout: 60
+
+# Agent 配置
+agent:
+  max_turns: 10
+  max_execution_time: 300
+  memory_type: sqlite
+  memory_path: /var/lib/hunterclaw/memory
+  workspace_dir: /var/lib/hunterclaw/workspaces
+  
+  # Skills 配置
+  skills:
+    enabled: true
+    auto_load: true
+    skills_dir: /var/lib/hunterclaw/skills
+    cache_enabled: true
+
+# Tools 配置
+tools:
+  # 工具策略
+  policy:
+    enabled: true
+    default_policy: allow
+    risk_analysis: true
+  
+  # 循环检测
+  loop_detection:
+    enabled: true
+    max_same_tool: 3
+    window_size: 10
+  
+  # Human-in-the-loop
+  approval:
+    enabled: true
+    default_mode: ask      # always | never | ask
+    timeout: 120           # 审批超时时间 (秒)
+  
+  # 内置工具
+  builtin:
+    - read_file
+    - write_file
+    - list_directory
+    - execute_command
+  
+  # MCP 工具
+  mcp:
+    enabled: true
+    servers: []
+
+# Session 配置
+session:
+  storage: sqlite
+  db_path: /var/lib/hunterclaw/db/sessions.db
+  ttl: 86400            # 24小时
+
+# 安全配置
+security:
+  api_tokens:
+    - ${HUNTERCLAW_API_TOKENS:-dev_token_12345}
+  
+  signing_secret: ${HUNTERCLAW_SIGNING_SECRET:-dev_secret}
+  
+  # 开发模式放宽限制
+  rate_limit:
+    enabled: false
+  
+  cors:
+    enabled: true
+    allow_origins:
+      - "*"
+
+# 渠道配置
+channels:
+  # 飞书渠道 (可选)
+  feishu:
+    enabled: false
+    app_id: ${FEISHU_APP_ID:-}
+    app_secret: ${FEISHU_APP_SECRET:-}
+    encrypt_key: ${FEISHU_ENCRYPT_KEY:-}
+    verification_token: ${FEISHU_VERIFICATION_TOKEN:-}
+
+# 开发特性
+development:
+  hot_reload: false         # 暂不支持
+  debug_mode: true
+  verbose_logging: true
+  enable_profiling: true

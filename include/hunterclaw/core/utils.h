@@ -13,6 +13,7 @@ std::string generate_uuid();
 // Time utilities
 Timestamp now();
 std::string format_timestamp(const Timestamp& ts);
+int64_t current_timestamp_ms();  // 获取当前时间戳(毫秒)
 
 // File utilities
 bool file_exists(const std::string& path);

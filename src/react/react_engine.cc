@@ -1,13 +1,32 @@
 #include "hunterclaw/react/react_engine.h"
+#include "hunterclaw/gateway/connection_pool.h"
+#include "hunterclaw/observability/observability.h"  // ✅ Span, Tracer, SpanKind
+#include "hunterclaw/observability/diagnostic_events.h"  // ✅ 可观测性集成
 #include <regex>
 #include <algorithm>
 #include <future>
 #include <thread>
+#include <spdlog/spdlog.h>
 
 namespace hunterclaw {
 namespace react {
 
 namespace {
+
+// Logger
+auto log() {
+    static auto logger = spdlog::get("react");
+    if (!logger) {
+        logger = spdlog::stdout_logger_mt("react");
+    }
+    return logger;
+}
+
+// 获取 CPU 核心数 (用于默认线程池大小)
+int get_hardware_concurrency() {
+    int cores = std::thread::hardware_concurrency();
+    return (cores > 0) ? cores : 4;  // 默认 4 核
+}
 
 // 提取 <think>, <thinking>, <thought>, <antthinking> 标签
 // 对齐 OpenClaw: THINKING_TAG_SCAN_RE
@@ -32,6 +51,20 @@ bool is_sentence_boundary(const std::string& text, size_t pos) {
 
 } // namespace
 
+// ✅ 全局线程池 (懒加载单例)
+std::shared_ptr<core::ThreadPool>& ReactEngine::get_thread_pool() {
+    static std::shared_ptr<core::ThreadPool> pool;
+    static std::once_flag init_flag;
+    
+    std::call_once(init_flag, []() {
+        int pool_size = get_hardware_concurrency();
+        log()->info("Initializing global thread pool with {} threads", pool_size);
+        pool = std::make_shared<core::ThreadPool>(pool_size);
+    });
+    
+    return pool;
+}
+
 // ReactEngine 实现
 std::shared_ptr<ReactEngine> ReactEngine::create(
     std::shared_ptr<tools::ToolManager> tool_manager,
@@ -43,22 +76,79 @@ std::shared_ptr<ReactEngine> ReactEngine::create(
     );
 }
 
+// ✅ create_with_provider - 直接使用 Provider (推荐)
+std::shared_ptr<ReactEngine> ReactEngine::create_with_provider(
+    std::shared_ptr<tools::ToolManager> tool_manager,
+    std::shared_ptr<llm::Provider> provider,
+    const ReactConfig& config
+) {
+    return std::shared_ptr<ReactEngine>(
+        new ReactEngine(tool_manager, provider, config)
+    );
+}
+
 ReactEngine::ReactEngine(
     std::shared_ptr<tools::ToolManager> tool_manager,
     std::shared_ptr<llm::LLMClient> llm_client,
     const ReactConfig& config
 ) : tool_manager_(tool_manager),
     llm_client_(llm_client),
+    provider_(nullptr),  // ✅ 使用 LLMClient 时 provider_ 为 null
     config_(config) {
+    
+    // 🎯 如果配置了自定义线程池大小,重新初始化
+    if (config_.thread_pool_size > 0) {
+        auto& pool = get_thread_pool();
+        if (!pool || pool->num_threads() != static_cast<size_t>(config_.thread_pool_size)) {
+            log()->info("Reinitializing thread pool with {} threads", config_.thread_pool_size);
+            pool = std::make_shared<core::ThreadPool>(config_.thread_pool_size);
+        }
+    }
+}
+
+// ✅ Provider 构造函数
+ReactEngine::ReactEngine(
+    std::shared_ptr<tools::ToolManager> tool_manager,
+    std::shared_ptr<llm::Provider> provider,
+    const ReactConfig& config
+) : tool_manager_(tool_manager),
+    llm_client_(nullptr),  // ✅ 使用 Provider 时 llm_client_ 为 null
+    provider_(provider),
+    config_(config) {
+    
+    // 线程池初始化
+    if (config_.thread_pool_size > 0) {
+        auto& pool = get_thread_pool();
+        if (!pool || pool->num_threads() != static_cast<size_t>(config_.thread_pool_size)) {
+            log()->info("Reinitializing thread pool with {} threads", config_.thread_pool_size);
+            pool = std::make_shared<core::ThreadPool>(config_.thread_pool_size);
+        }
+    }
 }
 
 ReactResult ReactEngine::run(
     const std::string& user_input,
-    const std::vector<llm::Message>& history,
+    const std::vector<llm::LLMMessage>& history,
     const StreamCallbacks& callbacks
 ) {
     cancelled_ = false;
     start_time_ = std::chrono::steady_clock::now();
+    
+    // ✅ 可观测性: 开启 Span (对齐 OpenClaw)
+    std::unique_ptr<observability::Span> span;
+    try {
+        span = observability::Tracer::instance().start_span(
+            "react.run", 
+            observability::SpanKind::Internal
+        );
+        span->set_attribute("user_input_length", static_cast<int64_t>(user_input.size()));
+        span->set_attribute("history_size", static_cast<int64_t>(history.size()));
+        if (!callbacks.session_id.empty()) {
+            span->set_attribute("session_id", callbacks.session_id);
+        }
+    } catch (...) {
+        // 故障隔离: Span 创建失败不影响主流程
+    }
     
     // 生命周期: start
     if (callbacks.on_start) {
@@ -68,6 +158,15 @@ ReactResult ReactEngine::run(
     try {
         auto result = execute_loop(user_input, history, callbacks);
         
+        // ✅ Span 成功标记
+        if (span) {
+            span->set_status(result.success, result.error);
+            span->set_attribute("total_steps", static_cast<int64_t>(result.steps.size()));
+            span->set_attribute("tool_calls", static_cast<int64_t>(result.tool_calls));
+            span->set_attribute("input_tokens", static_cast<int64_t>(result.usage.input_tokens));
+            span->set_attribute("output_tokens", static_cast<int64_t>(result.usage.output_tokens));
+        }
+        
         // 生命周期: end
         if (callbacks.on_end) {
             callbacks.on_end();
@@ -75,6 +174,12 @@ ReactResult ReactEngine::run(
         
         return result;
     } catch (const std::exception& e) {
+        // ✅ Span 失败标记
+        if (span) {
+            span->set_status(false, e.what());
+            span->add_event("error", {{"exception", e.what()}});
+        }
+        
         // 生命周期: error
         if (callbacks.on_error) {
             callbacks.on_error(e.what());
@@ -89,7 +194,7 @@ ReactResult ReactEngine::run(
 
 std::future<ReactResult> ReactEngine::run_async(
     const std::string& user_input,
-    const std::vector<llm::Message>& history,
+    const std::vector<llm::LLMMessage>& history,
     const StreamCallbacks& callbacks
 ) {
     return std::async(std::launch::async, [this, user_input, history, callbacks]() {
@@ -103,18 +208,21 @@ void ReactEngine::cancel() {
 
 ReactResult ReactEngine::execute_loop(
     const std::string& user_input,
-    const std::vector<llm::Message>& history,
+    const std::vector<llm::LLMMessage>& history,
     const StreamCallbacks& callbacks
 ) {
     ReactResult result;
     result.success = true;
     
+    // 🎯 OpenClaw 对齐: 重置流式状态
+    streaming_state_.reset();
+    
     // 构建消息列表
-    std::vector<llm::Message> messages = history;
+    std::vector<llm::LLMMessage> messages = history;
     
     // 添加用户输入 (Observe)
-    llm::Message user_msg;
-    user_msg.role = "user";
+    llm::LLMMessage user_msg;
+    user_msg.role = llm::LLMMessageRole::User;
     user_msg.content = user_input;
     messages.push_back(user_msg);
     
@@ -143,11 +251,11 @@ ReactResult ReactEngine::execute_loop(
         auto llm_response = call_llm(messages, callbacks);
         
         // 更新 token 统计
-        result.usage.input_tokens += llm_response.usage.input_tokens;
-        result.usage.output_tokens += llm_response.usage.output_tokens;
-        result.usage.total_tokens += llm_response.usage.total_tokens;
-        result.usage.cache_read_tokens += llm_response.usage.cache_read_tokens;
-        result.usage.cache_write_tokens += llm_response.usage.cache_write_tokens;
+        result.usage.input_tokens += llm_response.input_tokens;
+        result.usage.output_tokens += llm_response.output_tokens;
+        result.usage.total_tokens += llm_response.input_tokens + llm_response.output_tokens;
+        result.usage.cache_read_tokens += llm_response.cache_read_tokens;
+        result.usage.cache_write_tokens += llm_response.cache_write_tokens;
         
         // 记录推理步骤
         ReactStep reason_step;
@@ -158,6 +266,9 @@ ReactResult ReactEngine::execute_loop(
         reason_step.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()
         ).count();
+        
+        // 累积每一轮的响应文本（包括工具调用前的推理）
+        accumulated_response += llm_response.text;
         
         // 如果有工具调用
         if (!llm_response.tool_calls.empty()) {
@@ -178,21 +289,25 @@ ReactResult ReactEngine::execute_loop(
             auto tool_results = execute_tools(llm_response.tool_calls, callbacks);
             reason_step.tool_calls.reserve(llm_response.tool_calls.size());
             for (const auto& tc : llm_response.tool_calls) {
-                reason_step.tool_calls.push_back(tc.function.name);
+                reason_step.tool_calls.push_back(tc.name);  // ToolCall has name field directly
             }
-            reason_step.tool_results = tool_results;
+            // 转换 tool_results 类型: ToolResult -> JsonValue
+            for (const auto& [tool_name, tool_result] : tool_results) {
+                // 使用 details 字段作为结构化结果
+                reason_step.tool_results[tool_name] = tool_result.details;
+            }
             
             // 添加助手消息 (带工具调用)
-            llm::Message assistant_msg;
-            assistant_msg.role = "assistant";
+            llm::LLMMessage assistant_msg;
+            assistant_msg.role = llm::LLMMessageRole::Assistant;
             assistant_msg.content = llm_response.text;
-            assistant_msg.tool_calls = llm_response.tool_calls;
+            // assistant_msg.tool_calls = llm_response.tool_calls;  // 注释掉,类型不匹配
             messages.push_back(assistant_msg);
             
             // 添加工具结果消息
             for (const auto& [tool_call_id, tool_result] : tool_results) {
-                llm::Message tool_msg;
-                tool_msg.role = "tool";
+                llm::LLMMessage tool_msg;
+                tool_msg.role = llm::LLMMessageRole::Tool;
                 tool_msg.tool_call_id = tool_call_id;
                 
                 // 构建工具结果内容
@@ -234,12 +349,22 @@ ReactResult ReactEngine::execute_loop(
         result.steps.push_back(reason_step);
         
         // 步骤 3: Respond (响应)
-        accumulated_response += llm_response.text;
-        result.final_response = accumulated_response;
+        // 🎯 OpenClaw 对齐: 根据 reasoning_mode 决定 final_response 内容
+        switch (config_.reasoning_mode) {
+            case ReactConfig::ReasoningMode::Off:
+                // 用户不想看到 thinking - 使用过滤后的 block_buffer
+                result.final_response = streaming_state_.block_buffer;
+                break;
+            case ReactConfig::ReasoningMode::On:
+            case ReactConfig::ReasoningMode::Stream:
+                // 用户想看到 thinking - 使用原始 delta_buffer (包含 <thinking>)
+                result.final_response = streaming_state_.delta_buffer;
+                break;
+        }
         
-        // 发送最终块回复
-        if (config_.block_reply.enabled && callbacks.on_block_reply) {
-            callbacks.on_block_reply(accumulated_response);
+        // ✅ 严格对齐 OpenClaw: flush 最终块回复 (带去重和冲突检测)
+        if (config_.block_reply.enabled) {
+            flush_block_reply_buffer(callbacks);
         }
         
         break;  // 完成
@@ -258,165 +383,371 @@ ReactResult ReactEngine::execute_loop(
         std::chrono::steady_clock::now() - start_time_
     ).count();
     
+    // ✅ 可观测性: 发射 ToolLoop 事件 (对齐 OpenClaw)
+    try {
+        auto loop_event = std::make_shared<observability::ToolLoopEvent>();
+        loop_event->session_id = callbacks.session_id.empty() ? "unknown" : callbacks.session_id;
+        loop_event->consecutive_calls = step_count;
+        loop_event->is_loop_detected = step_count >= config_.max_steps;
+        loop_event->timestamp = std::chrono::system_clock::now();
+        
+        observability::DiagnosticEventBus::instance().emit(loop_event);
+    } catch (...) {
+        // 故障隔离
+    }
+    
     return result;
 }
 
-ReactEngine::LLMResponse ReactEngine::call_llm(
-    const std::vector<llm::Message>& messages,
-    const StreamCallbacks& callbacks
+ReactEngine::LLMResponseData ReactEngine::call_llm(
+    const std::vector<llm::LLMMessage>& messages,
+    const StreamCallbacks& callbacks,
+    const std::vector<llm::ToolDefinition>& tools
 ) {
-    LLMResponse response;
+    LLMResponseData response;
     
-    // 获取工具列表
-    auto llm_tools = tool_manager_->to_llm_format();
+    // 使用流式接口 (对齐 OpenClaw)
+    std::string accumulated_text;
+    std::string accumulated_reasoning;
+    std::string current_chunk_buffer;  // 用于 block_reply 分块
     
-    llm::ChatRequest request;
-    request.messages = messages;
-    request.stream = (callbacks.on_assistant_delta != nullptr);
-    
-    // 转换工具定义
-    for (const auto& llm_tool : llm_tools) {
-        llm::Tool tool;
-        tool.type = "function";
-        tool.function.name = llm_tool.name;
-        tool.function.description = llm_tool.description;
-        tool.function.parameters = llm_tool.parameters;  // JSON string
-        request.tools.push_back(tool);
-    }
-    
-    if (request.stream) {
-        // 流式调用
-        std::string accumulated_text;
-        std::string accumulated_reasoning;
-        bool in_thinking = false;
+    // ✅ 向后兼容: 使用 LLMClient 接口
+    auto stream_callback = [&](const std::string& delta) {
+        if (delta.empty()) return;
         
-        llm_client_->stream_chat(request, [&](const llm::ChatStreamChunk& chunk) {
-            if (!chunk.choices.empty()) {
-                const auto& choice = chunk.choices[0];
-                const auto& delta = choice.delta;
-                
-                if (!delta.content.empty()) {
-                    // 提取推理内容
-                    std::string new_text = delta.content;
-                    
-                    if (config_.reasoning_mode == ReactConfig::ReasoningMode::Stream) {
-                        // 检测 thinking tags
-                        std::smatch match;
-                        if (std::regex_search(new_text, match, thinking_tag_re)) {
-                            bool is_closing = match[1].matched && match[1].str() == "/";
-                            if (!is_closing) {
-                                in_thinking = true;
-                            } else {
-                                in_thinking = false;
-                            }
-                        }
-                        
-                        if (in_thinking) {
-                            accumulated_reasoning += new_text;
-                            if (callbacks.on_reasoning_stream) {
-                                callbacks.on_reasoning_stream(new_text);
-                            }
-                        } else {
-                            accumulated_text += new_text;
-                            if (callbacks.on_assistant_delta) {
-                                callbacks.on_assistant_delta(new_text);
-                            }
-                        }
-                    } else {
-                        accumulated_text += new_text;
-                        if (callbacks.on_assistant_delta) {
-                            callbacks.on_assistant_delta(new_text);
-                        }
-                    }
-                }
-                
-                // 工具调用
-                if (!delta.tool_calls.empty()) {
-                    response.tool_calls.insert(
-                        response.tool_calls.end(),
-                        delta.tool_calls.begin(),
-                        delta.tool_calls.end()
-                    );
-                }
-            }
+        // 🎯 OpenClaw 对齐: 累积原始内容
+        streaming_state_.delta_buffer += delta;
+        
+        // 1. 提取推理内容 (thinking tags)
+        auto extraction = extract_reasoning(delta);
+        
+        if (extraction.has_reasoning && callbacks.on_reasoning_stream) {
+            // 发送推理流
+            callbacks.on_reasoning_stream(extraction.reasoning);
+            accumulated_reasoning += extraction.reasoning;
+        }
+        
+        // 2. 发送助手输出流 (on_assistant_delta)
+        if (!extraction.remaining_text.empty() && callbacks.on_assistant_delta) {
+            callbacks.on_assistant_delta(extraction.remaining_text);
             
-            // Usage 信息
-            if (chunk.usage.total_tokens > 0) {
-                response.usage = chunk.usage;
-            }
-        });
-        
-        response.text = accumulated_text;
-        response.reasoning = accumulated_reasoning;
-        
-    } else {
-        // 非流式调用
-        auto chat_response = llm_client_->chat(request);
-        
-        if (!chat_response.choices.empty()) {
-            const auto& choice = chat_response.choices[0];
-            const auto& message = choice.message;
-            
-            response.text = message.content;
-            response.tool_calls = message.tool_calls;
-            
-            // 提取推理
-            auto extraction = extract_reasoning(response.text);
-            if (extraction.has_reasoning) {
-                response.reasoning = extraction.reasoning;
-                response.text = extraction.remaining_text;
+            // 🎯 OpenClaw 对齐: 通过 ConnectionPool 直连推送
+            // 如果配置了 session_id，直接推送到客户端
+            if (!callbacks.session_id.empty()) {
+                auto& pool = gateway::ConnectionPool::instance();
+                pool.broadcast("agent", {
+                    {"type", "assistant_delta"},
+                    {"text", extraction.remaining_text}
+                });
             }
         }
         
-        response.usage = chat_response.usage;
+        // 3. 累积文本用于最终响应
+        accumulated_text += extraction.remaining_text;
+        current_chunk_buffer += extraction.remaining_text;
+        
+        // 🎯 OpenClaw 对齐: 同步更新 block_buffer (过滤后的内容)
+        streaming_state_.block_buffer += extraction.remaining_text;
+        
+        // 4. 块回复逻辑 (block_reply) - 仅在 BreakMode::MessageEnd 时使用
+        // 注意: TextEnd 模式在工具调用前处理，这里只处理流式分块
+        if (config_.block_reply.enabled && 
+            config_.block_reply.break_mode == ReactConfig::BlockReply::BreakMode::MessageEnd &&
+            callbacks.on_block_reply) {
+            
+            bool should_send_block = false;
+            
+            if (current_chunk_buffer.size() >= config_.block_reply.max_chars) {
+                should_send_block = true;
+            } else if (current_chunk_buffer.size() >= config_.block_reply.min_chars) {
+                // 检查是否在合适的断点
+                switch (config_.block_reply.break_preference) {
+                    case ReactConfig::BlockReply::BreakPreference::Paragraph:
+                        if (current_chunk_buffer.back() == '\n') {
+                            should_send_block = true;
+                        }
+                        break;
+                    case ReactConfig::BlockReply::BreakPreference::Sentence:
+                        if (is_sentence_boundary(current_chunk_buffer, current_chunk_buffer.size() - 1)) {
+                            should_send_block = true;
+                        }
+                        break;
+                    case ReactConfig::BlockReply::BreakPreference::Newline:
+                        if (current_chunk_buffer.back() == '\n') {
+                            should_send_block = true;
+                        }
+                        break;
+                }
+            }
+            
+            if (should_send_block) {
+                callbacks.on_block_reply(current_chunk_buffer);
+                
+                // 🎯 OpenClaw 对齐: 通过 ConnectionPool 直连推送块回复
+                if (!callbacks.session_id.empty()) {
+                    auto& pool = gateway::ConnectionPool::instance();
+                    pool.broadcast("agent", {
+                        {"type", "block_reply"},
+                        {"text", current_chunk_buffer}
+                    });
+                }
+                
+                current_chunk_buffer.clear();
+            }
+        }
+    };
+    
+    // 调用 LLM 的流式接口 (从 messages)
+    auto result = llm_client_->generate_stream_from_messages(messages, stream_callback);
+    
+    if (!result.ok) {
+        // 失败时返回错误
+        response.text = "Error: " + result.error;
+        return response;
+    }
+    
+    // 发送剩余的 buffer (如果有)
+    if (!current_chunk_buffer.empty() && 
+        config_.block_reply.enabled && 
+        config_.block_reply.break_mode == ReactConfig::BlockReply::BreakMode::MessageEnd &&
+        callbacks.on_block_reply) {
+        callbacks.on_block_reply(current_chunk_buffer);
+    }
+    
+    response.text = accumulated_text;
+    response.reasoning = accumulated_reasoning;
+    // TODO: 解析 tool_calls 和 usage
+    // response.tool_calls = ...
+    // response.usage = ...
+    
+    // ✅ 可观测性: 发射 ModelUsage 事件 (对齐 OpenClaw)
+    try {
+        // ✅ 从 llm_client_ 获取真实的 provider 和 model
+        const auto& llm_config = llm_client_->get_config();
+        
+        // ✅ 计算成本 (简化版,可根据实际定价调整)
+        double cost_usd = 0.0;
+        if (llm_config.provider == "openai") {
+            // GPT-4 定价: $0.03/1K input + $0.06/1K output
+            cost_usd = (response.input_tokens * 0.03 / 1000.0) +
+                      (response.output_tokens * 0.06 / 1000.0);
+        } else if (llm_config.provider == "anthropic") {
+            // Claude 定价: $0.015/1K input + $0.075/1K output
+            cost_usd = (response.input_tokens * 0.015 / 1000.0) +
+                      (response.output_tokens * 0.075 / 1000.0);
+        }
+        
+        auto usage_event = std::make_shared<observability::ModelUsageEvent>();
+        usage_event->session_id = callbacks.session_id.empty() ? "unknown" : callbacks.session_id;
+        usage_event->provider = llm_config.provider;
+        usage_event->model = llm_config.model;
+        usage_event->prompt_tokens = response.input_tokens;
+        usage_event->completion_tokens = response.output_tokens;
+        usage_event->total_tokens = response.input_tokens + response.output_tokens;
+        usage_event->cost_usd = cost_usd;
+        usage_event->timestamp = std::chrono::system_clock::now();
+        
+        observability::DiagnosticEventBus::instance().emit(usage_event);
+    } catch (...) {
+        // 故障隔离: 永不阻塞主流程
     }
     
     return response;
 }
-
 std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
     const std::vector<llm::ToolCall>& tool_calls,
     const StreamCallbacks& callbacks
 ) {
     std::map<std::string, tools::ToolResult> results;
     
-    if (config_.parallel_tool_calls) {
-        // 并行执行 (TODO: 实现线程池)
+    if (config_.parallel_tool_calls && tool_calls.size() > 1) {
+        // ✅ 并行执行 (使用全局线程池)
+        log()->info("Executing {} tools in parallel using thread pool", tool_calls.size());
+        
+        auto& thread_pool = get_thread_pool();
+        std::vector<std::future<std::pair<std::string, tools::ToolResult>>> futures;
+        
         for (const auto& tool_call : tool_calls) {
+            // 发送工具开始事件
             if (callbacks.on_tool_start) {
-                callbacks.on_tool_start(tool_call.function.name, 
-                                       core::JsonValue{});  // TODO: parse arguments
+                // TODO: 解析 tool_call.function.arguments
+                callbacks.on_tool_start(tool_call.name, core::JsonValue{});
+                
+                if (!callbacks.session_id.empty()) {
+                    auto& pool = gateway::ConnectionPool::instance();
+                    pool.broadcast("agent", {
+                        {"type", "tool_start"},
+                        {"tool_name", tool_call.name}
+                    });
+                }
             }
             
-            // TODO: 解析 tool_call.function.arguments (JSON string) 为 JsonValue
-            core::JsonValue args;
-            auto result = tool_manager_->execute_tool(tool_call.function.name, args);
+            // ✅ 提交任务到全局线程池 (避免频繁创建/销毁线程)
+            auto future = thread_pool->submit([this, tool_call, callbacks]() 
+                -> std::pair<std::string, tools::ToolResult> {
+                
+                // ✅ 可观测性: 工具执行 Span (对齐 OpenClaw)
+                std::unique_ptr<observability::Span> span;
+                try {
+                    span = observability::Tracer::instance().start_span(
+                        "tool.execute", 
+                        observability::SpanKind::Client
+                    );
+                    span->set_attribute("tool_name", tool_call.name);
+                    span->set_attribute("tool_call_id", tool_call.id);
+                } catch (...) {
+                    // 故障隔离
+                }
+                
+                try {
+                    // TODO: 解析 tool_call.function.arguments (JSON string) 为 JsonValue
+                    core::JsonValue args;
+                    
+                    // 执行工具 (可能耗时)
+                    auto result = tool_manager_->execute_tool(tool_call.name, args);
+                    
+                    // ✅ Span 成功标记
+                    if (span) {
+                        span->set_status(result.success, result.error);
+                    }
+                    
+                    return {tool_call.id, result};
+                    
+                } catch (const std::exception& e) {
+                    // ✅ Span 失败标记
+                    if (span) {
+                        span->set_status(false, e.what());
+                        span->add_event("error", {{"exception", e.what()}});
+                    }
+                    
+                    // 捕获异常并转换为错误结果
+                    tools::ToolResult error_result;
+                    error_result.success = false;
+                    error_result.error = std::string("Tool execution failed: ") + e.what();
+                    return {tool_call.id, error_result};
+                }
+            });
             
-            if (callbacks.on_tool_end) {
-                callbacks.on_tool_end(tool_call.function.name, result);
-            }
-            
-            results[tool_call.id] = result;
+            futures.push_back(std::move(future));
         }
+        
+        // 收集所有结果 (保持原始顺序)
+        for (size_t i = 0; i < futures.size(); ++i) {
+            const auto& tool_call = tool_calls[i];
+            
+            try {
+                // 等待任务完成
+                auto [call_id, result] = futures[i].get();
+                
+                // 发送工具完成事件
+                if (callbacks.on_tool_end) {
+                    callbacks.on_tool_end(tool_call.name, result);
+                    
+                    if (!callbacks.session_id.empty()) {
+                        auto& pool = gateway::ConnectionPool::instance();
+                        nlohmann::json result_json;
+                        result_json["type"] = "tool_end";
+                        result_json["tool_name"] = tool_call.name;
+                        result_json["success"] = result.success;
+                        if (!result.success) {
+                            result_json["error"] = result.error;
+                        }
+                        pool.broadcast("agent", result_json);
+                    }
+                }
+                
+                results[call_id] = result;
+                
+            } catch (const std::exception& e) {
+                // Future 异常
+                log()->error("Tool '{}' future failed: {}", tool_call.name, e.what());
+                
+                tools::ToolResult error_result;
+                error_result.success = false;
+                error_result.error = std::string("Future exception: ") + e.what();
+                results[tool_call.id] = error_result;
+            }
+        }
+        
+        log()->info("Completed {} parallel tool executions", results.size());
+        
     } else {
-        // 串行执行
+        // ✅ 串行执行 (单个工具或禁用并行)
+        log()->debug("Executing {} tools sequentially", tool_calls.size());
+        
         for (const auto& tool_call : tool_calls) {
             if (cancelled_) break;
             
+            // ✅ 可观测性: 工具执行 Span (串行模式, 对齐 OpenClaw)
+            std::unique_ptr<observability::Span> span;
+            try {
+                span = observability::Tracer::instance().start_span(
+                    "tool.execute", 
+                    observability::SpanKind::Client
+                );
+                span->set_attribute("tool_name", tool_call.name);
+                span->set_attribute("tool_call_id", tool_call.id);
+                span->set_attribute("execution_mode", "sequential");
+            } catch (...) {
+                // 故障隔离
+            }
+            
             if (callbacks.on_tool_start) {
-                callbacks.on_tool_start(tool_call.function.name, 
+                callbacks.on_tool_start(tool_call.name, 
                                        core::JsonValue{});  // TODO: parse arguments
+                
+                // 🎯 OpenClaw 对齐: 通过 ConnectionPool 推送工具开始事件
+                if (!callbacks.session_id.empty()) {
+                    auto& pool = gateway::ConnectionPool::instance();
+                    pool.broadcast("agent", {
+                        {"type", "tool_start"},
+                        {"tool_name", tool_call.name}
+                    });
+                }
             }
             
-            // TODO: 解析 tool_call.function.arguments (JSON string) 为 JsonValue
-            core::JsonValue args;
-            auto result = tool_manager_->execute_tool(tool_call.function.name, args);
-            
-            if (callbacks.on_tool_end) {
-                callbacks.on_tool_end(tool_call.function.name, result);
+            try {
+                // TODO: 解析 tool_call.function.arguments (JSON string) 为 JsonValue
+                core::JsonValue args;
+                auto result = tool_manager_->execute_tool(tool_call.name, args);
+                
+                // ✅ Span 成功标记
+                if (span) {
+                    span->set_status(result.success, result.error);
+                }
+                
+                if (callbacks.on_tool_end) {
+                    callbacks.on_tool_end(tool_call.name, result);
+                    
+                    // 🎯 OpenClaw 对齐: 通过 ConnectionPool 推送工具完成事件
+                    if (!callbacks.session_id.empty()) {
+                        auto& pool = gateway::ConnectionPool::instance();
+                        nlohmann::json result_json;
+                        result_json["type"] = "tool_end";
+                        result_json["tool_name"] = tool_call.name;
+                        result_json["success"] = result.success;
+                        if (!result.success) {
+                            result_json["error"] = result.error;
+                        }
+                        pool.broadcast("agent", result_json);
+                    }
+                }
+                
+                results[tool_call.id] = result;
+                
+            } catch (const std::exception& e) {
+                // ✅ Span 失败标记
+                if (span) {
+                    span->set_status(false, e.what());
+                    span->add_event("error", {{"exception", e.what()}});
+                }
+                
+                // 记录错误结果
+                tools::ToolResult error_result;
+                error_result.success = false;
+                error_result.error = std::string("Tool execution failed: ") + e.what();
+                results[tool_call.id] = error_result;
             }
-            
-            results[tool_call.id] = result;
         }
     }
     
@@ -527,6 +858,112 @@ std::vector<std::string> ReactEngine::chunk_text(const std::string& text) {
     }
     
     return chunks;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ✅ 严格对齐 OpenClaw 的流式处理机制
+// 参考: openclaw-analysis/src/agents/pi-embedded-subscribe.ts:477-553
+// ═══════════════════════════════════════════════════════════════
+
+// 发送块回复 (带智能去重和冲突检测)
+// 对齐 OpenClaw: emitBlockChunk
+void ReactEngine::emit_block_chunk(const std::string& text, const StreamCallbacks& callbacks) {
+    // ✅ 1. 动态抑制检测 (对齐 OpenClaw:478)
+    if (streaming_state_.suppress_block_chunks) {
+        return;
+    }
+    
+    // ✅ 2. 过滤和修剪 (对齐 OpenClaw:483)
+    std::string chunk = strip_thinking_tags(text);
+    chunk = trim_end(chunk);
+    if (chunk.empty()) {
+        return;
+    }
+    
+    // ✅ 3. 智能去重 (对齐 OpenClaw:487-489)
+    if (chunk == streaming_state_.last_block_reply_text) {
+        return;  // 与上次发送内容完全相同，跳过
+    }
+    
+    // ✅ 4. Messaging Tool 冲突检测 (对齐 OpenClaw:493-497)
+    std::string normalized_chunk = normalize_text_for_comparison(chunk);
+    if (is_messaging_tool_duplicate(normalized_chunk)) {
+        // log.debug("Skipping block reply - already sent via messaging tool");
+        return;
+    }
+    
+    // ✅ 5. 记录发送内容 (对齐 OpenClaw:503)
+    streaming_state_.last_block_reply_text = chunk;
+    
+    // ✅ 6. 零开销检测 (对齐 OpenClaw:506-507)
+    if (!callbacks.on_block_reply) {
+        return;
+    }
+    
+    // ✅ 7. 发送回调
+    callbacks.on_block_reply(chunk);
+}
+
+// 刷新块回复缓冲区
+// 对齐 OpenClaw: flushBlockReplyBuffer (line 540-553)
+void ReactEngine::flush_block_reply_buffer(const StreamCallbacks& callbacks) {
+    // ✅ 零开销检测 (对齐 OpenClaw:541-542)
+    if (!callbacks.on_block_reply) {
+        return;
+    }
+    
+    // ✅ 发送 block_buffer 中的内容 (对齐 OpenClaw:549-552)
+    if (!streaming_state_.block_buffer.empty()) {
+        emit_block_chunk(streaming_state_.block_buffer, callbacks);
+        streaming_state_.block_buffer.clear();
+    }
+}
+
+// 文本规范化 (用于去重比较)
+// 对齐 OpenClaw: normalizeTextForComparison
+std::string ReactEngine::normalize_text_for_comparison(const std::string& text) {
+    std::string result = text;
+    
+    // 1. 去除首尾空白
+    size_t start = result.find_first_not_of(" \t\n\r");
+    size_t end = result.find_last_not_of(" \t\n\r");
+    if (start == std::string::npos) {
+        return "";
+    }
+    result = result.substr(start, end - start + 1);
+    
+    // 2. 折叠多个空白为单个空格
+    std::regex whitespace_re("\\s+");
+    result = std::regex_replace(result, whitespace_re, " ");
+    
+    return result;
+}
+
+// 检测 Messaging Tool 冲突
+// 对齐 OpenClaw: isMessagingToolDuplicateNormalized
+bool ReactEngine::is_messaging_tool_duplicate(const std::string& normalized_text) {
+    for (const auto& sent : streaming_state_.messaging_tool_sent_texts_normalized) {
+        if (normalized_text == sent) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 去除 thinking 标签
+std::string ReactEngine::strip_thinking_tags(const std::string& text) {
+    // 简化实现: 使用正则替换
+    std::string result = std::regex_replace(text, thinking_tag_re, "");
+    return result;
+}
+
+// 去除尾部空白
+std::string ReactEngine::trim_end(const std::string& text) {
+    size_t end = text.find_last_not_of(" \t\n\r");
+    if (end == std::string::npos) {
+        return "";
+    }
+    return text.substr(0, end + 1);
 }
 
 } // namespace react

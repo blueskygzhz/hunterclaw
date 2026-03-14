@@ -1,0 +1,365 @@
+#include "hunterclaw/tools/image_analysis_tool.h"
+#include "hunterclaw/core/logger.h"
+#include "hunterclaw/core/base64.h"
+#include <fstream>
+#include <sstream>
+
+namespace hunterclaw {
+namespace tools {
+
+using namespace hunterclaw::core;
+
+ImageAnalysisTool::ImageAnalysisTool(
+    const ToolContext& context,
+    std::shared_ptr<llm::LlmClient> llm_client
+) : context_(context), llm_client_(llm_client) {}
+
+std::string ImageAnalysisTool::description() const {
+    return R"(AI-powered image analysis and understanding tool.
+
+Providers:
+- openai: OpenAI Vision (gpt-4o, gpt-4o-mini)
+- anthropic: Claude Vision (claude-3.5-sonnet)
+- google: Gemini Vision (gemini-2.0-flash)
+
+Use cases:
+- Describe image content
+- OCR (extract text from images)
+- Object detection
+- Visual Q&A
+
+Example:
+{
+  "image_path": "/path/to/image.jpg",
+  "prompt": "What is in this image?",
+  "provider": "openai",
+  "model": "gpt-4o"
+})";
+}
+
+Tool::Schema ImageAnalysisTool::parameters() const {
+    Schema schema;
+    schema.type = "object";
+    schema.description = "Image analysis parameters";
+    
+    // image_path, image_url, or image_base64 (required)
+    JsonValue path_prop = JsonValue::object();
+    path_prop["type"] = "string";
+    path_prop["description"] = "Path to image file";
+    schema.properties["image_path"] = path_prop;
+    
+    JsonValue url_prop = JsonValue::object();
+    url_prop["type"] = "string";
+    url_prop["description"] = "Image URL";
+    schema.properties["image_url"] = url_prop;
+    
+    JsonValue base64_prop = JsonValue::object();
+    base64_prop["type"] = "string";
+    base64_prop["description"] = "Base64-encoded image data";
+    schema.properties["image_base64"] = base64_prop;
+    
+    // prompt (required)
+    JsonValue prompt_prop = JsonValue::object();
+    prompt_prop["type"] = "string";
+    prompt_prop["description"] = "Question or instruction about the image";
+    schema.properties["prompt"] = prompt_prop;
+    schema.required.push_back("prompt");
+    
+    // provider (optional)
+    JsonValue provider_prop = JsonValue::object();
+    provider_prop["type"] = "string";
+    provider_prop["enum"] = JsonValue::array({"openai", "anthropic", "google"});
+    provider_prop["default"] = "openai";
+    provider_prop["description"] = "Vision model provider";
+    schema.properties["provider"] = provider_prop;
+    
+    // model (optional)
+    JsonValue model_prop = JsonValue::object();
+    model_prop["type"] = "string";
+    model_prop["description"] = "Model name (e.g., gpt-4o, claude-3.5-sonnet)";
+    schema.properties["model"] = model_prop;
+    
+    // max_tokens (optional)
+    JsonValue tokens_prop = JsonValue::object();
+    tokens_prop["type"] = "number";
+    tokens_prop["default"] = 300;
+    tokens_prop["description"] = "Maximum response tokens";
+    schema.properties["max_tokens"] = tokens_prop;
+    
+    return schema;
+}
+
+ToolResult ImageAnalysisTool::execute(const JsonValue& params) {
+    ToolParams tp(params);
+    
+    // 1. 读取图像源
+    std::string image_path = tp.read_string("image_path");
+    std::string image_url = tp.read_string("image_url");
+    std::string image_base64 = tp.read_string("image_base64");
+    
+    if (image_path.empty() && image_url.empty() && image_base64.empty()) {
+        return tool_result::error(
+            "Missing required parameter: image_path, image_url, or image_base64"
+        );
+    }
+    
+    std::string image_source = !image_path.empty() ? image_path :
+                               !image_url.empty() ? image_url :
+                               image_base64;
+    
+    // 2. 读取 prompt
+    std::string prompt = tp.read_string("prompt", true);
+    if (prompt.empty()) {
+        return tool_result::error("Missing required parameter: prompt");
+    }
+    
+    // 3. 读取 provider
+    std::string provider = tp.read_string("provider", false, "openai");
+    
+    // 4. 路由到对应的 provider
+    if (provider == "openai") {
+        return provider_openai(image_source, prompt, params);
+    } else if (provider == "anthropic") {
+        return provider_anthropic(image_source, prompt, params);
+    } else if (provider == "google") {
+        return provider_google(image_source, prompt, params);
+    }
+    
+    return tool_result::error("Unknown provider: " + provider);
+}
+
+// ========== Provider 实现 ==========
+
+ToolResult ImageAnalysisTool::provider_openai(
+    const std::string& image_source,
+    const std::string& prompt,
+    const JsonValue& options
+) {
+    Logger::info("[ImageAnalysis] OpenAI Vision start");
+    
+    if (!llm_client_) {
+        return tool_result::error("LLM client not available");
+    }
+    
+    // 1. 读取参数
+    ToolParams tp(options);
+    std::string model = tp.read_string("model", false, "gpt-4o");
+    int max_tokens = static_cast<int>(tp.read_number("max_tokens", false, 300));
+    
+    // 2. 加载图像
+    auto image_result = load_image_base64(image_source);
+    if (!image_result) {
+        return tool_result::error("Failed to load image: " + image_result.error());
+    }
+    
+    std::string image_base64 = image_result.value();
+    std::string mime_type = detect_mime_type(image_base64);
+    
+    // 3. 构建 Vision 请求
+    // 使用 LlmClient 的 vision 能力
+    llm::LlmRequest request;
+    request.model = model;
+    request.max_tokens = max_tokens;
+    
+    // 构建 message with image
+    llm::Message msg;
+    msg.role = "user";
+    
+    // Content 包含文本和图片
+    llm::ContentPart text_part;
+    text_part.type = "text";
+    text_part.text = prompt;
+    
+    llm::ContentPart image_part;
+    image_part.type = "image_url";
+    image_part.image_url = llm::ImageUrl{
+        .url = "data:" + mime_type + ";base64," + image_base64
+    };
+    
+    msg.content = {text_part, image_part};
+    request.messages = {msg};
+    
+    // 4. 调用 LLM
+    auto response = llm_client_->chat(request);
+    if (!response) {
+        return tool_result::error("OpenAI Vision API failed: " + response.error());
+    }
+    
+    std::string analysis = response.value().content;
+    
+    Logger::info("[ImageAnalysis] OpenAI Vision success: " + 
+                 std::to_string(analysis.size()) + " chars");
+    
+    // 5. 返回结果
+    ToolResultContent content;
+    content.type = ToolResultContent::Type::Text;
+    content.text = "🖼️ Image Analysis:\n\n" + analysis;
+    
+    JsonValue details = JsonValue::object();
+    details["provider"] = "openai";
+    details["model"] = model;
+    details["analysis"] = analysis;
+    
+    return ToolResult{
+        .content = {content},
+        .details = details,
+        .success = true
+    };
+}
+
+ToolResult ImageAnalysisTool::provider_anthropic(
+    const std::string& image_source,
+    const std::string& prompt,
+    const JsonValue& options
+) {
+    Logger::info("[ImageAnalysis] Anthropic Vision start");
+    
+    if (!llm_client_) {
+        return tool_result::error("LLM client not available");
+    }
+    
+    // 1. 读取参数
+    ToolParams tp(options);
+    std::string model = tp.read_string("model", false, "claude-3.5-sonnet");
+    int max_tokens = static_cast<int>(tp.read_number("max_tokens", false, 300));
+    
+    // 2. 加载图像
+    auto image_result = load_image_base64(image_source);
+    if (!image_result) {
+        return tool_result::error("Failed to load image: " + image_result.error());
+    }
+    
+    std::string image_base64 = image_result.value();
+    std::string mime_type = detect_mime_type(image_base64);
+    
+    // 3. 构建请求
+    llm::LlmRequest request;
+    request.model = model;
+    request.max_tokens = max_tokens;
+    
+    llm::Message msg;
+    msg.role = "user";
+    
+    llm::ContentPart text_part;
+    text_part.type = "text";
+    text_part.text = prompt;
+    
+    llm::ContentPart image_part;
+    image_part.type = "image";
+    image_part.source = llm::ImageSource{
+        .type = "base64",
+        .media_type = mime_type,
+        .data = image_base64
+    };
+    
+    msg.content = {text_part, image_part};
+    request.messages = {msg};
+    
+    // 4. 调用 LLM
+    auto response = llm_client_->chat(request);
+    if (!response) {
+        return tool_result::error("Anthropic Vision API failed: " + response.error());
+    }
+    
+    std::string analysis = response.value().content;
+    
+    Logger::info("[ImageAnalysis] Anthropic Vision success");
+    
+    // 5. 返回结果
+    ToolResultContent content;
+    content.type = ToolResultContent::Type::Text;
+    content.text = "🖼️ Image Analysis:\n\n" + analysis;
+    
+    JsonValue details = JsonValue::object();
+    details["provider"] = "anthropic";
+    details["model"] = model;
+    details["analysis"] = analysis;
+    
+    return ToolResult{
+        .content = {content},
+        .details = details,
+        .success = true
+    };
+}
+
+ToolResult ImageAnalysisTool::provider_google(
+    const std::string& image_source,
+    const std::string& prompt,
+    const JsonValue& options
+) {
+    Logger::info("[ImageAnalysis] Google Gemini Vision start");
+    
+    // Gemini 实现类似
+    return tool_result::error("Google Gemini Vision not yet implemented");
+}
+
+// ========== 辅助函数 ==========
+
+Result<std::string> ImageAnalysisTool::load_image_base64(const std::string& source) {
+    // 1. 如果是 URL
+    if (source.find("http://") == 0 || source.find("https://") == 0) {
+        // URL - 直接返回 (某些 API 支持 URL)
+        return Result<std::string>::ok(source);
+    }
+    
+    // 2. 如果是文件路径
+    if (source.find("/") != std::string::npos || source.find("\\") != std::string::npos) {
+        try {
+            std::ifstream ifs(source, std::ios::binary);
+            if (!ifs) {
+                return Result<std::string>::error("Cannot open file: " + source);
+            }
+            
+            std::ostringstream oss;
+            oss << ifs.rdbuf();
+            std::string image_data = oss.str();
+            
+            // Base64 编码
+            std::string base64_data = base64::encode(image_data);
+            return Result<std::string>::ok(base64_data);
+        } catch (const std::exception& e) {
+            return Result<std::string>::error("Failed to read file: " + std::string(e.what()));
+        }
+    }
+    
+    // 3. 否则认为是 base64
+    return Result<std::string>::ok(source);
+}
+
+std::string ImageAnalysisTool::detect_mime_type(const std::string& image_data) {
+    // 简单的 MIME type 检测 (基于文件头)
+    if (image_data.size() < 4) {
+        return "image/jpeg";  // 默认
+    }
+    
+    // PNG: 89 50 4E 47
+    if (image_data[0] == '\x89' && image_data[1] == 'P' && 
+        image_data[2] == 'N' && image_data[3] == 'G') {
+        return "image/png";
+    }
+    
+    // JPEG: FF D8 FF
+    if (image_data[0] == '\xFF' && image_data[1] == '\xD8' && image_data[2] == '\xFF') {
+        return "image/jpeg";
+    }
+    
+    // GIF: 47 49 46 38
+    if (image_data[0] == 'G' && image_data[1] == 'I' && 
+        image_data[2] == 'F' && image_data[3] == '8') {
+        return "image/gif";
+    }
+    
+    // WebP: 52 49 46 46 ... 57 45 42 50
+    if (image_data.size() >= 12 &&
+        image_data[0] == 'R' && image_data[1] == 'I' && 
+        image_data[2] == 'F' && image_data[3] == 'F' &&
+        image_data[8] == 'W' && image_data[9] == 'E' &&
+        image_data[10] == 'B' && image_data[11] == 'P') {
+        return "image/webp";
+    }
+    
+    return "image/jpeg";  // 默认
+}
+
+} // namespace tools
+} // namespace hunterclaw

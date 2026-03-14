@@ -1,4 +1,5 @@
 #include "hunterclaw/memory/memory.h"
+#include <algorithm>
 #include <sqlite3.h>
 #include <uuid/uuid.h>
 #include <stdexcept>
@@ -187,7 +188,7 @@ std::vector<SearchResult> SQLiteVectorStorage::vector_search(
     
     sqlite3_finalize(stmt);
     
-    // 排序
+    // Sort results
     std::sort(results.begin(), results.end(),
              [](const SearchResult& a, const SearchResult& b) {
                  return a.score > b.score;

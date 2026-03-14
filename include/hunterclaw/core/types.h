@@ -9,6 +9,7 @@
 #include <variant>
 #include <functional>
 #include <stdexcept>
+#include <nlohmann/json.hpp>
 
 namespace hunterclaw {
 namespace core {
@@ -39,6 +40,32 @@ public:
     JsonValue(double n) : type_(Type::Number), num_val_(n) {}
     JsonValue(const std::string& s) : type_(Type::String), str_val_(s) {}
     JsonValue(const char* s) : type_(Type::String), str_val_(s) {}
+    
+    // Constructor from nlohmann::json
+    JsonValue(const nlohmann::json& j) : type_(Type::Null) {
+        if (j.is_null()) {
+            type_ = Type::Null;
+        } else if (j.is_boolean()) {
+            type_ = Type::Bool;
+            bool_val_ = j.get<bool>();
+        } else if (j.is_number()) {
+            type_ = Type::Number;
+            num_val_ = j.get<double>();
+        } else if (j.is_string()) {
+            type_ = Type::String;
+            str_val_ = j.get<std::string>();
+        } else if (j.is_array()) {
+            type_ = Type::Array;
+            for (const auto& item : j) {
+                arr_val_.push_back(std::make_shared<JsonValue>(item));
+            }
+        } else if (j.is_object()) {
+            type_ = Type::Object;
+            for (auto it = j.begin(); it != j.end(); ++it) {
+                obj_val_[it.key()] = std::make_shared<JsonValue>(it.value());
+            }
+        }
+    }
     
     static JsonValue null() { return JsonValue(); }
     static JsonValue array() { 
@@ -103,6 +130,35 @@ public:
             type_ = Type::Array;
         }
         arr_val_.push_back(std::make_shared<JsonValue>(val));
+    }
+    
+    // Convert to nlohmann::json
+    nlohmann::json to_json() const {
+        switch (type_) {
+            case Type::Null:
+                return nullptr;
+            case Type::Bool:
+                return bool_val_;
+            case Type::Number:
+                return num_val_;
+            case Type::String:
+                return str_val_;
+            case Type::Array: {
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& item : arr_val_) {
+                    arr.push_back(item->to_json());
+                }
+                return arr;
+            }
+            case Type::Object: {
+                nlohmann::json obj = nlohmann::json::object();
+                for (const auto& [key, value] : obj_val_) {
+                    obj[key] = value->to_json();
+                }
+                return obj;
+            }
+        }
+        return nullptr;
     }
     
     // Check if object contains key
@@ -259,8 +315,8 @@ struct SkillConfig {
     
     struct Load {
         std::vector<std::string> extra_dirs;
-        bool watch = true;
-        Duration watch_debounce_ms{500};
+        bool watch = true;  // 默认启用热重载 (100% 对齐 OpenClaw)
+        int watch_debounce_ms = 250;  // 防抖延迟 (毫秒)
     } load;
     
     struct Install {

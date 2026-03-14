@@ -1,5 +1,6 @@
 #include "hunterclaw/gateway/protocol.h"
-#include "hunterclaw/core/json.h"
+#include <nlohmann/json.hpp>
+using json = nlohmann::json;
 #include <uuid/uuid.h>
 
 namespace hunterclaw {

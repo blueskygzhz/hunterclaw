@@ -16,15 +16,23 @@ namespace {
         return logger;
     }
     
-    // 执行系统命令并捕获输出
+    // 执行系统命令并捕获输出 (带超时控制)
     core::Result<std::string> exec_command(
         const std::string& cmd,
         core::Duration timeout = std::chrono::seconds(300)
     ) {
         log()->info("Executing: {}", cmd);
         
-        // TODO: 实现超时控制的命令执行
-        FILE* pipe = popen(cmd.c_str(), "r");
+        // ✅ 使用 timeout 命令实现超时控制 (Linux/macOS)
+        #ifndef _WIN32
+        int timeout_secs = std::chrono::duration_cast<std::chrono::seconds>(timeout).count();
+        std::string timeout_cmd = "timeout " + std::to_string(timeout_secs) + "s " + cmd;
+        #else
+        // Windows: 不支持 timeout,直接执行
+        std::string timeout_cmd = cmd;
+        #endif
+        
+        FILE* pipe = popen(timeout_cmd.c_str(), "r");
         if (!pipe) {
             return core::Result<std::string>::Err("Failed to execute command");
         }
@@ -36,6 +44,13 @@ namespace {
         }
         
         int exit_code = pclose(pipe);
+        
+        // ✅ 超时检测 (exit code 124 = timeout)
+        if (exit_code == 124 || exit_code == -1) {
+            return core::Result<std::string>::Err(
+                "Command timed out after " + std::to_string(timeout_secs) + "s"
+            );
+        }
         
         if (exit_code != 0) {
             return core::Result<std::string>::Err(
@@ -288,10 +303,85 @@ private:
             return core::Result<bool>::Err("Download URL not specified");
         }
         
-        // TODO: 实现 HTTP 下载、解压、安装逻辑
-        log()->warn("Download installation not yet fully implemented");
+        log()->info("Downloading from: {}", spec.url);
         
-        return core::Result<bool>::Err("Download installation not yet implemented");
+        // 1. 确定目标目录
+        fs::path target_dir;
+        if (!spec.target_dir.empty()) {
+            target_dir = fs::path(spec.target_dir);
+        } else {
+            const char* home = std::getenv("HOME");
+            if (!home) {
+                return core::Result<bool>::Err("HOME not set");
+            }
+            target_dir = fs::path(home) / ".hunterclaw" / "bin";
+        }
+        
+        if (!fs::exists(target_dir)) {
+            std::error_code ec;
+            fs::create_directories(target_dir, ec);
+            if (ec) {
+                return core::Result<bool>::Err("Failed to create dir: " + ec.message());
+            }
+        }
+        
+        // 2. 下载文件
+        std::string filename = spec.archive;
+        if (filename.empty()) {
+            size_t pos = spec.url.find_last_of('/');
+            filename = (pos != std::string::npos) ? spec.url.substr(pos + 1) : "download.bin";
+        }
+        
+        fs::path temp_file = target_dir / filename;
+        std::string cmd;
+        
+        if (check_bin_exists("curl")) {
+            cmd = "curl -L -o \"" + temp_file.string() + "\" \"" + spec.url + "\"";
+        } else if (check_bin_exists("wget")) {
+            cmd = "wget -O \"" + temp_file.string() + "\" \"" + spec.url + "\"";
+        } else {
+            return core::Result<bool>::Err("curl/wget not found");
+        }
+        
+        auto result = exec_command(cmd, timeout);
+        if (result.is_err()) {
+            return core::Result<bool>::Err("Download failed: " + result.error);
+        }
+        
+        // 3. 解压
+        if (spec.extract) {
+            log()->info("Extracting: {}", temp_file.string());
+            std::string ext = temp_file.extension().string();
+            std::string extract_cmd;
+            
+            if (ext == ".tar" || ext == ".gz" || ext == ".tgz" || ext == ".bz2") {
+                extract_cmd = "tar -xf \"" + temp_file.string() + "\" -C \"" + target_dir.string() + "\"";
+                if (spec.strip_components > 0) {
+                    extract_cmd += " --strip-components=" + std::to_string(spec.strip_components);
+                }
+            } else if (ext == ".zip") {
+                if (!check_bin_exists("unzip")) {
+                    return core::Result<bool>::Err("unzip not found");
+                }
+                extract_cmd = "unzip -q -o \"" + temp_file.string() + "\" -d \"" + target_dir.string() + "\"";
+            } else {
+                return core::Result<bool>::Err("Unsupported format: " + ext);
+            }
+            
+            auto extract_result = exec_command(extract_cmd, timeout);
+            if (extract_result.is_err()) {
+                return core::Result<bool>::Err("Extract failed: " + extract_result.error);
+            }
+            
+            fs::remove(temp_file);
+        } else {
+            #ifndef _WIN32
+            exec_command("chmod +x \"" + temp_file.string() + "\"", std::chrono::seconds(5));
+            #endif
+        }
+        
+        log()->info("Installed to: {}", target_dir.string());
+        return core::Result<bool>::Ok(true);
     }
     
     bool check_bin_exists(const std::string& bin_name) const {

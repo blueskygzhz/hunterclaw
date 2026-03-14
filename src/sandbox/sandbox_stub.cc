@@ -4,55 +4,48 @@
 
 namespace hunterclaw::sandbox {
 
+namespace {
+
+// 获取 Sandbox logger
+auto get_logger() {
+    static auto logger = []() {
+        auto log = spdlog::get("sandbox");
+        if (!log) {
+            log = spdlog::stdout_logger_mt("sandbox");
+        }
+        return log;
+    }();
+    return logger;
+}
+
+} // namespace
+
 // Constructor and Destructor
 SandboxManager::SandboxManager() {
-    static auto logger = spdlog::get("sandbox");
-    if (!logger) {
-        logger = spdlog::stdout_logger_mt("sandbox");
-    }
-    logger->info("SandboxManager created");
+    get_logger()->info("SandboxManager created");
 }
 
 SandboxManager::~SandboxManager() {
-    static auto logger = spdlog::get("sandbox");
-    if (logger) {
-        logger->info("SandboxManager destroyed");
-    }
+    get_logger()->info("SandboxManager destroyed");
 }
 
 std::shared_ptr<Sandbox> SandboxManager::get_sandbox_instance(const std::string&) const {
-    static auto logger = spdlog::get("sandbox");
-    if (!logger) {
-        logger = spdlog::stdout_logger_mt("sandbox");
-    }
-    logger->warn("SandboxManager::get_sandbox_instance not implemented");
+    get_logger()->warn("SandboxManager::get_sandbox_instance not implemented");
     return nullptr;
 }
 
 SandboxInfo SandboxManager::get_sandbox(const std::string&) const {
-    static auto logger = spdlog::get("sandbox");
-    if (!logger) {
-        logger = spdlog::stdout_logger_mt("sandbox");
-    }
-    logger->warn("SandboxManager::get_sandbox not implemented");
+    get_logger()->warn("SandboxManager::get_sandbox not implemented");
     return SandboxInfo{};
 }
 
 bool SandboxManager::pause_sandbox(const std::string&) {
-    static auto logger = spdlog::get("sandbox");
-    if (!logger) {
-        logger = spdlog::stdout_logger_mt("sandbox");
-    }
-    logger->warn("SandboxManager::pause_sandbox not implemented");
+    get_logger()->warn("SandboxManager::pause_sandbox not implemented");
     return false;
 }
 
 bool SandboxManager::resume_sandbox(const std::string&) {
-    static auto logger = spdlog::get("sandbox");
-    if (!logger) {
-        logger = spdlog::stdout_logger_mt("sandbox");
-    }
-    logger->warn("SandboxManager::resume_sandbox not implemented");
+    get_logger()->warn("SandboxManager::resume_sandbox not implemented");
     return false;
 }
 

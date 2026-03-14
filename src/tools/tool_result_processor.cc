@@ -29,15 +29,15 @@ ImageSanitizer::ImageSanitizer(const ImageSanitizerConfig& config)
 core::Result<std::string> ImageSanitizer::sanitize_base64(const std::string& base64_data) {
     // 获取图片信息
     auto info_result = get_image_info(base64_data);
-    if (!info_result) {
-        return core::Result<std::string>::err(info_result.error());
+    if (info_result.is_err()) {
+        return core::Result<std::string>::Err(info_result.error);
     }
     
-    auto info = info_result.value();
+    auto info = info_result.value;
     
     // 检查是否需要处理
     if (!needs_sanitization(base64_data)) {
-        return core::Result<std::string>::ok(base64_data);
+        return core::Result<std::string>::Ok(base64_data);
     }
     
     // 调整大小和压缩
@@ -50,16 +50,16 @@ core::Result<void> ImageSanitizer::sanitize_file(const std::string& file_path) {
     // 2. 转为 Base64
     // 3. 调用 sanitize_base64
     // 4. 写回文件
-    return core::Result<void>::ok();
+    return core::Result<void>::Ok();
 }
 
 bool ImageSanitizer::needs_sanitization(const std::string& base64_data) {
     auto info_result = get_image_info(base64_data);
-    if (!info_result) {
+    if (info_result.is_err()) {
         return false;
     }
     
-    auto info = info_result.value();
+    auto info = info_result.value;
     
     return info.width > config_.max_width ||
            info.height > config_.max_height ||
@@ -76,7 +76,7 @@ core::Result<ImageSanitizer::ImageInfo> ImageSanitizer::get_image_info(const std
     
     // TODO: 使用图像库 (如 OpenCV, stb_image) 获取真实尺寸
     
-    return core::Result<ImageInfo>::ok(info);
+    return core::Result<ImageInfo>::Ok(info);
 }
 
 core::Result<std::string> ImageSanitizer::resize_and_compress(
@@ -95,7 +95,7 @@ core::Result<std::string> ImageSanitizer::resize_and_compress(
                 config_.max_width, config_.max_height);
     
     // 简化实现: 返回原始数据
-    return core::Result<std::string>::ok(base64_data);
+    return core::Result<std::string>::Ok(base64_data);
 }
 
 // ============================================================================

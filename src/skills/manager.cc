@@ -1,4 +1,5 @@
 #include "hunterclaw/skills/skill.h"
+#include "hunterclaw/skills/file_watcher.h"
 #include "hunterclaw/core/utils.h"
 #include <filesystem>
 #include <map>
@@ -11,6 +12,9 @@ namespace fs = std::filesystem;
 
 namespace hunterclaw {
 namespace skills {
+
+// Forward declarations
+static std::string xml_escape(const std::string& str);
 
 // Factory method
 std::shared_ptr<SkillManager> SkillManager::create(const core::SkillConfig& config) {
@@ -85,6 +89,8 @@ struct SkillManager::Impl {
     // Watcher state
     bool watching_ = false;
     std::thread watch_thread_;
+    std::shared_ptr<FileWatcher> file_watcher_;
+    uint64_t version_ = 0;
     
     explicit Impl(std::shared_ptr<core::Config> config)
         : config_(config) {}
@@ -96,6 +102,10 @@ struct SkillManager::Impl {
                 watch_thread_.join();
             }
         }
+    }
+    
+    uint64_t bump_version() {
+        return ++version_;
     }
     
     core::Result<bool> load_from_roots(const std::string& workspace_dir) {
@@ -111,13 +121,63 @@ struct SkillManager::Impl {
             SkillSource source;
         };
         
-        std::vector<SkillRoot> roots = {
-            {core::utils::expand_path("~/.hunterclaw/skills-bundled"), SkillSource::Bundled},
-            {core::utils::expand_path("~/.hunterclaw/skills"), SkillSource::Managed},
-            {core::utils::expand_path("~/.agents/skills"), SkillSource::Personal},
-        };
+        std::vector<SkillRoot> roots;
         
-        // 添加配置中的额外目录
+        // ===================================================================
+        // 1. Bundled Skills (系统内置层)
+        // ===================================================================
+        // OpenClaw: /usr/lib/node_modules/openclaw/skills/
+        // HunterClaw: ~/.hunterclaw/skills-bundled (可配置)
+        std::string bundled_path = core::utils::expand_path("~/.hunterclaw/skills-bundled");
+        const char* env_bundled = std::getenv("HUNTERCLAW_BUNDLED_SKILLS");
+        if (env_bundled && std::strlen(env_bundled) > 0) {
+            bundled_path = core::utils::expand_path(env_bundled);
+            log()->info("Using bundled skills from env: {}", bundled_path);
+        }
+        roots.push_back({bundled_path, SkillSource::Bundled});
+        
+        // ===================================================================
+        // 2. Managed/Local Skills (用户自定义层)
+        // ===================================================================
+        // ✅ OpenClaw 兼容: ~/.openclaw/skills/
+        roots.push_back({
+            core::utils::expand_path("~/.openclaw/skills"),
+            SkillSource::Managed
+        });
+        
+        // ✅ HunterClaw 专用: ~/.hunterclaw/skills/
+        roots.push_back({
+            core::utils::expand_path("~/.hunterclaw/skills"),
+            SkillSource::Managed
+        });
+        
+        // ===================================================================
+        // 3. Personal Skills (HunterClaw 多租户扩展)
+        // ===================================================================
+        roots.push_back({
+            core::utils::expand_path("~/.agents/skills"),
+            SkillSource::Personal
+        });
+        
+        // ===================================================================
+        // 4. Plugin Skills (OpenClaw 对齐: 扩展插件层)
+        // ===================================================================
+        // TODO: 实现 plugin_manager_ 后启用
+        // if (plugin_manager_) {
+        //     for (const auto& plugin : plugin_manager_->get_enabled_plugins()) {
+        //         std::string plugin_skills_path = 
+        //             core::utils::expand_path("~/.openclaw/extensions/" + plugin + "/skills");
+        //         
+        //         if (fs::exists(plugin_skills_path)) {
+        //             roots.push_back({plugin_skills_path, SkillSource::Plugin});
+        //             log()->info("Loading plugin skills: {}", plugin);
+        //         }
+        //     }
+        // }
+        
+        // ===================================================================
+        // 5. Extra Dirs (HunterClaw 配置扩展)
+        // ===================================================================
         if (config_) {
             for (const auto& dir : config_->skills.load.extra_dirs) {
                 roots.push_back({
@@ -127,12 +187,20 @@ struct SkillManager::Impl {
             }
         }
         
-        // 添加 Workspace Skills (最高优先级)
+        // ===================================================================
+        // 6. Project Hidden Skills (HunterClaw 扩展)
+        // ===================================================================
         if (!workspace_dir.empty()) {
             roots.push_back({
                 workspace_dir + "/.agents/skills",
                 SkillSource::Project
             });
+        }
+        
+        // ===================================================================
+        // 7. Workspace Skills (OpenClaw 100% 对齐: <workspace>/skills/)
+        // ===================================================================
+        if (!workspace_dir.empty()) {
             roots.push_back({
                 workspace_dir + "/skills",
                 SkillSource::Workspace
@@ -441,7 +509,7 @@ std::vector<SkillEntry> SkillManager::filter_eligible_skills(
     return result;
 }
 
-// 构建 LLM Prompt (100% 对齐 OpenClaw)
+// 构建 LLM Prompt (100% 对齐 OpenClaw 两阶段加载机制)
 std::string SkillManager::build_skills_prompt(
     const SkillEligibilityContext& ctx,
     const std::vector<std::string>& skill_filter
@@ -455,59 +523,55 @@ std::string SkillManager::build_skills_prompt(
     std::ostringstream ss;
     size_t total_chars = 0;
     
-    size_t max_chars = 30000;
-    if (impl_->config_) {
-        max_chars = impl_->config_->skills.limits.max_skills_prompt_chars;
-    }
-    
-    ss << "\n<skills>\n";
-    ss << "You have access to the following skills. Use them to enhance your capabilities:\n\n";
+    // 阶段 1: 只注入元信息列表
+    ss << "\n<available_skills>\n";
+    ss << "Before replying: scan <available_skills> <description> entries.\n";
+    ss << "Use the read tool to load SKILL.md at the listed <location> when needed.\n\n";
     
     for (const auto& entry : eligible_skills) {
         const auto& skill = entry.skill;
         
-        std::ostringstream skill_section;
+        // 只包含: 名称 + 描述 + 文件路径
+        ss << "  <skill>\n";
+        ss << "    <name>" << xml_escape(skill.name) << "</name>\n";
+        ss << "    <description>" << xml_escape(skill.description) << "</description>\n";
         
-        // Skill 标题
-        if (!entry.metadata.emoji.empty()) {
-            skill_section << "## " << entry.metadata.emoji << " " << skill.name << "\n\n";
-        } else {
-            skill_section << "## " << skill.name << "\n\n";
+        // 文件路径 (LLM 通过 read tool 加载)
+        std::string skill_path = skill.file_path.string();
+        if (!skill_path.empty()) {
+            ss << "    <location>" << xml_escape(skill_path) << "</location>\n";
         }
         
-        // 描述
-        skill_section << skill.description << "\n\n";
+        ss << "  </skill>\n";
         
-        // Homepage (可选)
-        if (!entry.metadata.homepage.empty()) {
-            skill_section << "**Homepage**: " << entry.metadata.homepage << "\n\n";
-        }
-        
-        // Markdown 内容 (LLM 可读的使用指南)
-        if (!skill.content.empty()) {
-            skill_section << skill.content << "\n\n";
-        }
-        
-        skill_section << "---\n\n";
-        
-        std::string section_str = skill_section.str();
-        
-        // 检查字符限制
-        if (total_chars + section_str.size() > max_chars) {
-            log()->warn("Reached max skills prompt chars ({}), truncating", max_chars);
-            break;
-        }
-        
-        ss << section_str;
-        total_chars += section_str.size();
+        total_chars += skill.name.size() + skill.description.size() + skill_path.size() + 97;
     }
     
-    ss << "</skills>\n";
+    ss << "</available_skills>\n";
     
-    log()->info("Built skills prompt with {} skills, {} chars", 
+    log()->info("Built skills catalog with {} skills, ~{} chars (metadata only)", 
                eligible_skills.size(), total_chars);
     
     return ss.str();
+}
+
+// XML 转义辅助函数
+static std::string xml_escape(const std::string& str) {
+    std::string result;
+    result.reserve(str.size());
+    
+    for (char c : str) {
+        switch (c) {
+            case '&': result += "&amp;"; break;
+            case '<': result += "&lt;"; break;
+            case '>': result += "&gt;"; break;
+            case '"': result += "&quot;"; break;
+            case '\'': result += "&apos;"; break;
+            default: result += c; break;
+        }
+    }
+    
+    return result;
 }
 
 // 安装 Skill 依赖
@@ -560,25 +624,111 @@ core::Result<SkillManager::ScanResult> SkillManager::scan_skill(const std::strin
     return SkillScanner::scan(entry_opt.value());
 }
 
-// 热重载
+// 热重载 (100% 对齐 OpenClaw 实现)
 void SkillManager::start_watch() {
-    if (impl_->watching_) {
+    if (impl_->file_watcher_ && impl_->file_watcher_->is_running()) {
         log()->warn("Skill watcher already running");
         return;
     }
     
-    impl_->watching_ = true;
+    // 检查配置
+    bool watch_enabled = true;
+    int debounce_ms = 250;
     
-    // TODO: 实现文件监听
-    log()->info("Skill hot-reload enabled");
-}
-
-void SkillManager::stop_watch() {
-    if (!impl_->watching_) {
+    if (impl_->config_) {
+        // OpenClaw 默认: watch !== false (即默认为 true)
+        watch_enabled = impl_->config_->skills.load.watch;
+        if (impl_->config_->skills.load.watch_debounce_ms > 0) {
+            debounce_ms = impl_->config_->skills.load.watch_debounce_ms;
+        }
+    }
+    
+    if (!watch_enabled) {
+        log()->info("Skill hot-reload disabled by config");
         return;
     }
     
-    impl_->watching_ = false;
+    // 创建 FileWatcher
+    FileWatcherConfig config;
+    config.debounce_delay = std::chrono::milliseconds(debounce_ms);
+    config.stability_threshold = std::chrono::milliseconds(debounce_ms);
+    config.ignore_initial = true;  // 忽略初始文件
+    
+    impl_->file_watcher_ = FileWatcher::create(config);
+    
+    // 设置回调 (触发重新加载)
+    impl_->file_watcher_->set_callback([this](const WatchEvent& event) {
+        std::string event_type;
+        switch (event.type) {
+            case WatchEventType::Add:    event_type = "add"; break;
+            case WatchEventType::Change: event_type = "change"; break;
+            case WatchEventType::Unlink: event_type = "unlink"; break;
+        }
+        
+        log()->info("Skill file {} detected: {}", event_type, event.path.string());
+        
+        // 递增版本号
+        uint64_t new_version = impl_->bump_version();
+        
+        // 重新加载 skills
+        auto result = reload_skills();
+        if (result.is_ok()) {
+            log()->info("Skills reloaded successfully (version: {})", new_version);
+        } else {
+            log()->error("Failed to reload skills: {}", result.error);
+        }
+    });
+    
+    // 添加监控目标: 只监控 SKILL.md 文件 (100% 对齐 OpenClaw)
+    std::vector<std::string> watch_patterns;
+    
+    // 1. Workspace skills
+    if (!impl_->workspace_dir_.empty()) {
+        watch_patterns.push_back(impl_->workspace_dir_ + "/skills/*/SKILL.md");
+        watch_patterns.push_back(impl_->workspace_dir_ + "/.agents/skills/*/SKILL.md");
+    }
+    
+    // 2. Personal skills
+    watch_patterns.push_back(core::utils::expand_path("~/.agents/skills/*/SKILL.md"));
+    
+    // 3. Managed skills
+    watch_patterns.push_back(core::utils::expand_path("~/.openclaw/skills/*/SKILL.md"));
+    watch_patterns.push_back(core::utils::expand_path("~/.hunterclaw/skills/*/SKILL.md"));
+    
+    // 4. Extra directories
+    if (impl_->config_) {
+        for (const auto& dir : impl_->config_->skills.load.extra_dirs) {
+            std::string expanded = core::utils::expand_path(dir);
+            watch_patterns.push_back(expanded + "/*/SKILL.md");
+        }
+    }
+    
+    // 添加所有监控
+    for (const auto& pattern : watch_patterns) {
+        auto result = impl_->file_watcher_->add_watch(pattern);
+        if (result.is_err()) {
+            log()->warn("Failed to add watch pattern {}: {}", pattern, result.error);
+        }
+    }
+    
+    // 启动监控
+    auto result = impl_->file_watcher_->start();
+    if (result.is_ok()) {
+        log()->info("Skill hot-reload enabled (debounce: {}ms)", debounce_ms);
+    } else {
+        log()->error("Failed to start skill watcher: {}", result.error);
+        impl_->file_watcher_.reset();
+    }
+}
+
+void SkillManager::stop_watch() {
+    if (!impl_->file_watcher_) {
+        return;
+    }
+    
+    impl_->file_watcher_->stop();
+    impl_->file_watcher_.reset();
+    
     log()->info("Skill hot-reload disabled");
 }
 

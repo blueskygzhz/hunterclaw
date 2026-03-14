@@ -1,0 +1,264 @@
+#include "hunterclaw/tools/gemini_vision_provider.h"
+#include <sstream>
+#include <fstream>
+
+namespace hunterclaw {
+
+GeminiVisionProvider::GeminiVisionProvider(
+    std::shared_ptr<HttpClient> http_client,
+    const std::string& api_key
+) : http_client_(http_client),
+    api_key_(api_key),
+    base_url_("https://generativelanguage.googleapis.com/v1beta") {}
+
+JsonValue GeminiVisionProvider::analyze_image(
+    const std::string& image_path,
+    const std::string& prompt,
+    const std::string& model
+) {
+    return analyze_images({image_path}, prompt, model);
+}
+
+JsonValue GeminiVisionProvider::analyze_video(
+    const std::string& video_path,
+    const std::string& prompt,
+    const std::string& model
+) {
+    // Check if file exists
+    std::ifstream file(video_path);
+    if (!file.good()) {
+        JsonValue error = JsonValue::object();
+        error["error"] = "Video file not found: " + video_path;
+        return error;
+    }
+    file.close();
+    
+    // Build request body
+    JsonValue request_body = JsonValue::object();
+    
+    // Build contents
+    JsonValue contents = JsonValue::array();
+    JsonValue content = JsonValue::object();
+    
+    JsonValue parts = JsonValue::array();
+    
+    // Add text prompt
+    JsonValue text_part = JsonValue::object();
+    text_part["text"] = prompt;
+    parts.push_back(text_part);
+    
+    // Add video
+    JsonValue video_part = JsonValue::object();
+    JsonValue inline_data = JsonValue::object();
+    inline_data["mime_type"] = get_mime_type(video_path);
+    inline_data["data"] = encode_file_to_base64(video_path);
+    video_part["inline_data"] = inline_data;
+    parts.push_back(video_part);
+    
+    content["parts"] = parts;
+    contents.push_back(content);
+    
+    request_body["contents"] = contents;
+    
+    // Call API
+    auto response = call_gemini_api(model, request_body);
+    
+    // Format result
+    JsonValue result = JsonValue::object();
+    result["status"] = "success";
+    result["provider"] = "gemini";
+    result["model"] = model;
+    result["input_type"] = "video";
+    
+    if (response.has("candidates") && response["candidates"].is_array() &&
+        response["candidates"].size() > 0) {
+        auto candidate = response["candidates"][0];
+        if (candidate.has("content") && candidate["content"].has("parts") &&
+            candidate["content"]["parts"].is_array() &&
+            candidate["content"]["parts"].size() > 0) {
+            auto part = candidate["content"]["parts"][0];
+            if (part.has("text")) {
+                result["analysis"] = part["text"].as_string();
+            }
+        }
+    }
+    
+    if (response.has("usageMetadata")) {
+        result["usage"] = response["usageMetadata"];
+    }
+    
+    return result;
+}
+
+JsonValue GeminiVisionProvider::analyze_images(
+    const std::vector<std::string>& image_paths,
+    const std::string& prompt,
+    const std::string& model
+) {
+    // Validate images exist
+    for (const auto& path : image_paths) {
+        std::ifstream file(path);
+        if (!file.good()) {
+            JsonValue error = JsonValue::object();
+            error["error"] = "Image file not found: " + path;
+            return error;
+        }
+        file.close();
+    }
+    
+    // Build request body
+    JsonValue request_body = JsonValue::object();
+    
+    // Build contents
+    JsonValue contents = JsonValue::array();
+    JsonValue content = JsonValue::object();
+    
+    JsonValue parts = JsonValue::array();
+    
+    // Add text prompt
+    JsonValue text_part = JsonValue::object();
+    text_part["text"] = prompt;
+    parts.push_back(text_part);
+    
+    // Add images
+    for (const auto& image_path : image_paths) {
+        JsonValue image_part = JsonValue::object();
+        JsonValue inline_data = JsonValue::object();
+        inline_data["mime_type"] = get_mime_type(image_path);
+        inline_data["data"] = encode_file_to_base64(image_path);
+        image_part["inline_data"] = inline_data;
+        parts.push_back(image_part);
+    }
+    
+    content["parts"] = parts;
+    contents.push_back(content);
+    
+    request_body["contents"] = contents;
+    
+    // Call API
+    auto response = call_gemini_api(model, request_body);
+    
+    // Format result
+    JsonValue result = JsonValue::object();
+    result["status"] = "success";
+    result["provider"] = "gemini";
+    result["model"] = model;
+    result["input_type"] = "image";
+    result["image_count"] = static_cast<int>(image_paths.size());
+    
+    if (response.has("candidates") && response["candidates"].is_array() &&
+        response["candidates"].size() > 0) {
+        auto candidate = response["candidates"][0];
+        if (candidate.has("content") && candidate["content"].has("parts") &&
+            candidate["content"]["parts"].is_array() &&
+            candidate["content"]["parts"].size() > 0) {
+            auto part = candidate["content"]["parts"][0];
+            if (part.has("text")) {
+                result["analysis"] = part["text"].as_string();
+            }
+        }
+    }
+    
+    if (response.has("usageMetadata")) {
+        result["usage"] = response["usageMetadata"];
+    }
+    
+    return result;
+}
+
+std::vector<std::string> GeminiVisionProvider::list_models() {
+    std::vector<std::string> models;
+    for (const auto& model : GEMINI_MODELS) {
+        models.push_back(model.name);
+    }
+    return models;
+}
+
+JsonValue GeminiVisionProvider::call_gemini_api(
+    const std::string& model,
+    const JsonValue& request_body
+) {
+    if (api_key_.empty()) {
+        JsonValue error = JsonValue::object();
+        error["error"] = "Gemini API key not set";
+        error["hint"] = "Set GEMINI_API_KEY environment variable";
+        return error;
+    }
+    
+    // Build URL
+    std::stringstream url;
+    url << base_url_ << "/models/" << model << ":generateContent?key=" << api_key_;
+    
+    // Set headers
+    JsonValue headers = JsonValue::object();
+    headers["Content-Type"] = "application/json";
+    
+    // Make request
+    auto response = http_client_->post(url.str(), request_body, headers);
+    
+    return response;
+}
+
+std::string GeminiVisionProvider::encode_file_to_base64(const std::string& file_path) {
+    // TODO: Implement proper base64 encoding
+    // For now, return empty string
+    // In production, use a base64 encoding library
+    return "";
+}
+
+std::string GeminiVisionProvider::get_mime_type(const std::string& file_path) {
+    // Simple mime type detection based on extension
+    size_t dot_pos = file_path.rfind('.');
+    if (dot_pos == std::string::npos) {
+        return "application/octet-stream";
+    }
+    
+    std::string ext = file_path.substr(dot_pos + 1);
+    
+    // Convert to lowercase
+    for (char& c : ext) {
+        c = tolower(c);
+    }
+    
+    // Image types
+    if (ext == "jpg" || ext == "jpeg") return "image/jpeg";
+    if (ext == "png") return "image/png";
+    if (ext == "gif") return "image/gif";
+    if (ext == "webp") return "image/webp";
+    if (ext == "bmp") return "image/bmp";
+    
+    // Video types
+    if (ext == "mp4") return "video/mp4";
+    if (ext == "mov") return "video/quicktime";
+    if (ext == "avi") return "video/x-msvideo";
+    if (ext == "webm") return "video/webm";
+    if (ext == "mkv") return "video/x-matroska";
+    
+    return "application/octet-stream";
+}
+
+JsonValue GeminiVisionProvider::build_content_parts(
+    const std::string& prompt,
+    const std::vector<std::string>& file_paths
+) {
+    JsonValue parts = JsonValue::array();
+    
+    // Add text
+    JsonValue text_part = JsonValue::object();
+    text_part["text"] = prompt;
+    parts.push_back(text_part);
+    
+    // Add files
+    for (const auto& file_path : file_paths) {
+        JsonValue file_part = JsonValue::object();
+        JsonValue inline_data = JsonValue::object();
+        inline_data["mime_type"] = get_mime_type(file_path);
+        inline_data["data"] = encode_file_to_base64(file_path);
+        file_part["inline_data"] = inline_data;
+        parts.push_back(file_part);
+    }
+    
+    return parts;
+}
+
+} // namespace hunterclaw

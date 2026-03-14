@@ -3,6 +3,7 @@
 #include "hunterclaw/tools/tool_loop_detector.h"
 #include "hunterclaw/tools/tool_policy.h"
 #include "hunterclaw/tools/tool_result_processor.h"
+#include "hunterclaw/tools/approval.h"
 #include "hunterclaw/mcp/mcporter_client.h"
 #include "hunterclaw/mcp/mcp_tool_adapter.h"
 #include <stdexcept>
@@ -138,7 +139,74 @@ ToolResult ToolManager::execute_tool(
         
         if (policy_result.decision == PolicyDecision::REQUIRE_APPROVAL) {
             log()->info("Tool '{}' requires approval: {}", name, policy_result.reason);
-            // TODO: 实现用户审批流程
+            
+            // 实现用户审批流程（对齐 OpenClaw）
+            if (approval_manager_) {
+                // 构建审批请求
+                std::string command = name;
+                if (params.is_object() && params.contains("command")) {
+                    command = params["command"].as_string();
+                }
+                
+                std::vector<std::string> argv = {name};
+                if (params.is_object() && params.contains("args") && params["args"].is_array()) {
+                    // 简化处理：从字符串解析参数
+                    if (params["args"].is_string()) {
+                        std::string args_str = params["args"].as_string();
+                        // 简单的空格分割
+                        std::istringstream iss(args_str);
+                        std::string arg;
+                        while (iss >> arg) {
+                            argv.push_back(arg);
+                        }
+                    }
+                }
+                
+                std::string cwd = context_.workspace_dir;
+                if (params.is_object() && params.contains("cwd")) {
+                    cwd = params["cwd"].as_string();
+                }
+                
+                auto agent_config = approval_manager_->get_agent_config(context_.agent_id);
+                auto approval_req = build_approval_request(
+                    command, argv, cwd, 
+                    context_.agent_id, context_.session_key, 
+                    agent_config
+                );
+                
+                // 请求审批
+                auto req_result = approval_manager_->request_approval(approval_req);
+                if (req_result.is_err()) {
+                    return tool_result::error("Failed to request approval: " + req_result.error);
+                }
+                
+                log()->info("Waiting for approval: {}", approval_req.id);
+                
+                // 等待用户决策
+                auto resp_result = approval_manager_->wait_decision(approval_req.id);
+                if (resp_result.is_err()) {
+                    return tool_result::error("Approval wait failed: " + resp_result.error);
+                }
+                
+                auto& response = resp_result.value;
+                
+                // 处理决策
+                if (response.decision == ApprovalDecision::DENY) {
+                    log()->warn("Tool '{}' denied by user", name);
+                    return tool_result::error("Execution denied by user: " + response.reason);
+                }
+                
+                if (response.decision == ApprovalDecision::TIMEOUT) {
+                    log()->warn("Tool '{}' approval timeout", name);
+                    return tool_result::error("Approval timeout");
+                }
+                
+                // ALLOW_ONCE 或 ALLOW_ALWAYS，继续执行
+                log()->info("Tool '{}' approved by {}", name, response.resolved_by);
+            } else {
+                // 没有 approval_manager，直接拒绝
+                return tool_result::error("Tool requires approval but approval manager not configured");
+            }
         }
     }
     
@@ -412,6 +480,25 @@ void ToolManager::enable_result_normalization(bool enable) {
         result_pipeline_->remove_processor("normalizer");
         log()->info("Result normalization disabled");
     }
+}
+
+// ========== 审批系统 ==========
+
+std::shared_ptr<ApprovalManager> ToolManager::get_approval_manager() {
+    return approval_manager_;
+}
+
+void ToolManager::set_approval_manager(std::shared_ptr<ApprovalManager> manager) {
+    approval_manager_ = manager;
+    log()->info("Approval manager set");
+}
+
+void ToolManager::enable_approval_system(const std::string& config_path) {
+    if (!approval_manager_) {
+        approval_manager_ = ApprovalManager::create(config_path);
+    }
+    log()->info("Approval system enabled with config: {}", 
+                config_path.empty() ? "default" : config_path);
 }
 
 // Tool结果辅助函数实现

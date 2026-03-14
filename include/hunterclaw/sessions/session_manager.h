@@ -4,12 +4,56 @@
 #include <string>
 #include <memory>
 #include <optional>
+#include <vector>
 #include <unordered_map>
 #include "hunterclaw/core/result.h"
 #include "hunterclaw/routing/router.h"
 
 namespace hunterclaw {
 namespace sessions {
+
+// ============================================================================
+// ACP 集成数据结构 (对齐 OpenClaw ACP 协议)
+// ============================================================================
+
+// ACP 身份状态
+enum class AcpIdentityState {
+    Pending,   // 等待解析
+    Resolved   // 已解析
+};
+
+// ACP 会话身份 (对齐 OpenClaw SessionAcpIdentity)
+struct SessionAcpIdentity {
+    AcpIdentityState state = AcpIdentityState::Pending;
+    std::optional<std::string> acp_record_id;     // ACP 记录ID
+    std::optional<std::string> acp_session_id;    // ACP 会话ID
+    std::optional<std::string> agent_session_id;  // Agent 会话ID
+    std::string source;                            // 来源: ensure/status/event
+    uint64_t last_updated_at = 0;                  // 最后更新时间
+};
+
+// ACP 运行时选项 (对齐 OpenClaw AcpSessionRuntimeOptions)
+struct AcpSessionRuntimeOptions {
+    std::string mode;         // persistent/oneshot
+    std::string model;        // 模型名称
+    std::string cwd;          // 工作目录
+    std::optional<int> max_turns;  // 最大轮次
+};
+
+// ACP 会话元数据 (对齐 OpenClaw SessionAcpMeta)
+struct SessionAcpMeta {
+    std::string backend;                           // ACP 后端标识
+    std::string agent;                             // Agent 标识
+    std::string runtime_session_name;              // 运行时会话名
+    std::optional<SessionAcpIdentity> identity;    // ACP 身份
+    AcpSessionRuntimeOptions runtime_options;      // 运行时选项
+    std::string state;                             // idle/running/error
+    uint64_t last_activity_at = 0;                 // 最后活动时间
+};
+
+// ============================================================================
+// 会话数据结构
+// ============================================================================
 
 // 会话元数据 (对齐 OpenClaw SessionMetadata)
 struct SessionMetadata {
@@ -22,7 +66,7 @@ struct SessionMetadata {
     std::optional<std::string> sender_username;    // 发送者用户名
 };
 
-// 会话条目 (对齐 OpenClaw SessionEntry)
+// 会话条目 (对齐 OpenClaw SessionEntry - 完整版)
 struct SessionEntry {
     std::string session_id;        // 会话ID (UUID)
     std::string session_key;       // 会话key (唯一标识)
@@ -36,8 +80,16 @@ struct SessionEntry {
     int total_tokens = 0;
     int context_tokens = 0;
     
-    // 元数据
+    // 基础元数据
     SessionMetadata metadata;
+    
+    // ACP 集成 (可选 - 支持 ACP 协议)
+    std::optional<SessionAcpMeta> acp;
+    
+    // 会话标识 (对齐 OpenClaw)
+    std::optional<std::string> label;          // 会话标签 (用户友好名称)
+    std::optional<std::string> display_name;   // 显示名称
+    std::optional<std::string> chat_type;      // 聊天类型: dm/group/channel
     
     // 会话历史 (简化版，实际可能需要独立存储)
     std::vector<std::string> messages;
@@ -62,6 +114,26 @@ struct SessionConfig {
     SessionMaintenanceMode maintenance_mode = SessionMaintenanceMode::Warn;
     int prune_after_days = 30;         // 清理旧会话 (天)
     int max_entries = 500;             // 最大会话数
+    
+    // Per-Agent Storage (对齐 OpenClaw)
+    bool per_agent_storage = true;     // 是否按 Agent 分离存储
+};
+
+// ============================================================================
+// Session Mapper (对齐 OpenClaw SessionMapper)
+// ============================================================================
+
+// Session 标签/Key 映射器
+class SessionMapper {
+public:
+    // 解析 label → session_key (对齐 OpenClaw sessions.resolve)
+    static core::Result<std::string> resolve_session_key(
+        const std::string& label_or_key,
+        bool require_existing = false
+    );
+    
+    // 从 session_key 提取 label
+    static std::optional<std::string> extract_label(const std::string& session_key);
 };
 
 // 会话管理器接口 (对齐 OpenClaw)
@@ -71,9 +143,9 @@ public:
     
     virtual ~SessionManager() = default;
     
-    // 获取或创建会话
+    // 获取或创建会话 (支持 label 解析)
     virtual core::Result<SessionEntry> get_or_create_session(
-        const std::string& session_key,
+        const std::string& label_or_key,  // 支持 label 或 key
         const std::string& agent_id,
         const SessionMetadata& metadata
     ) = 0;
@@ -81,8 +153,11 @@ public:
     // 更新会话
     virtual core::Result<bool> update_session(const SessionEntry& session) = 0;
     
-    // 删除会话
-    virtual core::Result<bool> delete_session(const std::string& session_key) = 0;
+    // 删除会话 (支持 label 解析)
+    virtual core::Result<bool> delete_session(const std::string& label_or_key) = 0;
+    
+    // 通过 label 或 key 获取会话
+    virtual core::Result<SessionEntry> get_session(const std::string& label_or_key) = 0;
     
     // 列出所有会话
     virtual core::Result<std::vector<SessionEntry>> list_sessions(
@@ -105,14 +180,16 @@ public:
     FileSessionManager(const std::string& storage_dir, const SessionConfig& config);
     
     core::Result<SessionEntry> get_or_create_session(
-        const std::string& session_key,
+        const std::string& label_or_key,
         const std::string& agent_id,
         const SessionMetadata& metadata
     ) override;
     
     core::Result<bool> update_session(const SessionEntry& session) override;
     
-    core::Result<bool> delete_session(const std::string& session_key) override;
+    core::Result<bool> delete_session(const std::string& label_or_key) override;
+    
+    core::Result<SessionEntry> get_session(const std::string& label_or_key) override;
     
     core::Result<std::vector<SessionEntry>> list_sessions(
         const std::optional<std::string>& agent_id
@@ -127,7 +204,11 @@ private:
     SessionConfig config_;
     
     // 辅助方法
-    std::string get_session_file_path(const std::string& session_key) const;
+    std::string resolve_storage_path(const std::string& agent_id) const;
+    std::string get_session_file_path(
+        const std::string& session_key,
+        const std::string& agent_id
+    ) const;
     core::Result<bool> write_session(const SessionEntry& session);
     core::Result<SessionEntry> read_session(const std::string& file_path);
     bool is_idle(const SessionEntry& session) const;

@@ -1,4 +1,5 @@
 #include "hunterclaw/sessions/session_manager.h"
+#include "hunterclaw/observability/diagnostic_events.h"  // ✅ 可观测性集成
 #include <fstream>
 #include <filesystem>
 #include <nlohmann/json.hpp>
@@ -42,6 +43,80 @@ static uint64_t current_timestamp_ms() {
 }
 
 // JSON 序列化
+
+// ACP Identity 序列化
+static json to_json(const SessionAcpIdentity& identity) {
+    json j;
+    j["state"] = (identity.state == AcpIdentityState::Pending) ? "pending" : "resolved";
+    if (identity.acp_record_id) j["acpRecordId"] = *identity.acp_record_id;
+    if (identity.acp_session_id) j["acpSessionId"] = *identity.acp_session_id;
+    if (identity.agent_session_id) j["agentSessionId"] = *identity.agent_session_id;
+    j["source"] = identity.source;
+    j["lastUpdatedAt"] = identity.last_updated_at;
+    return j;
+}
+
+static SessionAcpIdentity acp_identity_from_json(const json& j) {
+    SessionAcpIdentity identity;
+    std::string state_str = j.value("state", "pending");
+    identity.state = (state_str == "resolved") ? AcpIdentityState::Resolved : AcpIdentityState::Pending;
+    if (j.contains("acpRecordId")) identity.acp_record_id = j["acpRecordId"].get<std::string>();
+    if (j.contains("acpSessionId")) identity.acp_session_id = j["acpSessionId"].get<std::string>();
+    if (j.contains("agentSessionId")) identity.agent_session_id = j["agentSessionId"].get<std::string>();
+    identity.source = j.value("source", "");
+    identity.last_updated_at = j.value("lastUpdatedAt", 0ULL);
+    return identity;
+}
+
+// ACP Runtime Options 序列化
+static json to_json(const AcpSessionRuntimeOptions& opts) {
+    json j;
+    j["mode"] = opts.mode;
+    j["model"] = opts.model;
+    j["cwd"] = opts.cwd;
+    if (opts.max_turns) j["maxTurns"] = *opts.max_turns;
+    return j;
+}
+
+static AcpSessionRuntimeOptions acp_runtime_options_from_json(const json& j) {
+    AcpSessionRuntimeOptions opts;
+    opts.mode = j.value("mode", "persistent");
+    opts.model = j.value("model", "");
+    opts.cwd = j.value("cwd", "");
+    if (j.contains("maxTurns")) opts.max_turns = j["maxTurns"].get<int>();
+    return opts;
+}
+
+// ACP Meta 序列化
+static json to_json(const SessionAcpMeta& acp) {
+    json j;
+    j["backend"] = acp.backend;
+    j["agent"] = acp.agent;
+    j["runtimeSessionName"] = acp.runtime_session_name;
+    if (acp.identity) j["identity"] = to_json(*acp.identity);
+    j["runtimeOptions"] = to_json(acp.runtime_options);
+    j["state"] = acp.state;
+    j["lastActivityAt"] = acp.last_activity_at;
+    return j;
+}
+
+static SessionAcpMeta acp_meta_from_json(const json& j) {
+    SessionAcpMeta acp;
+    acp.backend = j.value("backend", "");
+    acp.agent = j.value("agent", "");
+    acp.runtime_session_name = j.value("runtimeSessionName", "");
+    if (j.contains("identity")) {
+        acp.identity = acp_identity_from_json(j["identity"]);
+    }
+    if (j.contains("runtimeOptions")) {
+        acp.runtime_options = acp_runtime_options_from_json(j["runtimeOptions"]);
+    }
+    acp.state = j.value("state", "idle");
+    acp.last_activity_at = j.value("lastActivityAt", 0ULL);
+    return acp;
+}
+
+// SessionMetadata 序列化
 static json to_json(const SessionMetadata& meta) {
     json j;
     if (meta.provider) j["provider"] = *meta.provider;
@@ -108,6 +183,16 @@ static SessionEntry session_from_json(const json& j) {
         session.metadata = metadata_from_json(j["metadata"]);
     }
     
+    // ACP 集成
+    if (j.contains("acp")) {
+        session.acp = acp_meta_from_json(j["acp"]);
+    }
+    
+    // 会话标识
+    if (j.contains("label")) session.label = j["label"].get<std::string>();
+    if (j.contains("displayName")) session.display_name = j["displayName"].get<std::string>();
+    if (j.contains("chatType")) session.chat_type = j["chatType"].get<std::string>();
+    
     if (j.contains("messages")) {
         session.messages = j["messages"].get<std::vector<std::string>>();
     }
@@ -144,7 +229,31 @@ FileSessionManager::FileSessionManager(
     }
 }
 
-std::string FileSessionManager::get_session_file_path(const std::string& session_key) const {
+std::string FileSessionManager::resolve_storage_path(const std::string& agent_id) const {
+    if (!config_.per_agent_storage || agent_id.empty()) {
+        return storage_dir_;
+    }
+    
+    // Per-Agent Storage: {storage_dir}/agents/{agent_id}/
+    std::string agent_dir = storage_dir_ + "/agents/" + agent_id;
+    
+    try {
+        fs::create_directories(agent_dir);
+        fs::permissions(agent_dir,
+            fs::perms::owner_read | fs::perms::owner_write | fs::perms::owner_exec,
+            fs::perm_options::replace);
+    } catch (...) {
+        // Fallback to storage_dir
+        return storage_dir_;
+    }
+    
+    return agent_dir;
+}
+
+std::string FileSessionManager::get_session_file_path(
+    const std::string& session_key,
+    const std::string& agent_id
+) const {
     // URL-safe encode session_key
     std::string encoded;
     for (char c : session_key) {
@@ -154,12 +263,14 @@ std::string FileSessionManager::get_session_file_path(const std::string& session
             encoded += '_';
         }
     }
-    return storage_dir_ + "/" + encoded + ".json";
+    
+    std::string base_dir = resolve_storage_path(agent_id);
+    return base_dir + "/" + encoded + ".json";
 }
 
 core::Result<bool> FileSessionManager::write_session(const SessionEntry& session) {
     try {
-        std::string file_path = get_session_file_path(session.session_key);
+        std::string file_path = get_session_file_path(session.session_key, session.agent_id);
         std::string tmp_path = file_path + ".tmp";
         
         json j = to_json(session);
@@ -198,11 +309,18 @@ core::Result<SessionEntry> FileSessionManager::read_session(const std::string& f
 }
 
 core::Result<SessionEntry> FileSessionManager::get_or_create_session(
-    const std::string& session_key,
+    const std::string& label_or_key,
     const std::string& agent_id,
     const SessionMetadata& metadata
 ) {
-    std::string file_path = get_session_file_path(session_key);
+    // 解析 label → key
+    auto key_result = SessionMapper::resolve_session_key(label_or_key, false);
+    if (key_result.is_err()) {
+        return core::Result<SessionEntry>::Err(key_result.error);
+    }
+    std::string session_key = key_result.value;
+    
+    std::string file_path = get_session_file_path(session_key, agent_id);
     
     // Try to load existing session
     if (fs::exists(file_path)) {
@@ -236,27 +354,154 @@ core::Result<SessionEntry> FileSessionManager::get_or_create_session(
     session.updated_at = session.created_at;
     session.metadata = metadata;
     
+    // 如果是 label,存储 label
+    auto extracted_label = SessionMapper::extract_label(label_or_key);
+    if (extracted_label) {
+        session.label = *extracted_label;
+    }
+    
     auto write_result = write_session(session);
     if (write_result.is_err()) {
         return core::Result<SessionEntry>::Err(write_result.error);
+    }
+    
+    // ✅ 可观测性: 发射 SessionState 事件 (对齐 OpenClaw)
+    try {
+        auto state_event = std::make_shared<observability::SessionStateEvent>();
+        state_event->session_id = session.session_id;
+        state_event->old_state = observability::SessionState::IDLE;
+        state_event->new_state = observability::SessionState::PROCESSING;
+        state_event->reason = "created";
+        state_event->state_duration_ms = 0;
+        state_event->timestamp = std::chrono::system_clock::now();
+        
+        observability::DiagnosticEventBus::instance().emit(state_event);
+    } catch (...) {
+        // 故障隔离
     }
     
     return core::Result<SessionEntry>::Ok(session);
 }
 
 core::Result<bool> FileSessionManager::update_session(const SessionEntry& session) {
-    return write_session(session);
+    auto result = write_session(session);
+    
+    // ✅ 可观测性: 发射 SessionState 事件 (更新)
+    if (result.is_ok()) {
+        try {
+            auto state_event = std::make_shared<observability::SessionStateEvent>();
+            state_event->session_id = session.session_id;
+            state_event->old_state = observability::SessionState::PROCESSING;
+            state_event->new_state = observability::SessionState::IDLE;
+            state_event->reason = "active";
+            state_event->state_duration_ms = 0;
+            state_event->timestamp = std::chrono::system_clock::now();
+            
+            observability::DiagnosticEventBus::instance().emit(state_event);
+        } catch (...) {}
+    }
+    
+    return result;
 }
 
-core::Result<bool> FileSessionManager::delete_session(const std::string& session_key) {
+core::Result<SessionEntry> FileSessionManager::get_session(const std::string& label_or_key) {
+    // 解析 label → key
+    auto key_result = SessionMapper::resolve_session_key(label_or_key, true);
+    if (key_result.is_err()) {
+        return core::Result<SessionEntry>::Err(key_result.error);
+    }
+    std::string session_key = key_result.value;
+    
+    // 需要遍历所有 agent 目录查找 (Per-Agent Storage)
+    if (config_.per_agent_storage) {
+        std::string agents_dir = storage_dir_ + "/agents";
+        if (fs::exists(agents_dir)) {
+            for (const auto& agent_entry : fs::directory_iterator(agents_dir)) {
+                if (agent_entry.is_directory()) {
+                    std::string agent_id = agent_entry.path().filename().string();
+                    std::string file_path = get_session_file_path(session_key, agent_id);
+                    
+                    if (fs::exists(file_path)) {
+                        return read_session(file_path);
+                    }
+                }
+            }
+        }
+    }
+    
+    // Fallback: 尝试直接路径 (不带 agent_id)
+    std::string file_path = get_session_file_path(session_key, "");
+    if (fs::exists(file_path)) {
+        return read_session(file_path);
+    }
+    
+    return core::Result<SessionEntry>::Err("Session not found: " + label_or_key);
+}
+
+core::Result<bool> FileSessionManager::delete_session(const std::string& label_or_key) {
     try {
-        std::string file_path = get_session_file_path(session_key);
+        // 解析 label → key
+        auto key_result = SessionMapper::resolve_session_key(label_or_key, true);
+        if (key_result.is_err()) {
+            return core::Result<bool>::Err(key_result.error);
+        }
+        std::string session_key = key_result.value;
         
-        if (fs::exists(file_path)) {
-            fs::remove(file_path);
+        bool deleted = false;
+        std::string deleted_session_id;
+        
+        // 尝试删除所有可能的路径 (Per-Agent Storage)
+        if (config_.per_agent_storage) {
+            std::string agents_dir = storage_dir_ + "/agents";
+            if (fs::exists(agents_dir)) {
+                for (const auto& agent_entry : fs::directory_iterator(agents_dir)) {
+                    if (agent_entry.is_directory()) {
+                        std::string agent_id = agent_entry.path().filename().string();
+                        std::string file_path = get_session_file_path(session_key, agent_id);
+                        
+                        if (fs::exists(file_path)) {
+                            // 读取 session_id (用于可观测性)
+                            auto session_result = read_session(file_path);
+                            if (session_result.is_ok()) {
+                                deleted_session_id = session_result.value.session_id;
+                            }
+                            
+                            fs::remove(file_path);
+                            deleted = true;
+                        }
+                    }
+                }
+            }
         }
         
-        return core::Result<bool>::Ok(true);
+        // Fallback: 尝试直接路径
+        std::string file_path = get_session_file_path(session_key, "");
+        if (fs::exists(file_path)) {
+            auto session_result = read_session(file_path);
+            if (session_result.is_ok()) {
+                deleted_session_id = session_result.value.session_id;
+            }
+            
+            fs::remove(file_path);
+            deleted = true;
+        }
+        
+        // ✅ 可观测性: 发射 SessionState 事件 (结束)
+        if (deleted && !deleted_session_id.empty()) {
+            try {
+                auto state_event = std::make_shared<observability::SessionStateEvent>();
+                state_event->session_id = deleted_session_id;
+                state_event->old_state = observability::SessionState::IDLE;
+                state_event->new_state = observability::SessionState::IDLE;
+                state_event->reason = "ended";
+                state_event->state_duration_ms = 0;
+                state_event->timestamp = std::chrono::system_clock::now();
+                
+                observability::DiagnosticEventBus::instance().emit(state_event);
+            } catch (...) {}
+        }
+        
+        return core::Result<bool>::Ok(deleted);
     } catch (const std::exception& e) {
         return core::Result<bool>::Err("Failed to delete session: " + 
                                        std::string(e.what()));
@@ -269,15 +514,44 @@ core::Result<std::vector<SessionEntry>> FileSessionManager::list_sessions(
     try {
         std::vector<SessionEntry> sessions;
         
-        for (const auto& entry : fs::directory_iterator(storage_dir_)) {
-            if (entry.is_regular_file() && entry.path().extension() == ".json") {
-                auto result = read_session(entry.path().string());
-                if (result.is_ok()) {
-                    auto session = result.value;
+        if (config_.per_agent_storage) {
+            // Per-Agent Storage: 遍历 agents 子目录
+            std::string agents_dir = storage_dir_ + "/agents";
+            
+            if (fs::exists(agents_dir)) {
+                for (const auto& agent_entry : fs::directory_iterator(agents_dir)) {
+                    if (!agent_entry.is_directory()) continue;
                     
-                    // Filter by agent_id if provided
-                    if (!agent_id || session.agent_id == *agent_id) {
-                        sessions.push_back(session);
+                    std::string current_agent_id = agent_entry.path().filename().string();
+                    
+                    // 过滤 agent_id
+                    if (agent_id && current_agent_id != *agent_id) {
+                        continue;
+                    }
+                    
+                    // 遍历该 agent 的所有 session 文件
+                    for (const auto& entry : fs::directory_iterator(agent_entry.path())) {
+                        if (entry.is_regular_file() && entry.path().extension() == ".json") {
+                            auto result = read_session(entry.path().string());
+                            if (result.is_ok()) {
+                                sessions.push_back(result.value);
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // 统一存储: 直接遍历 storage_dir
+            for (const auto& entry : fs::directory_iterator(storage_dir_)) {
+                if (entry.is_regular_file() && entry.path().extension() == ".json") {
+                    auto result = read_session(entry.path().string());
+                    if (result.is_ok()) {
+                        auto session = result.value;
+                        
+                        // Filter by agent_id if provided
+                        if (!agent_id || session.agent_id == *agent_id) {
+                            sessions.push_back(session);
+                        }
                     }
                 }
             }
@@ -332,7 +606,7 @@ bool FileSessionManager::should_reset(const SessionEntry& session) const {
 }
 
 core::Result<int> FileSessionManager::prune_sessions() {
-    auto sessions_result = list_sessions();
+    auto sessions_result = list_sessions(std::nullopt);
     if (sessions_result.is_err()) {
         return core::Result<int>::Err(sessions_result.error);
     }
@@ -373,6 +647,92 @@ core::Result<int> FileSessionManager::prune_sessions() {
     }
     
     return core::Result<int>::Ok(pruned);
+}
+
+// ============================================================================
+// SessionMapper Implementation (对齐 OpenClaw)
+// ============================================================================
+
+core::Result<std::string> SessionMapper::resolve_session_key(
+    const std::string& label_or_key,
+    bool require_existing
+) {
+    std::string input = label_or_key;
+    
+    // 修剪空白
+    input.erase(0, input.find_first_not_of(" \t\n\r"));
+    input.erase(input.find_last_not_of(" \t\n\r") + 1);
+    
+    if (input.empty()) {
+        return core::Result<std::string>::Err("Empty session key or label");
+    }
+    
+    // 检查是否是 Label 格式: "label:xxx"
+    const std::string label_prefix = "label:";
+    if (input.substr(0, label_prefix.size()) == label_prefix) {
+        // 这是一个 Label - 需要解析
+        std::string label = input.substr(label_prefix.size());
+        
+        // 验证 label (不能为空，最大长度 64)
+        if (label.empty()) {
+            return core::Result<std::string>::Err("Empty label");
+        }
+        if (label.size() > 64) {
+            return core::Result<std::string>::Err("Label too long (max 64 characters)");
+        }
+        
+        // 构造 session_key: 转换为规范化的 key
+        // 对齐 OpenClaw: label 转换为小写，替换空格为 '-'
+        std::string normalized_label = label;
+        std::transform(normalized_label.begin(), normalized_label.end(),
+                      normalized_label.begin(), ::tolower);
+        std::replace(normalized_label.begin(), normalized_label.end(), ' ', '-');
+        
+        // 构造 session_key: agent:main:{label}
+        // 注意: 这里假设使用 "main" agent (对齐 OpenClaw 默认逻辑)
+        std::string session_key = "agent:main:label:" + normalized_label;
+        
+        return core::Result<std::string>::Ok(session_key);
+    }
+    
+    // 不是 label 格式 - 直接作为 session_key
+    // 对齐 OpenClaw: session_key 应该是小写
+    std::string session_key = input;
+    std::transform(session_key.begin(), session_key.end(),
+                  session_key.begin(), ::tolower);
+    
+    // 如果需要验证存在 (require_existing)
+    // 注意: 这里简化实现，不做文件存在检查 (由调用方处理)
+    
+    return core::Result<std::string>::Ok(session_key);
+}
+
+std::optional<std::string> SessionMapper::extract_label(const std::string& session_key) {
+    // 尝试从 session_key 提取 label
+    // 对齐 OpenClaw: 如果 session_key 包含 "label:" 片段，提取它
+    
+    const std::string label_marker = "label:";
+    auto pos = session_key.find(label_marker);
+    if (pos == std::string::npos) {
+        return std::nullopt;
+    }
+    
+    // 提取 label 部分 (从 "label:" 后面到下一个 ':' 或结束)
+    size_t start = pos + label_marker.size();
+    size_t end = session_key.find(':', start);
+    
+    std::string label;
+    if (end == std::string::npos) {
+        label = session_key.substr(start);
+    } else {
+        label = session_key.substr(start, end - start);
+    }
+    
+    if (label.empty()) {
+        return std::nullopt;
+    }
+    
+    return label;
 }
 
 } // namespace sessions

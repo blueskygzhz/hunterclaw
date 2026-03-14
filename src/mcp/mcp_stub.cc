@@ -5,40 +5,40 @@
 
 namespace hunterclaw::mcp {
 
+namespace {
+
+// 获取 MCP logger
+auto get_logger() {
+    static auto logger = []() {
+        auto log = spdlog::get("mcp");
+        if (!log) {
+            log = spdlog::stdout_logger_mt("mcp");
+        }
+        return log;
+    }();
+    return logger;
+}
+
+} // namespace
+
 bool McporterClient::is_mcporter_installed() {
-    static auto logger = spdlog::get("mcp");
-    if (!logger) {
-        logger = spdlog::stdout_logger_mt("mcp");
-    }
-    logger->warn("McporterClient::is_mcporter_installed not implemented");
+    get_logger()->warn("McporterClient::is_mcporter_installed not implemented");
     return false;
 }
 
 std::shared_ptr<McporterClient> create_mcporter_client(const McporterConfig&) {
-    static auto logger = spdlog::get("mcp");
-    if (!logger) {
-        logger = spdlog::stdout_logger_mt("mcp");
-    }
-    logger->warn("create_mcporter_client not implemented (requires subprocess.h)");
+    get_logger()->warn("create_mcporter_client not implemented (requires subprocess.h)");
     return nullptr;
 }
 
 std::shared_ptr<McpToolRegistry> McpToolRegistry::create(std::shared_ptr<McporterClient>) {
-    static auto logger = spdlog::get("mcp");
-    if (!logger) {
-        logger = spdlog::stdout_logger_mt("mcp");
-    }
-    logger->warn("McpToolRegistry::create not implemented");
+    get_logger()->warn("McpToolRegistry::create not implemented");
     return nullptr;
 }
 
 core::Result<int> McpToolRegistry::discover_and_register(tools::ToolManager&,
                                                           const std::vector<std::string>&) {
-    static auto logger = spdlog::get("mcp");
-    if (!logger) {
-        logger = spdlog::stdout_logger_mt("mcp");
-    }
-    logger->warn("McpToolRegistry::discover_and_register not implemented");
+    get_logger()->warn("McpToolRegistry::discover_and_register not implemented");
     
     core::Result<int> result;
     result.error = "Not implemented";

@@ -71,12 +71,12 @@ struct SkillFrontmatter {
 // ============================================================================
 
 enum class SkillSource {
-    Bundled,    // Built-in skills
-    Managed,    // ~/.hunterclaw/skills
-    Personal,   // ~/.agents/skills
-    Project,    // <workspace>/.agents/skills
-    Workspace,  // <workspace>/skills
-    Plugin      // From plugin
+    Bundled,    // Built-in skills (系统内置)
+    Managed,    // ~/.openclaw/skills or ~/.hunterclaw/skills (平台管理)
+    Personal,   // ~/.agents/skills (租户/用户)
+    Plugin,     // ~/.openclaw/extensions/<plugin>/skills (扩展插件)
+    Project,    // <workspace>/.agents/skills (项目隐藏)
+    Workspace   // <workspace>/skills (项目公共)
 };
 
 struct Skill {

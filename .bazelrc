@@ -1,0 +1,60 @@
+# ============================================================================
+# Bazel Configuration for HunterClaw
+# ============================================================================
+
+# C++ Standard
+build --cxxopt=-std=c++17
+build --host_cxxopt=-std=c++17
+
+# Compiler Flags
+build --cxxopt=-Wall
+build --cxxopt=-Wextra
+build --cxxopt=-Wpedantic
+
+# Position Independent Code (for shared libraries and plugins)
+build --force_pic
+
+# ============================================================================
+# Build Configurations
+# ============================================================================
+
+# Debug build
+build:debug --compilation_mode=dbg
+build:debug --cxxopt=-g
+build:debug --cxxopt=-O0
+build:debug --cxxopt=-DDEBUG
+
+# Release build (default)
+build:release --compilation_mode=opt
+build:release --cxxopt=-O3
+build:release --cxxopt=-DNDEBUG
+build:release --cxxopt=-march=native
+
+# Fast build (for development)
+build:fastbuild --compilation_mode=fastbuild
+
+# ============================================================================
+# Platform-specific settings
+# ============================================================================
+
+# Linux
+build:linux --cxxopt=-fPIC
+build:linux --linkopt=-lpthread
+build:linux --linkopt=-ldl
+
+# ============================================================================
+# Test Configuration
+# ============================================================================
+test --test_output=errors
+test --test_verbose_timeout_warnings
+
+# ============================================================================
+# Default Configuration
+# ============================================================================
+build --config=release
+
+# Enable color output
+common --color=yes
+
+# Show test output
+test --test_output=all

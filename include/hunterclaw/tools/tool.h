@@ -211,6 +211,17 @@ public:
     
     /// 启用结果规范化
     void enable_result_normalization(bool enable = true);
+    
+    // ========== 审批系统 (100% 对齐 OpenClaw) ==========
+    
+    /// 获取审批管理器
+    std::shared_ptr<class ApprovalManager> get_approval_manager();
+    
+    /// 设置审批管理器
+    void set_approval_manager(std::shared_ptr<class ApprovalManager> manager);
+    
+    /// 启用审批系统
+    void enable_approval_system(const std::string& config_path = "");
 
 private:
     ToolContext context_;
@@ -234,6 +245,9 @@ private:
     // 结果处理
     std::shared_ptr<ResultProcessingPipeline> result_pipeline_;
     bool result_normalization_enabled_ = false;
+    
+    // 审批系统
+    std::shared_ptr<class ApprovalManager> approval_manager_;
 };
 
 // 内置Tools工厂

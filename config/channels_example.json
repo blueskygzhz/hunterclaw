@@ -1,0 +1,109 @@
+{
+  "telegram": {
+    "enabled": true,
+    "default_account": "default",
+    
+    "accounts": {
+      "default": {
+        "token": "YOUR_BOT_TOKEN_HERE",
+        
+        "connection_mode": "polling",
+        
+        "polling": {
+          "timeout_seconds": 30,
+          "retry_delay_seconds": 5
+        },
+        
+        "webhook": {
+          "enabled": false,
+          "url": "https://your-domain.com/telegram/webhook",
+          "host": "0.0.0.0",
+          "port": 8443,
+          "certificate_path": "/path/to/cert.pem",
+          "secret_token": "your_secret_token"
+        },
+        
+        "permissions": {
+          "allow_groups": true,
+          "allow_private": true,
+          "allowlist": []
+        },
+        
+        "features": {
+          "parse_mode": "Markdown",
+          "enable_notification": true
+        }
+      }
+    }
+  },
+  
+  "discord": {
+    "enabled": true,
+    "default_account": "default",
+    
+    "accounts": {
+      "default": {
+        "token": "YOUR_BOT_TOKEN_HERE",
+        
+        "intents": [
+          "GUILDS",
+          "GUILD_MESSAGES",
+          "MESSAGE_CONTENT",
+          "DIRECT_MESSAGES"
+        ],
+        
+        "permissions": {
+          "allow_guilds": true,
+          "allow_dms": true,
+          "allowlist_guilds": [],
+          "allowlist_users": []
+        },
+        
+        "features": {
+          "enable_typing": true,
+          "enable_reactions": true
+        }
+      }
+    }
+  },
+  
+  "feishu": {
+    "enabled": true,
+    "default_account": "default",
+    
+    "accounts": {
+      "default": {
+        "app_id": "cli_a1b2c3d4e5f6g7h8",
+        "app_secret": "YOUR_APP_SECRET_HERE",
+        "verification_token": "YOUR_VERIFICATION_TOKEN",
+        "encrypt_key": "YOUR_ENCRYPT_KEY",
+        
+        "domain": "feishu",
+        
+        "connection_mode": "websocket",
+        
+        "webhook": {
+          "enabled": false,
+          "path": "/feishu/webhook",
+          "host": "0.0.0.0",
+          "port": 8089
+        },
+        
+        "permissions": {
+          "dm_policy": "allowlist",
+          "group_policy": "allowlist",
+          "allow_from": [
+            "ou_xxx",
+            "oc_xxx"
+          ]
+        },
+        
+        "features": {
+          "enable_message_dedup": true,
+          "dedup_window_seconds": 300,
+          "max_reconnect_attempts": 10
+        }
+      }
+    }
+  }
+}
