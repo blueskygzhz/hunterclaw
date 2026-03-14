@@ -10,6 +10,9 @@ namespace utils {
 // UUID generation
 std::string generate_uuid();
 
+// Random string generation
+std::string generate_random_string(size_t length);
+
 // Time utilities
 Timestamp now();
 std::string format_timestamp(const Timestamp& ts);

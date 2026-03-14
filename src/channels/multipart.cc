@@ -4,6 +4,7 @@
 #include <random>
 #include <algorithm>
 #include <cstring>
+#include <map>
 
 namespace hunterclaw {
 namespace channels {

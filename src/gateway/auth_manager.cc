@@ -12,6 +12,15 @@ using json = nlohmann::json;
 namespace hunterclaw {
 namespace gateway {
 
+// Helper function to get logger
+static inline std::shared_ptr<spdlog::logger> get_logger() {
+    static auto logger = spdlog::get("auth_manager");
+    if (!logger) {
+        logger = spdlog::stdout_logger_mt("auth_manager");
+    }
+    return logger;
+}
+
 // ============================================================================
 // AuthManager::Impl
 // ============================================================================
@@ -44,7 +53,7 @@ struct AuthManager::Impl {
         
         try {
             if (!std::filesystem::exists(devices_file)) {
-                spdlog::info("[AuthManager] No devices file found, starting fresh");
+                get_logger()->info("[AuthManager] No devices file found, starting fresh");
                 return core::Result<bool>::Ok(true);
             }
             
@@ -102,7 +111,7 @@ struct AuthManager::Impl {
                 devices[device.device_id] = device;
             }
             
-            spdlog::info("[AuthManager] Loaded {} devices", devices.size());
+            get_logger()->info("[AuthManager] Loaded {} devices", devices.size());
             return core::Result<bool>::Ok(true);
             
         } catch (const std::exception& e) {
@@ -143,7 +152,7 @@ struct AuthManager::Impl {
             file << j.dump(2);
             file.close();
             
-            spdlog::info("[AuthManager] Saved {} devices", devices.size());
+            get_logger()->info("[AuthManager] Saved {} devices", devices.size());
             return core::Result<bool>::Ok(true);
             
         } catch (const std::exception& e) {
@@ -174,12 +183,12 @@ AuthResult AuthManager::authenticate_connect(
     // 获取鉴权配置
     auto& auth_config = impl_->config->gateway.auth;
     
-    spdlog::debug("[AuthManager] Authenticating connection (mode: {})", 
+    get_logger()->debug("[AuthManager] Authenticating connection (mode: {})", 
         auth_config.mode);
     
     // 1. 无鉴权模式
     if (!auth_config.enabled || auth_config.mode == "none") {
-        spdlog::debug("[AuthManager] Auth disabled, granting default scopes");
+        get_logger()->debug("[AuthManager] Auth disabled, granting default scopes");
         result.ok = true;
         result.device_id = params.value("deviceId", "anonymous");
         result.scopes = {
@@ -195,13 +204,13 @@ AuthResult AuthManager::authenticate_connect(
         std::string token = params.value("token", "");
         
         if (!validate_bearer_token(token)) {
-            spdlog::warn("[AuthManager] Bearer token validation failed");
+            get_logger()->warn("[AuthManager] Bearer token validation failed");
             result.ok = false;
             result.reason = auth_errors::NOT_AUTHENTICATED;
             return result;
         }
         
-        spdlog::debug("[AuthManager] Bearer token validated");
+        get_logger()->debug("[AuthManager] Bearer token validated");
         result.ok = true;
         result.device_id = params.value("deviceId", "authenticated");
         result.scopes = {
@@ -221,14 +230,14 @@ AuthResult AuthManager::authenticate_connect(
         std::string device_token = params.value("deviceToken", "");
         
         if (device_id.empty() || device_token.empty()) {
-            spdlog::warn("[AuthManager] Missing deviceId or deviceToken");
+            get_logger()->warn("[AuthManager] Missing deviceId or deviceToken");
             result.ok = false;
             result.reason = auth_errors::NOT_AUTHENTICATED;
             return result;
         }
         
         if (!verify_device(device_id, device_token)) {
-            spdlog::warn("[AuthManager] Device verification failed: {}", device_id);
+            get_logger()->warn("[AuthManager] Device verification failed: {}", device_id);
             result.ok = false;
             result.reason = auth_errors::DEVICE_TOKEN_MISMATCH;
             return result;
@@ -242,7 +251,7 @@ AuthResult AuthManager::authenticate_connect(
             return result;
         }
         
-        spdlog::debug("[AuthManager] Device authenticated: {}", device_id);
+        get_logger()->debug("[AuthManager] Device authenticated: {}", device_id);
         result.ok = true;
         result.device_id = device_id;
         result.scopes = device_opt->scopes;
@@ -256,14 +265,14 @@ AuthResult AuthManager::authenticate_connect(
         std::string signature = params.value("signature", "");
         
         if (device_id.empty() || nonce_param.empty() || signature.empty()) {
-            spdlog::warn("[AuthManager] Missing challenge parameters");
+            get_logger()->warn("[AuthManager] Missing challenge parameters");
             result.ok = false;
             result.reason = auth_errors::NOT_AUTHENTICATED;
             return result;
         }
         
         if (!verify_device_signature(device_id, nonce_param, signature)) {
-            spdlog::warn("[AuthManager] Signature verification failed: {}", device_id);
+            get_logger()->warn("[AuthManager] Signature verification failed: {}", device_id);
             result.ok = false;
             result.reason = auth_errors::INVALID_SIGNATURE;
             return result;
@@ -277,7 +286,7 @@ AuthResult AuthManager::authenticate_connect(
             return result;
         }
         
-        spdlog::debug("[AuthManager] Challenge-response authenticated: {}", device_id);
+        get_logger()->debug("[AuthManager] Challenge-response authenticated: {}", device_id);
         result.ok = true;
         result.device_id = device_id;
         result.scopes = device_opt->scopes;
@@ -285,7 +294,7 @@ AuthResult AuthManager::authenticate_connect(
     }
     
     // 未知鉴权模式
-    spdlog::error("[AuthManager] Invalid auth mode: {}", auth_config.mode);
+    get_logger()->error("[AuthManager] Invalid auth mode: {}", auth_config.mode);
     result.ok = false;
     result.reason = auth_errors::INVALID_AUTH_MODE;
     return result;
@@ -304,7 +313,7 @@ bool AuthManager::validate_bearer_token(const std::string& token) const {
     
     std::string expected = impl_->config->gateway.auth.bearer_token;
     if (expected.empty()) {
-        spdlog::warn("[AuthManager] Bearer token not configured");
+        get_logger()->warn("[AuthManager] Bearer token not configured");
         return false;
     }
     
@@ -358,7 +367,7 @@ core::Result<DeviceInfo> AuthManager::register_device(
     // 保存到磁盘
     impl_->save_devices();
     
-    spdlog::info("[AuthManager] Registered device: {} ({})", 
+    get_logger()->info("[AuthManager] Registered device: {} ({})", 
         device.device_name, device.device_id);
     
     return core::Result<DeviceInfo>::Ok(device);
@@ -372,7 +381,7 @@ bool AuthManager::verify_device(
     
     auto it = impl_->devices.find(device_id);
     if (it == impl_->devices.end()) {
-        spdlog::debug("[AuthManager] Device not found: {}", device_id);
+        get_logger()->debug("[AuthManager] Device not found: {}", device_id);
         return false;
     }
     
@@ -380,19 +389,19 @@ bool AuthManager::verify_device(
     
     // 检查 Token
     if (device.device_token != device_token) {
-        spdlog::debug("[AuthManager] Device token mismatch: {}", device_id);
+        get_logger()->debug("[AuthManager] Device token mismatch: {}", device_id);
         return false;
     }
     
     // 检查是否撤销
     if (device.revoked) {
-        spdlog::debug("[AuthManager] Device revoked: {}", device_id);
+        get_logger()->debug("[AuthManager] Device revoked: {}", device_id);
         return false;
     }
     
     // 检查是否过期
     if (core::utils::now() > device.expires_at) {
-        spdlog::debug("[AuthManager] Device token expired: {}", device_id);
+        get_logger()->debug("[AuthManager] Device token expired: {}", device_id);
         return false;
     }
     
@@ -433,7 +442,7 @@ bool AuthManager::revoke_device(const std::string& device_id) {
     // 保存到磁盘
     impl_->save_devices();
     
-    spdlog::info("[AuthManager] Revoked device: {}", device_id);
+    get_logger()->info("[AuthManager] Revoked device: {}", device_id);
     return true;
 }
 
@@ -450,7 +459,7 @@ bool AuthManager::delete_device(const std::string& device_id) {
     // 保存到磁盘
     impl_->save_devices();
     
-    spdlog::info("[AuthManager] Deleted device: {}", device_id);
+    get_logger()->info("[AuthManager] Deleted device: {}", device_id);
     return true;
 }
 
@@ -481,7 +490,7 @@ bool AuthManager::update_device(
     // 保存到磁盘
     impl_->save_devices();
     
-    spdlog::debug("[AuthManager] Updated device: {}", device_id);
+    get_logger()->debug("[AuthManager] Updated device: {}", device_id);
     return true;
 }
 
@@ -497,7 +506,7 @@ DeviceChallenge AuthManager::create_challenge() {
     
     impl_->challenges[challenge.nonce] = challenge;
     
-    spdlog::debug("[AuthManager] Created challenge: {}", challenge.nonce);
+    get_logger()->debug("[AuthManager] Created challenge: {}", challenge.nonce);
     return challenge;
 }
 
@@ -511,13 +520,13 @@ bool AuthManager::verify_device_signature(
     // 1. 检查挑战是否存在
     auto it = impl_->challenges.find(nonce);
     if (it == impl_->challenges.end()) {
-        spdlog::debug("[AuthManager] Challenge not found: {}", nonce);
+        get_logger()->debug("[AuthManager] Challenge not found: {}", nonce);
         return false;
     }
     
     // 2. 检查挑战是否过期
     if (it->second.is_expired()) {
-        spdlog::debug("[AuthManager] Challenge expired: {}", nonce);
+        get_logger()->debug("[AuthManager] Challenge expired: {}", nonce);
         impl_->challenges.erase(it);
         return false;
     }
@@ -525,13 +534,13 @@ bool AuthManager::verify_device_signature(
     // 3. 获取设备公钥
     auto device_opt = get_device(device_id);
     if (!device_opt.has_value()) {
-        spdlog::debug("[AuthManager] Device not found: {}", device_id);
+        get_logger()->debug("[AuthManager] Device not found: {}", device_id);
         return false;
     }
     
     const auto& device = device_opt.value();
     if (device.public_key.empty()) {
-        spdlog::debug("[AuthManager] Device has no public key: {}", device_id);
+        get_logger()->debug("[AuthManager] Device has no public key: {}", device_id);
         return false;
     }
     
@@ -543,7 +552,7 @@ bool AuthManager::verify_device_signature(
     // 5. 清理挑战 (一次性使用)
     impl_->challenges.erase(it);
     
-    spdlog::debug("[AuthManager] Signature verification result: {}", valid);
+    get_logger()->debug("[AuthManager] Signature verification result: {}", valid);
     return valid;
 }
 

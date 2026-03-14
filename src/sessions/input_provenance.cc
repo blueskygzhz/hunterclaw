@@ -7,7 +7,10 @@ namespace sessions {
 
 namespace {
     auto log() {
-        static auto logger = spdlog::default_logger();
+        static auto logger = spdlog::get("input_provenance");
+        if (!logger) {
+            logger = spdlog::stdout_logger_mt("input_provenance");
+        }
         return logger;
     }
     

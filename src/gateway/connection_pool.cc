@@ -1,29 +1,10 @@
 #include "hunterclaw/gateway/connection_pool.h"
 #include <spdlog/spdlog.h>
 #include <algorithm>
+#include <shared_mutex>
 
 namespace hunterclaw {
 namespace gateway {
-
-// ============================================================================
-// BroadcastOptions Implementation
-// ============================================================================
-
-BroadcastOptions BroadcastOptions::to_session(const std::string& session_id) {
-    BroadcastOptions opts;
-    opts.target_sessions = {session_id};
-    return opts;
-}
-
-BroadcastOptions BroadcastOptions::to_channel(const std::string& channel_id) {
-    BroadcastOptions opts;
-    opts.target_channels = {channel_id};
-    return opts;
-}
-
-BroadcastOptions BroadcastOptions::to_all() {
-    return BroadcastOptions{};
-}
 
 // ============================================================================
 // ConnectionPool Implementation
@@ -223,61 +204,6 @@ void ConnectionPool::unsubscribe(uint64_t subscription_id) {
     }
 }
 
-void ConnectionPool::unsubscribe_all(void* owner) {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
-    
-    size_t removed = 0;
-    for (auto it = subscriptions_.begin(); it != subscriptions_.end();) {
-        if (it->second.owner == owner) {
-            it = subscriptions_.erase(it);
-            removed++;
-        } else {
-            ++it;
-        }
-    }
-    
-    if (removed > 0) {
-        spdlog::debug("[ConnectionPool] Unsubscribed {} subscriptions for owner {}",
-            removed, owner);
-    }
-}
-
-ConnectionPoolStats ConnectionPool::get_stats() const {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
-    
-    ConnectionPoolStats stats;
-    stats.total_connections = connections_.size();
-    stats.total_sessions = session_connections_.size();
-    stats.total_channels = channel_connections_.size();
-    stats.total_subscriptions = subscriptions_.size();
-    
-    // 计算消息统计
-    for (const auto& [_, conn] : connections_) {
-        stats.total_messages_sent += conn.messages_sent;
-    }
-    
-    return stats;
-}
-
-void ConnectionPool::notify_subscribers(const std::string& event, const json& payload) {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
-    
-    // 匹配订阅者
-    std::vector<Subscription> matched_subs;
-    
-    for (const auto& [_, sub] : subscriptions_) {
-        if (match_event_pattern(event, sub.event_pattern)) {
-            matched_subs.push_back(sub);
-        }
-    }
-    
-    lock.unlock();
-    
-    // 通知订阅者
-    for (const auto& sub : matched_subs) {
-        try {
-            sub.callback(payload);
-        } catch (const std::exception& e) {
             spdlog::error("[ConnectionPool] Subscriber callback error: {}", e.what());
         }
     }

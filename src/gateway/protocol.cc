@@ -21,7 +21,7 @@ nlohmann::json ErrorShape::to_json() const {
 
 core::Result<ErrorShape> ErrorShape::from_json(const nlohmann::json& j) {
     if (!j.contains("code") || !j.contains("message")) {
-        return core::Result<ErrorShape>::err("Missing required fields");
+        return core::Result<ErrorShape>::Err("Missing required fields");
     }
     
     ErrorShape err;
@@ -35,7 +35,7 @@ core::Result<ErrorShape> ErrorShape::from_json(const nlohmann::json& j) {
         err.retry_after_ms = j["retryAfterMs"].get<int64_t>();
     }
     
-    return core::Result<ErrorShape>::ok(std::move(err));
+    return core::Result<ErrorShape>::Ok(std::move(err));
 }
 
 // ============================================================================
@@ -55,7 +55,7 @@ nlohmann::json RequestFrame::to_json() const {
 
 core::Result<RequestFrame> RequestFrame::from_json(const nlohmann::json& j) {
     if (!j.contains("id") || !j.contains("method")) {
-        return core::Result<RequestFrame>::err("Missing required fields");
+        return core::Result<RequestFrame>::Err("Missing required fields");
     }
     
     RequestFrame req;
@@ -66,7 +66,7 @@ core::Result<RequestFrame> RequestFrame::from_json(const nlohmann::json& j) {
         req.params = j["params"];
     }
     
-    return core::Result<RequestFrame>::ok(std::move(req));
+    return core::Result<RequestFrame>::Ok(std::move(req));
 }
 
 // ============================================================================
@@ -94,7 +94,7 @@ nlohmann::json ResponseFrame::to_json() const {
 
 core::Result<ResponseFrame> ResponseFrame::from_json(const nlohmann::json& j) {
     if (!j.contains("id") || !j.contains("ok")) {
-        return core::Result<ResponseFrame>::err("Missing required fields");
+        return core::Result<ResponseFrame>::Err("Missing required fields");
     }
     
     ResponseFrame res;
@@ -112,7 +112,7 @@ core::Result<ResponseFrame> ResponseFrame::from_json(const nlohmann::json& j) {
         }
     }
     
-    return core::Result<ResponseFrame>::ok(std::move(res));
+    return core::Result<ResponseFrame>::Ok(std::move(res));
 }
 
 ResponseFrame ResponseFrame::success(const std::string& id, const nlohmann::json& payload) {
@@ -152,7 +152,7 @@ nlohmann::json EventFrame::to_json() const {
 
 core::Result<EventFrame> EventFrame::from_json(const nlohmann::json& j) {
     if (!j.contains("event")) {
-        return core::Result<EventFrame>::err("Missing event field");
+        return core::Result<EventFrame>::Err("Missing event field");
     }
     
     EventFrame evt;
@@ -165,7 +165,7 @@ core::Result<EventFrame> EventFrame::from_json(const nlohmann::json& j) {
         evt.payload = j["payload"];
     }
     
-    return core::Result<EventFrame>::ok(std::move(evt));
+    return core::Result<EventFrame>::Ok(std::move(evt));
 }
 
 // ============================================================================
@@ -189,16 +189,16 @@ bool FrameValidator::validate_event_frame(const nlohmann::json& j) {
 
 core::Result<FrameType> FrameValidator::detect_frame_type(const nlohmann::json& j) {
     if (!j.contains("type")) {
-        return core::Result<FrameType>::err("Missing type field");
+        return core::Result<FrameType>::Err("Missing type field");
     }
     
     std::string type = j["type"].get<std::string>();
     
-    if (type == "req") return core::Result<FrameType>::ok(FrameType::Request);
-    if (type == "res") return core::Result<FrameType>::ok(FrameType::Response);
-    if (type == "event") return core::Result<FrameType>::ok(FrameType::Event);
+    if (type == "req") return core::Result<FrameType>::Ok(FrameType::Request);
+    if (type == "res") return core::Result<FrameType>::Ok(FrameType::Response);
+    if (type == "event") return core::Result<FrameType>::Ok(FrameType::Event);
     
-    return core::Result<FrameType>::err("Unknown frame type: " + type);
+    return core::Result<FrameType>::Err("Unknown frame type: " + type);
 }
 
 // ============================================================================
@@ -249,7 +249,7 @@ nlohmann::json ConnectRequest::to_params() const {
 
 core::Result<HelloOk> HelloOk::from_payload(const nlohmann::json& j) {
     if (!j.contains("connId") || !j.contains("serverTime") || !j.contains("protocolVersion")) {
-        return core::Result<HelloOk>::err("Missing required fields in hello.ok");
+        return core::Result<HelloOk>::Err("Missing required fields in hello.ok");
     }
     
     HelloOk hello;
@@ -257,7 +257,7 @@ core::Result<HelloOk> HelloOk::from_payload(const nlohmann::json& j) {
     hello.server_time = j["serverTime"].get<int64_t>();
     hello.protocol_version = j["protocolVersion"].get<int>();
     
-    return core::Result<HelloOk>::ok(std::move(hello));
+    return core::Result<HelloOk>::Ok(std::move(hello));
 }
 
 // ============================================================================

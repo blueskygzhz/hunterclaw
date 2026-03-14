@@ -50,8 +50,8 @@ public:
                "5. Run now: {\"action\": \"run\", \"id\": \"job-123\"}";
     }
     
-    tools::Schema parameters() const override {
-        tools::Schema schema;
+    Tool::Schema parameters() const override {
+        Tool::Schema schema;
         schema.type = "object";
         schema.description = "Cron management parameters";
         

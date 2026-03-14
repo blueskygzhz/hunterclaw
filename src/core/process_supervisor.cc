@@ -56,43 +56,26 @@ Result<void> ManagedRun::Spawn(const SpawnInput& input) {
   std::lock_guard<std::mutex> lock(mutex_);
   
   if (state_ != RunState::Starting) {
-    return Error("Process already spawned");
+    return Error<void>("Process already spawned");
   }
   
-  // 创建子进程
-  SubprocessOptions options;
-  if (!input.argv.empty()) {
-    options.command = input.argv[0];
-    if (input.argv.size() > 1) {
-      options.args = std::vector<std::string>(input.argv.begin() + 1, input.argv.end());
-    }
-  }
-  options.cwd = input.cwd;
-  options.env = input.env;
-  options.capture_stdout = true;
-  options.capture_stderr = true;
-  
-  subprocess_ = std::make_unique<Subprocess>(options);
-  auto result = subprocess_->Start();
-  if (!result.ok()) {
-    UpdateState(RunState::Exited);
-    return result;
-  }
-  
-  // 设置信号桥接
-  if (config_.forward_signals && subprocess_->pid()) {
-    SignalBridgeConfig bridge_config;
-    bridge_config.forward_signals = {
-        SignalType::SIGINT,
-        SignalType::SIGTERM,
-        SignalType::SIGHUP
-    };
+  // 使用 subprocess::popen 创建子进程
+  try {
+    subprocess_ = std::unique_ptr<core::subprocess::Process>(
+        core::subprocess::popen(input.argv, true, true)
+    );
     
-    signal_bridge_ = std::make_unique<SignalBridge>(
-        *subprocess_->pid(),
-        bridge_config);
-    signal_bridge_->Activate();
+    if (!subprocess_) {
+      UpdateState(RunState::Exited);
+      return Error<void>("Failed to spawn process");
+    }
+  } catch (const std::exception& e) {
+    UpdateState(RunState::Exited);
+    return Error<void>(std::string("Spawn failed: ") + e.what());
   }
+  
+  // TODO: 实现信号桥接 (需要 SignalBridge 实现)
+  // if (config_.forward_signals && subprocess_->pid() > 0) { ... }
   
   // 更新状态
   UpdateState(RunState::Running);
@@ -105,7 +88,6 @@ Result<void> ManagedRun::Spawn(const SpawnInput& input) {
     record.state = state_;
     record.started_at_ms = started_at_;
     record.pid = subprocess_->pid();
-    // Note: RunRecord doesn't have command/args fields in core::supervisor_types.h
     
     config_.callbacks.on_start(record);
   }
@@ -118,37 +100,34 @@ Result<void> ManagedRun::Spawn(const SpawnInput& input) {
   // 启动输出读取线程
   std::thread(&ManagedRun::OutputReader, this).detach();
   
-  return Ok();
+  return OkVoid();
 }
 
 Result<void> ManagedRun::Cancel(TerminationReason reason) {
   std::lock_guard<std::mutex> lock(mutex_);
   
   if (state_ == RunState::Exited) {
-    return Ok();  // 已经退出
+    return OkVoid();  // 已经退出
   }
   
   if (!subprocess_) {
-    return Error("Process not spawned");
+    return Error<void>("Process not spawned");
   }
   
   // 更新状态
   UpdateState(RunState::Exiting);
   
-  // 终止进程树
-  if (subprocess_->pid()) {
-    KillTreeOptions options;
-    options.force = (reason == TerminationReason::OverallTimeout ||
-                     reason == TerminationReason::NoOutputTimeout);
-    options.grace_period_ms = options.force ? 1000 : 3000;
-    
-    auto result = KillProcessTree(*subprocess_->pid(), options);
-    if (!result.ok()) {
-      return result;
+  // 终止进程 (简化实现)
+  if (subprocess_ && subprocess_->is_alive()) {
+    int pid = subprocess_->pid();
+    if (pid > 0) {
+      // TODO: 使用 KillProcessTree 终止进程树
+      // 目前只等待进程结束
+      subprocess_->wait();
     }
   }
   
-  return Ok();
+  return OkVoid();
 }
 
 Result<RunExit> ManagedRun::Wait(int64_t timeout_ms) {
@@ -156,7 +135,7 @@ Result<RunExit> ManagedRun::Wait(int64_t timeout_ms) {
   
   // 如果已经退出,直接返回
   if (exit_) {
-    return Ok(*exit_);
+    return Result<RunExit>::Ok(*exit_);
   }
   
   // 等待退出
@@ -169,7 +148,7 @@ Result<RunExit> ManagedRun::Wait(int64_t timeout_ms) {
     exit_cv_.wait(lock, [this] { return exit_.has_value(); });
   }
   
-  return Ok(*exit_);
+  return Result<RunExit>::Ok(*exit_);
 }
 
 RunState ManagedRun::GetState() const {

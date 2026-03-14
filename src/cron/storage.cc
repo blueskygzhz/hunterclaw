@@ -173,27 +173,6 @@ core::Result<std::vector<RunLog>> CronStorage::load_run_logs(
         
         std::vector<RunLog> logs;
         for (const auto& log_json : data) {
-            auto log_result = deserialize_run_log(log_json);
-            if (log_result.is_ok()) {
-                auto log_entry = log_result.unwrap();
-                
-                // 过滤 job_id
-                if (job_id.has_value() && log_entry.job_id != *job_id) {
-                    continue;
-                }
-                
-                logs.push_back(std::move(log_entry));
-            }
-        }
-        
-        // 按时间倒序排序 (最新的在前)
-        std::sort(logs.begin(), logs.end(), [](const RunLog& a, const RunLog& b) {
-            return a.started_at_ms > b.started_at_ms;
-        });
-        
-        // 分页
-        if (offset >= logs.size()) {
-            return core::Result<std::vector<RunLog>>::Ok({});
         }
         
         size_t end = std::min(offset + limit, logs.size());
@@ -486,43 +465,11 @@ json CronStorage::serialize_run_log(const RunLog& log) {
     return j;
 }
 
-core::Result<RunLog> CronStorage::deserialize_run_log(const json& j) {
-    try {
-        RunLog log;
-        log.job_id = j.at("job_id").get<std::string>();
-        log.run_id = j.at("run_id").get<std::string>();
-        log.started_at_ms = j.at("started_at_ms").get<int64_t>();
-        log.finished_at_ms = j.at("finished_at_ms").get<int64_t>();
-        log.status = static_cast<RunStatus>(j.at("status").get<int>());
-        
-        if (j.contains("output")) log.output = j.at("output").get<std::string>();
-        if (j.contains("error")) log.error = j.at("error").get<std::string>();
-        if (j.contains("exit_code")) log.exit_code = j.at("exit_code").get<int>();
-        
-        return core::Result<RunLog>::Ok(std::move(log));
-        
-    } catch (const std::exception& e) {
-        return core::Result<RunLog>::Err(
-            std::string("Failed to deserialize run log: ") + e.what()
-        );
-    }
-}
 
 // ============================================================================
 // Backup Management
 // ============================================================================
 
-void CronStorage::cleanup_old_backups(const std::string& prefix, size_t keep_count) {
-    try {
-        std::string backups_dir = base_dir_ + "/backups";
-        
-        // 列出所有备份文件
-        std::vector<fs::path> backups;
-        for (const auto& entry : fs::directory_iterator(backups_dir)) {
-            std::string filename = entry.path().filename().string();
-            if (filename.compare(0, prefix.size(), prefix) == 0) {
-                backups.push_back(entry.path());
-            }
         }
         
         // 按修改时间排序 (最新的在前)

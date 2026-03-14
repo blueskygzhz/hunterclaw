@@ -32,6 +32,24 @@ std::string generate_uuid() {
     return ss.str();
 }
 
+// Generate random string of given length
+std::string generate_random_string(size_t length) {
+    static const char alphanum[] =
+        "0123456789"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "abcdefghijklmnopqrstuvwxyz";
+    static std::random_device rd;
+    static std::mt19937 gen(rd());
+    static std::uniform_int_distribution<> dis(0, sizeof(alphanum) - 2);
+    
+    std::string result;
+    result.reserve(length);
+    for (size_t i = 0; i < length; i++) {
+        result += alphanum[dis(gen)];
+    }
+    return result;
+}
+
 // Get current timestamp
 Timestamp now() {
     return std::chrono::system_clock::now();

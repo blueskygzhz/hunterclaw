@@ -8,6 +8,7 @@
 #include <set>
 #include <mutex>
 #include <map>
+#include <atomic>
 
 namespace hunterclaw {
 namespace gateway {

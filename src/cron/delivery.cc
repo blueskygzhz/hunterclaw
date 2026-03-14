@@ -1,5 +1,6 @@
 #include "hunterclaw/cron/delivery.h"
 #include "hunterclaw/channels/channel.h"
+#include "hunterclaw/channels/manager.h"
 #include <spdlog/spdlog.h>
 #include <curl/curl.h>
 #include <regex>
@@ -187,9 +188,9 @@ core::Result<bool> DeliveryService::deliver_webhook(
     try {
         auto response = send_webhook_post(url, webhook_payload);
         
-        if (!response.ok) {
-            log()->error("Webhook delivery failed: {}", response.error.value_or("Unknown error"));
-            return core::Result<bool>::Err(response.error.value_or("Webhook POST failed"));
+        if (!response.is_ok()) {
+            log()->error("Webhook delivery failed: {}", response.error);
+            return core::Result<bool>::Err(response.error);
         }
         
         log()->info("Webhook delivered successfully to {}", url);

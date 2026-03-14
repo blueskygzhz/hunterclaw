@@ -18,8 +18,8 @@ public:
 
 WebSocket::WebSocket(const std::string& url)
     : impl_(std::make_unique<Impl>(url)) {
-    spdlog::warn("[WebSocket] Creating WebSocket for URL: {}", url);
-    spdlog::warn("[WebSocket] NOTE: This is a stub implementation. Real WebSocket support requires a proper library like websocketpp or Boost.Beast");
+    spdlog::get("websocket")->warn("[WebSocket] Creating WebSocket for URL: {}", url);
+    spdlog::get("websocket")->warn("[WebSocket] NOTE: This is a stub implementation. Real WebSocket support requires a proper library like websocketpp or Boost.Beast");
 }
 
 WebSocket::~WebSocket() {
@@ -29,14 +29,14 @@ WebSocket::~WebSocket() {
 }
 
 Result<bool> WebSocket::connect() {
-    spdlog::warn("[WebSocket] Stub connect() called for URL: {}", impl_->url_);
-    spdlog::error("[WebSocket] WebSocket functionality is not implemented. This is a placeholder.");
+    spdlog::get("websocket")->warn("[WebSocket] Stub connect() called for URL: {}", impl_->url_);
+    spdlog::get("websocket")->error("[WebSocket] WebSocket functionality is not implemented. This is a placeholder.");
     return Result<bool>::Err("WebSocket connect() not implemented - stub only");
 }
 
 void WebSocket::close() {
     if (impl_->connected_) {
-        spdlog::info("[WebSocket] Stub close() called");
+        spdlog::get("websocket")->info("[WebSocket] Stub close() called");
         impl_->connected_ = false;
     }
 }
@@ -46,7 +46,7 @@ Result<bool> WebSocket::send(const std::string& message) {
         return Result<bool>::Err("WebSocket not connected");
     }
     
-    spdlog::warn("[WebSocket] Stub send() called with message length: {}", message.size());
+    spdlog::get("websocket")->warn("[WebSocket] Stub send() called with message length: {}", message.size());
     return Result<bool>::Err("WebSocket send() not implemented - stub only");
 }
 
@@ -55,7 +55,7 @@ Result<std::string> WebSocket::receive() {
         return Result<std::string>::Err("WebSocket not connected");
     }
     
-    spdlog::warn("[WebSocket] Stub receive() called");
+    spdlog::get("websocket")->warn("[WebSocket] Stub receive() called");
     return Result<std::string>::Err("WebSocket receive() not implemented - stub only");
 }
 

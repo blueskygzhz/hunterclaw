@@ -320,10 +320,13 @@ AgentConfig SubagentSpawner::build_subagent_config(
     const SubagentSpawnOptions& options,
     const SubagentDepthInfo& depth_info
 ) {
-    // Get requester agent config as base
-    auto requester_agent = agent_manager_->get_agent(requester_agent_id);
-    AgentConfig config = requester_agent ? 
-        requester_agent->get_config() : AgentConfig();
+    // TODO: Get requester agent config as base (requires AgentManager implementation)
+    // auto requester_agent = agent_manager_->get_agent(requester_agent_id);
+    // AgentConfig config = requester_agent ? 
+    //     requester_agent->get_config() : AgentConfig();
+    
+    // 使用默认配置
+    AgentConfig config;
     
     // Override with subagent-specific settings
     config.id = options.subagent_name + "_" + std::to_string(depth_info.depth);
