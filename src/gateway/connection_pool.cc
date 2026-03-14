@@ -189,13 +189,16 @@ uint64_t ConnectionPool::subscribe(
     
     subscriptions_[sub_id] = std::move(sub);
     
-    spdlog::debug("[ConnectionPool] Subscribed to '{}' (id: {})", event_pattern, sub_id);
+    auto logger = spdlog::get("connection_pool");
+    if (logger) {
+        logger->debug("[ConnectionPool] Subscribed to '{}' (id: {})", event_pattern, sub_id);
+    }
     
     return sub_id;
 }
 
 void ConnectionPool::unsubscribe(uint64_t subscription_id) {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(mutex_);
     
     auto it = subscriptions_.find(subscription_id);
     if (it != subscriptions_.end()) {

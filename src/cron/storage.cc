@@ -470,6 +470,8 @@ json CronStorage::serialize_run_log(const RunLog& log) {
 // Backup Management
 // ============================================================================
 
+// TODO: 实现备份管理功能
+/*
         }
         
         // 按修改时间排序 (最新的在前)
@@ -487,6 +489,7 @@ json CronStorage::serialize_run_log(const RunLog& log) {
         log()->error("Failed to cleanup backups: {}", e.what());
     }
 }
+*/
 
 } // namespace cron
 } // namespace hunterclaw

@@ -501,7 +501,7 @@ AcpMessage AcpProtocol::create_message(
     AcpMessage msg;
     
     // 生成消息 ID
-    msg.message_id = core::utils::generate_id("msg");
+    msg.message_id = core::utils::generate_uuid("msg");
     msg.from_agent_id = from_agent;
     msg.to_agent_id = to_agent;
     msg.content = content;
