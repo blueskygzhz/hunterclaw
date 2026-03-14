@@ -10,9 +10,20 @@
 #include <mutex>
 #include <condition_variable>
 #include <chrono>
+#include <thread>
+#include <atomic>
 
 namespace hunterclaw {
 namespace agents {
+
+// Forward declarations
+class Agent;
+class AgentManager;
+
+// Type aliases for forward-declared types
+namespace {
+    using AgentPtr = std::shared_ptr<Agent>;
+}
 
 // ============================================================================
 // Subagent Types & Configuration
@@ -260,7 +271,7 @@ private:
     
     // Helper: setup event handlers
     void setup_event_handlers(
-        Agent::Ptr subagent,
+        AgentPtr subagent,
         const std::string& subagent_run_id
     );
 };

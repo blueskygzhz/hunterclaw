@@ -13,7 +13,7 @@ namespace {
             if (!l) {
                 // Create a simple stdout logger if none exists
                 try {
-                    l = spdlog::stdout_color_mt("hunterclaw");
+                    l = spdlog::stdout_logger_mt("hunterclaw");
                 } catch (...) {
                     // If it already exists, get it
                     l = spdlog::get("hunterclaw");

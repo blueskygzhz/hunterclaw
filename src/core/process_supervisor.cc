@@ -13,6 +13,21 @@ int64_t GetCurrentTimeMs() {
       std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
+// Result helper functions
+template<typename T>
+core::Result<T> Ok(T value) {
+  return core::Result<T>::Ok(std::move(value));
+}
+
+template<typename T>
+core::Result<T> Error(const std::string& msg) {
+  return core::Result<T>::Err(msg);
+}
+
+core::Result<void> OkVoid() {
+  return core::Result<void>::Ok();
+}
+
 }  // namespace
 
 //==============================================================================
@@ -33,7 +48,7 @@ ManagedRun::ManagedRun(
 ManagedRun::~ManagedRun() {
   // 如果进程还在运行,尝试优雅关闭
   if (IsRunning() && subprocess_) {
-    Cancel(TerminationReason::ProcessSupervisorShutdown);
+    Cancel(TerminationReason::ManualCancel);
   }
 }
 
@@ -145,7 +160,7 @@ Result<RunExit> ManagedRun::Wait(int64_t timeout_ms) {
   if (timeout_ms > 0) {
     auto timeout = std::chrono::milliseconds(timeout_ms);
     if (!exit_cv_.wait_for(lock, timeout, [this] { return exit_.has_value(); })) {
-      return Error("Wait timeout");
+      return Error<RunExit>("Wait timeout");
     }
   } else {
     exit_cv_.wait(lock, [this] { return exit_.has_value(); });
@@ -161,7 +176,7 @@ RunState ManagedRun::GetState() const {
 
 std::optional<pid_t> ManagedRun::GetPid() const {
   std::lock_guard<std::mutex> lock(mutex_);
-  return subprocess_ ? subprocess_->GetPid() : std::nullopt;
+  return subprocess_ ? std::optional<pid_t>(subprocess_->pid()) : std::nullopt;
 }
 
 std::optional<RunRecord> ManagedRun::GetRecord() const {
@@ -171,16 +186,16 @@ std::optional<RunRecord> ManagedRun::GetRecord() const {
   record.run_id = run_id_;
   record.scope_key = scope_key_;
   record.state = state_;
-  record.started_at = started_at_;
-  record.pid = subprocess_ ? subprocess_->GetPid() : std::nullopt;
+  record.started_at_ms = started_at_;
+  record.pid = subprocess_ ? std::optional<int>(subprocess_->pid()) : std::nullopt;
   
-  if (subprocess_) {
-    record.command = subprocess_->GetOptions().command;
-    record.args = subprocess_->GetOptions().args;
-  }
+  // Note: subprocess::Process doesn't expose command/args, skip these fields
   
   if (exit_) {
-    record.exit_info = *exit_;
+    // Copy exit info to record fields
+    record.exit_code = exit_->exit_code;
+    record.signal = exit_->signal;
+    record.termination_reason = exit_->reason;
   }
   
   return record;
@@ -262,7 +277,7 @@ void ManagedRun::OutputReader() {
   }
   
   // 等待进程退出
-  auto result = subprocess_->Wait();
+  int exit_code = subprocess_->wait();
   
   // 更新最后输出时间
   {
@@ -272,17 +287,10 @@ void ManagedRun::OutputReader() {
   
   // 触发退出事件
   RunExit exit;
-  if (result.ok()) {
-    auto& res = *result;
-    exit.exit_code = res.exit_code;
-    exit.stdout_output = res.stdout_output;
-    exit.stderr_output = res.stderr_output;
-    exit.reason = TerminationReason::Exited;
-  } else {
-    exit.exit_code = -1;
-    exit.error_message = result.error();
-    exit.reason = TerminationReason::Error;
-  }
+  exit.exit_code = exit_code;
+  // Note: subprocess::Process.wait() doesn't capture stdout/stderr
+  // Those are accumulated in real-time via read_stdout()/read_stderr()
+  exit.reason = TerminationReason::Exit;
   
   TriggerExit(exit);
 }
@@ -307,25 +315,24 @@ ProcessSupervisor::~ProcessSupervisor() {
   }
   
   for (auto& run : active) {
-    run->Cancel(TerminationReason::ProcessSupervisorShutdown);
+    run->Cancel(TerminationReason::ManualCancel);
   }
 }
 
 Result<std::shared_ptr<ManagedRun>> ProcessSupervisor::Spawn(
     const SpawnInput& input,
     const SupervisorConfig& config) {
-  // 生成运行ID
-  std::string run_id = input.run_id.empty() 
-      ? "run_" + std::to_string(GetCurrentTimeMs())
-      : input.run_id;
+  // 生成运行ID (SpawnInput 没有 run_id 字段,总是生成新的)
+  std::string run_id = "run_" + std::to_string(GetCurrentTimeMs());
   
   // 创建 ManagedRun
-  auto run = std::make_shared<ManagedRun>(run_id, input.scope_key, config);
+  std::string scope = input.scope_key ? *input.scope_key : "";
+  auto run = std::make_shared<ManagedRun>(run_id, scope, config);
   
   // 启动进程
   auto result = run->Spawn(input);
-  if (!result.ok()) {
-    return Error(result.error());
+  if (!result.is_ok()) {
+    return Error<std::shared_ptr<ManagedRun>>(result.error);
   }
   
   // 添加到管理列表
@@ -354,7 +361,7 @@ Result<void> ProcessSupervisor::Cancel(
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = runs_.find(run_id);
     if (it == runs_.end()) {
-      return Error("Run not found: " + run_id);
+      return Error<void>("Run not found: " + run_id);
     }
     run = it->second;
   }

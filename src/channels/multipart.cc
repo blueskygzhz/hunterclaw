@@ -55,7 +55,7 @@ core::Result<bool> MultipartFormEncoder::add_file_from_path(
     // Read file
     std::ifstream file(file_path, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
-        return core::Result<bool>::error("Failed to open file: " + file_path);
+        return core::Result<bool>::Err("Failed to open file: " + file_path);
     }
     
     auto size = file.tellg();
@@ -63,7 +63,7 @@ core::Result<bool> MultipartFormEncoder::add_file_from_path(
     
     std::vector<uint8_t> buffer(size);
     if (!file.read(reinterpret_cast<char*>(buffer.data()), size)) {
-        return core::Result<bool>::error("Failed to read file: " + file_path);
+        return core::Result<bool>::Err("Failed to read file: " + file_path);
     }
     
     // Extract filename
@@ -78,7 +78,7 @@ core::Result<bool> MultipartFormEncoder::add_file_from_path(
         : content_type;
     
     add_file(name, buffer, filename, mime);
-    return core::Result<bool>::ok(true);
+    return core::Result<bool>::Ok(true);
 }
 
 std::vector<uint8_t> MultipartFormEncoder::encode() const {
