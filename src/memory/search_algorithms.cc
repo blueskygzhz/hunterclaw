@@ -1,3 +1,4 @@
+#include <optional>
 #include "hunterclaw/memory/search_algorithms.h"
 #include <algorithm>
 #include <cmath>

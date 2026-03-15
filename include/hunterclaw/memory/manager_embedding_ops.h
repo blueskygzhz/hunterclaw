@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include "hunterclaw/memory/manager_sync_ops.h"
 #include "hunterclaw/memory/types.h"
 #include "hunterclaw/memory/chunking.h"

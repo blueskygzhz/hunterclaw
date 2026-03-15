@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include "hunterclaw/memory/types.h"
 #include "hunterclaw/memory/chunking.h"
 #include "hunterclaw/core/types.h"

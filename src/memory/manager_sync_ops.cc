@@ -1,3 +1,4 @@
+#include <optional>
 #include "hunterclaw/memory/manager_sync_ops.h"
 #include "hunterclaw/memory/sqlite_storage.h"
 #include "hunterclaw/logging/subsystem_logger.h"

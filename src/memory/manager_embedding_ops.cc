@@ -1,3 +1,4 @@
+#include <optional>
 #include "hunterclaw/memory/manager_embedding_ops.h"
 #include "hunterclaw/memory/sqlite_storage.h"
 #include "hunterclaw/memory/embedding_provider.h"

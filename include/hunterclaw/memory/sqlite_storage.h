@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include "hunterclaw/memory/types.h"
 #include "hunterclaw/core/types.h"
 #include <sqlite3.h>

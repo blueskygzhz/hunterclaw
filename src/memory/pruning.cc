@@ -1,3 +1,4 @@
+#include <optional>
 #include "hunterclaw/memory/pruning.h"
 #include <algorithm>
 #include <sstream>

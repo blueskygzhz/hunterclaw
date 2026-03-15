@@ -1,3 +1,4 @@
+#include <optional>
 #include "hunterclaw/memory/qmd_manager.h"
 #include "hunterclaw/memory/json_parser.h"
 #include <stdexcept>

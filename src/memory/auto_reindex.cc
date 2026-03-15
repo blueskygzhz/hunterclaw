@@ -1,3 +1,4 @@
+#include <optional>
 #include "hunterclaw/memory/auto_reindex.h"
 #include "hunterclaw/memory/sqlite_storage.h"
 #include "hunterclaw/core/json.h"

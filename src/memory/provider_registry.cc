@@ -1,3 +1,4 @@
+#include <optional>
 #include "hunterclaw/memory/registry.h"
 #include "hunterclaw/memory/memory.h"  // 使用现有的 MemoryManager
 #include "hunterclaw/memory/sqlite_storage.h"

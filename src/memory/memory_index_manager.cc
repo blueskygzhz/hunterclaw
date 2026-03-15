@@ -1,3 +1,4 @@
+#include <optional>
 #include "hunterclaw/memory/memory_index_manager.h"
 #include "hunterclaw/memory/search_algorithms.h"
 #include <chrono>

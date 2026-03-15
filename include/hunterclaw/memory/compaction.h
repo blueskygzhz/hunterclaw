@@ -48,6 +48,8 @@ struct CompactionConfig {
 // 压缩统计
 struct CompactionStats {
     int total_compactions = 0;
+    int total_memory_flushes = 0;        // 总 memory flush 次数
+    int total_failures = 0;              // 总失败次数
     int messages_before = 0;
     int messages_after = 0;
     int tokens_before = 0;
@@ -55,6 +57,7 @@ struct CompactionStats {
     int tokens_saved = 0;
     float compression_ratio = 0.0f;
     std::chrono::system_clock::time_point last_compaction;
+    std::chrono::system_clock::time_point last_memory_flush;  // 最后 memory flush 时间
 };
 
 // Agent消息（简化版）
@@ -71,6 +74,19 @@ struct CompactionResult {
     std::vector<AgentMessage> compressed_messages;  // 压缩后的消息
     std::string summary;                            // 摘要内容
     CompactionStats stats;                          // 压缩统计
+    
+    // 便捷访问字段（与 stats 同步）
+    int messages_before = 0;
+    int messages_after = 0;
+    int tokens_before = 0;
+    int tokens_after = 0;
+    int tokens_saved = 0;
+    float compression_ratio = 0.0f;
+    int duration_ms = 0;
+    
+    // 状态字段
+    bool compacted = false;                 // 是否成功压缩
+    std::string reason;                     // 失败原因（如果有）
 };
 
 // Forward declaration

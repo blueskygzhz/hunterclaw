@@ -1,3 +1,4 @@
+#include <optional>
 #include "hunterclaw/memory/qmd_scope.h"
 #include <algorithm>
 #include <sstream>

@@ -1,3 +1,4 @@
+#include <optional>
 #include "hunterclaw/memory/json_parser.h"
 #include <sstream>
 #include <regex>

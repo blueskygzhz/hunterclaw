@@ -1,3 +1,4 @@
+#include <optional>
 #include "hunterclaw/memory/embedding_provider.h"
 #include "hunterclaw/memory/http_client.h"
 #include <nlohmann/json.hpp>

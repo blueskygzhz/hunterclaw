@@ -1,3 +1,4 @@
+#include <optional>
 #include "hunterclaw/memory/compaction.h"
 #include "hunterclaw/llm/llm_client.h"
 #include "hunterclaw/core/utils.h"

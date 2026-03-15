@@ -1,3 +1,4 @@
+#include <optional>
 #include "hunterclaw/memory/manager_search.h"
 #include "hunterclaw/memory/memory_index_manager.h"
 #include "hunterclaw/memory/sqlite_storage.h"

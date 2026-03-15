@@ -1,3 +1,4 @@
+#include <optional>
 #include "hunterclaw/memory/sqlite_storage.h"
 #include <sqlite3.h>
 #include <fstream>
