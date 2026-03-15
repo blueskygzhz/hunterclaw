@@ -4,6 +4,7 @@
 #include <vector>
 #include <optional>
 #include <map>
+#include <set>
 #include <functional>
 #include <cstdint>
 
@@ -293,6 +294,35 @@ struct ResolvedMemorySearchConfig {
         std::string base_url = "https://generativelanguage.googleapis.com/v1beta";
         int output_dimensionality = 768;
     } gemini;
+    
+    // Sync configuration (对齐 manager-sync-ops.ts)
+    struct SyncConfig {
+        bool watch = true;
+        int watch_debounce_ms = 5000;
+        std::optional<int> interval_minutes;
+        
+        struct SessionsConfig {
+            int delta_bytes = 0;
+            int delta_messages = 0;
+        };
+        std::optional<SessionsConfig> sessions;
+    } sync;
+    
+    // Store configuration
+    struct StoreConfig {
+        std::string path;
+        VectorConfig vector;
+    } store;
+    
+    // Multimodal configuration
+    struct MultimodalConfig {
+        bool enabled = false;
+        std::set<std::string> modalities;
+        int max_file_bytes = 10 * 1024 * 1024;  // 10MB
+    } multimodal;
+    
+    // Extra paths for memory indexing
+    std::vector<std::string> extra_paths;
 };
 
 // Type alias for convenience

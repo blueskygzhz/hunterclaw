@@ -145,38 +145,6 @@ struct MemoryStatus {
     int vector_dims = -1;
 };
 
-// Forward declarations
-class SQLiteVectorStorage;
-
-// Sync params for callback
-struct SyncParams {
-    std::string reason = "manual";
-    bool force = false;
-    bool needs_full_reindex = false;
-};
-
-// Embedding cache entry
-struct EmbeddingCacheEntry {
-    std::string content_hash;
-    std::string provider;
-    std::string model;
-    std::string provider_key;
-    std::vector<float> embedding;
-    int64_t updated_at;
-};
-
-// MemoryIndexMeta (简化版，对齐 manager-sync-ops.ts:54-63)
-struct MemoryIndexMeta {
-    std::string model;
-    std::string provider;
-    std::optional<std::string> provider_key;
-    std::optional<std::vector<MemorySource>> sources;
-    std::optional<std::string> scope_hash;
-    int chunk_tokens;
-    int chunk_overlap;
-    std::optional<int> vector_dims;
-};
-
 // Memory manager with auto-reindex
 class MemoryManagerWithAutoReindex {
 public:

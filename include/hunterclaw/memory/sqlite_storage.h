@@ -169,6 +169,14 @@ public:
         bool committed_ = false;
     };
     
+    // ========================================================================
+    // 辅助SQL方法 (public for manager_sync_ops)
+    // ========================================================================
+    
+    // 执行SQL语句的辅助方法
+    core::Result<bool> exec_sql(const std::string& sql);
+    core::Result<sqlite3_stmt*> prepare_statement(const std::string& sql);
+    
 private:
     explicit SQLiteVectorStorage(const Config& config);
     
@@ -253,10 +261,6 @@ private:
     
     // BM25 rank转score (对齐 bm25RankToScore in hybrid.ts)
     double bm25_rank_to_score(double rank);
-    
-    // 执行SQL语句的辅助方法
-    core::Result<bool> exec_sql(const std::string& sql);
-    core::Result<sqlite3_stmt*> prepare_statement(const std::string& sql);
 };
 
 } // namespace memory
