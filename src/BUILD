@@ -9,13 +9,7 @@ package(default_visibility = ["//visibility:public"])
 # ============================================================================
 cc_library(
     name = "hunterclaw_memory",
-    srcs = glob(
-        ["memory/*.cc"],
-        exclude = [
-            "memory/plugin_manager.cc",  # 需要更多适配工作
-            "memory/sqlite_plugin.cc",   # 需要更多适配工作
-        ],
-    ),
+    srcs = glob(["memory/*.cc"]),
     deps = [
         "//:hunterclaw_headers",
         "@nlohmann_json//:json",

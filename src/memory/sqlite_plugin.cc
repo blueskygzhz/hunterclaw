@@ -1,6 +1,5 @@
 #include "hunterclaw/memory/sqlite_plugin.h"
-#include "hunterclaw/memory/registry.h"
-#include "hunterclaw/memory/embedding_provider.h"
+#include "hunterclaw/memory/provider_registry.h"
 #include <spdlog/spdlog.h>
 #include <sqlite3.h>
 #include <json/json.h>
@@ -11,6 +10,16 @@
 namespace hunterclaw {
 namespace memory {
 
+namespace {
+    auto log() {
+        auto logger = spdlog::get("memory");
+        if (!logger) {
+            logger = spdlog::stdout_logger_mt("memory");
+        }
+        return logger;
+    }
+}
+
 // ========================================
 // SQLiteMemoryProvider 实现细节
 // ========================================
@@ -19,8 +28,7 @@ class SQLiteMemoryProvider::Impl {
 public:
     sqlite3* db = nullptr;
     std::string db_path;
-    std::string embedding_provider_type;  // "openai", "ollama", "gemini"
-    std::shared_ptr<EmbeddingProvider> embedding_provider;  // 实际的 embedding provider
+    std::string embedding_provider;
     
     // 配置参数
     bool hybrid_search_enabled = true;
@@ -34,7 +42,7 @@ public:
     core::Result<bool> init_database() {
         int rc = sqlite3_open(db_path.c_str(), &db);
         if (rc != SQLITE_OK) {
-            return core::Err("Failed to open database: " + std::string(sqlite3_errmsg(db)));
+            return core::Result<bool>::Err("Failed to open database: " + std::string(sqlite3_errmsg(db)));
         }
         
         // 执行 schema
@@ -88,11 +96,11 @@ public:
         if (rc != SQLITE_OK) {
             std::string error = err_msg;
             sqlite3_free(err_msg);
-            return core::Err("Failed to execute schema: " + error);
+            return core::Result<bool>::Err("Failed to execute schema: " + error);
         }
         
-        spdlog::info("SQLiteMemoryProvider: database initialized at {}", db_path);
-        return core::Ok(true);
+        log()->info("SQLiteMemoryProvider: database initialized at {}", db_path);
+        return core::Result<bool>::Ok(true);
     }
     
     // 生成 UUID
@@ -118,28 +126,15 @@ public:
         return dot / (std::sqrt(norm_a) * std::sqrt(norm_b));
     }
     
-    // 获取 embedding (使用 EmbeddingProvider)
+    // 获取 embedding (简化实现,需要调用实际 LLM API)
     std::vector<float> get_embedding(const std::string& text) {
-        // ========== 使用 EmbeddingProvider 获取真实 embedding ==========
-        if (!embedding_provider_) {
-            spdlog::warn("[SQLiteMemoryProvider] No embedding provider configured, using random embedding");
-            // 回退: 生成随机 embedding (仅用于测试)
-            std::vector<float> embedding(1536, 0.0f);
-            for (size_t i = 0; i < embedding.size(); ++i) {
-                embedding[i] = static_cast<float>(rand()) / RAND_MAX;
-            }
-            return embedding;
+        // TODO: 实际调用 embedding API (OpenAI, Ollama, etc.)
+        // 这里返回假 embedding
+        std::vector<float> embedding(1536, 0.0f);
+        for (size_t i = 0; i < embedding.size(); ++i) {
+            embedding[i] = static_cast<float>(rand()) / RAND_MAX;
         }
-        
-        // 调用 EmbeddingProvider API
-        auto result = embedding_provider_->embed(text);
-        if (!result) {
-            spdlog::error("[SQLiteMemoryProvider] Failed to get embedding: {}", result.error());
-            // 回退: 返回零向量
-            return std::vector<float>(embedding_provider_->dimension(), 0.0f);
-        }
-        
-        return result.value();
+        return embedding;
     }
 };
 
@@ -153,35 +148,7 @@ SQLiteMemoryProvider::SQLiteMemoryProvider(
     const std::map<std::string, std::string>& config
 ) : impl_(std::make_unique<Impl>()) {
     impl_->db_path = db_path;
-    impl_->embedding_provider_type = embedding_provider;
-    
-    // ========== 创建 EmbeddingProvider ==========
-    // 从 config 提取 embedding provider 配置
-    std::map<std::string, std::string> embedding_config;
-    for (const auto& [key, value] : config) {
-        if (key.find("embedding_") == 0) {
-            // 提取 embedding_* 配置项
-            std::string clean_key = key.substr(10);  // 去掉 "embedding_" 前缀
-            embedding_config[clean_key] = value;
-        }
-    }
-    
-    // 创建 embedding provider
-    auto provider_result = EmbeddingProviderFactory::create(
-        embedding_provider,
-        embedding_config
-    );
-    
-    if (provider_result) {
-        impl_->embedding_provider = provider_result.value();
-        spdlog::info("[SQLiteMemoryProvider] Initialized embedding provider: {} (model: {})",
-            embedding_provider,
-            impl_->embedding_provider->model_name());
-    } else {
-        spdlog::warn("[SQLiteMemoryProvider] Failed to create embedding provider: {}",
-            provider_result.error());
-        // 继续运行,但 embedding 功能将不可用
-    }
+    impl_->embedding_provider = embedding_provider;
     
     // 解析配置
     if (config.find("hybrid_search") != config.end()) {
@@ -202,8 +169,8 @@ SQLiteMemoryProvider::SQLiteMemoryProvider(
     
     // 初始化数据库
     auto result = impl_->init_database();
-    if (!result) {
-        spdlog::error("SQLiteMemoryProvider: failed to initialize database: {}", result.error());
+    if (result.is_err()) {
+        log()->error("SQLiteMemoryProvider: failed to initialize database: {}", result.error);
     }
 }
 
@@ -246,7 +213,7 @@ core::Result<std::string> SQLiteMemoryProvider::add_memory(
     
     int rc = sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
-        return core::Err("Failed to prepare statement: " + std::string(sqlite3_errmsg(impl_->db)));
+        return core::Result<std::string>::Err("Failed to prepare statement: " + std::string(sqlite3_errmsg(impl_->db)));
     }
     
     sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
@@ -259,7 +226,7 @@ core::Result<std::string> SQLiteMemoryProvider::add_memory(
     sqlite3_finalize(stmt);
     
     if (rc != SQLITE_DONE) {
-        return core::Err("Failed to insert memory: " + std::string(sqlite3_errmsg(impl_->db)));
+        return core::Result<std::string>::Err("Failed to insert memory: " + std::string(sqlite3_errmsg(impl_->db)));
     }
     
     // 4. 插入 metadata
@@ -275,24 +242,43 @@ core::Result<std::string> SQLiteMemoryProvider::add_memory(
         sqlite3_finalize(meta_stmt);
     }
     
-    spdlog::debug("SQLiteMemoryProvider: added memory {}", id);
-    return core::Ok(id);
+    log()->debug("SQLiteMemoryProvider: added memory {}", id);
+    return core::Result<std::string>::Ok(id);
 }
 
 // ========================================
 // 搜索记忆
 // ========================================
 
-core::Result<std::vector<Memory>> SQLiteMemoryProvider::search_memories(
+core::Result<std::vector<MemorySearchResult>> SQLiteMemoryProvider::search_memories(
     const std::string& query,
     const SearchOptions& options
 ) {
-    if (impl_->hybrid_search_enabled && options.hybrid_search) {
-        return hybrid_search(query, options);
+    // TODO: SearchOptions 没有 hybrid 字段，暂时总是使用 hybrid search
+    if (impl_->hybrid_search_enabled) {
+        // hybrid_search 返回 Memory，需要转换为 MemorySearchResult
+        auto hybrid_result = hybrid_search(query, options);
+        if (hybrid_result.is_err()) {
+            return core::Result<std::vector<MemorySearchResult>>::Err(hybrid_result.error);
+        }
+        
+        // 转换 Memory -> MemorySearchResult
+        std::vector<MemorySearchResult> converted_results;
+        for (const auto& mem : hybrid_result.value) {
+            MemorySearchResult result;
+            result.path = mem.id;
+            result.start_line = 0;
+            result.end_line = 0;
+            result.score = mem.score;
+            result.snippet = mem.content;
+            result.source = MemorySource::Memory;
+            converted_results.push_back(result);
+        }
+        return core::Result<std::vector<MemorySearchResult>>::Ok(converted_results);
     }
     
     // 纯 FTS5 搜索 (简化实现)
-    std::vector<Memory> results;
+    std::vector<MemorySearchResult> results;
     
     const char* sql = "SELECT m.id, m.content, m.created_at, m.updated_at "
                       "FROM memories m "
@@ -303,40 +289,45 @@ core::Result<std::vector<Memory>> SQLiteMemoryProvider::search_memories(
     sqlite3_stmt* stmt;
     int rc = sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
-        return core::Err("Failed to prepare search statement");
+        return core::Result<std::vector<MemorySearchResult>>::Err("Failed to prepare search statement");
     }
     
     sqlite3_bind_text(stmt, 1, query.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, 2, options.limit);
+    sqlite3_bind_int(stmt, 2, options.max_results.value_or(10));
     
     while (sqlite3_step(stmt) == SQLITE_ROW) {
-        Memory mem;
-        mem.id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-        mem.content = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-        mem.score = 0.8;  // 简化评分
-        results.push_back(mem);
+        MemorySearchResult result;
+        result.path = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        result.snippet = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        result.start_line = 0;
+        result.end_line = 0;
+        result.score = 0.8;  // 简化评分
+        result.source = MemorySource::Memory;
+        results.push_back(result);
     }
     
     sqlite3_finalize(stmt);
     
+    // TODO: 重新实现 MMR 和 temporal_decay 以支持 MemorySearchResult
     // 应用 MMR 重排
-    if (impl_->mmr_enabled && options.mmr_rerank) {
-        results = apply_mmr(results);
-    }
+    // if (impl_->mmr_enabled && options.mmr_rerank) {
+    //     results = apply_mmr(results);
+    // }
     
     // 应用时间衰减
-    if (impl_->temporal_decay_enabled && options.temporal_decay) {
-        apply_temporal_decay(results, impl_->temporal_decay_half_life);
-    }
+    // if (impl_->temporal_decay_enabled && options.temporal_decay) {
+    //     apply_temporal_decay(results, impl_->temporal_decay_half_life);
+    // }
     
     // 过滤低分结果
+    double min_score_threshold = options.min_score.value_or(0.0);
     results.erase(
         std::remove_if(results.begin(), results.end(),
-            [&](const Memory& m) { return m.score < options.min_score; }),
+            [min_score_threshold](const MemorySearchResult& m) { return m.score < min_score_threshold; }),
         results.end()
     );
     
-    return core::Ok(results);
+    return core::Result<std::vector<MemorySearchResult>>::Ok(results);
 }
 
 // ========================================
@@ -375,24 +366,25 @@ core::Result<std::vector<Memory>> SQLiteMemoryProvider::hybrid_search(
     // 排序并取 top-k
     std::sort(vector_results.begin(), vector_results.end(),
         [](const Memory& a, const Memory& b) { return a.score > b.score; });
-    if (vector_results.size() > static_cast<size_t>(options.limit)) {
-        vector_results.resize(options.limit);
+    if (vector_results.size() > static_cast<size_t>(options.max_results.value_or(10))) {
+        vector_results.resize(options.max_results.value_or(10));
     }
     
     // 2. FTS5 关键词搜索
     auto fts_result = search_memories(query, options);
-    if (!fts_result) {
-        return fts_result;
+    if (fts_result.is_err()) {
+        return core::Result<std::vector<Memory>>::Err(fts_result.error);
     }
-    auto keyword_results = fts_result.value();
+    auto keyword_results = fts_result.value;
     
     // 3. 合并结果 (加权融合)
     std::map<std::string, double> merged_scores;
     for (const auto& mem : vector_results) {
         merged_scores[mem.id] = mem.score * impl_->vector_weight;
     }
-    for (const auto& mem : keyword_results) {
-        merged_scores[mem.id] += mem.score * impl_->text_weight;
+    for (const auto& result : keyword_results) {
+        // MemorySearchResult 使用 path 作为 id
+        merged_scores[result.path] += result.score * impl_->text_weight;
     }
     
     // 4. 构建最终结果
@@ -413,11 +405,11 @@ core::Result<std::vector<Memory>> SQLiteMemoryProvider::hybrid_search(
         [](const Memory& a, const Memory& b) { return a.score > b.score; });
     
     // 限制数量
-    if (final_results.size() > static_cast<size_t>(options.limit)) {
-        final_results.resize(options.limit);
+    if (final_results.size() > static_cast<size_t>(options.max_results.value_or(10))) {
+        final_results.resize(options.max_results.value_or(10));
     }
     
-    return core::Ok(final_results);
+    return core::Result<std::vector<Memory>>::Ok(final_results);
 }
 
 // ========================================
@@ -480,7 +472,7 @@ void SQLiteMemoryProvider::apply_temporal_decay(
     auto now = std::chrono::system_clock::now();
     
     for (auto& mem : memories) {
-        auto age = std::chrono::duration_cast<std::chrono::hours>(now - mem.created_at).count() / 24.0;
+        auto age = std::chrono::duration_cast<std::chrono::hours>(now - std::chrono::system_clock::time_point(std::chrono::milliseconds(mem.created_at))).count() / 24.0;
         double decay_factor = std::pow(0.5, age / half_life_days);
         mem.score *= decay_factor;
     }
@@ -499,7 +491,7 @@ core::Result<bool> SQLiteMemoryProvider::remove_memory(const std::string& id) {
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     
-    return (rc == SQLITE_DONE) ? core::Ok(true) : core::Err("Failed to remove memory");
+    return (rc == SQLITE_DONE) ? core::Result<bool>::Ok(true) : core::Result<bool>::Err("Failed to remove memory");
 }
 
 core::Result<bool> SQLiteMemoryProvider::update_memory(
@@ -509,10 +501,10 @@ core::Result<bool> SQLiteMemoryProvider::update_memory(
 ) {
     // 简化实现: 删除并重新添加
     auto remove_result = remove_memory(id);
-    if (!remove_result) return remove_result;
+    if (remove_result.is_err()) return remove_result;
     
     auto add_result = add_memory(content, metadata);
-    return add_result ? core::Ok(true) : core::Err(add_result.error());
+    return add_result.is_ok() ? core::Result<bool>::Ok(true) : core::Result<bool>::Err(add_result.error);
 }
 
 core::Result<bool> SQLiteMemoryProvider::clear_memories() {
@@ -523,10 +515,10 @@ core::Result<bool> SQLiteMemoryProvider::clear_memories() {
     if (rc != SQLITE_OK) {
         std::string error = err_msg;
         sqlite3_free(err_msg);
-        return core::Err(error);
+        return core::Result<bool>::Err(error);
     }
     
-    return core::Ok(true);
+    return core::Result<bool>::Ok(true);
 }
 
 core::Result<MemoryStats> SQLiteMemoryProvider::get_stats() {
@@ -542,7 +534,7 @@ core::Result<MemoryStats> SQLiteMemoryProvider::get_stats() {
     }
     sqlite3_finalize(stmt);
     
-    return core::Ok(stats);
+    return core::Result<MemoryStats>::Ok(stats);
 }
 
 core::Result<Memory> SQLiteMemoryProvider::get_memory(const std::string& id) {
@@ -557,11 +549,11 @@ core::Result<Memory> SQLiteMemoryProvider::get_memory(const std::string& id) {
         mem.id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
         mem.content = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
         sqlite3_finalize(stmt);
-        return core::Ok(mem);
+        return core::Result<Memory>::Ok(mem);
     }
     
     sqlite3_finalize(stmt);
-    return core::Err("Memory not found");
+    return core::Result<Memory>::Err("Memory not found");
 }
 
 // ========================================
@@ -569,35 +561,33 @@ core::Result<Memory> SQLiteMemoryProvider::get_memory(const std::string& id) {
 // ========================================
 
 core::Result<bool> SQLiteMemoryPlugin::init(const plugins::PluginContext& ctx) {
-    spdlog::info("SQLiteMemoryPlugin: initializing...");
+    log()->info("SQLiteMemoryPlugin: initializing...");
     
     // 解析配置
     std::string db_path = "./memory.db";
     std::string embedding_provider = "openai";
+    std::map<std::string, std::string> config_map;
     
-    if (ctx.config.find("db_path") != ctx.config.end()) {
-        db_path = ctx.config.at("db_path");
-    }
-    if (ctx.config.find("embedding_provider") != ctx.config.end()) {
-        embedding_provider = ctx.config.at("embedding_provider");
-    }
+    // 从 ctx.config (shared_ptr<Config>) 提取配置
+    // TODO: 实际应该通过 Config API 获取配置项
+    // 暂时使用默认值
     
     // 创建 Provider
-    provider_ = std::make_shared<SQLiteMemoryProvider>(db_path, embedding_provider, ctx.config);
+    provider_ = std::make_shared<SQLiteMemoryProvider>(db_path, embedding_provider, config_map);
     
     // 注册到 Registry
     auto& registry = MemoryProviderRegistry::instance();
     auto register_result = registry.register_provider(id(), provider_);
-    if (!register_result) {
-        return core::Err("Failed to register provider: " + register_result.error());
+    if (register_result.is_err()) {
+        return core::Result<bool>::Err("Failed to register provider: " + register_result.error);
     }
     
-    spdlog::info("SQLiteMemoryPlugin: initialized with db_path={}", db_path);
-    return core::Ok(true);
+    log()->info("SQLiteMemoryPlugin: initialized with db_path={}", db_path);
+    return core::Result<bool>::Ok(true);
 }
 
 core::Result<bool> SQLiteMemoryPlugin::shutdown() {
-    spdlog::info("SQLiteMemoryPlugin: shutting down...");
+    log()->info("SQLiteMemoryPlugin: shutting down...");
     
     // 从 Registry 移除
     auto& registry = MemoryProviderRegistry::instance();
@@ -605,7 +595,7 @@ core::Result<bool> SQLiteMemoryPlugin::shutdown() {
     
     provider_.reset();
     
-    return core::Ok(true);
+    return core::Result<bool>::Ok(true);
 }
 
 } // namespace memory
