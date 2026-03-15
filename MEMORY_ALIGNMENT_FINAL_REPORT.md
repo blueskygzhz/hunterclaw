@@ -1,9 +1,9 @@
 # HunterClaw Memory 严格对齐 OpenClaw - 最终实施报告
 
-**日期**: 2026-03-14  
+**日期**: 2026-03-15 (Phase 7更新)  
 **项目**: HunterClaw Memory Module  
 **对齐目标**: OpenClaw Memory (100%)  
-**状态**: ✅ **核心实现完成**
+**状态**: ✅ **核心实现完成 + QMD子系统完成 (99%)**
 
 ---
 
@@ -24,10 +24,10 @@ HunterClaw Memory 模块严格对齐 OpenClaw TypeScript 实现,提供完整的:
 ### 总体数据
 | 维度 | 数量 | 说明 |
 |------|------|------|
-| **头文件** | 23个 | 5005行 |
-| **源文件** | 20个 | 7629行 |
-| **总代码** | **43个文件** | **12634行** |
-| **文档** | 14份 | ~140KB |
+| **头文件** | 27个 | 5610行 |
+| **源文件** | 24个 | 9124行 |
+| **总代码** | **51个文件** | **14734行** |
+| **文档** | 16份 | ~170KB |
 
 ### 分阶段实现
 
@@ -66,6 +66,18 @@ HunterClaw Memory 模块严格对齐 OpenClaw TypeScript 实现,提供完整的:
 19. ✅ **manager_sync_ops.cc** (673行) - 核心同步逻辑实现
 20. ✅ **file_watcher.h** (120行) - 跨平台文件监听接口
 21. ✅ **file_watcher_linux.cc** (223行) - Linux inotify实现
+
+#### Phase 6 - Manager Embedding Operations (已完成,+1112行)
+22. ✅ **manager_embedding_ops.h** (317行) - 批量embedding接口定义
+23. ✅ **manager_embedding_ops.cc** (795行) - 批量embedding完整实现
+
+#### Phase 7 - QMD Core Modules (已完成,+988行)
+24. ✅ **qmd_query_parser.h** (82行) - QMD查询结果解析接口
+25. ✅ **qmd_query_parser.cc** (228行) - JSON解析/错误处理
+26. ✅ **qmd_process.h** (92行) - CLI进程管理接口
+27. ✅ **qmd_process.cc** (258行) - 进程执行/超时控制
+28. ✅ **qmd_scope.h** (114行) - 作用域规则接口
+29. ✅ **qmd_scope.cc** (214行) - 规则引擎实现
 
 ---
 

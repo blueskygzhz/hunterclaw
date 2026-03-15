@@ -92,6 +92,14 @@ cc_library(
         "memory/session_files.cc",  # Session文件处理
         "memory/manager_sync_ops.cc",  # Manager同步操作
         "memory/file_watcher_linux.cc",  # 文件监听(Linux)
+        "memory/manager_embedding_ops.cc",  # Manager Embedding批处理
+        "memory/qmd_query_parser.cc",  # QMD查询解析
+        "memory/qmd_process.cc",  # QMD进程管理
+        "memory/qmd_scope.cc",  # QMD作用域规则
+        "memory/backend_config.cc",  # Backend配置解析
+        "memory/query_expansion.cc",  # 查询扩展
+        "memory/temporal_decay.cc",  # 时间衰减
+        "memory/multimodal.cc",  # 多模态支持
     ],
     deps = [
         "//:hunterclaw_headers",

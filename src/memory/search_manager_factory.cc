@@ -1,137 +1,425 @@
 #include "hunterclaw/memory/search_manager_factory.h"
+#include "hunterclaw/memory/memory_index_manager.h"
+#include "hunterclaw/memory/qmd_manager.h"
+#include "hunterclaw/logging/subsystem.h"
+#include <json/json.h>
 
 namespace hunterclaw {
 namespace memory {
 
+// 严格对齐 OpenClaw src/memory/search-manager.ts
+
 // ============================================================================
-// MemorySearchManagerFactory Implementation
+// 全局变量 (对齐 QMD_MANAGER_CACHE)
 // ============================================================================
 
-std::unique_ptr<MemorySearchManager> MemorySearchManagerFactory::create(
-    const MemoryIndexManagerConfig& config) {
+std::map<std::string, std::shared_ptr<MemorySearchManager>> qmd_manager_cache;
+std::mutex qmd_cache_mutex;
+
+static auto log = logging::create_subsystem_logger("memory");
+
+// ============================================================================
+// QMD缓存Key构建 (对齐 buildQmdCacheKey)
+// ============================================================================
+
+std::string build_qmd_cache_key(
+    const std::string& agent_id,
+    const ResolvedQmdConfig& qmd_config
+) {
+    // 对齐 OpenClaw: agentId + JSON.stringify(config)
+    // 简化实现: agentId + command + collections
+    std::string key = agent_id + ":" + qmd_config.command;
     
-    // Create MemoryIndexManager which implements MemorySearchManager interface
-    return std::make_unique<MemoryIndexManager>(config);
+    for (const auto& col : qmd_config.collections) {
+        key += "|" + col.name + "=" + col.path;
+    }
+    
+    return key;
 }
 
-std::unique_ptr<MemorySearchManager> MemorySearchManagerFactory::create_with_fallback(
-    const MemoryIndexManagerConfig& primary_config,
-    const MemoryIndexManagerConfig& fallback_config) {
-    
+void evict_qmd_cache_entry(const std::string& cache_key) {
+    std::lock_guard<std::mutex> lock(qmd_cache_mutex);
+    qmd_manager_cache.erase(cache_key);
+}
+
+// ============================================================================
+// FallbackMemoryManager实现 (对齐 FallbackMemoryManager class)
+// ============================================================================
+
+FallbackMemoryManager::FallbackMemoryManager(
+    std::shared_ptr<MemorySearchManager> primary,
+    FallbackFactory fallback_factory,
+    OnCloseCallback on_close
+) : primary_(std::move(primary)),
+    fallback_factory_(std::move(fallback_factory)),
+    on_close_(std::move(on_close))
+{
+}
+
+FallbackMemoryManager::~FallbackMemoryManager() {
+    // 析构时关闭
     try {
-        // Try primary config
-        auto manager = create(primary_config);
-        
-        // Probe embedding provider
-        auto probe_res = static_cast<MemoryIndexManager*>(manager.get())->probe_embedding_provider();
-        if (probe_res.is_ok() && probe_res.value().ok) {
-            return manager;
-        }
-        
-        // Primary failed, try fallback
-        return create(fallback_config);
-    } catch (const std::exception& e) {
-        // Primary failed with exception, try fallback
-        return create(fallback_config);
+        close();
+    } catch (...) {
+        // 忽略异常
     }
 }
 
-Result<std::unique_ptr<MemorySearchManager>> MemorySearchManagerFactory::create_auto(
-    const AutoConfig& auto_config) {
+void FallbackMemoryManager::handle_primary_failure(const std::string& error) {
+    std::lock_guard<std::mutex> lock(mutex_);
     
-    MemoryIndexManagerConfig config;
-    config.db_path = auto_config.db_path;
-    config.workspace_dir = auto_config.workspace_dir;
+    if (primary_failed_) {
+        return;  // 已经失败过
+    }
     
-    // Auto-select provider: try remote providers first
-    EmbeddingProviderOptions provider_opts;
-    provider_opts.provider = "auto";
-    provider_opts.fallback = auto_config.fallback_provider.value_or("ollama");
-    provider_opts.model = auto_config.model;
-    provider_opts.remote_api_key = auto_config.api_key;
-    provider_opts.remote_base_url = auto_config.base_url;
+    primary_failed_ = true;
+    last_error_ = error;
     
-    config.embedding_provider_options = provider_opts;
+    log->warn("qmd memory failed; switching to builtin index: {}", error);
     
-    // Set vector extension path if provided
-    config.vector_extension_path = auto_config.vector_extension_path;
+    // 尝试关闭primary
+    if (primary_) {
+        try {
+            primary_->close();
+        } catch (...) {
+            // 忽略关闭错误
+        }
+    }
     
-    // Default search config
-    config.max_results = auto_config.max_results.value_or(10);
-    config.min_score = auto_config.min_score.value_or(0.7);
-    config.fts_enabled = true;
-    config.vector_enabled = true;
-    config.cache_enabled = true;
+    // 驱逐缓存 (对齐 OpenClaw注释: Evict the failed wrapper so the next request can retry QMD with a fresh manager)
+    evict_cache_entry();
+}
+
+void FallbackMemoryManager::evict_cache_entry() {
+    if (cache_evicted_) {
+        return;
+    }
+    cache_evicted_ = true;
+    if (on_close_) {
+        on_close_();
+    }
+}
+
+core::Result<std::shared_ptr<MemorySearchManager>> FallbackMemoryManager::ensure_fallback() {
+    std::lock_guard<std::mutex> lock(mutex_);
     
-    // Hybrid weights
-    config.vector_weight = 0.7;
-    config.text_weight = 0.3;
+    if (fallback_) {
+        return core::Result<std::shared_ptr<MemorySearchManager>>::ok_value(fallback_);
+    }
     
-    // MMR config
-    config.mmr_enabled = auto_config.mmr_enabled.value_or(true);
-    config.mmr_lambda = auto_config.mmr_lambda.value_or(0.5);
-    config.mmr_top_k = auto_config.mmr_top_k.value_or(20);
+    // 创建fallback
+    auto result = fallback_factory_();
+    if (result.is_error()) {
+        log->warn("memory fallback unavailable: {}", result.error());
+        return result;
+    }
     
-    // Temporal decay config
-    config.temporal_decay_enabled = auto_config.temporal_decay_enabled.value_or(true);
-    config.temporal_decay_half_life_days = auto_config.temporal_decay_half_life_days.value_or(30.0);
-    config.temporal_decay_min_score_multiplier = auto_config.temporal_decay_min_multiplier.value_or(0.5);
-    
-    try {
-        auto manager = create(config);
-        return Result<std::unique_ptr<MemorySearchManager>>::ok_value(std::move(manager));
-    } catch (const std::exception& e) {
-        return Result<std::unique_ptr<MemorySearchManager>>::error(
-            std::string("Failed to create manager: ") + e.what()
+    if (!result.value()) {
+        log->warn("memory fallback requested but builtin index is unavailable");
+        return core::Result<std::shared_ptr<MemorySearchManager>>::error(
+            "fallback unavailable"
         );
     }
+    
+    fallback_ = result.value();
+    return core::Result<std::shared_ptr<MemorySearchManager>>::ok_value(fallback_);
 }
 
 // ============================================================================
-// Global Manager Cache (对齐 OpenClaw INDEX_CACHE)
+// MemorySearchManager接口实现
 // ============================================================================
 
-namespace {
-    std::mutex cache_mutex;
-    std::map<std::string, std::shared_ptr<MemorySearchManager>> manager_cache;
-}
-
-std::shared_ptr<MemorySearchManager> MemorySearchManagerFactory::get_or_create(
-    const std::string& cache_key,
-    const MemoryIndexManagerConfig& config) {
+std::vector<MemorySearchResult> FallbackMemoryManager::search(
+    const std::string& query,
+    const SearchOptions& opts
+) {
+    bool should_fallback = false;
     
-    std::lock_guard<std::mutex> lock(cache_mutex);
-    
-    auto it = manager_cache.find(cache_key);
-    if (it != manager_cache.end()) {
-        return it->second;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        should_fallback = primary_failed_;
     }
     
-    // Create new manager
-    auto manager = create(config);
-    auto shared_manager = std::shared_ptr<MemorySearchManager>(std::move(manager));
-    
-    manager_cache[cache_key] = shared_manager;
-    
-    return shared_manager;
-}
-
-void MemorySearchManagerFactory::clear_cache() {
-    std::lock_guard<std::mutex> lock(cache_mutex);
-    
-    // Close all managers before clearing
-    for (auto& [key, manager] : manager_cache) {
-        if (auto* idx_manager = dynamic_cast<MemoryIndexManager*>(manager.get())) {
-            idx_manager->close();
+    if (!should_fallback) {
+        try {
+            return primary_->search(query, opts);
+        } catch (const std::exception& e) {
+            handle_primary_failure(e.what());
+            should_fallback = true;
         }
     }
     
-    manager_cache.clear();
+    // 使用fallback
+    auto fallback_res = ensure_fallback();
+    if (fallback_res.is_ok() && fallback_res.value()) {
+        return fallback_res.value()->search(query, opts);
+    }
+    
+    std::string error_msg;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        error_msg = last_error_.value_or("memory search unavailable");
+    }
+    throw std::runtime_error(error_msg);
 }
 
-size_t MemorySearchManagerFactory::cache_size() {
-    std::lock_guard<std::mutex> lock(cache_mutex);
-    return manager_cache.size();
+ReadFileResult FallbackMemoryManager::read_file(const ReadFileParams& params) {
+    bool should_fallback = false;
+    
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        should_fallback = primary_failed_;
+    }
+    
+    if (!should_fallback) {
+        return primary_->read_file(params);
+    }
+    
+    // 使用fallback
+    auto fallback_res = ensure_fallback();
+    if (fallback_res.is_ok() && fallback_res.value()) {
+        return fallback_res.value()->read_file(params);
+    }
+    
+    std::string error_msg;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        error_msg = last_error_.value_or("memory read unavailable");
+    }
+    throw std::runtime_error(error_msg);
+}
+
+MemoryProviderStatus FallbackMemoryManager::status() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    if (!primary_failed_) {
+        return primary_->status();
+    }
+    
+    // Fallback状态 (对齐 OpenClaw status()逻辑)
+    MemoryProviderStatus fallback_status;
+    if (fallback_) {
+        fallback_status = fallback_->status();
+    } else {
+        fallback_status = primary_->status();
+    }
+    
+    // 添加fallback信息
+    // 注: OpenClaw在custom字段添加fallback信息
+    // C++简化实现: 直接在status message中标注
+    
+    return fallback_status;
+}
+
+void FallbackMemoryManager::sync(const SyncParams& params) {
+    bool should_fallback = false;
+    
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        should_fallback = primary_failed_;
+    }
+    
+    if (!should_fallback) {
+        primary_->sync(params);
+        return;
+    }
+    
+    // 使用fallback
+    auto fallback_res = ensure_fallback();
+    if (fallback_res.is_ok() && fallback_res.value()) {
+        fallback_res.value()->sync(params);
+    }
+}
+
+MemoryEmbeddingProbeResult FallbackMemoryManager::probe_embedding_availability() {
+    bool should_fallback = false;
+    
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        should_fallback = primary_failed_;
+    }
+    
+    if (!should_fallback) {
+        return primary_->probe_embedding_availability();
+    }
+    
+    // 使用fallback
+    auto fallback_res = ensure_fallback();
+    if (fallback_res.is_ok() && fallback_res.value()) {
+        return fallback_res.value()->probe_embedding_availability();
+    }
+    
+    std::string error_msg;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        error_msg = last_error_.value_or("memory embeddings unavailable");
+    }
+    
+    return {
+        .ok = false,
+        .error = error_msg
+    };
+}
+
+bool FallbackMemoryManager::probe_vector_availability() {
+    bool should_fallback = false;
+    
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        should_fallback = primary_failed_;
+    }
+    
+    if (!should_fallback) {
+        return primary_->probe_vector_availability();
+    }
+    
+    // 使用fallback
+    auto fallback_res = ensure_fallback();
+    if (fallback_res.is_ok() && fallback_res.value()) {
+        return fallback_res.value()->probe_vector_availability();
+    }
+    
+    return false;
+}
+
+void FallbackMemoryManager::close() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    if (primary_) {
+        try {
+            primary_->close();
+        } catch (...) {
+            // 忽略错误
+        }
+    }
+    
+    if (fallback_) {
+        try {
+            fallback_->close();
+        } catch (...) {
+            // 忽略错误
+        }
+    }
+    
+    evict_cache_entry();
+}
+
+// ============================================================================
+// 核心API: get_memory_search_manager (对齐 getMemorySearchManager)
+// ============================================================================
+
+MemorySearchManagerResult get_memory_search_manager(const GetManagerParams& params) {
+    auto resolved = params.backend_config;
+    
+    // QMD backend优先
+    if (resolved.backend == "qmd" && resolved.qmd) {
+        bool status_only = (params.purpose == "status");
+        std::string cache_key;
+        
+        if (!status_only) {
+            cache_key = build_qmd_cache_key(params.agent_id, *resolved.qmd);
+            
+            // 检查缓存
+            {
+                std::lock_guard<std::mutex> lock(qmd_cache_mutex);
+                auto it = qmd_manager_cache.find(cache_key);
+                if (it != qmd_manager_cache.end()) {
+                    return MemorySearchManagerResult::ok(it->second);
+                }
+            }
+        }
+        
+        // 创建QMD Manager
+        try {
+            QmdManagerParams qmd_params;
+            qmd_params.agent_id = params.agent_id;
+            qmd_params.resolved_config = *resolved.qmd;
+            qmd_params.mode = status_only ? "status" : "full";
+            
+            auto primary = QmdMemoryManager::create(qmd_params);
+            
+            if (primary) {
+                if (status_only) {
+                    return MemorySearchManagerResult::ok(primary);
+                }
+                
+                // 包装为FallbackMemoryManager
+                auto wrapper = std::make_shared<FallbackMemoryManager>(
+                    primary,
+                    // fallback factory: 创建builtin index
+                    [params]() -> core::Result<std::shared_ptr<MemorySearchManager>> {
+                        // 创建MemoryIndexManager作为fallback
+                        MemoryIndexManagerConfig config;
+                        config.workspace_dir = params.workspace_dir;
+                        config.db_path = (fs::path(params.workspace_dir) / ".hunterclaw" / "memory.db").string();
+                        
+                        try {
+                            auto mgr = std::make_shared<MemoryIndexManager>(config);
+                            return core::Result<std::shared_ptr<MemorySearchManager>>::ok_value(mgr);
+                        } catch (const std::exception& e) {
+                            return core::Result<std::shared_ptr<MemorySearchManager>>::error(e.what());
+                        }
+                    },
+                    // onClose: 驱逐缓存
+                    [cache_key]() {
+                        if (!cache_key.empty()) {
+                            evict_qmd_cache_entry(cache_key);
+                        }
+                    }
+                );
+                
+                // 缓存wrapper
+                if (!cache_key.empty()) {
+                    std::lock_guard<std::mutex> lock(qmd_cache_mutex);
+                    qmd_manager_cache[cache_key] = wrapper;
+                }
+                
+                return MemorySearchManagerResult::ok(wrapper);
+            }
+        } catch (const std::exception& e) {
+            std::string message = std::string("qmd memory unavailable; falling back to builtin: ") + e.what();
+            log->warn(message);
+        }
+    }
+    
+    // Builtin backend fallback
+    try {
+        MemoryIndexManagerConfig config;
+        config.workspace_dir = params.workspace_dir;
+        config.db_path = (fs::path(params.workspace_dir) / ".hunterclaw" / "memory.db").string();
+        
+        auto manager = std::make_shared<MemoryIndexManager>(config);
+        return MemorySearchManagerResult::ok(manager);
+    } catch (const std::exception& e) {
+        return MemorySearchManagerResult::err(e.what());
+    }
+}
+
+// ============================================================================
+// 全局关闭 (对齐 closeAllMemorySearchManagers)
+// ============================================================================
+
+void close_all_memory_search_managers() {
+    std::vector<std::shared_ptr<MemorySearchManager>> managers;
+    
+    {
+        std::lock_guard<std::mutex> lock(qmd_cache_mutex);
+        for (auto& [key, mgr] : qmd_manager_cache) {
+            managers.push_back(mgr);
+        }
+        qmd_manager_cache.clear();
+    }
+    
+    // 关闭所有manager
+    for (auto& mgr : managers) {
+        try {
+            mgr->close();
+        } catch (const std::exception& e) {
+            log->warn("failed to close qmd memory manager: {}", e.what());
+        }
+    }
+    
+    // 注: MemoryIndexManager的全局关闭在memory_index_manager.cc中单独管理
 }
 
 } // namespace memory

@@ -1,10 +1,12 @@
 #pragma once
 
 #include "hunterclaw/memory/types.h"
-#include "hunterclaw/memory/memory_index_manager.h"
+#include "hunterclaw/memory/backend_config.h"
 #include "hunterclaw/core/types.h"
 #include <memory>
 #include <string>
+#include <map>
+#include <mutex>
 #include <functional>
 
 namespace hunterclaw {
@@ -13,25 +15,36 @@ namespace memory {
 // 严格对齐 OpenClaw src/memory/search-manager.ts
 
 // ============================================================================
-// MemorySearchManager工厂结果 (对齐 search-manager.ts:20-23)
+// MemorySearchManager工厂结果 (对齐 MemorySearchManagerResult)
 // ============================================================================
 struct MemorySearchManagerResult {
     std::shared_ptr<MemorySearchManager> manager;
     std::optional<std::string> error;
+    
+    static MemorySearchManagerResult ok(std::shared_ptr<MemorySearchManager> mgr) {
+        return { .manager = std::move(mgr), .error = std::nullopt };
+    }
+    
+    static MemorySearchManagerResult err(const std::string& msg) {
+        return { .manager = nullptr, .error = msg };
+    }
 };
 
 // ============================================================================
-// 工厂函数 (对齐 getMemorySearchManager in search-manager.ts:25-86)
+// 获取Manager参数 (对齐 getMemorySearchManager params)
 // ============================================================================
-
 struct GetManagerParams {
     std::string agent_id;
     std::string workspace_dir;
-    ResolvedMemorySearchConfig settings;
+    ResolvedMemoryBackendConfig backend_config;
     std::string purpose = "default";  // "default" | "status"
 };
 
-// 获取MemorySearchManager
+// ============================================================================
+// 核心API (对齐 search-manager.ts)
+// ============================================================================
+
+// 获取MemorySearchManager (对齐 getMemorySearchManager)
 // 优先尝试QMD backend,失败则fallback到builtin
 MemorySearchManagerResult get_memory_search_manager(const GetManagerParams& params);
 
@@ -40,15 +53,18 @@ void close_all_memory_search_managers();
 
 // ============================================================================
 // FallbackMemoryManager - QMD到Builtin的Fallback包装器
-// (对齐 search-manager.ts:104-183)
+// (对齐 FallbackMemoryManager in search-manager.ts:104-247)
 // ============================================================================
 class FallbackMemoryManager : public MemorySearchManager {
 public:
+    using FallbackFactory = std::function<core::Result<std::shared_ptr<MemorySearchManager>>()>;
+    using OnCloseCallback = std::function<void()>;
+    
     // 构造函数
     FallbackMemoryManager(
         std::shared_ptr<MemorySearchManager> primary,
-        std::function<std::shared_ptr<MemorySearchManager>()> fallback_factory,
-        std::function<void()> on_close = nullptr
+        FallbackFactory fallback_factory,
+        OnCloseCallback on_close = nullptr
     );
     
     ~FallbackMemoryManager() override;
@@ -78,14 +94,20 @@ public:
     // Fallback状态查询
     // ========================================================================
     
-    bool is_primary_failed() const { return primary_failed_; }
+    bool is_primary_failed() const { 
+        std::lock_guard<std::mutex> lock(mutex_);
+        return primary_failed_; 
+    }
     
-    std::optional<std::string> get_last_error() const { return last_error_; }
+    std::optional<std::string> get_last_error() const { 
+        std::lock_guard<std::mutex> lock(mutex_);
+        return last_error_; 
+    }
     
 private:
     std::shared_ptr<MemorySearchManager> primary_;
-    std::function<std::shared_ptr<MemorySearchManager>()> fallback_factory_;
-    std::function<void()> on_close_;
+    FallbackFactory fallback_factory_;
+    OnCloseCallback on_close_;
     
     std::shared_ptr<MemorySearchManager> fallback_;
     bool primary_failed_ = false;
@@ -94,10 +116,10 @@ private:
     
     mutable std::mutex mutex_;
     
-    // 确保fallback存在
+    // 确保fallback存在 (对齐 ensureFallback)
     core::Result<std::shared_ptr<MemorySearchManager>> ensure_fallback();
     
-    // 驱逐缓存条目
+    // 驱逐缓存条目 (对齐 evictCacheEntry)
     void evict_cache_entry();
     
     // 处理primary失败
@@ -105,37 +127,21 @@ private:
 };
 
 // ============================================================================
-// QMD后端配置解析 (对齐 backend-config.ts)
+// QMD缓存管理 (对齐 QMD_MANAGER_CACHE)
 // ============================================================================
 
-struct ResolvedQmdConfig {
-    std::string qmd_path;
-    std::optional<std::string> workspace_dir;
-    std::optional<std::string> provider;
-    std::optional<std::string> model;
-};
-
-struct ResolvedBackendConfig {
-    std::string backend;  // "builtin" | "qmd"
-    std::optional<ResolvedQmdConfig> qmd;
-};
-
-// 解析memory backend配置
-ResolvedBackendConfig resolve_memory_backend_config(const GetManagerParams& params);
-
-// ============================================================================
-// QMD缓存管理
-// ============================================================================
-
-// 构建QMD缓存key
+// 构建QMD缓存key (对齐 buildQmdCacheKey)
 std::string build_qmd_cache_key(
     const std::string& agent_id,
     const ResolvedQmdConfig& qmd_config
 );
 
-// QMD Manager缓存
+// QMD Manager全局缓存
 extern std::map<std::string, std::shared_ptr<MemorySearchManager>> qmd_manager_cache;
 extern std::mutex qmd_cache_mutex;
+
+// 清除QMD缓存条目
+void evict_qmd_cache_entry(const std::string& cache_key);
 
 } // namespace memory
 } // namespace hunterclaw
