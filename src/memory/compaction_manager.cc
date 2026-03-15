@@ -238,12 +238,19 @@ core::Result<void> CompactionManager::post_compaction_memory_sync(
                session_files.size());
     
     // 对齐 OpenClaw: syncSessionFiles with needsFullReindex=false
-    // TODO: 实现 memory_provider 的 sync_session_files 接口
-    // 暂时记录日志
+    // 实际的同步逻辑应该调用 MemoryManagerSyncOps::sync_session_files
+    // 这里只记录日志,等待 MemoryProvider 接口扩展支持 sync_session_files
+    
     for (const auto& file : session_files) {
-        log()->debug("[compaction] should sync session file: {}", file);
+        log()->debug("[compaction] post-compaction sync target: {}", file);
     }
     
+    // Note: 完整实现需要:
+    // 1. MemoryProvider 提供 sync_session_files(files, needsFullReindex=false) 接口
+    // 2. 或者直接调用 MemoryManagerSyncOps 的对应方法
+    // 3. 确保只更新指定的 transcript 文件,不触发全局 reindex
+    
+    log()->info("[compaction] post-compaction memory sync completed (placeholder)");
     return core::Result<void>::Ok();
 }
 
