@@ -675,17 +675,5 @@ void QmdMemoryManager::wait_for_pending_update() {
     // ]);
 }
 
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// Global Parse Function
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-std::vector<QmdQueryResult> parse_qmd_query_json(
-    const std::string& stdout_data,
-    const std::string& stderr_data
-) {
-    // Delegate to JsonParser
-    return JsonParser::parse_qmd_json_array(stdout_data);
-}
-
 }  // namespace memory
 }  // namespace hunterclaw

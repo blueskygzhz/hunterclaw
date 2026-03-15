@@ -8,6 +8,7 @@
 #include <thread>
 #include <chrono>
 #include <random>
+#include <regex>
 
 // 严格对齐 OpenClaw src/memory/manager-embedding-ops.ts
 // 实现完整的批量 embedding、缓存和重试逻辑
@@ -26,29 +27,17 @@ static std::vector<uint8_t> vector_to_blob(const std::vector<float>& embedding) 
     return blob;
 }
 
-// Estimate UTF-8 bytes (简化实现)
-static size_t estimate_utf8_bytes(const std::string& text) {
-    return text.size();  // 简化: 实际应该考虑token估算
-}
-
-// Hash text (简化实现)
-static std::string hash_text(const std::string& text) {
-    // 简化: 实际应该使用crypto hash
-    std::hash<std::string> hasher;
-    size_t hash = hasher(text);
-    std::ostringstream oss;
-    oss << std::hex << hash;
-    return oss.str();
-}
-
 // ============================================================================
 // ManagerEmbeddingOps Implementation
 // ============================================================================
 
 ManagerEmbeddingOps::ManagerEmbeddingOps(
-    SQLiteStorage* storage,
+    SQLiteVectorStorage* storage,
     const MemoryConfig& config
-) : ManagerSyncOps(storage, config) {
+) {
+    storage_ = storage;
+    config_ = config;
+    
     // Initialize batch failure lock
     std::promise<void> promise;
     promise.set_value();
@@ -124,8 +113,8 @@ ManagerEmbeddingOps::load_embedding_cache(const std::vector<std::string>& hashes
     }
 
     // 分批查询 (对齐:110-124)
-    const std::string provider_id = provider_->id();
-    const std::string model = provider_->model();
+    const std::string provider_id = provider_->get_id();
+    const std::string model = provider_->get_model();
     const std::string provider_key = compute_provider_key();
     
     constexpr int batch_size = 400;
@@ -171,8 +160,8 @@ void ManagerEmbeddingOps::upsert_embedding_cache(
         std::chrono::system_clock::now().time_since_epoch()
     ).count();
     
-    const std::string provider_id = provider_->id();
-    const std::string model = provider_->model();
+    const std::string provider_id = provider_->get_id();
+    const std::string model = provider_->get_model();
     const std::string provider_key = compute_provider_key();
     
     const std::string sql = 
@@ -205,7 +194,7 @@ void ManagerEmbeddingOps::prune_embedding_cache_if_needed() {
         return;
     }
     
-    const int max = config_.cache.max_entries;
+    const int max = config_.cache.max_entries.value_or(10000);  // 默认10000
     if (max <= 0) {
         return;
     }
@@ -238,7 +227,7 @@ void ManagerEmbeddingOps::prune_embedding_cache_if_needed() {
 core::Result<std::vector<std::vector<float>>>
 ManagerEmbeddingOps::embed_chunks_in_batches(const std::vector<MemoryChunk>& chunks) {
     if (chunks.empty()) {
-        return Ok(std::vector<std::vector<float>>{});
+        return core::Result<std::vector<std::vector<float>>>::Ok(std::vector<std::vector<float>>{});
     }
 
     // 收集缓存 (对齐:189)
@@ -247,7 +236,7 @@ ManagerEmbeddingOps::embed_chunks_in_batches(const std::vector<MemoryChunk>& chu
     const auto& missing = cached_result.missing;
 
     if (missing.empty()) {
-        return Ok(embeddings);
+        return core::Result<std::vector<std::vector<float>>>::Ok(embeddings);
     }
 
     // 提取 missing chunks
@@ -262,7 +251,7 @@ ManagerEmbeddingOps::embed_chunks_in_batches(const std::vector<MemoryChunk>& chu
     std::vector<EmbeddingCacheEntry> to_cache;
     
     if (!provider_) {
-        return Err("Cannot embed batch in FTS-only mode (no embedding provider)");
+        return core::Result<std::vector<std::vector<float>>>::Err("Cannot embed batch in FTS-only mode (no embedding provider)");
     }
 
     size_t cursor = 0;
@@ -279,7 +268,7 @@ ManagerEmbeddingOps::embed_chunks_in_batches(const std::vector<MemoryChunk>& chu
         if (!batch_result.is_ok()) {
             return batch_result;
         }
-        auto batch_embeddings = batch_result.unwrap();
+        auto batch_embeddings = batch_result.value;
 
         // 填充结果 (对齐:214-222)
         for (size_t i = 0; i < batch.size(); ++i) {
@@ -297,7 +286,7 @@ ManagerEmbeddingOps::embed_chunks_in_batches(const std::vector<MemoryChunk>& chu
     // 更新缓存 (对齐:224)
     upsert_embedding_cache(to_cache);
     
-    return Ok(embeddings);
+    return core::Result<std::vector<std::vector<float>>>::Ok(embeddings);
 }
 
 // ============================================================================
@@ -341,8 +330,8 @@ std::string ManagerEmbeddingOps::compute_provider_key() const {
         return hash_text(R"({"provider":"none","model":"fts-only"})");
     }
 
-    const std::string id = provider_->id();
-    const std::string model = provider_->model();
+    const std::string id = provider_->get_id();
+    const std::string model = provider_->get_model();
 
     // OpenAI (对齐:233-245)
     if (id == "openai") {
@@ -379,10 +368,10 @@ std::string ManagerEmbeddingOps::compute_provider_key() const {
 core::Result<std::vector<std::vector<float>>>
 ManagerEmbeddingOps::embed_batch_with_retry(const std::vector<std::string>& texts) {
     if (texts.empty()) {
-        return Ok(std::vector<std::vector<float>>{});
+        return core::Result<std::vector<std::vector<float>>>::Ok(std::vector<std::vector<float>>{});
     }
     if (!provider_) {
-        return Err("Cannot embed batch in FTS-only mode (no embedding provider)");
+        return core::Result<std::vector<std::vector<float>>>::Err("Cannot embed batch in FTS-only mode (no embedding provider)");
     }
 
     int attempt = 0;
@@ -399,7 +388,7 @@ ManagerEmbeddingOps::embed_batch_with_retry(const std::vector<std::string>& text
             // 调用 provider (简化: 实际应该加timeout)
             auto result = provider_->embed_batch(texts);
             if (!result.is_ok()) {
-                throw std::runtime_error(result.error_message());
+                throw std::runtime_error(result.error);
             }
             
             return result;
@@ -410,7 +399,7 @@ ManagerEmbeddingOps::embed_batch_with_retry(const std::vector<std::string>& text
             // 对齐 manager-embedding-ops.ts:547-554
             if (!is_retryable_embedding_error(message) || 
                 attempt >= EMBEDDING_RETRY_MAX_ATTEMPTS) {
-                return Err(message);
+                return core::Result<std::vector<std::vector<float>>>::Err(message);
             }
             
             wait_for_embedding_retry(delay_ms, "retrying");
@@ -423,7 +412,7 @@ ManagerEmbeddingOps::embed_batch_with_retry(const std::vector<std::string>& text
 core::Result<std::vector<float>>
 ManagerEmbeddingOps::embed_query_with_timeout(const std::string& text) {
     if (!provider_) {
-        return Err("Cannot embed query in FTS-only mode (no embedding provider)");
+        return core::Result<std::vector<float>>::Err("Cannot embed query in FTS-only mode (no embedding provider)");
     }
 
     // 对齐 manager-embedding-ops.ts:615-626
@@ -466,7 +455,7 @@ bool ManagerEmbeddingOps::is_structured_input_too_large_error(const std::string&
 
 int ManagerEmbeddingOps::resolve_embedding_timeout(const std::string& kind) const {
     // 对齐 manager-embedding-ops.ts:607-613
-    const bool is_local = provider_ && provider_->id() == "local";
+    const bool is_local = provider_ && provider_->get_id() == "local";
     
     if (kind == "query") {
         return is_local ? EMBEDDING_QUERY_TIMEOUT_LOCAL_MS 
@@ -495,6 +484,17 @@ int ManagerEmbeddingOps::get_index_concurrency() const {
     // 对齐 manager-embedding-ops.ts:756-758
     return config_.batch.enabled ? config_.batch.concurrency 
                                 : EMBEDDING_INDEX_CONCURRENCY;
+}
+
+core::Result<bool> ManagerEmbeddingOps::ensure_vector_ready(size_t dimensions) {
+    // 简化实现：确保向量表已创建
+    if (!config_.vector.enabled || !storage_) {
+        return core::Result<bool>::Ok(false);
+    }
+    
+    // 实际应该检查/创建 chunks_vec 表
+    // 这里简化为总是返回 true
+    return core::Result<bool>::Ok(true);
 }
 
 // ============================================================================
@@ -553,7 +553,7 @@ void ManagerEmbeddingOps::clear_indexed_file_data(
     MemorySource source
 ) {
     // 对齐 manager-embedding-ops.ts:760-778
-    const std::string source_str = (source == MemorySource::MEMORY) ? "memory" : "sessions";
+    const std::string source_str = (source == MemorySource::Memory) ? "memory" : "sessions";
     
     // Vector table
     if (config_.vector.enabled) {
@@ -569,7 +569,7 @@ void ManagerEmbeddingOps::clear_indexed_file_data(
         const std::string sql = 
             "DELETE FROM chunks_fts "
             "WHERE path = ? AND source = ? AND model = ?";
-        // storage_->execute(sql, {pathname, source_str, provider_->model()});
+        // storage_->execute(sql, {pathname, source_str, provider_->get_model()});
     }
     
     // Chunks table
@@ -582,7 +582,7 @@ void ManagerEmbeddingOps::upsert_file_record(
     MemorySource source
 ) {
     // 对齐 manager-embedding-ops.ts:780-791
-    const std::string source_str = (source == MemorySource::MEMORY) ? "memory" : "sessions";
+    const std::string source_str = (source == MemorySource::Memory) ? "memory" : "sessions";
     const std::string sql = 
         "INSERT INTO files (path, source, hash, mtime, size) VALUES (?, ?, ?, ?, ?) "
         "ON CONFLICT(path) DO UPDATE SET "
@@ -599,7 +599,7 @@ void ManagerEmbeddingOps::delete_file_record(
     MemorySource source
 ) {
     // 对齐 manager-embedding-ops.ts:793-795
-    const std::string source_str = (source == MemorySource::MEMORY) ? "memory" : "sessions";
+    const std::string source_str = (source == MemorySource::Memory) ? "memory" : "sessions";
     const std::string sql = "DELETE FROM files WHERE path = ? AND source = ?";
     // storage_->execute(sql, {pathname, source_str});
 }
@@ -614,7 +614,7 @@ core::Result<void> ManagerEmbeddingOps::index_file(
     // FTS-only mode: skip (对齐:807-814)
     if (!provider_) {
         // log.debug("Skipping embedding indexing in FTS-only mode", ...);
-        return Ok();
+        return core::Result<void>::Ok();
     }
 
     // 读取内容
@@ -627,7 +627,7 @@ core::Result<void> ManagerEmbeddingOps::index_file(
     }
 
     // 分块 (对齐:828-838)
-    auto chunks = chunk_markdown(file_content, config_.chunking);
+    auto chunks = chunk_markdown(entry.path, file_content, config_.chunking.tokens);
     
     // 过滤空chunks
     chunks.erase(
@@ -637,7 +637,7 @@ core::Result<void> ManagerEmbeddingOps::index_file(
     );
 
     // Batch embedding (对齐:840-844)
-    Result<std::vector<std::vector<float>>> embeddings_result;
+    core::Result<std::vector<std::vector<float>>> embeddings_result;
     if (config_.batch.enabled) {
         embeddings_result = embed_chunks_with_batch(chunks, entry, source);
     } else {
@@ -645,9 +645,9 @@ core::Result<void> ManagerEmbeddingOps::index_file(
     }
     
     if (!embeddings_result.is_ok()) {
-        return Err(embeddings_result.error_message());
+        return core::Result<void>::Err(embeddings_result.error);
     }
-    auto embeddings = embeddings_result.unwrap();
+    auto embeddings = embeddings_result.value;
 
     // Ensure vector ready (对齐:865-866)
     std::optional<std::vector<float>> sample;
@@ -660,7 +660,7 @@ core::Result<void> ManagerEmbeddingOps::index_file(
     bool vector_ready = false;
     if (sample.has_value()) {
         auto result = ensure_vector_ready(sample->size());
-        vector_ready = result.is_ok() && result.unwrap();
+        vector_ready = result.is_ok() && result.value;
     }
 
     // 清理旧数据 (对齐:868)
@@ -671,7 +671,7 @@ core::Result<void> ManagerEmbeddingOps::index_file(
     clear_indexed_file_data(entry.path, source);
 
     // 插入chunks (对齐:869-922)
-    const std::string source_str = (source == MemorySource::MEMORY) ? "memory" : "sessions";
+    const std::string source_str = (source == MemorySource::Memory) ? "memory" : "sessions";
     
     for (size_t i = 0; i < chunks.size(); ++i) {
         const auto& chunk = chunks[i];
@@ -681,7 +681,7 @@ core::Result<void> ManagerEmbeddingOps::index_file(
         std::ostringstream id_oss;
         id_oss << source_str << ":" << entry.path << ":" 
                << chunk.start_line << ":" << chunk.end_line << ":" 
-               << chunk.hash << ":" << provider_->model();
+               << chunk.hash << ":" << provider_->get_model();
         const std::string id = hash_text(id_oss.str());
         
         // 序列化embedding
@@ -725,7 +725,7 @@ core::Result<void> ManagerEmbeddingOps::index_file(
     // 更新文件记录 (对齐:923)
     upsert_file_record(entry, source);
     
-    return Ok();
+    return core::Result<void>::Ok();
 }
 
 // ============================================================================
@@ -743,7 +743,7 @@ ManagerEmbeddingOps::embed_chunks_with_batch(
         return embed_chunks_in_batches(chunks);
     }
     
-    const std::string id = provider_->id();
+    const std::string id = provider_->get_id();
     
     if (id == "openai") {
         return embed_chunks_with_openai_batch(chunks, entry, source);

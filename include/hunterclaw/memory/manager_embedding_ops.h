@@ -77,6 +77,11 @@ struct VoyageBatchRequest : BatchRequestBase {
 
 class ManagerEmbeddingOps {
 protected:
+    // Core members
+    SQLiteVectorStorage* storage_ = nullptr;
+    MemoryConfig config_;
+    EmbeddingProvider* provider_ = nullptr;
+    
     // Batch failure tracking (对齐 manager-embedding-ops.ts:50-53)
     int batch_failure_count_ = 0;
     std::string batch_failure_last_error_;
@@ -186,7 +191,7 @@ public:
     // Timeout wrapper (对齐:628-647)
     template<typename T>
     core::Result<T> with_timeout(
-        std::function<Result<T>()> func,
+        std::function<core::Result<T>()> func,
         int timeout_ms,
         const std::string& message
     );
@@ -214,8 +219,8 @@ public:
     template<typename T>
     core::Result<T> run_batch_with_fallback(
         const std::string& provider,
-        std::function<Result<T>()> run_func,
-        std::function<Result<std::vector<std::vector<float>>>()> fallback_func
+        std::function<core::Result<T>()> run_func,
+        std::function<core::Result<std::vector<std::vector<float>>>()> fallback_func
     );
 
     // ========================================================================
@@ -272,6 +277,9 @@ public:
 
     // 解析embedding timeout (对齐:607-613)
     int resolve_embedding_timeout(const std::string& kind) const;  // "query" or "batch"
+    
+    // 确保向量表准备就绪
+    core::Result<bool> ensure_vector_ready(size_t dimensions);
 
 protected:
     // ========================================================================

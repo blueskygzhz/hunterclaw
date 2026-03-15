@@ -276,7 +276,27 @@ struct ResolvedMemorySearchConfig {
         int poll_interval_ms = 1000;
         int timeout_ms = 600000;  // 10分钟
     } batch;
+    
+    struct VectorConfig {
+        bool enabled = true;
+    } vector;
+    
+    struct FtsConfig {
+        bool enabled = true;
+    } fts;
+    
+    struct OpenAIConfig {
+        std::string base_url = "https://api.openai.com/v1";
+    } openai;
+    
+    struct GeminiConfig {
+        std::string base_url = "https://generativelanguage.googleapis.com/v1beta";
+        int output_dimensionality = 768;
+    } gemini;
 };
+
+// Type alias for convenience
+using MemoryConfig = ResolvedMemorySearchConfig;
 
 } // namespace memory
 } // namespace hunterclaw

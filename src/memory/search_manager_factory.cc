@@ -75,7 +75,7 @@ void FallbackMemoryManager::handle_primary_failure(const std::string& error) {
     primary_failed_ = true;
     last_error_ = error;
     
-    log->warn("qmd memory failed; switching to builtin index: {}", error);
+    log->warn("qmd memory failed; switching to builtin index: " + error);
     
     // 尝试关闭primary
     if (primary_) {
@@ -110,7 +110,7 @@ core::Result<std::shared_ptr<MemorySearchManager>> FallbackMemoryManager::ensure
     // 创建fallback
     auto result = fallback_factory_();
     if (result.is_err()) {
-        log->warn("memory fallback unavailable: {}", result.error);
+        log->warn("memory fallback unavailable: " + result.error);
         return result;
     }
     
@@ -331,10 +331,20 @@ MemorySearchManagerResult get_memory_search_manager(const GetManagerParams& para
         
         // 创建QMD Manager
         try {
-            QmdManagerParams qmd_params;
+            QmdMemoryManager::CreateParams qmd_params;
             qmd_params.agent_id = params.agent_id;
-            qmd_params.resolved_config = *resolved.qmd;
-            qmd_params.mode = status_only ? "status" : "full";
+            qmd_params.workspace_dir = params.workspace_dir;
+            qmd_params.qmd_config.qmd_binary_path = resolved.qmd->command;
+            qmd_params.qmd_config.collections.clear();
+            for (const auto& col : resolved.qmd->collections) {
+                ManagedCollection mc;
+                mc.name = col.name;
+                mc.path = col.path;
+                mc.pattern = col.pattern;
+                mc.kind = col.kind;
+                qmd_params.qmd_config.collections.push_back(mc);
+            }
+            qmd_params.mode = status_only ? QmdManagerMode::STATUS : QmdManagerMode::FULL;
             
             auto primary = QmdMemoryManager::create(qmd_params);
             
@@ -349,16 +359,17 @@ MemorySearchManagerResult get_memory_search_manager(const GetManagerParams& para
                     // fallback factory: 创建builtin index
                     [params]() -> core::Result<std::shared_ptr<MemorySearchManager>> {
                         // 创建MemoryIndexManager作为fallback
-                        MemoryIndexManagerConfig config;
-                        config.workspace_dir = params.workspace_dir;
-                        config.db_path = (fs::path(params.workspace_dir) / ".hunterclaw" / "memory.db").string();
+                        MemoryIndexManager::Params mgr_params;
+                        mgr_params.agent_id = params.agent_id;
+                        mgr_params.workspace_dir = params.workspace_dir;
+                        // 使用默认的 builtin 搜索配置
+                        mgr_params.settings = ResolvedMemorySearchConfig{};
                         
-                        try {
-                            auto mgr = std::make_shared<MemoryIndexManager>(config);
-                            return core::Result<std::shared_ptr<MemorySearchManager>>::Ok(mgr);
-                        } catch (const std::exception& e) {
-                            return core::Result<std::shared_ptr<MemorySearchManager>>::Err(e.what());
+                        auto result = MemoryIndexManager::get(mgr_params);
+                        if (result.is_err()) {
+                            return core::Result<std::shared_ptr<MemorySearchManager>>::Err(result.error);
                         }
+                        return core::Result<std::shared_ptr<MemorySearchManager>>::Ok(result.value);
                     },
                     // onClose: 驱逐缓存
                     [cache_key]() {
@@ -384,12 +395,17 @@ MemorySearchManagerResult get_memory_search_manager(const GetManagerParams& para
     
     // Builtin backend fallback
     try {
-        MemoryIndexManagerConfig config;
-        config.workspace_dir = params.workspace_dir;
-        config.db_path = (fs::path(params.workspace_dir) / ".hunterclaw" / "memory.db").string();
+        MemoryIndexManager::Params mgr_params;
+        mgr_params.agent_id = params.agent_id;
+        mgr_params.workspace_dir = params.workspace_dir;
+        // 使用默认的 builtin 搜索配置
+        mgr_params.settings = ResolvedMemorySearchConfig{};
         
-        auto manager = std::make_shared<MemoryIndexManager>(config);
-        return MemorySearchManagerResult::Ok(manager);
+        auto result = MemoryIndexManager::get(mgr_params);
+        if (result.is_err()) {
+            return MemorySearchManagerResult::Err(result.error);
+        }
+        return MemorySearchManagerResult::Ok(result.value);
     } catch (const std::exception& e) {
         return MemorySearchManagerResult::Err(e.what());
     }
