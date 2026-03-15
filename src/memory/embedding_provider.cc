@@ -24,19 +24,21 @@ struct OpenAIConfig {
 };
 
 struct OllamaConfig {
-    std::string model = "nomic-embed-text";
+    std::string model = "nomic-embed-text";  // 对齐 DEFAULT_OLLAMA_EMBEDDING_MODEL
     std::string base_url = "http://localhost:11434";
+    std::string api_key;  // Optional (对齐 OpenClaw: Authorization header)
+    std::map<std::string, std::string> headers;  // Custom headers
     int max_input_tokens = 8192;
 };
 
 struct GeminiConfig {
-    std::string model = "text-embedding-004";
+    std::string model = "gemini-embedding-001";  // 对齐 DEFAULT_GEMINI_EMBEDDING_MODEL
     std::string base_url = "https://generativelanguage.googleapis.com/v1beta";
     std::string api_key;
     std::map<std::string, std::string> headers;
-    std::string task_type = "RETRIEVAL_DOCUMENT";
-    int output_dimensionality = 768;
-    int max_input_tokens = 8192;
+    std::string task_type = "RETRIEVAL_DOCUMENT";  // 对齐 GeminiTaskType
+    std::optional<int> output_dimensionality;       // gemini-embedding-2 支持
+    int max_input_tokens = 2048;                   // text-embedding-004: 2048
 };
 
 struct VoyageConfig {
@@ -355,9 +357,14 @@ core::Result<std::vector<float>> OllamaEmbeddingProvider::embed_query(const std:
 core::Result<std::vector<std::vector<float>>> OllamaEmbeddingProvider::embed_batch(
     const std::vector<std::string>& texts) {
     
+    // 严格对齐 OpenClaw embeddings-ollama.ts:104-107
+    // "Ollama /api/embeddings accepts one prompt per request."
+    // Promise.all(texts.map(embedOne))
+    
     std::vector<std::vector<float>> results;
     results.reserve(texts.size());
     
+    // 顺序调用 embed_query (可优化为并行)
     for (const auto& text : texts) {
         auto res = embed_query(text);
         if (!res.is_ok()) {
@@ -389,27 +396,47 @@ std::optional<int> GeminiEmbeddingProvider::get_max_input_tokens() const {
 }
 
 core::Result<std::vector<float>> GeminiEmbeddingProvider::embed_query(const std::string& text) {
-    // 构建Gemini请求 (对齐 embeddings-gemini.ts)
+    // 严格对齐 OpenClaw embeddings-gemini.ts:227-241
+    // embedQuery function
+    
+    if (text.empty() || text.find_first_not_of(" \t\r\n") == std::string::npos) {
+        return core::Result<std::vector<float>>::Ok(std::vector<float>());
+    }
+    
+    // 检查是否为 gemini-embedding-2 模型
+    bool is_v2 = (config_.model == "gemini-embedding-2-preview");
+    
+    // 构建 Gemini 请求 (对齐 buildGeminiTextEmbeddingRequest)
     json request_body = {
-        {"model", "models/" + config_.model},
         {"content", {
-            {"parts", {{{"text", text}}}}
-        }}
+            {"parts", json::array({{{"text", text}}})}
+        }},
+        {"taskType", config_.task_type.empty() ? "RETRIEVAL_QUERY" : config_.task_type}
     };
     
-    // 添加task_type和outputDimensionality
-    if (!config_.task_type.empty()) {
-        request_body["taskType"] = config_.task_type;
-    }
-    if (config_.output_dimensionality > 0) {
-        request_body["outputDimensionality"] = config_.output_dimensionality;
+    // gemini-embedding-2 支持 outputDimensionality
+    if (is_v2 && config_.output_dimensionality) {
+        request_body["outputDimensionality"] = config_.output_dimensionality.value();
     }
     
+    // 构建 headers (对齐 parseGeminiAuth)
     std::map<std::string, std::string> headers = config_.headers;
     headers["Content-Type"] = "application/json";
     
-    // Gemini API endpoint (含API key)
-    std::string url = config_.base_url + "/models/" + config_.model + ":embedContent";
+    // Gemini API endpoint: /v1beta/models/{model}:embedContent
+    std::string url = config_.base_url;
+    if (url.back() == '/') {
+        url.pop_back();
+    }
+    
+    std::string model_path = config_.model;
+    if (model_path.find("models/") != 0) {
+        model_path = "models/" + model_path;
+    }
+    
+    url += "/" + model_path + ":embedContent";
+    
+    // Gemini 使用 ?key= 参数传递 API key (不是 Authorization header)
     if (!config_.api_key.empty()) {
         url += "?key=" + config_.api_key;
     }
@@ -417,7 +444,9 @@ core::Result<std::vector<float>> GeminiEmbeddingProvider::embed_query(const std:
     auto result = HttpClient::post_json(url, request_body, headers, 30000);
     
     if (!result.is_ok()) {
-        return core::Result<std::vector<float>>::Err("Gemini API error: " + result.error);
+        return core::Result<std::vector<float>>::Err(
+            "gemini embeddings failed: " + result.error
+        );
     }
     
     // 解析响应: {"embedding": {"values": [0.1, 0.2, ...]}}
@@ -425,11 +454,14 @@ core::Result<std::vector<float>> GeminiEmbeddingProvider::embed_query(const std:
         const auto& resp_json = result.value;
         
         if (!resp_json.contains("embedding") || !resp_json["embedding"].contains("values")) {
-            return core::Result<std::vector<float>>::Err("Invalid Gemini response format");
+            return core::Result<std::vector<float>>::Err(
+                "gemini embeddings response missing embedding.values"
+            );
         }
         
         std::vector<float> embedding = resp_json["embedding"]["values"].get<std::vector<float>>();
         
+        // 对齐 OpenClaw: sanitizeAndNormalizeEmbedding
         return core::Result<std::vector<float>>::Ok(normalize_embedding(embedding));
         
     } catch (const std::exception& e) {
@@ -442,7 +474,104 @@ core::Result<std::vector<float>> GeminiEmbeddingProvider::embed_query(const std:
 core::Result<std::vector<std::vector<float>>> GeminiEmbeddingProvider::embed_batch(
     const std::vector<std::string>& texts) {
     
-    return core::Result<std::vector<std::vector<float>>>::Err("Gemini batch not yet implemented");
+    // 严格对齐 OpenClaw embeddings-gemini.ts:243-271
+    // embedBatch function -> embedBatchInputs
+    
+    if (texts.empty()) {
+        return core::Result<std::vector<std::vector<float>>>::Ok(
+            std::vector<std::vector<float>>()
+        );
+    }
+    
+    // 检查是否为 gemini-embedding-2 模型
+    bool is_v2 = (config_.model == "gemini-embedding-2-preview");
+    
+    // 构建模型路径
+    std::string model_path = config_.model;
+    if (model_path.find("models/") != 0) {
+        model_path = "models/" + model_path;
+    }
+    
+    // 构建 batch 请求 (对齐 buildGeminiEmbeddingRequest)
+    json::array_t requests;
+    for (const auto& text : texts) {
+        json request = {
+            {"model", model_path},
+            {"content", {
+                {"parts", json::array({{{"text", text}}})}
+            }},
+            {"taskType", config_.task_type.empty() ? "RETRIEVAL_DOCUMENT" : config_.task_type}
+        };
+        
+        if (is_v2 && config_.output_dimensionality) {
+            request["outputDimensionality"] = config_.output_dimensionality.value();
+        }
+        
+        requests.push_back(request);
+    }
+    
+    json request_body = {
+        {"requests", requests}
+    };
+    
+    // 构建 headers
+    std::map<std::string, std::string> headers = config_.headers;
+    headers["Content-Type"] = "application/json";
+    
+    // Gemini Batch API endpoint: /v1beta/models/{model}:batchEmbedContents
+    std::string url = config_.base_url;
+    if (url.back() == '/') {
+        url.pop_back();
+    }
+    url += "/" + model_path + ":batchEmbedContents";
+    
+    if (!config_.api_key.empty()) {
+        url += "?key=" + config_.api_key;
+    }
+    
+    auto result = HttpClient::post_json(url, request_body, headers, 30000);
+    
+    if (!result.is_ok()) {
+        return core::Result<std::vector<std::vector<float>>>::Err(
+            "gemini batch embeddings failed: " + result.error
+        );
+    }
+    
+    // 解析响应: {"embeddings": [{"values": [...]}, ...]}
+    try {
+        const auto& resp_json = result.value;
+        
+        if (!resp_json.contains("embeddings") || !resp_json["embeddings"].is_array()) {
+            return core::Result<std::vector<std::vector<float>>>::Err(
+                "gemini batch response missing embeddings array"
+            );
+        }
+        
+        const auto& embeddings_json = resp_json["embeddings"];
+        std::vector<std::vector<float>> results;
+        results.reserve(texts.size());
+        
+        // 对齐 OpenClaw: 按顺序映射结果
+        for (size_t i = 0; i < texts.size(); ++i) {
+            if (i < embeddings_json.size() && 
+                embeddings_json[i].contains("values") &&
+                embeddings_json[i]["values"].is_array()) {
+                
+                std::vector<float> embedding = embeddings_json[i]["values"].get<std::vector<float>>();
+                results.push_back(normalize_embedding(embedding));
+            } else {
+                // 对齐 OpenClaw: 缺失的 embedding 返回空数组
+                results.push_back(std::vector<float>());
+            }
+        }
+        
+        return core::Result<std::vector<std::vector<float>>>::Ok(results);
+        
+    } catch (const std::exception& e) {
+        return core::Result<std::vector<std::vector<float>>>::Err(
+            std::string("Failed to parse Gemini batch response: ") + e.what()
+        );
+    }
 }
 
 // ============================================================================
