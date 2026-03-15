@@ -1,4 +1,5 @@
 #include "hunterclaw/memory/memory.h"
+#include "hunterclaw/memory/embedding_provider.h"
 #include <cmath>
 #include <algorithm>
 #include <chrono>
@@ -67,7 +68,7 @@ std::shared_ptr<MemoryManager> MemoryManager::create(
     std::shared_ptr<EmbeddingProvider> embedding,
     const SearchConfig& config
 ) {
-    auto manager = std::make_shared<MemoryManager>();
+    auto manager = std::shared_ptr<MemoryManager>(new MemoryManager());
     manager->storage_ = storage;
     manager->embedding_ = embedding;
     manager->config_ = config;
@@ -209,14 +210,21 @@ std::vector<SearchResult> MemoryManager::maximal_marginal_relevance(
         for (size_t i = 0; i < remaining.size(); ++i) {
             const auto& candidate = remaining[i];
             
+            // Skip if no embedding
+            if (!candidate.embedding.has_value()) {
+                continue;
+            }
+            
             // 相关性得分 (与查询的相似度)
-            double relevance = similarity::cosine(query_embedding, candidate.embedding);
+            double relevance = similarity::cosine(query_embedding, candidate.embedding.value());
             
             // 多样性惩罚 (与已选结果的最大相似度)
             double max_similarity = 0.0;
             for (const auto& selected_result : selected) {
-                double sim = similarity::cosine(candidate.embedding, selected_result.embedding);
-                max_similarity = std::max(max_similarity, sim);
+                if (selected_result.embedding.has_value()) {
+                    double sim = similarity::cosine(candidate.embedding.value(), selected_result.embedding.value());
+                    max_similarity = std::max(max_similarity, sim);
+                }
             }
             
             // MMR得分: λ * 相关性 - (1-λ) * 多样性惩罚

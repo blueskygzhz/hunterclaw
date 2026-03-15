@@ -1,7 +1,7 @@
 #include "hunterclaw/memory/search_manager_factory.h"
 #include "hunterclaw/memory/memory_index_manager.h"
 #include "hunterclaw/memory/qmd_manager.h"
-#include "hunterclaw/logging/subsystem.h"
+#include "hunterclaw/logging/subsystem_logger.h"
 #include <json/json.h>
 
 namespace hunterclaw {

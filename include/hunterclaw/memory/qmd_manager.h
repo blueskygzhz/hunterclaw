@@ -105,18 +105,14 @@ public:
     
     std::vector<MemorySearchResult> search(
         const std::string& query,
-        const SearchOptions* opts = nullptr
+        const SearchOptions& opts = {}
     ) override;
     
-    ReadFileResult read_file(
-        const std::string& rel_path,
-        int from = 0,
-        int lines = -1
-    ) override;
+    ReadFileResult read_file(const ReadFileParams& params) override;
     
     MemoryProviderStatus status() override;
     
-    void sync(const SyncParams* params = nullptr) override;
+    void sync(const SyncParams& params = {}) override;
     
     MemoryEmbeddingProbeResult probe_embedding_availability() override;
     
@@ -192,6 +188,18 @@ private:
     
     // Normalize BM25 Query for Han script (中文查询优化)
     std::string normalize_han_bm25_query(const std::string& query);
+    
+    // 文件路径解析
+    std::optional<std::string> resolve_doc_location(const QmdQueryResult& result);
+    
+    // 结果多样化(按source)
+    std::vector<MemorySearchResult> diversify_results_by_source(
+        const std::vector<MemorySearchResult>& results,
+        int limit
+    );
+    
+    // 等待pending更新完成
+    void wait_for_pending_update();
     
     // ============== Session Management ==============
     

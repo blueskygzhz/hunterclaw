@@ -2,7 +2,7 @@
 
 #include "hunterclaw/memory/manager_sync_ops.h"
 #include "hunterclaw/memory/types.h"
-#include "hunterclaw/common/result.h"
+#include "hunterclaw/core/result.h"
 #include <vector>
 #include <string>
 #include <map>

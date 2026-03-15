@@ -148,7 +148,7 @@ double age_in_days_from_timestamp(
     
     auto age_duration = now - timestamp;
     auto age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(age_duration).count();
-    age_ms = std::max(0LL, age_ms);
+    age_ms = std::max<int64_t>(0, age_ms);
     
     return static_cast<double>(age_ms) / DAY_MS;
 }
