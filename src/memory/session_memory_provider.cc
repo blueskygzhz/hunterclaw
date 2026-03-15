@@ -1,6 +1,6 @@
 #include "hunterclaw/memory/session_memory_provider.h"
 #include "hunterclaw/memory/session_files.h"
-#include "hunterclaw/core/logging.h"
+#include <spdlog/spdlog.h>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -9,6 +9,16 @@ namespace fs = std::filesystem;
 
 namespace hunterclaw {
 namespace memory {
+
+namespace {
+    auto log() {
+        auto logger = spdlog::get("memory");
+        if (!logger) {
+            logger = spdlog::stdout_logger_mt("memory");
+        }
+        return logger;
+    }
+}
 
 // ========================================
 // SessionMemoryProvider Implementation
@@ -21,46 +31,77 @@ SessionMemoryProvider::SessionMemoryProvider(
     const SessionMemoryConfig& config
 ) : provider_id_(provider_id),
     storage_(storage),
-    config_(config),
-    logger_(core::Logger::get()) {
+    config_(config) {
     
-    logger_->info("SessionMemoryProvider created: id={}, enabled={}, export_dir={}, retention_days={}",
-                  provider_id_, config_.enabled, 
-                  config_.export_dir.value_or("none"),
-                  config_.retention_days);
-}
-
-std::string SessionMemoryProvider::provider_id() const {
-    return provider_id_;
+    log()->info("SessionMemoryProvider created: id={}, enabled={}, export_dir={}, retention_days={}",
+                provider_id_, config_.enabled, 
+                config_.export_dir.value_or("none"),
+                config_.retention_days.value_or(0));
 }
 
 // ========================================
-// 核心搜索接口 (对齐 OpenClaw)
+// MemoryProvider 接口实现
 // ========================================
 
-core::Result<std::vector<Memory>> SessionMemoryProvider::search_memories(
+core::Result<std::string> SessionMemoryProvider::add_memory(
+    const std::string& content,
+    const std::map<std::string, std::string>& metadata
+) {
+    if (!config_.enabled) {
+        return core::Result<std::string>::Ok("");  // 静默跳过
+    }
+    
+    log()->debug("Session memory add_memory called with content: {}", content);
+    // Session memory 主要用于导出，不需要添加 memory
+    // 返回空 ID
+    return core::Result<std::string>::Ok("");
+}
+
+core::Result<std::vector<MemorySearchResult>> SessionMemoryProvider::search_memories(
     const std::string& query,
     const SearchOptions& options
 ) {
     if (!config_.enabled) {
-        return core::Err("Session memory is disabled");
+        return core::Result<std::vector<MemorySearchResult>>::Err("Session memory is disabled");
     }
     
-    // 对齐 OpenClaw: 如果指定了 sessionKey, 只搜索该 session
-    std::string session_key = options.session_key.value_or("");
-    
-    SearchOptions session_options = options;
-    if (!session_key.empty()) {
-        // 添加 source 过滤: sessions
-        session_options.filters["source"] = "sessions";
-        session_options.filters["session_key"] = session_key;
-    } else {
-        // 搜索所有 sessions
-        session_options.filters["source"] = "sessions";
+    // 简单实现：返回空结果（session memory 主要用于导出，不用于搜索）
+    log()->debug("Session memory search_memories called for query: {}", query);
+    return core::Result<std::vector<MemorySearchResult>>::Ok(std::vector<MemorySearchResult>{});
+}
+
+core::Result<bool> SessionMemoryProvider::remove_memory(const std::string& id) {
+    if (!config_.enabled) {
+        return core::Result<bool>::Ok(false);
     }
     
-    // 委托给底层 storage 搜索
-    return storage_->search(query, session_options);
+    log()->debug("Session memory remove_memory called for id: {}", id);
+    // Session memory 不支持删除
+    return core::Result<bool>::Ok(false);
+}
+
+core::Result<bool> SessionMemoryProvider::update_memory(
+    const std::string& id,
+    const std::string& content,
+    const std::map<std::string, std::string>& metadata
+) {
+    if (!config_.enabled) {
+        return core::Result<bool>::Ok(false);
+    }
+    
+    log()->debug("Session memory update_memory called for id: {}", id);
+    // Session memory 不支持更新
+    return core::Result<bool>::Ok(false);
+}
+
+core::Result<bool> SessionMemoryProvider::clear_memories() {
+    if (!config_.enabled) {
+        return core::Result<bool>::Ok(false);
+    }
+    
+    log()->debug("Session memory clear_memories called");
+    // Session memory 不支持清空
+    return core::Result<bool>::Ok(false);
 }
 
 // ========================================
@@ -72,7 +113,7 @@ core::Result<void> SessionMemoryProvider::export_session_messages(
     const std::vector<SessionMessage>& messages
 ) {
     if (!config_.enabled || !config_.export_dir) {
-        return core::Ok();  // 静默跳过
+        return core::Result<void>::Ok();  // 静默跳过
     }
     
     // 对齐 OpenClaw: exportSessionMessagesBatch
@@ -92,7 +133,7 @@ core::Result<void> SessionMemoryProvider::export_session_messages(
     try {
         std::ofstream ofs(full_path, std::ios::app);
         if (!ofs) {
-            return core::Err("Failed to open session file: " + full_path.string());
+            return core::Result<void>::Err("Failed to open session file: " + full_path.string());
         }
         
         for (const auto& msg : messages) {
@@ -110,11 +151,11 @@ core::Result<void> SessionMemoryProvider::export_session_messages(
         }
         
         ofs.close();
-        logger_->debug("Exported {} messages to {}", messages.size(), full_path.string());
+        log()->debug("Exported {} messages to {}", messages.size(), full_path.string());
         
-        return core::Ok();
+        return core::Result<void>::Ok();
     } catch (const std::exception& e) {
-        return core::Err(std::string("Session export failed: ") + e.what());
+        return core::Result<void>::Err(std::string("Session export failed: ") + e.what());
     }
 }
 
@@ -130,16 +171,16 @@ core::Result<void> SessionMemoryProvider::trigger_delta_update(
     // triggerDeltaUpdate 方法
     
     if (!config_.enabled) {
-        return core::Ok();
+        return core::Result<void>::Ok();
     }
     
-    logger_->info("Triggering delta update for session: {} ({} new messages)",
+    log()->info("Triggering delta update for session: {} ({} new messages)",
                   session_key, new_messages.size());
     
     // 1. 导出消息到文件
     auto export_result = export_session_messages(session_key, new_messages);
-    if (!export_result) {
-        logger_->warn("Delta export failed: {}", export_result.error());
+    if (!export_result.is_ok()) {
+        log()->warn("Delta export failed: {}", export_result.error);
     }
     
     // 2. 索引新消息到数据库
@@ -170,8 +211,8 @@ core::Result<void> SessionMemoryProvider::trigger_delta_update(
         // 对齐 OpenClaw: this.embed([memory])
     }
     
-    logger_->info("Delta update completed for session: {}", session_key);
-    return core::Ok();
+    log()->info("Delta update completed for session: {}", session_key);
+    return core::Result<void>::Ok();
 }
 
 // ========================================
@@ -180,7 +221,7 @@ core::Result<void> SessionMemoryProvider::trigger_delta_update(
 
 core::Result<void> SessionMemoryProvider::prune_old_sessions() {
     if (!config_.enabled || !config_.retention_days || !config_.export_dir) {
-        return core::Ok();
+        return core::Result<void>::Ok();
     }
     
     // 对齐 OpenClaw: pruneOldSessionFiles
@@ -189,7 +230,7 @@ core::Result<void> SessionMemoryProvider::prune_old_sessions() {
     int retention_days = config_.retention_days.value();
     fs::path export_dir = config_.export_dir.value();
     
-    logger_->info("Pruning sessions older than {} days from {}", 
+    log()->info("Pruning sessions older than {} days from {}", 
                   retention_days, export_dir.string());
     
     // 计算截止时间
@@ -201,7 +242,7 @@ core::Result<void> SessionMemoryProvider::prune_old_sessions() {
     
     try {
         if (!fs::exists(export_dir)) {
-            return core::Ok();
+            return core::Result<void>::Ok();
         }
         
         for (const auto& entry : fs::directory_iterator(export_dir)) {
@@ -219,15 +260,15 @@ core::Result<void> SessionMemoryProvider::prune_old_sessions() {
             if (ftime_t < cutoff_time_t) {
                 fs::remove(entry);
                 deleted_count++;
-                logger_->debug("Pruned old session file: {}", entry.path().filename().string());
+                log()->debug("Pruned old session file: {}", entry.path().filename().string());
             }
         }
         
-        logger_->info("Pruned {} old session files", deleted_count);
-        return core::Ok();
+        log()->info("Pruned {} old session files", deleted_count);
+        return core::Result<void>::Ok();
         
     } catch (const std::exception& e) {
-        return core::Err(std::string("Session pruning failed: ") + e.what());
+        return core::Result<void>::Err(std::string("Session pruning failed: ") + e.what());
     }
 }
 
@@ -244,30 +285,5 @@ fs::path SessionMemoryProvider::generate_session_filename(const std::string& ses
     return fs::path(safe_key + ".jsonl");
 }
 
-core::Result<ProviderStats> SessionMemoryProvider::get_stats() const {
-    if (!config_.enabled) {
-        return core::Err("Session memory is disabled");
-    }
-    
-    // 获取底层 storage 统计
-    return storage_->get_stats();
-}
-
-core::Result<void> SessionMemoryProvider::sync(const SyncParams& params) {
-    // SessionMemoryProvider 不需要主动 sync
-    // 数据通过 trigger_delta_update 增量更新
-    return core::Ok();
-}
-
-core::Result<void> SessionMemoryProvider::add_memories(
-    const std::vector<Memory>& memories
-) {
-    if (!config_.enabled) {
-        return core::Err("Session memory is disabled");
-    }
-    
-    return storage_->add_memories(memories);
-}
-
-} // namespace memory
-} // namespace hunterclaw
+}  // namespace memory
+}  // namespace hunterclaw

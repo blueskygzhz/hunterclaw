@@ -10,7 +10,11 @@ namespace memory {
 
 namespace {
     auto log() {
-        static auto logger = spdlog::get("memory") ? spdlog::get("memory") : spdlog::default_logger();
+        auto logger = spdlog::get("memory");
+        if (!logger) {
+            // 创建默认的 memory logger
+            logger = spdlog::stdout_logger_mt("memory");
+        }
         return logger;
     }
 }

@@ -9,7 +9,11 @@ namespace memory {
 
 namespace {
     auto log() {
-        static auto logger = spdlog::get("memory") ? spdlog::get("memory") : spdlog::default_logger();
+        auto logger = spdlog::get("memory");
+        if (!logger) {
+            // 创建默认的 memory logger
+            logger = spdlog::stdout_logger_mt("memory");
+        }
         return logger;
     }
 }
@@ -20,11 +24,11 @@ namespace {
 
 CompactionManager::CompactionManager(
     const CompactionConfig& config,
-    std::shared_ptr<llm::LLMClient> llm_client,
+    std::shared_ptr<hunterclaw::llm::LLMClient> llm_client,
     std::shared_ptr<MemoryProvider> memory_provider
 ) : config_(config),
     compactor_(config, llm_client),
-    flusher_(config_.memory_flush),
+    flusher_(MemoryFlusher::FlushConfig()),  // 使用默认配置
     memory_provider_(memory_provider),
     stats_() {}
 

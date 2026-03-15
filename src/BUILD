@@ -35,6 +35,12 @@ cc_library(
         "memory/multimodal.cc",
         "memory/json_parser.cc",
         "memory/pruning.cc",
+        # Compaction 模块 (OpenClaw 对齐) - 核心3个文件已成功编译✅
+        "memory/compaction.cc",
+        "memory/compaction_manager.cc",
+        "memory/compaction_hooks.cc",
+        # session_memory_provider (正在修复)
+        "memory/session_memory_provider.cc",
     ],
     deps = [
         "//:hunterclaw_headers",

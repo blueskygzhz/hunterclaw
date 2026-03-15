@@ -10,11 +10,19 @@
 #include <spdlog/spdlog.h>
 
 namespace hunterclaw {
+
+// 导入 llm 命名空间以简化代码
+using namespace hunterclaw::llm;
+
 namespace memory {
 
 namespace {
     auto log() {
-        static auto logger = spdlog::get("memory") ? spdlog::get("memory") : spdlog::default_logger();
+        auto logger = spdlog::get("memory");
+        if (!logger) {
+            // 创建默认的 memory logger
+            logger = spdlog::stdout_logger_mt("memory");
+        }
         return logger;
     }
 }
@@ -25,7 +33,7 @@ namespace {
 
 MemoryCompactor::MemoryCompactor(
     const CompactionConfig& config,
-    std::shared_ptr<llm::LLMClient> llm_client
+    std::shared_ptr<hunterclaw::llm::LLMClient> llm_client
 ) : config_(config), 
     stats_(),
     llm_client_(llm_client) {}
@@ -136,7 +144,7 @@ std::string MemoryCompactor::format_messages_for_summary(
         } else if (msg.role == "assistant") {
             oss << "Assistant: ";
         } else if (msg.role == "tool") {
-            oss << "Tool (" << msg.name.value_or("unknown") << "): ";
+            oss << "Tool (" << (msg.name ? *msg.name : "unknown") << "): ";
         } else {
             oss << msg.role << ": ";
         }
@@ -195,46 +203,34 @@ core::Result<std::string> MemoryCompactor::summarize_chunk(
     // 检查 LLM Client 是否可用
     if (!llm_client_) {
         // 降级: 返回简化摘要
-        return Result<std::string>::ok(
+        return core::Result<std::string>::Ok(
             "[Summarized " + std::to_string(chunk.size()) + 
             " messages covering conversation history]"
         );
     }
     
     // 构建 LLM 请求消息
-    std::vector<llm::Message> messages;
+    std::vector<hunterclaw::llm::LLMMessage> messages;
     
     // System prompt
-    llm::Message system_msg;
-    system_msg.role = "system";
-    system_msg.content = config_.summarization.system_prompt;
+    auto system_msg = hunterclaw::llm::LLMMessage::system(config_.summarization.system_prompt);
     messages.push_back(system_msg);
     
     // User prompt
-    llm::Message user_msg;
-    user_msg.role = "user";
-    user_msg.content = prompt;
+    auto user_msg = hunterclaw::llm::LLMMessage::user(prompt);
     messages.push_back(user_msg);
     
-    // 创建完成请求
-    llm::CompletionRequest request;
-    request.model = model_id;
-    request.messages = messages;
-    request.max_tokens = 2000;
-    request.temperature = 0.5;  // 较低温度以获得稳定摘要
-    request.stream = false;
+    // 调用 LLM (使用 generate_from_messages 接口)
+    auto result = llm_client_->generate_from_messages(messages);
     
-    // 调用 LLM
-    auto result = llm_client_->complete(request);
-    
-    if (result.is_err()) {
-        return Result<std::string>::err(
-            "LLM summarization failed: " + result.error()
+    if (!result.is_ok()) {
+        return core::Result<std::string>::Err(
+            "LLM summarization failed: " + result.error
         );
     }
     
     // 提取摘要内容
-    std::string summary = result.value().content;
+    std::string summary = result.value;
     
     // 后处理: 移除多余空白 (假设 core::utils::trim 存在)
     // 如果不存在，使用简单的实现
@@ -250,12 +246,10 @@ core::Result<std::string> MemoryCompactor::summarize_chunk(
     log()->info("Generated summary for {} messages ({} chars)",
                chunk.size(), summary.length());
     
-    // 更新统计 (如果提供了 usage 信息)
-    if (result.value().usage.total_tokens > 0) {
-        stats_.total_compactions++;
-    }
+    // 更新统计
+    stats_.total_compactions++;
     
-    return Result<std::string>::ok(summary);
+    return core::Result<std::string>::Ok(summary);
 }
 
 core::Result<CompactionResult> MemoryCompactor::summarize_in_stages(
@@ -272,7 +266,7 @@ core::Result<CompactionResult> MemoryCompactor::summarize_in_stages(
         // 消息太少，直接摘要整体
         auto summary_result = summarize_chunk(messages, model_id, api_key);
         if (!summary_result.is_ok()) {
-            return Result<CompactionResult>::error(summary_result.error);
+            return core::Result<CompactionResult>::Err(summary_result.error);
         }
         
         result.summary = summary_result.value;
@@ -294,7 +288,7 @@ core::Result<CompactionResult> MemoryCompactor::summarize_in_stages(
         for (const auto& chunk : chunks) {
             auto summary_result = summarize_chunk(chunk, model_id, api_key, previous_summary);
             if (!summary_result.is_ok()) {
-                return Result<CompactionResult>::error(summary_result.error);
+                return core::Result<CompactionResult>::Err(summary_result.error);
             }
             
             chunk_summaries.push_back(summary_result.value);
@@ -341,7 +335,7 @@ core::Result<CompactionResult> MemoryCompactor::summarize_in_stages(
     stats_.tokens_saved += result.stats.tokens_saved;
     stats_.last_compaction = result.stats.last_compaction;
     
-    return Result<CompactionResult>::ok(std::move(result));
+    return core::Result<CompactionResult>::Ok(std::move(result));
 }
 
 // ============================================================================
@@ -373,20 +367,20 @@ core::Result<bool> MemoryFlusher::flush_if_needed(
     int context_window,
     int reserve_tokens_floor,
     size_t transcript_size_bytes,
-    const std::function<Result<void>()>& flush_callback
+    const std::function<core::Result<void>()>& flush_callback
 ) {
     if (!should_flush(current_token_count, context_window, reserve_tokens_floor, transcript_size_bytes)) {
-        return Result<bool>::ok(false);
+        return core::Result<bool>::Ok(false);
     }
     
     // 执行刷新回调
     auto result = flush_callback();
     if (!result.is_ok()) {
-        return Result<bool>::error(result.error);
+        return core::Result<bool>::Err(result.error);
     }
     
     last_flush_ = std::chrono::system_clock::now();
-    return Result<bool>::ok(true);
+    return core::Result<bool>::Ok(true);
 }
 
 } // namespace memory
