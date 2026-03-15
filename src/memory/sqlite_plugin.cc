@@ -7,6 +7,7 @@
 #include <cmath>
 #include <algorithm>
 #include <set>
+#include <map>
 #include <chrono>
 
 namespace hunterclaw {
@@ -249,6 +250,64 @@ core::Result<std::string> SQLiteMemoryProvider::add_memory(
 }
 
 // ========================================
+// 辅助函数: 从数据库获取指定 path/id 的 embedding
+// ========================================
+
+std::optional<std::vector<float>> SQLiteMemoryProvider::get_embedding_for_path(const std::string& path) {
+    // path 可能是 memory ID 或文件路径
+    // 尝试通过 ID 查询
+    const char* sql = "SELECT embedding FROM memories WHERE id = ?";
+    sqlite3_stmt* stmt;
+    
+    int rc = sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        return std::nullopt;
+    }
+    
+    sqlite3_bind_text(stmt, 1, path.c_str(), -1, SQLITE_TRANSIENT);
+    
+    std::optional<std::vector<float>> result;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const void* blob = sqlite3_column_blob(stmt, 0);
+        int blob_size = sqlite3_column_bytes(stmt, 0);
+        
+        if (blob && blob_size > 0 && blob_size % 4 == 0) {
+            // 反序列化 embedding (float32 数组)
+            std::vector<float> embedding(blob_size / 4);
+            std::memcpy(embedding.data(), blob, blob_size);
+            result = embedding;
+        }
+    }
+    
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+// ========================================
+// 辅助函数: 从数据库获取指定 path/id 的 created_at 时间戳
+// ========================================
+
+std::optional<int64_t> SQLiteMemoryProvider::get_timestamp_for_path(const std::string& path) {
+    const char* sql = "SELECT created_at FROM memories WHERE id = ?";
+    sqlite3_stmt* stmt;
+    
+    int rc = sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        return std::nullopt;
+    }
+    
+    sqlite3_bind_text(stmt, 1, path.c_str(), -1, SQLITE_TRANSIENT);
+    
+    std::optional<int64_t> result;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        result = sqlite3_column_int64(stmt, 0);
+    }
+    
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+// ========================================
 // 搜索记忆
 // ========================================
 
@@ -464,7 +523,7 @@ std::vector<Memory> SQLiteMemoryProvider::apply_mmr(
     return selected;
 }
 
-// MMR 重排 (MemorySearchResult 版本) - 对齐 OpenClaw
+// MMR 重排 (MemorySearchResult 版本) - 严格对齐 OpenClaw mmr.ts
 std::vector<MemorySearchResult> SQLiteMemoryProvider::apply_mmr_to_search_results(
     const std::vector<MemorySearchResult>& results,
     double lambda,
@@ -476,11 +535,22 @@ std::vector<MemorySearchResult> SQLiteMemoryProvider::apply_mmr_to_search_result
     std::vector<MemorySearchResult> reranked;
     std::set<size_t> selected_indices;
     
-    // 第一步: 选择最高相关性的结果
+    // 缓存 embedding 数据: path -> embedding
+    std::map<std::string, std::vector<float>> embedding_cache;
+    
+    // 预加载所有结果的 embedding
+    for (const auto& result : results) {
+        auto embedding = get_embedding_for_path(result.path);
+        if (embedding.has_value()) {
+            embedding_cache[result.path] = embedding.value();
+        }
+    }
+    
+    // 第一步: 选择最高相关性的结果（对齐 OpenClaw）
     reranked.push_back(results[0]);
     selected_indices.insert(0);
     
-    // 迭代选择剩余 k-1 个结果
+    // 迭代选择剩余 k-1 个结果（对齐 OpenClaw mmr.ts:28-50）
     while (reranked.size() < k && reranked.size() < results.size()) {
         double max_mmr_score = -1.0;
         size_t best_idx = 0;
@@ -490,20 +560,31 @@ std::vector<MemorySearchResult> SQLiteMemoryProvider::apply_mmr_to_search_result
             
             const auto& candidate = results[i];
             
-            // 计算与已选择项的最大相似度
+            // 获取候选的 embedding
+            auto cand_emb_it = embedding_cache.find(candidate.path);
+            if (cand_emb_it == embedding_cache.end()) {
+                // 如果没有 embedding，使用 snippet 长度作为后备
+                continue;
+            }
+            
+            // 计算与已选择项的最大相似度（对齐 OpenClaw mmr.ts:33-39）
             double max_sim = 0.0;
             for (size_t sel_idx : selected_indices) {
                 const auto& selected = results[sel_idx];
-                // 使用 snippet 长度差异作为简化的相似度度量
-                // 在完整实现中应该使用 embedding 的余弦相似度
-                double sim = 1.0 - std::abs(static_cast<double>(
-                    candidate.snippet.size() - selected.snippet.size())) / 1000.0;
-                sim = std::max(0.0, std::min(1.0, sim));
-                max_sim = std::max(max_sim, sim);
+                auto sel_emb_it = embedding_cache.find(selected.path);
+                
+                if (sel_emb_it != embedding_cache.end()) {
+                    // 使用真实的余弦相似度（对齐 OpenClaw）
+                    double sim = impl_->cosine_similarity(
+                        cand_emb_it->second, 
+                        sel_emb_it->second
+                    );
+                    max_sim = std::max(max_sim, sim);
+                }
             }
             
             // MMR 分数: λ * relevance - (1-λ) * max_similarity
-            // 对齐 OpenClaw: score = lambda * relevance - (1 - lambda) * max_sim
+            // 严格对齐 OpenClaw mmr.ts:42
             double mmr_score = lambda * candidate.score - (1.0 - lambda) * max_sim;
             
             if (mmr_score > max_mmr_score) {
@@ -516,7 +597,7 @@ std::vector<MemorySearchResult> SQLiteMemoryProvider::apply_mmr_to_search_result
             reranked.push_back(results[best_idx]);
             selected_indices.insert(best_idx);
         } else {
-            break; // 没有更多有效候选
+            break; // 没有更多有效候选（对齐 OpenClaw）
         }
     }
     
@@ -540,7 +621,7 @@ void SQLiteMemoryProvider::apply_temporal_decay(
     }
 }
 
-// 时间衰减 (MemorySearchResult 版本) - 对齐 OpenClaw
+// 时间衰减 (MemorySearchResult 版本) - 严格对齐 OpenClaw temporal-decay.ts
 void SQLiteMemoryProvider::apply_temporal_decay_to_search_results(
     std::vector<MemorySearchResult>& results,
     int half_life_days
@@ -549,24 +630,36 @@ void SQLiteMemoryProvider::apply_temporal_decay_to_search_results(
         return;
     }
     
+    // 获取当前时间戳 (毫秒)
+    auto now = std::chrono::system_clock::now();
+    int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()
+    ).count();
+    
+    // 计算 lambda = ln(2) / half_life_days (对齐 OpenClaw temporal-decay.ts:12-16)
+    const double lambda = std::log(2.0) / half_life_days;
+    const int64_t DAY_MS = 24LL * 60 * 60 * 1000;
+    
     for (auto& result : results) {
-        // 对齐 OpenClaw: decay_factor = 2^(-age_days / half_life_days)
-        // 等价于: decay_factor = 0.5^(age_days / half_life_days)
+        // 从数据库获取真实的时间戳
+        auto timestamp_opt = get_timestamp_for_path(result.path);
         
-        // 假设 result 有时间戳字段（如果没有，则跳过衰减）
-        // TODO: MemorySearchResult 需要添加 timestamp 字段
-        // 这里简化处理：假设所有结果都是当前时间创建的
-        // 在完整实现中应该从数据库中查询创建时间
+        if (!timestamp_opt.has_value()) {
+            // 如果没有时间戳，跳过衰减 (对齐 OpenClaw: evergreen memory)
+            continue;
+        }
         
-        // 简化实现：使用默认衰减（假设平均年龄为 7 天）
-        double avg_age_days = 7.0;
+        int64_t created_at = timestamp_opt.value();
         
-        // 计算衰减因子: decay = exp(-lambda * age)
-        // 其中 lambda = ln(2) / half_life_days
-        double lambda = std::log(2.0) / half_life_days;
-        double decay_factor = std::exp(-lambda * avg_age_days);
+        // 计算年龄 (天数) (对齐 OpenClaw temporal-decay.ts:141-153)
+        double age_days = static_cast<double>(now_ms - created_at) / DAY_MS;
+        age_days = std::max(0.0, age_days); // 确保非负
         
-        // 应用衰减到分数
+        // 计算衰减因子: decay = exp(-lambda * age_days)
+        // 对齐 OpenClaw temporal-decay.ts:19-27
+        double decay_factor = std::exp(-lambda * age_days);
+        
+        // 应用衰减到分数 (对齐 OpenClaw temporal-decay.ts:30)
         result.score *= decay_factor;
     }
 }
