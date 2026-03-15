@@ -116,8 +116,8 @@ public:
             
             // Success
             tools::ToolResult tool_result;
-            tool_result.ok = true;
-            tool_result.data = convert_from_json(result);
+            tool_result.success = true;
+            tool_result.details = convert_from_json(result);
             
             return tool_result;
             
@@ -125,7 +125,7 @@ public:
             log()->error("CronTool exception: {}", e.what());
             
             tools::ToolResult tool_result;
-            tool_result.ok = false;
+            tool_result.success = false;
             tool_result.error = std::string("Cron tool failed: ") + e.what();
             return tool_result;
         }
@@ -139,62 +139,15 @@ private:
     std::shared_ptr<GatewayCronIntegration> integration_;
     
     // Helper: Convert core::JsonValue to nlohmann::json
+    // Helper: Convert core::JsonValue to nlohmann::json
     nlohmann::json convert_to_json(const core::JsonValue& value) {
-        // TODO: Implement proper conversion
-        // For now, use string serialization as workaround
-        
-        nlohmann::json result;
-        
-        if (value.is_object()) {
-            for (const auto& [key, val] : value.as_object()) {
-                result[key] = convert_to_json(val);
-            }
-        } else if (value.is_array()) {
-            for (const auto& item : value.as_array()) {
-                result.push_back(convert_to_json(item));
-            }
-        } else if (value.is_string()) {
-            result = value.as_string();
-        } else if (value.is_bool()) {
-            result = value.as_bool();
-        } else if (value.is_number()) {
-            // Assume integer for simplicity
-            result = static_cast<int>(value.as_int());
-        } else {
-            result = nullptr;
-        }
-        
-        return result;
+        return value.to_json();
     }
     
     // Helper: Convert nlohmann::json to core::JsonValue
     core::JsonValue convert_from_json(const nlohmann::json& j) {
-        // TODO: Implement proper conversion
-        // For now, use simple object wrapping
-        
-        if (j.is_object()) {
-            auto obj = core::JsonValue::object();
-            for (auto it = j.begin(); it != j.end(); ++it) {
-                obj[it.key()] = convert_from_json(it.value());
-            }
-            return obj;
-        } else if (j.is_array()) {
-            std::vector<core::JsonValue> arr;
-            for (const auto& item : j) {
-                arr.push_back(convert_from_json(item));
-            }
-            return core::JsonValue::array(arr);
-        } else if (j.is_string()) {
-            return core::JsonValue(j.get<std::string>());
-        } else if (j.is_boolean()) {
-            return core::JsonValue(j.get<bool>());
-        } else if (j.is_number_integer()) {
-            return core::JsonValue(static_cast<int64_t>(j.get<int>()));
-        } else if (j.is_number_float()) {
-            return core::JsonValue(j.get<double>());
-        } else {
-            return core::JsonValue();  // null
-        }
+        // JsonValue has a constructor that accepts nlohmann::json
+        return core::JsonValue(j);
     }
 };
 

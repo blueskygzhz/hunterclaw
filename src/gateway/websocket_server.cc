@@ -248,25 +248,4 @@ bool WebSocketServer::is_running() const {
     return impl_->is_running();
 }
 
-ServerStats WebSocketServer::get_stats() const {
-    return impl_->get_stats();
-}
-
-std::vector<WebSocketClient> WebSocketServer::get_all_clients() const {
-    return impl_->get_all_clients();
-}
-
-void WebSocketServer::register_method_handler(const std::string& method, MethodHandler handler) {
-    impl_->register_method_handler(method, std::move(handler));
-}
-
-void WebSocketServer::set_connection_handler(ConnectionHandler handler) {
-    impl_->set_connection_handler(std::move(handler));
-}
-
-void WebSocketServer::set_disconnection_handler(DisconnectionHandler handler) {
-    impl_->set_disconnection_handler(std::move(handler));
-}
-
-}  // namespace gateway
 }  // namespace hunterclaw

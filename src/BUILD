@@ -23,6 +23,7 @@ cc_library(
             "cron/*.cc",
             "auto_reply/*.cc",
             "config/*.cc",
+            "memory/*.cc",
         ],
         exclude = [
             "main.cc",
@@ -33,7 +34,6 @@ cc_library(
             "mcp/**",
             "react/**",
             "sandbox/**",
-            "memory/**",
             # Exclude daemon implementations (platform-specific)
             "daemon/*.cc",
         ],
@@ -67,6 +67,51 @@ cc_library(
         ],
         "//conditions:default": [],
     }),
+    linkstatic = False,
+    visibility = ["//visibility:public"],
+)
+
+# ============================================================================
+# Memory Library - 严格对齐 OpenClaw Memory 实现
+# ============================================================================
+cc_library(
+    name = "hunterclaw_memory",
+    srcs = [
+        "memory/memory_manager.cc",
+        "memory/sqlite_storage.cc",
+        "memory/search_algorithms.cc",
+        "memory/embedding_provider.cc",
+        "memory/http_client.cc",  # HTTP客户端
+        "memory/memory_index_manager.cc",
+        "memory/search_manager_factory.cc",
+        "memory/provider_registry.cc",
+        "memory/qmd_manager.cc",
+        "memory/auto_reindex.cc",  # 自动重索引
+        "memory/chunking.cc",  # 文件分块
+        "memory/manager_search.cc",  # Manager搜索操作
+        "memory/session_files.cc",  # Session文件处理
+        "memory/manager_sync_ops.cc",  # Manager同步操作
+        "memory/file_watcher_linux.cc",  # 文件监听(Linux)
+    ],
+    deps = [
+        "//:hunterclaw_headers",
+        "@nlohmann_json//:json",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+    copts = [
+        "-std=c++17",
+        "-Wall",
+        "-Wextra",
+        "-I/usr/include/jsoncpp",
+    ],
+    linkopts = [
+        "-lpthread",
+        "-luuid",
+        "-lsqlite3",
+        "-ljsoncpp",
+        "-lcurl",  # libcurl for HTTP
+    ],
     linkstatic = False,
     visibility = ["//visibility:public"],
 )

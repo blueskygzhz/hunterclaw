@@ -166,7 +166,8 @@ std::map<std::string, ListedCollection> QmdMemoryManager::list_collections_best_
     
     try {
         auto qmd_result = run_qmd({"collection", "list", "--json"}, 
-            QmdCommandOptions{qmd_config_.update.command_timeout_ms});
+            QmdCommandOptions opts{qmd_config_.update.command_timeout_ms, {}};
+            &opts);
         
         // Parse JSON (simplified - real implementation would use JSON library)
         // Format: [{"name": "...", "path": "...", "pattern": "..."}, ...]
@@ -190,12 +191,14 @@ void QmdMemoryManager::add_collection(
         "--glob", pattern
     };
     
-    run_qmd(args, QmdCommandOptions{qmd_config_.update.command_timeout_ms});
+    QmdCommandOptions opts{qmd_config_.update.command_timeout_ms, {}};
+    run_qmd(args, &opts);
 }
 
 void QmdMemoryManager::remove_collection(const std::string& name) {
     run_qmd({"collection", "remove", name}, 
-        QmdCommandOptions{qmd_config_.update.command_timeout_ms});
+        QmdCommandOptions opts{qmd_config_.update.command_timeout_ms, {}};
+        &opts);
 }
 
 void QmdMemoryManager::ensure_collection_path(const ManagedCollection& collection) {
@@ -208,7 +211,8 @@ void QmdMemoryManager::run_update(const std::string& reason, bool force) {
         args.push_back("--force");
     }
     
-    run_qmd(args, QmdCommandOptions{qmd_config_.update.command_timeout_ms});
+    QmdCommandOptions opts{qmd_config_.update.command_timeout_ms, {}};
+    run_qmd(args, &opts);
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -217,7 +221,7 @@ void QmdMemoryManager::run_update(const std::string& reason, bool force) {
 
 std::vector<MemorySearchResult> QmdMemoryManager::search(
     const std::string& query,
-    const SearchOptions& opts
+    const SearchOptions* opts
 ) {
     if (closed_) {
         throw std::runtime_error("QmdMemoryManager is closed");
@@ -309,14 +313,15 @@ MemoryProviderStatus QmdMemoryManager::status() {
     return status;
 }
 
-void QmdMemoryManager::sync(const SyncParams& params) {
-    run_update(params.reason.empty() ? "manual" : params.reason, params.force);
+void QmdMemoryManager::sync(const SyncParams* params) {
+    run_update(params->reason.empty() ? "manual" : params->reason, params->force);
 }
 
 MemoryEmbeddingProbeResult QmdMemoryManager::probe_embedding_availability() {
     try {
         // Try to run a test query
-        run_qmd({"query", "test", "--limit", "1"}, QmdCommandOptions{5000});
+        QmdCommandOptions opts{5000, {}};
+        run_qmd({"query", "test", "--limit", "1"}, &opts);
         return MemoryEmbeddingProbeResult{true, ""};
     } catch (const std::exception& e) {
         return MemoryEmbeddingProbeResult{false, e.what()};
@@ -342,7 +347,7 @@ void QmdMemoryManager::close() {
 
 QmdMemoryManager::QmdCommandResult QmdMemoryManager::run_qmd(
     const std::vector<std::string>& args,
-    const QmdCommandOptions& opts
+    const QmdCommandOptions* opts
 ) {
     // Build command
     std::ostringstream cmd;

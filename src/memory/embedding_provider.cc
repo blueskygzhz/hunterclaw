@@ -1,478 +1,637 @@
 #include "hunterclaw/memory/embedding_provider.h"
-#include <spdlog/spdlog.h>
-#include <curl/curl.h>
-#include <json/json.h>
 #include <sstream>
+#include <cmath>
 
 namespace hunterclaw {
 namespace memory {
 
 // ============================================================================
-// HTTP Client 辅助类
+// Helper: Vector normalization
 // ============================================================================
 
-class HTTPClient {
-public:
-    struct Response {
-        int status_code = 0;
-        std::string body;
-        std::map<std::string, std::string> headers;
+std::vector<float> normalize_embedding(const std::vector<float>& vec) {
+    double sum_sq = 0.0;
+    for (float v : vec) {
+        if (!std::isfinite(v)) {
+            // Sanitize: replace NaN/Inf with 0
+            continue;
+        }
+        sum_sq += v * v;
+    }
+    
+    if (sum_sq == 0.0) {
+        return std::vector<float>(vec.size(), 0.0f);
+    }
+    
+    float norm = std::sqrt(sum_sq);
+    std::vector<float> normalized;
+    normalized.reserve(vec.size());
+    
+    for (float v : vec) {
+        if (!std::isfinite(v)) {
+            normalized.push_back(0.0f);
+        } else {
+            normalized.push_back(v / norm);
+        }
+    }
+    
+    return normalized;
+}
+
+// ============================================================================
+// OpenAI Provider
+// ============================================================================
+
+OpenAIEmbeddingProvider::OpenAIEmbeddingProvider(const OpenAIConfig& config)
+    : config_(config) {}
+
+std::string OpenAIEmbeddingProvider::id() const {
+    return "openai";
+}
+
+std::string OpenAIEmbeddingProvider::model() const {
+    return config_.model;
+}
+
+std::optional<int> OpenAIEmbeddingProvider::max_input_tokens() const {
+    return config_.max_input_tokens;
+}
+
+Result<std::vector<float>> OpenAIEmbeddingProvider::embed_query(const std::string& text) {
+    // 构建请求 (对齐 OpenClaw embeddings-openai.ts)
+    json request_body = {
+        {"model", config_.model},
+        {"input", text}
     };
     
-    static core::Result<Response> post(
-        const std::string& url,
-        const std::string& json_body,
-        const std::map<std::string, std::string>& headers
-    ) {
-        CURL* curl = curl_easy_init();
-        if (!curl) {
-            return core::Err("Failed to initialize CURL");
-        }
-        
-        Response response;
-        std::string response_body;
-        
-        // 回调函数
-        auto write_callback = [](void* contents, size_t size, size_t nmemb, void* userp) -> size_t {
-            ((std::string*)userp)->append((char*)contents, size * nmemb);
-            return size * nmemb;
-        };
-        
-        // 设置 CURL 选项
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_POST, 1L);
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body.c_str());
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_body);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
-        
-        // 设置请求头
-        struct curl_slist* http_headers = nullptr;
-        http_headers = curl_slist_append(http_headers, "Content-Type: application/json");
-        
-        for (const auto& [key, value] : headers) {
-            std::string header = key + ": " + value;
-            http_headers = curl_slist_append(http_headers, header.c_str());
-        }
-        
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, http_headers);
-        
-        // 执行请求
-        CURLcode res = curl_easy_perform(curl);
-        
-        if (res != CURLE_OK) {
-            curl_slist_free_all(http_headers);
-            curl_easy_cleanup(curl);
-            return core::Err("CURL request failed: " + std::string(curl_easy_strerror(res)));
-        }
-        
-        // 获取状态码
-        long status_code;
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status_code);
-        response.status_code = static_cast<int>(status_code);
-        response.body = response_body;
-        
-        curl_slist_free_all(http_headers);
-        curl_easy_cleanup(curl);
-        
-        return core::Ok(response);
-    }
-};
-
-// ============================================================================
-// OpenAI Embedding Provider
-// ============================================================================
-
-class OpenAIEmbeddingProvider::Impl {
-public:
-    std::string api_key_;
-    std::string model_;
-    std::string base_url_;
-    
-    Impl(const std::string& api_key, const std::string& model, const std::string& base_url)
-        : api_key_(api_key), model_(model), base_url_(base_url) {}
-    
-    int get_dimension() const {
-        if (model_ == "text-embedding-3-large") return 3072;
-        if (model_ == "text-embedding-3-small") return 1536;
-        if (model_ == "text-embedding-ada-002") return 1536;
-        return 1536;  // 默认
+    if (config_.dimensions > 0) {
+        request_body["dimensions"] = config_.dimensions;
     }
     
-    core::Result<std::vector<float>> embed(const std::string& text) {
-        // 构造请求
-        Json::Value request_json;
-        request_json["input"] = text;
-        request_json["model"] = model_;
-        request_json["encoding_format"] = "float";
-        
-        Json::StreamWriterBuilder writer;
-        std::string request_body = Json::writeString(writer, request_json);
-        
-        // 发送请求
-        std::string url = base_url_ + "/embeddings";
-        std::map<std::string, std::string> headers = {
-            {"Authorization", "Bearer " + api_key_}
-        };
-        
-        auto response = HTTPClient::post(url, request_body, headers);
-        if (!response) {
-            return core::Err("HTTP request failed: " + response.error());
-        }
-        
-        auto resp = response.value();
-        if (resp.status_code != 200) {
-            return core::Err("OpenAI API error (status " + std::to_string(resp.status_code) + "): " + resp.body);
-        }
-        
-        // 解析响应
-        Json::CharReaderBuilder reader;
-        Json::Value response_json;
-        std::istringstream iss(resp.body);
-        std::string errs;
-        
-        if (!Json::parseFromStream(reader, iss, &response_json, &errs)) {
-            return core::Err("Failed to parse JSON response: " + errs);
-        }
-        
-        // 提取 embedding
-        if (!response_json.isMember("data") || !response_json["data"].isArray() || response_json["data"].empty()) {
-            return core::Err("Invalid response format: missing 'data' array");
-        }
-        
-        const auto& data = response_json["data"][0];
-        if (!data.isMember("embedding") || !data["embedding"].isArray()) {
-            return core::Err("Invalid response format: missing 'embedding' array");
-        }
-        
-        std::vector<float> embedding;
-        for (const auto& val : data["embedding"]) {
-            embedding.push_back(val.asFloat());
-        }
-        
-        spdlog::debug("[OpenAIEmbeddingProvider] Generated embedding: dim={}", embedding.size());
-        
-        return core::Ok(embedding);
+    // 设置headers
+    std::map<std::string, std::string> headers = config_.headers;
+    headers["Authorization"] = "Bearer " + config_.api_key;
+    headers["Content-Type"] = "application/json";
+    
+    // 发送HTTP请求
+    std::string url = config_.base_url + "/embeddings";
+    auto result = HttpClient::post_json(url, request_body, headers, 30000);
+    
+    if (!result.is_ok()) {
+        return Result<std::vector<float>>::error("OpenAI API error: " + result.error());
     }
     
-    core::Result<std::vector<std::vector<float>>> embed_batch(const std::vector<std::string>& texts) {
-        // 批量请求
-        Json::Value request_json;
-        Json::Value input_array(Json::arrayValue);
-        for (const auto& text : texts) {
-            input_array.append(text);
-        }
-        request_json["input"] = input_array;
-        request_json["model"] = model_;
-        request_json["encoding_format"] = "float";
+    // 解析响应 (对齐 OpenClaw格式)
+    try {
+        const auto& resp_json = result.value();
         
-        Json::StreamWriterBuilder writer;
-        std::string request_body = Json::writeString(writer, request_json);
-        
-        std::string url = base_url_ + "/embeddings";
-        std::map<std::string, std::string> headers = {
-            {"Authorization", "Bearer " + api_key_}
-        };
-        
-        auto response = HTTPClient::post(url, request_body, headers);
-        if (!response) {
-            return core::Err("HTTP request failed: " + response.error());
+        // 响应格式: {"data": [{"embedding": [0.1, 0.2, ...]}]}
+        if (!resp_json.contains("data") || !resp_json["data"].is_array()) {
+            return Result<std::vector<float>>::error("Invalid OpenAI response format");
         }
         
-        auto resp = response.value();
-        if (resp.status_code != 200) {
-            return core::Err("OpenAI API error: " + resp.body);
+        const auto& data = resp_json["data"];
+        if (data.empty()) {
+            return Result<std::vector<float>>::error("Empty embeddings in response");
         }
         
-        Json::CharReaderBuilder reader;
-        Json::Value response_json;
-        std::istringstream iss(resp.body);
-        std::string errs;
-        
-        if (!Json::parseFromStream(reader, iss, &response_json, &errs)) {
-            return core::Err("Failed to parse JSON response: " + errs);
+        const auto& first_item = data[0];
+        if (!first_item.contains("embedding")) {
+            return Result<std::vector<float>>::error("No embedding field in response");
         }
         
-        std::vector<std::vector<float>> embeddings;
-        for (const auto& data : response_json["data"]) {
-            std::vector<float> embedding;
-            for (const auto& val : data["embedding"]) {
-                embedding.push_back(val.asFloat());
-            }
-            embeddings.push_back(embedding);
-        }
+        std::vector<float> embedding = first_item["embedding"].get<std::vector<float>>();
         
-        spdlog::debug("[OpenAIEmbeddingProvider] Generated {} embeddings", embeddings.size());
+        // Normalize embedding
+        return Result<std::vector<float>>::ok_value(normalize_embedding(embedding));
         
-        return core::Ok(embeddings);
-    }
-};
-
-OpenAIEmbeddingProvider::OpenAIEmbeddingProvider(
-    const std::string& api_key,
-    const std::string& model,
-    const std::string& base_url
-) : impl_(std::make_unique<Impl>(api_key, model, base_url)) {}
-
-OpenAIEmbeddingProvider::~OpenAIEmbeddingProvider() = default;
-
-core::Result<std::vector<float>> OpenAIEmbeddingProvider::embed(const std::string& text) {
-    return impl_->embed(text);
-}
-
-core::Result<std::vector<std::vector<float>>> OpenAIEmbeddingProvider::embed_batch(
-    const std::vector<std::string>& texts
-) {
-    return impl_->embed_batch(texts);
-}
-
-std::string OpenAIEmbeddingProvider::model_name() const {
-    return impl_->model_;
-}
-
-int OpenAIEmbeddingProvider::dimension() const {
-    return impl_->get_dimension();
-}
-
-// ============================================================================
-// Ollama Embedding Provider
-// ============================================================================
-
-class OllamaEmbeddingProvider::Impl {
-public:
-    std::string model_;
-    std::string base_url_;
-    
-    Impl(const std::string& model, const std::string& base_url)
-        : model_(model), base_url_(base_url) {}
-    
-    int get_dimension() const {
-        if (model_ == "nomic-embed-text") return 768;
-        if (model_ == "mxbai-embed-large") return 1024;
-        if (model_ == "all-minilm") return 384;
-        return 768;  // 默认
-    }
-    
-    core::Result<std::vector<float>> embed(const std::string& text) {
-        Json::Value request_json;
-        request_json["model"] = model_;
-        request_json["prompt"] = text;
-        
-        Json::StreamWriterBuilder writer;
-        std::string request_body = Json::writeString(writer, request_json);
-        
-        std::string url = base_url_ + "/api/embeddings";
-        
-        auto response = HTTPClient::post(url, request_body, {});
-        if (!response) {
-            return core::Err("HTTP request failed: " + response.error());
-        }
-        
-        auto resp = response.value();
-        if (resp.status_code != 200) {
-            return core::Err("Ollama API error: " + resp.body);
-        }
-        
-        Json::CharReaderBuilder reader;
-        Json::Value response_json;
-        std::istringstream iss(resp.body);
-        std::string errs;
-        
-        if (!Json::parseFromStream(reader, iss, &response_json, &errs)) {
-            return core::Err("Failed to parse JSON response: " + errs);
-        }
-        
-        if (!response_json.isMember("embedding") || !response_json["embedding"].isArray()) {
-            return core::Err("Invalid response format");
-        }
-        
-        std::vector<float> embedding;
-        for (const auto& val : response_json["embedding"]) {
-            embedding.push_back(val.asFloat());
-        }
-        
-        spdlog::debug("[OllamaEmbeddingProvider] Generated embedding: dim={}", embedding.size());
-        
-        return core::Ok(embedding);
-    }
-    
-    core::Result<std::vector<std::vector<float>>> embed_batch(const std::vector<std::string>& texts) {
-        // Ollama 不支持批量,逐个调用
-        std::vector<std::vector<float>> embeddings;
-        for (const auto& text : texts) {
-            auto result = embed(text);
-            if (!result) {
-                return core::Err(result.error());
-            }
-            embeddings.push_back(result.value());
-        }
-        return core::Ok(embeddings);
-    }
-};
-
-OllamaEmbeddingProvider::OllamaEmbeddingProvider(
-    const std::string& model,
-    const std::string& base_url
-) : impl_(std::make_unique<Impl>(model, base_url)) {}
-
-OllamaEmbeddingProvider::~OllamaEmbeddingProvider() = default;
-
-core::Result<std::vector<float>> OllamaEmbeddingProvider::embed(const std::string& text) {
-    return impl_->embed(text);
-}
-
-core::Result<std::vector<std::vector<float>>> OllamaEmbeddingProvider::embed_batch(
-    const std::vector<std::string>& texts
-) {
-    return impl_->embed_batch(texts);
-}
-
-std::string OllamaEmbeddingProvider::model_name() const {
-    return impl_->model_;
-}
-
-int OllamaEmbeddingProvider::dimension() const {
-    return impl_->get_dimension();
-}
-
-// ============================================================================
-// Gemini Embedding Provider
-// ============================================================================
-
-class GeminiEmbeddingProvider::Impl {
-public:
-    std::string api_key_;
-    std::string model_;
-    
-    Impl(const std::string& api_key, const std::string& model)
-        : api_key_(api_key), model_(model) {}
-    
-    core::Result<std::vector<float>> embed(const std::string& text) {
-        Json::Value request_json;
-        request_json["content"]["parts"][0]["text"] = text;
-        
-        Json::StreamWriterBuilder writer;
-        std::string request_body = Json::writeString(writer, request_json);
-        
-        std::string url = "https://generativelanguage.googleapis.com/v1beta/models/" + 
-            model_ + ":embedContent?key=" + api_key_;
-        
-        auto response = HTTPClient::post(url, request_body, {});
-        if (!response) {
-            return core::Err("HTTP request failed: " + response.error());
-        }
-        
-        auto resp = response.value();
-        if (resp.status_code != 200) {
-            return core::Err("Gemini API error: " + resp.body);
-        }
-        
-        Json::CharReaderBuilder reader;
-        Json::Value response_json;
-        std::istringstream iss(resp.body);
-        std::string errs;
-        
-        if (!Json::parseFromStream(reader, iss, &response_json, &errs)) {
-            return core::Err("Failed to parse JSON response: " + errs);
-        }
-        
-        if (!response_json.isMember("embedding") || !response_json["embedding"].isMember("values")) {
-            return core::Err("Invalid response format");
-        }
-        
-        std::vector<float> embedding;
-        for (const auto& val : response_json["embedding"]["values"]) {
-            embedding.push_back(val.asFloat());
-        }
-        
-        spdlog::debug("[GeminiEmbeddingProvider] Generated embedding: dim={}", embedding.size());
-        
-        return core::Ok(embedding);
-    }
-    
-    core::Result<std::vector<std::vector<float>>> embed_batch(const std::vector<std::string>& texts) {
-        // Gemini 批量调用
-        std::vector<std::vector<float>> embeddings;
-        for (const auto& text : texts) {
-            auto result = embed(text);
-            if (!result) {
-                return core::Err(result.error());
-            }
-            embeddings.push_back(result.value());
-        }
-        return core::Ok(embeddings);
-    }
-};
-
-GeminiEmbeddingProvider::GeminiEmbeddingProvider(
-    const std::string& api_key,
-    const std::string& model
-) : impl_(std::make_unique<Impl>(api_key, model)) {}
-
-GeminiEmbeddingProvider::~GeminiEmbeddingProvider() = default;
-
-core::Result<std::vector<float>> GeminiEmbeddingProvider::embed(const std::string& text) {
-    return impl_->embed(text);
-}
-
-core::Result<std::vector<std::vector<float>>> GeminiEmbeddingProvider::embed_batch(
-    const std::vector<std::string>& texts
-) {
-    return impl_->embed_batch(texts);
-}
-
-std::string GeminiEmbeddingProvider::model_name() const {
-    return impl_->model_;
-}
-
-// ============================================================================
-// Embedding Provider Factory
-// ============================================================================
-
-core::Result<std::shared_ptr<EmbeddingProvider>> EmbeddingProviderFactory::create(
-    const std::string& type,
-    const std::map<std::string, std::string>& config
-) {
-    if (type == "openai") {
-        auto api_key_it = config.find("api_key");
-        if (api_key_it == config.end()) {
-            return core::Err("OpenAI provider requires 'api_key'");
-        }
-        
-        std::string model = config.count("model") ? config.at("model") : "text-embedding-3-small";
-        std::string base_url = config.count("base_url") ? config.at("base_url") : "https://api.openai.com/v1";
-        
-        return core::Ok<std::shared_ptr<EmbeddingProvider>>(
-            std::make_shared<OpenAIEmbeddingProvider>(api_key_it->second, model, base_url)
+    } catch (const std::exception& e) {
+        return Result<std::vector<float>>::error(
+            std::string("Failed to parse OpenAI response: ") + e.what()
         );
     }
-    else if (type == "ollama") {
-        std::string model = config.count("model") ? config.at("model") : "nomic-embed-text";
-        std::string base_url = config.count("base_url") ? config.at("base_url") : "http://localhost:11434";
-        
-        return core::Ok<std::shared_ptr<EmbeddingProvider>>(
-            std::make_shared<OllamaEmbeddingProvider>(model, base_url)
+}
+
+Result<std::vector<std::vector<float>>> OpenAIEmbeddingProvider::embed_batch(
+    const std::vector<std::string>& texts) {
+    
+    // 构建批量请求 (对齐 OpenClaw)
+    json request_body = {
+        {"model", config_.model},
+        {"input", texts}
+    };
+    
+    if (config_.dimensions > 0) {
+        request_body["dimensions"] = config_.dimensions;
+    }
+    
+    // 设置headers
+    std::map<std::string, std::string> headers = config_.headers;
+    headers["Authorization"] = "Bearer " + config_.api_key;
+    headers["Content-Type"] = "application/json";
+    
+    // 发送HTTP请求
+    std::string url = config_.base_url + "/embeddings";
+    auto result = HttpClient::post_json(url, request_body, headers, 60000);
+    
+    if (!result.is_ok()) {
+        return Result<std::vector<std::vector<float>>>::error(
+            "OpenAI batch API error: " + result.error()
         );
     }
-    else if (type == "gemini") {
-        auto api_key_it = config.find("api_key");
-        if (api_key_it == config.end()) {
-            return core::Err("Gemini provider requires 'api_key'");
+    
+    // 解析响应
+    try {
+        const auto& resp_json = result.value();
+        
+        if (!resp_json.contains("data") || !resp_json["data"].is_array()) {
+            return Result<std::vector<std::vector<float>>>::error(
+                "Invalid OpenAI batch response format"
+            );
         }
         
-        std::string model = config.count("model") ? config.at("model") : "text-embedding-004";
+        const auto& data = resp_json["data"];
+        std::vector<std::vector<float>> embeddings;
+        embeddings.reserve(data.size());
         
-        return core::Ok<std::shared_ptr<EmbeddingProvider>>(
-            std::make_shared<GeminiEmbeddingProvider>(api_key_it->second, model)
+        for (const auto& item : data) {
+            if (!item.contains("embedding")) {
+                return Result<std::vector<std::vector<float>>>::error(
+                    "Missing embedding in response item"
+                );
+            }
+            
+            std::vector<float> embedding = item["embedding"].get<std::vector<float>>();
+            embeddings.push_back(normalize_embedding(embedding));
+        }
+        
+        return Result<std::vector<std::vector<float>>>::ok_value(embeddings);
+        
+    } catch (const std::exception& e) {
+        return Result<std::vector<std::vector<float>>>::error(
+            std::string("Failed to parse OpenAI batch response: ") + e.what()
         );
-    }
-    else {
-        return core::Err("Unknown embedding provider type: " + type);
     }
 }
 
-std::vector<std::string> EmbeddingProviderFactory::list_providers() {
-    return {"openai", "ollama", "gemini"};
+// ============================================================================
+// Ollama Provider
+// ============================================================================
+
+OllamaEmbeddingProvider::OllamaEmbeddingProvider(const OllamaConfig& config)
+    : config_(config) {}
+
+std::string OllamaEmbeddingProvider::id() const {
+    return "ollama";
+}
+
+std::string OllamaEmbeddingProvider::model() const {
+    return config_.model;
+}
+
+std::optional<int> OllamaEmbeddingProvider::max_input_tokens() const {
+    return config_.max_input_tokens;
+}
+
+Result<std::vector<float>> OllamaEmbeddingProvider::embed_query(const std::string& text) {
+    // 构建Ollama请求 (对齐 embeddings-ollama.ts)
+    json request_body = {
+        {"model", config_.model},
+        {"prompt", text}
+    };
+    
+    std::map<std::string, std::string> headers = {
+        {"Content-Type", "application/json"}
+    };
+    
+    // Ollama API endpoint
+    std::string url = config_.base_url + "/api/embeddings";
+    auto result = HttpClient::post_json(url, request_body, headers, 30000);
+    
+    if (!result.is_ok()) {
+        return Result<std::vector<float>>::error("Ollama API error: " + result.error());
+    }
+    
+    // 解析响应: {"embedding": [0.1, 0.2, ...]}
+    try {
+        const auto& resp_json = result.value();
+        
+        if (!resp_json.contains("embedding")) {
+            return Result<std::vector<float>>::error("No embedding field in Ollama response");
+        }
+        
+        std::vector<float> embedding = resp_json["embedding"].get<std::vector<float>>();
+        
+        return Result<std::vector<float>>::ok_value(normalize_embedding(embedding));
+        
+    } catch (const std::exception& e) {
+        return Result<std::vector<float>>::error(
+            std::string("Failed to parse Ollama response: ") + e.what()
+        );
+    }
+}
+
+Result<std::vector<std::vector<float>>> OllamaEmbeddingProvider::embed_batch(
+    const std::vector<std::string>& texts) {
+    
+    std::vector<std::vector<float>> results;
+    results.reserve(texts.size());
+    
+    for (const auto& text : texts) {
+        auto res = embed_query(text);
+        if (!res.is_ok()) {
+            return Result<std::vector<std::vector<float>>>::error(res.error_message());
+        }
+        results.push_back(res.value());
+    }
+    
+    return Result<std::vector<std::vector<float>>>::ok_value(results);
+}
+
+// ============================================================================
+// Gemini Provider
+// ============================================================================
+
+GeminiEmbeddingProvider::GeminiEmbeddingProvider(const GeminiConfig& config)
+    : config_(config) {}
+
+std::string GeminiEmbeddingProvider::id() const {
+    return "gemini";
+}
+
+std::string GeminiEmbeddingProvider::model() const {
+    return config_.model;
+}
+
+std::optional<int> GeminiEmbeddingProvider::max_input_tokens() const {
+    return config_.max_input_tokens;
+}
+
+Result<std::vector<float>> GeminiEmbeddingProvider::embed_query(const std::string& text) {
+    // 构建Gemini请求 (对齐 embeddings-gemini.ts)
+    json request_body = {
+        {"model", "models/" + config_.model},
+        {"content", {
+            {"parts", {{{"text", text}}}}
+        }}
+    };
+    
+    // 添加task_type和outputDimensionality
+    if (!config_.task_type.empty()) {
+        request_body["taskType"] = config_.task_type;
+    }
+    if (config_.output_dimensionality > 0) {
+        request_body["outputDimensionality"] = config_.output_dimensionality;
+    }
+    
+    std::map<std::string, std::string> headers = config_.headers;
+    headers["Content-Type"] = "application/json";
+    
+    // Gemini API endpoint (含API key)
+    std::string url = config_.base_url + "/models/" + config_.model + ":embedContent";
+    if (!config_.api_key.empty()) {
+        url += "?key=" + config_.api_key;
+    }
+    
+    auto result = HttpClient::post_json(url, request_body, headers, 30000);
+    
+    if (!result.is_ok()) {
+        return Result<std::vector<float>>::error("Gemini API error: " + result.error());
+    }
+    
+    // 解析响应: {"embedding": {"values": [0.1, 0.2, ...]}}
+    try {
+        const auto& resp_json = result.value();
+        
+        if (!resp_json.contains("embedding") || !resp_json["embedding"].contains("values")) {
+            return Result<std::vector<float>>::error("Invalid Gemini response format");
+        }
+        
+        std::vector<float> embedding = resp_json["embedding"]["values"].get<std::vector<float>>();
+        
+        return Result<std::vector<float>>::ok_value(normalize_embedding(embedding));
+        
+    } catch (const std::exception& e) {
+        return Result<std::vector<float>>::error(
+            std::string("Failed to parse Gemini response: ") + e.what()
+        );
+    }
+}
+
+Result<std::vector<std::vector<float>>> GeminiEmbeddingProvider::embed_batch(
+    const std::vector<std::string>& texts) {
+    
+    return Result<std::vector<std::vector<float>>>::error("Gemini batch not yet implemented");
+}
+
+// ============================================================================
+// Voyage Provider
+// ============================================================================
+
+VoyageEmbeddingProvider::VoyageEmbeddingProvider(const VoyageConfig& config)
+    : config_(config) {}
+
+std::string VoyageEmbeddingProvider::id() const {
+    return "voyage";
+}
+
+std::string VoyageEmbeddingProvider::model() const {
+    return config_.model;
+}
+
+std::optional<int> VoyageEmbeddingProvider::max_input_tokens() const {
+    return config_.max_input_tokens;
+}
+
+Result<std::vector<float>> VoyageEmbeddingProvider::embed_query(const std::string& text) {
+    // 构建Voyage请求 (对齐 embeddings-voyage.ts)
+    json request_body = {
+        {"model", config_.model},
+        {"input", json::array({text})},
+        {"input_type", "query"}
+    };
+    
+    std::map<std::string, std::string> headers = config_.headers;
+    headers["Authorization"] = "Bearer " + config_.api_key;
+    headers["Content-Type"] = "application/json";
+    
+    // Voyage API endpoint
+    std::string url = config_.base_url + "/embeddings";
+    auto result = HttpClient::post_json(url, request_body, headers, 30000);
+    
+    if (!result.is_ok()) {
+        return Result<std::vector<float>>::error("Voyage API error: " + result.error());
+    }
+    
+    // 解析响应: {data: [{embedding: [0.1, 0.2, ...]}]}
+    try {
+        const auto& resp_json = result.value();
+        
+        if (!resp_json.contains("data") || !resp_json["data"].is_array()) {
+            return Result<std::vector<float>>::error("Invalid Voyage response format");
+        }
+        
+        const auto& data = resp_json["data"];
+        if (data.empty()) {
+            return Result<std::vector<float>>::error("Empty data in Voyage response");
+        }
+        
+        const auto& first_item = data[0];
+        if (!first_item.contains("embedding")) {
+            return Result<std::vector<float>>::error("No embedding field in Voyage response");
+        }
+        
+        std::vector<float> embedding = first_item["embedding"].get<std::vector<float>>();
+        
+        return Result<std::vector<float>>::ok_value(normalize_embedding(embedding));
+        
+    } catch (const std::exception& e) {
+        return Result<std::vector<float>>::error(
+            std::string("Failed to parse Voyage response: ") + e.what()
+        );
+    }
+}
+
+Result<std::vector<std::vector<float>>> VoyageEmbeddingProvider::embed_batch(
+    const std::vector<std::string>& texts) {
+    
+    return Result<std::vector<std::vector<float>>>::error("Voyage batch not yet implemented");
+}
+
+// ============================================================================
+// Mistral Provider
+// ============================================================================
+
+MistralEmbeddingProvider::MistralEmbeddingProvider(const MistralConfig& config)
+    : config_(config) {}
+
+std::string MistralEmbeddingProvider::id() const {
+    return "mistral";
+}
+
+std::string MistralEmbeddingProvider::model() const {
+    return config_.model;
+}
+
+std::optional<int> MistralEmbeddingProvider::max_input_tokens() const {
+    return config_.max_input_tokens;
+}
+
+Result<std::vector<float>> MistralEmbeddingProvider::embed_query(const std::string& text) {
+    // 构建Mistral请求 (对齐 embeddings-mistral.ts)
+    json request_body = {
+        {"model", config_.model},
+        {"input", json::array({text})}
+    };
+    
+    std::map<std::string, std::string> headers = config_.headers;
+    headers["Authorization"] = "Bearer " + config_.api_key;
+    headers["Content-Type"] = "application/json";
+    
+    // Mistral API endpoint
+    std::string url = config_.base_url + "/embeddings";
+    auto result = HttpClient::post_json(url, request_body, headers, 30000);
+    
+    if (!result.is_ok()) {
+        return Result<std::vector<float>>::error("Mistral API error: " + result.error());
+    }
+    
+    // 解析响应 (OpenAI格式兼容): {data: [{embedding: [...]}]}
+    try {
+        const auto& resp_json = result.value();
+        
+        if (!resp_json.contains("data") || !resp_json["data"].is_array()) {
+            return Result<std::vector<float>>::error("Invalid Mistral response format");
+        }
+        
+        const auto& data = resp_json["data"];
+        if (data.empty()) {
+            return Result<std::vector<float>>::error("Empty data in Mistral response");
+        }
+        
+        const auto& first_item = data[0];
+        if (!first_item.contains("embedding")) {
+            return Result<std::vector<float>>::error("No embedding field in Mistral response");
+        }
+        
+        std::vector<float> embedding = first_item["embedding"].get<std::vector<float>>();
+        
+        return Result<std::vector<float>>::ok_value(normalize_embedding(embedding));
+        
+    } catch (const std::exception& e) {
+        return Result<std::vector<float>>::error(
+            std::string("Failed to parse Mistral response: ") + e.what()
+        );
+    }
+}
+
+Result<std::vector<std::vector<float>>> MistralEmbeddingProvider::embed_batch(
+    const std::vector<std::string>& texts) {
+    
+    // 构建批量请求 (对齐 Mistral API格式)
+    json request_body = {
+        {"model", config_.model},
+        {"input", texts}
+    };
+    
+    std::map<std::string, std::string> headers = config_.headers;
+    headers["Authorization"] = "Bearer " + config_.api_key;
+    headers["Content-Type"] = "application/json";
+    
+    std::string url = config_.base_url + "/embeddings";
+    auto result = HttpClient::post_json(url, request_body, headers, 60000);
+    
+    if (!result.is_ok()) {
+        return Result<std::vector<std::vector<float>>>::error(
+            "Mistral batch API error: " + result.error()
+        );
+    }
+    
+    // 解析响应
+    try {
+        const auto& resp_json = result.value();
+        
+        if (!resp_json.contains("data") || !resp_json["data"].is_array()) {
+            return Result<std::vector<std::vector<float>>>::error(
+                "Invalid Mistral batch response format"
+            );
+        }
+        
+        const auto& data = resp_json["data"];
+        std::vector<std::vector<float>> embeddings;
+        embeddings.reserve(data.size());
+        
+        for (const auto& item : data) {
+            if (!item.contains("embedding")) {
+                return Result<std::vector<std::vector<float>>>::error(
+                    "Missing embedding in Mistral response item"
+                );
+            }
+            
+            std::vector<float> embedding = item["embedding"].get<std::vector<float>>();
+            embeddings.push_back(normalize_embedding(embedding));
+        }
+        
+        return Result<std::vector<std::vector<float>>>::ok_value(embeddings);
+        
+    } catch (const std::exception& e) {
+        return Result<std::vector<std::vector<float>>>::error(
+            std::string("Failed to parse Mistral batch response: ") + e.what()
+        );
+    }
+}
+
+// ============================================================================
+// Provider Factory - 严格对齐 OpenClaw embeddings.ts::createEmbeddingProvider
+// ============================================================================
+
+Result<EmbeddingProviderResult> create_embedding_provider(const EmbeddingProviderOptions& options) {
+    EmbeddingProviderResult result;
+    result.requested_provider = options.provider;
+    
+    auto try_create_provider = [&](const std::string& provider_id) -> Result<std::unique_ptr<EmbeddingProvider>> {
+        if (provider_id == "openai") {
+            OpenAIConfig config;
+            config.model = options.model.value_or("text-embedding-3-small");
+            config.base_url = options.remote_base_url.value_or("https://api.openai.com/v1");
+            config.api_key = options.remote_api_key.value_or("");
+            config.max_input_tokens = 8191;
+            
+            if (config.api_key.empty()) {
+                return Result<std::unique_ptr<EmbeddingProvider>>::error("No API key for OpenAI");
+            }
+            
+            return Result<std::unique_ptr<EmbeddingProvider>>::ok_value(
+                std::make_unique<OpenAIEmbeddingProvider>(config)
+            );
+        }
+        
+        if (provider_id == "ollama") {
+            OllamaConfig config;
+            config.model = options.model.value_or("nomic-embed-text");
+            config.base_url = options.remote_base_url.value_or("http://localhost:11434");
+            
+            return Result<std::unique_ptr<EmbeddingProvider>>::ok_value(
+                std::make_unique<OllamaEmbeddingProvider>(config)
+            );
+        }
+        
+        if (provider_id == "gemini") {
+            GeminiConfig config;
+            config.model = options.model.value_or("text-embedding-004");
+            config.api_key = options.remote_api_key.value_or("");
+            
+            if (config.api_key.empty()) {
+                return Result<std::unique_ptr<EmbeddingProvider>>::error("No API key for Gemini");
+            }
+            
+            return Result<std::unique_ptr<EmbeddingProvider>>::ok_value(
+                std::make_unique<GeminiEmbeddingProvider>(config)
+            );
+        }
+        
+        if (provider_id == "voyage") {
+            VoyageConfig config;
+            config.model = options.model.value_or("voyage-2");
+            config.api_key = options.remote_api_key.value_or("");
+            
+            if (config.api_key.empty()) {
+                return Result<std::unique_ptr<EmbeddingProvider>>::error("No API key for Voyage");
+            }
+            
+            return Result<std::unique_ptr<EmbeddingProvider>>::ok_value(
+                std::make_unique<VoyageEmbeddingProvider>(config)
+            );
+        }
+        
+        if (provider_id == "mistral") {
+            MistralConfig config;
+            config.model = options.model.value_or("mistral-embed");
+            config.api_key = options.remote_api_key.value_or("");
+            
+            if (config.api_key.empty()) {
+                return Result<std::unique_ptr<EmbeddingProvider>>::error("No API key for Mistral");
+            }
+            
+            return Result<std::unique_ptr<EmbeddingProvider>>::ok_value(
+                std::make_unique<MistralEmbeddingProvider>(config)
+            );
+        }
+        
+        return Result<std::unique_ptr<EmbeddingProvider>>::error("Unknown provider: " + provider_id);
+    };
+    
+    // Try primary provider
+    std::string primary_provider = options.provider;
+    if (primary_provider == "auto") {
+        // Auto-select: try OpenAI first
+        primary_provider = "openai";
+    }
+    
+    auto primary_result = try_create_provider(primary_provider);
+    
+    if (primary_result.is_ok()) {
+        result.provider = std::move(primary_result.value());
+        return Result<EmbeddingProviderResult>::ok_value(std::move(result));
+    }
+    
+    // Try fallback if configured
+    if (!options.fallback.empty() && options.fallback != "none") {
+        auto fallback_result = try_create_provider(options.fallback);
+        
+        if (fallback_result.is_ok()) {
+            result.provider = std::move(fallback_result.value());
+            result.fallback_from = primary_provider;
+            result.fallback_reason = primary_result.error_message();
+            return Result<EmbeddingProviderResult>::ok_value(std::move(result));
+        }
+    }
+    
+    // No provider available
+    result.provider = nullptr;
+    result.provider_unavailable_reason = primary_result.error_message();
+    
+    return Result<EmbeddingProviderResult>::ok_value(std::move(result));
 }
 
 } // namespace memory

@@ -105,7 +105,7 @@ public:
     
     std::vector<MemorySearchResult> search(
         const std::string& query,
-        const SearchOptions& opts = SearchOptions()
+        const SearchOptions* opts = nullptr
     ) override;
     
     ReadFileResult read_file(
@@ -116,7 +116,7 @@ public:
     
     MemoryProviderStatus status() override;
     
-    void sync(const SyncParams& params = SyncParams()) override;
+    void sync(const SyncParams* params = nullptr) override;
     
     MemoryEmbeddingProbeResult probe_embedding_availability() override;
     
@@ -147,7 +147,7 @@ private:
     
     QmdCommandResult run_qmd(
         const std::vector<std::string>& args,
-        const QmdCommandOptions& opts = QmdCommandOptions()
+        const QmdCommandOptions* opts = nullptr
     );
     
     // ============== Collection Management ==============

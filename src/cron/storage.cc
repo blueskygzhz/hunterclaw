@@ -415,55 +415,6 @@ core::Result<Schedule> CronStorage::deserialize_schedule(const json& j) {
     }
 }
 
-json CronStorage::serialize_delivery(const Delivery& delivery) {
-    json j;
-    j["mode"] = static_cast<int>(delivery.mode);
-    
-    if (delivery.announce_channel.has_value()) {
-        j["announce_channel"] = *delivery.announce_channel;
-    }
-    if (delivery.webhook_url.has_value()) {
-        j["webhook_url"] = *delivery.webhook_url;
-    }
-    
-    return j;
-}
-
-core::Result<Delivery> CronStorage::deserialize_delivery(const json& j) {
-    try {
-        Delivery delivery;
-        delivery.mode = static_cast<DeliveryMode>(j.at("mode").get<int>());
-        
-        if (j.contains("announce_channel")) {
-            delivery.announce_channel = j.at("announce_channel").get<std::string>();
-        }
-        if (j.contains("webhook_url")) {
-            delivery.webhook_url = j.at("webhook_url").get<std::string>();
-        }
-        
-        return core::Result<Delivery>::Ok(std::move(delivery));
-        
-    } catch (const std::exception& e) {
-        return core::Result<Delivery>::Err(
-            std::string("Failed to deserialize delivery: ") + e.what()
-        );
-    }
-}
-
-json CronStorage::serialize_run_log(const RunLog& log) {
-    json j;
-    j["job_id"] = log.job_id;
-    j["run_id"] = log.run_id;
-    j["started_at_ms"] = log.started_at_ms;
-    j["finished_at_ms"] = log.finished_at_ms;
-    j["status"] = static_cast<int>(log.status);
-    
-    if (log.output.has_value()) j["output"] = *log.output;
-    if (log.error.has_value()) j["error"] = *log.error;
-    if (log.exit_code.has_value()) j["exit_code"] = *log.exit_code;
-    
-    return j;
-}
 
 
 // ============================================================================

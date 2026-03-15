@@ -1,6 +1,8 @@
 #include "hunterclaw/memory/registry.h"
 #include "hunterclaw/memory/memory.h"  // 使用现有的 MemoryManager
 #include <stdexcept>
+#include <mutex>
+#include <chrono>
 
 namespace hunterclaw {
 namespace memory {
@@ -19,14 +21,14 @@ core::Result<bool> MemoryProviderRegistry::register_provider(
     std::shared_ptr<MemoryProvider> provider
 ) {
     if (!provider) {
-        return core::Err("Provider is null");
+        return core::Result<bool>::Err("Provider is null");
     }
     
     std::lock_guard<std::mutex> lock(mutex_);
     
     // 检查是否已存在
     if (providers_.find(provider_id) != providers_.end()) {
-        return core::Err("Provider '" + provider_id + "' already registered");
+        return core::Result<bool>::Err("Provider '" + provider_id + "' already registered");
     }
     
     providers_[provider_id] = provider;
@@ -36,7 +38,7 @@ core::Result<bool> MemoryProviderRegistry::register_provider(
         default_provider_id_ = provider_id;
     }
     
-    return core::Ok(true);
+    return core::Result<bool>::Ok(true);
 }
 
 core::Result<bool> MemoryProviderRegistry::unregister_provider(
@@ -46,7 +48,7 @@ core::Result<bool> MemoryProviderRegistry::unregister_provider(
     
     auto it = providers_.find(provider_id);
     if (it == providers_.end()) {
-        return core::Err("Provider '" + provider_id + "' not found");
+        return core::Result<bool>::Err("Provider '" + provider_id + "' not found");
     }
     
     providers_.erase(it);
@@ -60,7 +62,7 @@ core::Result<bool> MemoryProviderRegistry::unregister_provider(
         }
     }
     
-    return core::Ok(true);
+    return core::Result<bool>::Ok(true);
 }
 
 bool MemoryProviderRegistry::has_provider(const std::string& provider_id) const {
@@ -75,25 +77,25 @@ core::Result<std::shared_ptr<MemoryProvider>> MemoryProviderRegistry::get_provid
     
     auto it = providers_.find(provider_id);
     if (it == providers_.end()) {
-        return core::Err("Provider '" + provider_id + "' not found");
+        return core::Result<std::shared_ptr<MemoryProvider>>::Err("Provider '" + provider_id + "' not found");
     }
     
-    return core::Ok(it->second);
+    return core::Result<std::shared_ptr<MemoryProvider>>::Ok(it->second);
 }
 
 core::Result<std::shared_ptr<MemoryProvider>> MemoryProviderRegistry::get_default_provider() const {
     std::lock_guard<std::mutex> lock(mutex_);
     
     if (default_provider_id_.empty()) {
-        return core::Err("No default provider set");
+        return core::Result<std::shared_ptr<MemoryProvider>>::Err("No default provider set");
     }
     
     auto it = providers_.find(default_provider_id_);
     if (it == providers_.end()) {
-        return core::Err("Default provider not found");
+        return core::Result<std::shared_ptr<MemoryProvider>>::Err("Default provider not found");
     }
     
-    return core::Ok(it->second);
+    return core::Result<std::shared_ptr<MemoryProvider>>::Ok(it->second);
 }
 
 void MemoryProviderRegistry::set_default_provider(const std::string& provider_id) {
@@ -127,8 +129,8 @@ MemoryProviderRegistry::get_all_provider_info() const {
         
         // 尝试获取统计信息
         auto stats_result = provider->get_stats();
-        if (stats_result) {
-            const auto& stats = stats_result.value();
+        if (stats_result.is_ok()) {
+            const auto& stats = stats_result.value;
             info.memory_count = stats.total_memories;
             info.total_size = stats.total_size;
         }
@@ -157,24 +159,24 @@ core::Result<std::string> MemoryProviderRegistry::create_and_register_provider(
     // 查找工厂
     auto it = factories_.find(provider_type);
     if (it == factories_.end()) {
-        return core::Err("No factory registered for provider type '" + provider_type + "'");
+        return core::Result<std::string>::Err("No factory registered for provider type '" + provider_type + "'");
     }
     
     // 创建 provider
     auto result = it->second(config);
-    if (!result) {
-        return core::Err("Failed to create provider: " + result.error());
+    if (result.is_err()) {
+        return core::Result<std::string>::Err("Failed to create provider: " + result.error);
     }
     
     // 注册
-    providers_[provider_id] = result.value();
+    providers_[provider_id] = result.value;
     
     // 如果是第一个 provider,设置为默认
     if (default_provider_id_.empty()) {
         default_provider_id_ = provider_id;
     }
     
-    return core::Ok(provider_id);
+    return core::Result<std::string>::Ok(provider_id);
 }
 
 core::Result<std::shared_ptr<MemoryProvider>> 
@@ -183,17 +185,17 @@ MemoryProviderRegistry::create_session_provider(
     const SessionMemoryContext& context
 ) {
     auto provider_result = get_provider(underlying_provider_id);
-    if (!provider_result) {
-        return core::Err(provider_result.error());
+    if (provider_result.is_err()) {
+        return core::Result<std::shared_ptr<MemoryProvider>>::Err(provider_result.error);
     }
     
     // 创建 Session-scoped Provider
     auto session_provider = std::make_shared<SessionMemoryProvider>(
-        provider_result.value(),
+        provider_result.value,
         context
     );
     
-    return core::Ok(std::static_pointer_cast<MemoryProvider>(session_provider));
+    return core::Result<std::shared_ptr<MemoryProvider>>::Ok(std::static_pointer_cast<MemoryProvider>(session_provider));
 }
 
 void MemoryProviderRegistry::shutdown_all() {
@@ -244,14 +246,14 @@ core::Result<std::string> SQLiteMemoryProvider::add_memory(
     const std::map<std::string, std::string>& metadata
 ) {
     if (!impl_->manager) {
-        return core::Err("Memory manager not initialized");
+        return core::Result<std::string>::Err("Memory manager not initialized");
     }
     
     try {
         std::string id = impl_->manager->add_memory(content, metadata);
-        return core::Ok(id);
+        return core::Result<std::string>::Ok(id);
     } catch (const std::exception& e) {
-        return core::Err(std::string("Failed to add memory: ") + e.what());
+        return core::Result<std::string>::Err(std::string("Failed to add memory: ") + e.what());
     }
 }
 
@@ -260,7 +262,7 @@ core::Result<std::vector<Memory>> SQLiteMemoryProvider::search_memories(
     const SearchOptions& options
 ) {
     if (!impl_->manager) {
-        return core::Err("Memory manager not initialized");
+        return core::Result<std::vector<Memory>>::Err("Memory manager not initialized");
     }
     
     try {
@@ -283,22 +285,22 @@ core::Result<std::vector<Memory>> SQLiteMemoryProvider::search_memories(
             memories.push_back(mem);
         }
         
-        return core::Ok(memories);
+        return core::Result<std::vector<Memory>>::Ok(memories);
     } catch (const std::exception& e) {
-        return core::Err(std::string("Failed to search memories: ") + e.what());
+        return core::Result<std::vector<Memory>>::Err(std::string("Failed to search memories: ") + e.what());
     }
 }
 
 core::Result<bool> SQLiteMemoryProvider::remove_memory(const std::string& id) {
     if (!impl_->manager) {
-        return core::Err("Memory manager not initialized");
+        return core::Result<bool>::Err("Memory manager not initialized");
     }
     
     try {
         bool success = impl_->manager->remove_memory(id);
-        return core::Ok(success);
+        return core::Result<bool>::Ok(success);
     } catch (const std::exception& e) {
-        return core::Err(std::string("Failed to remove memory: ") + e.what());
+        return core::Result<bool>::Err(std::string("Failed to remove memory: ") + e.what());
     }
 }
 
@@ -310,28 +312,28 @@ core::Result<bool> SQLiteMemoryProvider::update_memory(
     // MemoryManager 目前不支持 update
     // 实现为 remove + add
     auto remove_result = remove_memory(id);
-    if (!remove_result) {
+    if (remove_result.is_err()) {
         return remove_result;
     }
     
     auto add_result = add_memory(content, metadata);
-    if (!add_result) {
-        return core::Err("Failed to update memory: " + add_result.error());
+    if (add_result.is_err()) {
+        return core::Result<bool>::Err("Failed to update memory: " + add_result.error);
     }
     
-    return core::Ok(true);
+    return core::Result<bool>::Ok(true);
 }
 
 core::Result<bool> SQLiteMemoryProvider::clear_memories() {
     if (!impl_->manager) {
-        return core::Err("Memory manager not initialized");
+        return core::Result<bool>::Err("Memory manager not initialized");
     }
     
     try {
         // TODO: MemoryManager 需要添加 clear 方法
-        return core::Err("Clear not implemented yet");
+        return core::Result<bool>::Err("Clear not implemented yet");
     } catch (const std::exception& e) {
-        return core::Err(std::string("Failed to clear memories: ") + e.what());
+        return core::Result<bool>::Err(std::string("Failed to clear memories: ") + e.what());
     }
 }
 
@@ -343,12 +345,12 @@ core::Result<MemoryStats> SQLiteMemoryProvider::get_stats() {
     stats.total_size = 0;
     stats.last_updated = std::chrono::system_clock::now();
     
-    return core::Ok(stats);
+    return core::Result<MemoryStats>::Ok(stats);
 }
 
 core::Result<Memory> SQLiteMemoryProvider::get_memory(const std::string& id) {
     // TODO: 实现按 ID 查找
-    return core::Err("Get memory by ID not implemented yet");
+    return core::Result<Memory>::Err("Get memory by ID not implemented yet");
 }
 
 // ========================================
@@ -366,9 +368,9 @@ core::Result<std::shared_ptr<MemoryProvider>> MemoryProviderFactory::create_sqli
             embedding_provider,
             config
         );
-        return core::Ok(std::static_pointer_cast<MemoryProvider>(provider));
+        return core::Result<std::shared_ptr<MemoryProvider>>::Ok(std::static_pointer_cast<MemoryProvider>(provider));
     } catch (const std::exception& e) {
-        return core::Err(std::string("Failed to create SQLite provider: ") + e.what());
+        return core::Result<std::shared_ptr<MemoryProvider>>::Err(std::string("Failed to create SQLite provider: ") + e.what());
     }
 }
 
@@ -377,7 +379,7 @@ core::Result<std::shared_ptr<MemoryProvider>> MemoryProviderFactory::create_memo
     const std::string& endpoint
 ) {
     // TODO: 实现 MemOS Cloud Provider
-    return core::Err("MemOS Cloud provider not implemented yet");
+    return core::Result<std::shared_ptr<MemoryProvider>>::Err("MemOS Cloud provider not implemented yet");
 }
 
 core::Result<std::shared_ptr<MemoryProvider>> MemoryProviderFactory::create_supabase(
@@ -385,7 +387,7 @@ core::Result<std::shared_ptr<MemoryProvider>> MemoryProviderFactory::create_supa
     const std::string& api_key
 ) {
     // TODO: 实现 Supabase Provider
-    return core::Err("Supabase provider not implemented yet");
+    return core::Result<std::shared_ptr<MemoryProvider>>::Err("Supabase provider not implemented yet");
 }
 
 core::Result<std::shared_ptr<MemoryProvider>> MemoryProviderFactory::create_from_config(
@@ -405,7 +407,7 @@ core::Result<std::shared_ptr<MemoryProvider>> MemoryProviderFactory::create_from
         std::string api_key = config.count("api_key") ? config.at("api_key") : "";
         return create_supabase(url, api_key);
     } else {
-        return core::Err("Unknown provider type: " + provider_type);
+        return core::Result<std::shared_ptr<MemoryProvider>>::Err("Unknown provider type: " + provider_type);
     }
 }
 
