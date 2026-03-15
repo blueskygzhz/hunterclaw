@@ -1,16 +1,27 @@
-#include <optional>
 #include "hunterclaw/memory/registry.h"
 #include "hunterclaw/memory/memory.h"  // 使用现有的 MemoryManager
 #include "hunterclaw/memory/sqlite_storage.h"
+#include <spdlog/spdlog.h>
 #include <stdexcept>
 #include <mutex>
 #include <chrono>
+#include <optional>
 
 namespace hunterclaw {
 namespace memory {
 
+namespace {
+    auto log() {
+        auto logger = spdlog::get("memory");
+        if (!logger) {
+            logger = spdlog::stdout_logger_mt("memory");
+        }
+        return logger;
+    }
+}
+
 // ========================================
-// MemoryProviderRegistry 实现
+// MemoryProviderRegistry 实现 (对齐 OpenClaw)
 // ========================================
 
 MemoryProviderRegistry& MemoryProviderRegistry::instance() {
@@ -23,6 +34,7 @@ core::Result<bool> MemoryProviderRegistry::register_provider(
     std::shared_ptr<MemoryProvider> provider
 ) {
     if (!provider) {
+        log()->error("[MemoryProviderRegistry] Cannot register null provider");
         return core::Result<bool>::Err("Provider is null");
     }
     
@@ -30,7 +42,8 @@ core::Result<bool> MemoryProviderRegistry::register_provider(
     
     // 检查是否已存在
     if (providers_.find(provider_id) != providers_.end()) {
-        return core::Result<bool>::Err("Provider '" + provider_id + "' already registered");
+        log()->warn("[MemoryProviderRegistry] Provider '{}' already registered, replacing", provider_id);
+        // 对齐 OpenClaw: 允许覆盖已有的 provider
     }
     
     providers_[provider_id] = provider;
@@ -39,6 +52,9 @@ core::Result<bool> MemoryProviderRegistry::register_provider(
     if (default_provider_id_.empty()) {
         default_provider_id_ = provider_id;
     }
+    
+    log()->info("[MemoryProviderRegistry] Registered provider: {} ({})", 
+               provider_id, provider->provider_name());
     
     return core::Result<bool>::Ok(true);
 }

@@ -9,39 +9,13 @@ package(default_visibility = ["//visibility:public"])
 # ============================================================================
 cc_library(
     name = "hunterclaw_memory",
-    srcs = [
-        "memory/memory_manager.cc",
-        "memory/sqlite_storage.cc",
-        "memory/search_algorithms.cc",
-        "memory/embedding_provider.cc",
-        "memory/http_client.cc",
-        "memory/memory_index_manager.cc",
-        "memory/search_manager_factory.cc",
-        "memory/provider_registry.cc",
-        "memory/qmd_manager.cc",
-        "memory/auto_reindex.cc",
-        "memory/chunking.cc",
-        "memory/manager_search.cc",
-        "memory/session_files.cc",
-        "memory/manager_sync_ops.cc",
-        "memory/file_watcher_linux.cc",
-        "memory/manager_embedding_ops.cc",
-        "memory/qmd_query_parser.cc",
-        "memory/qmd_process.cc",
-        "memory/qmd_scope.cc",
-        "memory/backend_config.cc",
-        "memory/query_expansion.cc",
-        "memory/temporal_decay.cc",
-        "memory/multimodal.cc",
-        "memory/json_parser.cc",
-        "memory/pruning.cc",
-        # Compaction 模块 (OpenClaw 对齐) - 核心3个文件已成功编译✅
-        "memory/compaction.cc",
-        "memory/compaction_manager.cc",
-        "memory/compaction_hooks.cc",
-        # session_memory_provider (正在修复)
-        "memory/session_memory_provider.cc",
-    ],
+    srcs = glob(
+        ["memory/*.cc"],
+        exclude = [
+            "memory/plugin_manager.cc",  # 需要更多适配工作
+            "memory/sqlite_plugin.cc",   # 需要更多适配工作
+        ],
+    ),
     deps = [
         "//:hunterclaw_headers",
         "@nlohmann_json//:json",
