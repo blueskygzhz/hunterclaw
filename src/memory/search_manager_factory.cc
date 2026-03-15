@@ -104,25 +104,25 @@ core::Result<std::shared_ptr<MemorySearchManager>> FallbackMemoryManager::ensure
     std::lock_guard<std::mutex> lock(mutex_);
     
     if (fallback_) {
-        return core::Result<std::shared_ptr<MemorySearchManager>>::ok_value(fallback_);
+        return core::Result<std::shared_ptr<MemorySearchManager>>::Ok(fallback_);
     }
     
     // 创建fallback
     auto result = fallback_factory_();
-    if (result.is_error()) {
-        log->warn("memory fallback unavailable: {}", result.error());
+    if (result.is_err()) {
+        log->warn("memory fallback unavailable: {}", result.error);
         return result;
     }
     
-    if (!result.value()) {
+    if (!result.value) {
         log->warn("memory fallback requested but builtin index is unavailable");
-        return core::Result<std::shared_ptr<MemorySearchManager>>::error(
+        return core::Result<std::shared_ptr<MemorySearchManager>>::Err(
             "fallback unavailable"
         );
     }
     
-    fallback_ = result.value();
-    return core::Result<std::shared_ptr<MemorySearchManager>>::ok_value(fallback_);
+    fallback_ = result.value;
+    return core::Result<std::shared_ptr<MemorySearchManager>>::Ok(fallback_);
 }
 
 // ============================================================================
@@ -151,8 +151,8 @@ std::vector<MemorySearchResult> FallbackMemoryManager::search(
     
     // 使用fallback
     auto fallback_res = ensure_fallback();
-    if (fallback_res.is_ok() && fallback_res.value()) {
-        return fallback_res.value()->search(query, opts);
+    if (fallback_res.is_ok() && fallback_res.value) {
+        return fallback_res.value->search(query, opts);
     }
     
     std::string error_msg;
@@ -177,8 +177,8 @@ ReadFileResult FallbackMemoryManager::read_file(const ReadFileParams& params) {
     
     // 使用fallback
     auto fallback_res = ensure_fallback();
-    if (fallback_res.is_ok() && fallback_res.value()) {
-        return fallback_res.value()->read_file(params);
+    if (fallback_res.is_ok() && fallback_res.value) {
+        return fallback_res.value->read_file(params);
     }
     
     std::string error_msg;
@@ -226,8 +226,8 @@ void FallbackMemoryManager::sync(const SyncParams& params) {
     
     // 使用fallback
     auto fallback_res = ensure_fallback();
-    if (fallback_res.is_ok() && fallback_res.value()) {
-        fallback_res.value()->sync(params);
+    if (fallback_res.is_ok() && fallback_res.value) {
+        fallback_res.value->sync(params);
     }
 }
 
@@ -245,8 +245,8 @@ MemoryEmbeddingProbeResult FallbackMemoryManager::probe_embedding_availability()
     
     // 使用fallback
     auto fallback_res = ensure_fallback();
-    if (fallback_res.is_ok() && fallback_res.value()) {
-        return fallback_res.value()->probe_embedding_availability();
+    if (fallback_res.is_ok() && fallback_res.value) {
+        return fallback_res.value->probe_embedding_availability();
     }
     
     std::string error_msg;
@@ -275,8 +275,8 @@ bool FallbackMemoryManager::probe_vector_availability() {
     
     // 使用fallback
     auto fallback_res = ensure_fallback();
-    if (fallback_res.is_ok() && fallback_res.value()) {
-        return fallback_res.value()->probe_vector_availability();
+    if (fallback_res.is_ok() && fallback_res.value) {
+        return fallback_res.value->probe_vector_availability();
     }
     
     return false;
@@ -324,7 +324,7 @@ MemorySearchManagerResult get_memory_search_manager(const GetManagerParams& para
                 std::lock_guard<std::mutex> lock(qmd_cache_mutex);
                 auto it = qmd_manager_cache.find(cache_key);
                 if (it != qmd_manager_cache.end()) {
-                    return MemorySearchManagerResult::ok(it->second);
+                    return MemorySearchManagerResult::Ok(it->second);
                 }
             }
         }
@@ -340,7 +340,7 @@ MemorySearchManagerResult get_memory_search_manager(const GetManagerParams& para
             
             if (primary) {
                 if (status_only) {
-                    return MemorySearchManagerResult::ok(primary);
+                    return MemorySearchManagerResult::Ok(primary);
                 }
                 
                 // 包装为FallbackMemoryManager
@@ -355,9 +355,9 @@ MemorySearchManagerResult get_memory_search_manager(const GetManagerParams& para
                         
                         try {
                             auto mgr = std::make_shared<MemoryIndexManager>(config);
-                            return core::Result<std::shared_ptr<MemorySearchManager>>::ok_value(mgr);
+                            return core::Result<std::shared_ptr<MemorySearchManager>>::Ok(mgr);
                         } catch (const std::exception& e) {
-                            return core::Result<std::shared_ptr<MemorySearchManager>>::error(e.what());
+                            return core::Result<std::shared_ptr<MemorySearchManager>>::Err(e.what());
                         }
                     },
                     // onClose: 驱逐缓存
@@ -374,7 +374,7 @@ MemorySearchManagerResult get_memory_search_manager(const GetManagerParams& para
                     qmd_manager_cache[cache_key] = wrapper;
                 }
                 
-                return MemorySearchManagerResult::ok(wrapper);
+                return MemorySearchManagerResult::Ok(wrapper);
             }
         } catch (const std::exception& e) {
             std::string message = std::string("qmd memory unavailable; falling back to builtin: ") + e.what();
@@ -389,9 +389,9 @@ MemorySearchManagerResult get_memory_search_manager(const GetManagerParams& para
         config.db_path = (fs::path(params.workspace_dir) / ".hunterclaw" / "memory.db").string();
         
         auto manager = std::make_shared<MemoryIndexManager>(config);
-        return MemorySearchManagerResult::ok(manager);
+        return MemorySearchManagerResult::Ok(manager);
     } catch (const std::exception& e) {
-        return MemorySearchManagerResult::err(e.what());
+        return MemorySearchManagerResult::Err(e.what());
     }
 }
 
@@ -415,7 +415,7 @@ void close_all_memory_search_managers() {
         try {
             mgr->close();
         } catch (const std::exception& e) {
-            log->warn("failed to close qmd memory manager: {}", e.what());
+            log->warn(std::string("failed to close qmd memory manager: ") + e.what());
         }
     }
     

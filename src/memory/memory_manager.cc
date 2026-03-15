@@ -80,20 +80,28 @@ std::string MemoryManager::add_memory(
     const std::map<std::string, std::string>& metadata
 ) {
     // 生成embedding
-    auto embedding = embedding_->embed_query(content);
+    auto embedding_result = embedding_->embed_query(content);
+    if (!embedding_result.is_ok()) {
+        // 如果embedding失败，返回空向量
+        return storage_->add(content, std::vector<float>(), metadata);
+    }
     
     // 存储到数据库
-    return storage_->add(content, embedding, metadata);
+    return storage_->add(content, embedding_result.value, metadata);
 }
 
 std::vector<SearchResult> MemoryManager::search(const std::string& query) {
     // 1. 生成查询embedding
-    auto query_embedding = embedding_->embed_query(query);
+    auto query_embedding_result = embedding_->embed_query(query);
+    if (!query_embedding_result.is_ok()) {
+        // 如果embedding失败，返回空结果
+        return {};
+    }
     
     // 2. 向量搜索
     int vector_limit = config_.max_results * config_.hybrid.candidate_multiplier;
     auto vector_results = storage_->vector_search(
-        query_embedding,
+        query_embedding_result.value,
         vector_limit,
         config_.min_score
     );
@@ -114,7 +122,7 @@ std::vector<SearchResult> MemoryManager::search(const std::string& query) {
     
     // 6. MMR重排 (增加多样性)
     if (config_.hybrid.mmr.enabled) {
-        combined = maximal_marginal_relevance(combined, query_embedding);
+        combined = maximal_marginal_relevance(combined, query_embedding_result.value);
     }
     
     // 7. 时间衰减

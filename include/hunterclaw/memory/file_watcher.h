@@ -11,6 +11,7 @@
 
 namespace hunterclaw {
 namespace memory {
+using core::Result;
 
 // File change event types
 enum class FileChangeType {

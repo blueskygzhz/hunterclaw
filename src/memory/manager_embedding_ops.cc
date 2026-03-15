@@ -235,7 +235,7 @@ void ManagerEmbeddingOps::prune_embedding_cache_if_needed() {
 // Core Embedding Logic (对齐 manager-embedding-ops.ts:185-226)
 // ============================================================================
 
-Result<std::vector<std::vector<float>>>
+core::Result<std::vector<std::vector<float>>>
 ManagerEmbeddingOps::embed_chunks_in_batches(const std::vector<MemoryChunk>& chunks) {
     if (chunks.empty()) {
         return Ok(std::vector<std::vector<float>>{});
@@ -376,7 +376,7 @@ std::string ManagerEmbeddingOps::compute_provider_key() const {
 // Retry & Timeout (对齐 manager-embedding-ops.ts:524-647)
 // ============================================================================
 
-Result<std::vector<std::vector<float>>>
+core::Result<std::vector<std::vector<float>>>
 ManagerEmbeddingOps::embed_batch_with_retry(const std::vector<std::string>& texts) {
     if (texts.empty()) {
         return Ok(std::vector<std::vector<float>>{});
@@ -420,7 +420,7 @@ ManagerEmbeddingOps::embed_batch_with_retry(const std::vector<std::string>& text
     }
 }
 
-Result<std::vector<float>>
+core::Result<std::vector<float>>
 ManagerEmbeddingOps::embed_query_with_timeout(const std::string& text) {
     if (!provider_) {
         return Err("Cannot embed query in FTS-only mode (no embedding provider)");
@@ -604,7 +604,7 @@ void ManagerEmbeddingOps::delete_file_record(
     // storage_->execute(sql, {pathname, source_str});
 }
 
-Result<void> ManagerEmbeddingOps::index_file(
+core::Result<void> ManagerEmbeddingOps::index_file(
     const MemoryFileEntry& entry,
     MemorySource source,
     const std::optional<std::string>& content
@@ -732,7 +732,7 @@ Result<void> ManagerEmbeddingOps::index_file(
 // Provider Batch API (简化实现 - 对齐 manager-embedding-ops.ts:442-522)
 // ============================================================================
 
-Result<std::vector<std::vector<float>>>
+core::Result<std::vector<std::vector<float>>>
 ManagerEmbeddingOps::embed_chunks_with_batch(
     const std::vector<MemoryChunk>& chunks,
     const MemoryFileEntry& entry,
@@ -758,7 +758,7 @@ ManagerEmbeddingOps::embed_chunks_with_batch(
     return embed_chunks_in_batches(chunks);
 }
 
-Result<std::vector<std::vector<float>>>
+core::Result<std::vector<std::vector<float>>>
 ManagerEmbeddingOps::embed_chunks_with_openai_batch(
     const std::vector<MemoryChunk>& chunks,
     const MemoryFileEntry& entry,
@@ -769,7 +769,7 @@ ManagerEmbeddingOps::embed_chunks_with_openai_batch(
     return embed_chunks_in_batches(chunks);
 }
 
-Result<std::vector<std::vector<float>>>
+core::Result<std::vector<std::vector<float>>>
 ManagerEmbeddingOps::embed_chunks_with_gemini_batch(
     const std::vector<MemoryChunk>& chunks,
     const MemoryFileEntry& entry,
@@ -780,7 +780,7 @@ ManagerEmbeddingOps::embed_chunks_with_gemini_batch(
     return embed_chunks_in_batches(chunks);
 }
 
-Result<std::vector<std::vector<float>>>
+core::Result<std::vector<std::vector<float>>>
 ManagerEmbeddingOps::embed_chunks_with_voyage_batch(
     const std::vector<MemoryChunk>& chunks,
     const MemoryFileEntry& entry,

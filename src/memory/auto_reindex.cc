@@ -22,13 +22,13 @@ core::Result<ReindexReason> AutoReindexDetector::check_reindex_needed(
     auto load_result = load_state();
     if (!load_result.is_ok()) {
         // No saved state - first time initialization
-        return core::Result<ReindexReason>::ok_value(ReindexReason{ReindexReason::None, "", ""});
+        return core::Result<ReindexReason>::Ok(ReindexReason{ReindexReason::None, "", ""});
     }
     
-    const auto& old_info = load_result.value();
+    const auto& old_info = load_result.value;
     ReindexReason reason = compare_provider_info(old_info, current_info);
     
-    return core::Result<ReindexReason>::ok_value(reason);
+    return core::Result<ReindexReason>::Ok(reason);
 }
 
 core::Result<bool> AutoReindexDetector::save_state(const MemoryProviderInfo& info) {
@@ -42,16 +42,16 @@ core::Result<bool> AutoReindexDetector::save_state(const MemoryProviderInfo& inf
         
         std::ofstream file(state_file_);
         if (!file) {
-            return core::Result<bool>::error("Failed to open state file for writing");
+            return core::Result<bool>::Err("Failed to open state file for writing");
         }
         
         file << state.dump(2);
         file.close();
         
-        return core::Result<bool>::ok_value(true);
+        return core::Result<bool>::Ok(true);
         
     } catch (const std::exception& e) {
-        return core::Result<bool>::error(
+        return core::Result<bool>::Err(
             std::string("Failed to save state: ") + e.what()
         );
     }
@@ -61,7 +61,7 @@ core::Result<MemoryProviderInfo> AutoReindexDetector::load_state() {
     try {
         std::ifstream file(state_file_);
         if (!file) {
-            return core::Result<MemoryProviderInfo>::error("State file not found");
+            return core::Result<MemoryProviderInfo>::Err("State file not found");
         }
         
         json state;
@@ -73,10 +73,10 @@ core::Result<MemoryProviderInfo> AutoReindexDetector::load_state() {
         info.output_dimensions = state.value("output_dimensions", -1);
         info.endpoint = state.value("endpoint", "");
         
-        return core::Result<MemoryProviderInfo>::ok_value(info);
+        return core::Result<MemoryProviderInfo>::Ok(info);
         
     } catch (const std::exception& e) {
-        return core::Result<MemoryProviderInfo>::error(
+        return core::Result<MemoryProviderInfo>::Err(
             std::string("Failed to load state: ") + e.what()
         );
     }
@@ -84,9 +84,9 @@ core::Result<MemoryProviderInfo> AutoReindexDetector::load_state() {
 
 core::Result<bool> AutoReindexDetector::clear_state() {
     if (std::remove(state_file_.c_str()) != 0) {
-        return core::Result<bool>::error("Failed to delete state file");
+        return core::Result<bool>::Err("Failed to delete state file");
     }
-    return core::Result<bool>::ok_value(true);
+    return core::Result<bool>::Ok(true);
 }
 
 ReindexReason AutoReindexDetector::compare_provider_info(
@@ -152,10 +152,10 @@ core::Result<bool> MemoryManagerWithAutoReindex::initialize(
     // Check if reindex is needed
     auto reindex_result = detector_->check_reindex_needed(provider_info);
     if (!reindex_result.is_ok()) {
-        return core::Result<bool>::error(reindex_result.error());
+        return core::Result<bool>::Err(reindex_result.error);
     }
     
-    const auto& reason = reindex_result.value();
+    const auto& reason = reindex_result.value;
     
     if (reason.type != ReindexReason::None) {
         // Log reindex reason
@@ -163,8 +163,8 @@ core::Result<bool> MemoryManagerWithAutoReindex::initialize(
         // Trigger automatic reindex
         auto reindex_success = do_full_reindex();
         if (!reindex_success.is_ok()) {
-            return core::Result<bool>::error(
-                "Auto-reindex failed: " + reindex_success.error()
+            return core::Result<bool>::Err(
+                "Auto-reindex failed: " + reindex_success.error
             );
         }
     }
@@ -172,8 +172,8 @@ core::Result<bool> MemoryManagerWithAutoReindex::initialize(
     // Save current state
     auto save_result = detector_->save_state(provider_info);
     if (!save_result.is_ok()) {
-        return core::Result<bool>::error(
-            "Failed to save provider state: " + save_result.error()
+        return core::Result<bool>::Err(
+            "Failed to save provider state: " + save_result.error
         );
     }
     
@@ -182,7 +182,7 @@ core::Result<bool> MemoryManagerWithAutoReindex::initialize(
     current_status_.model = provider_info.model;
     current_status_.output_dimensions = provider_info.output_dimensions;
     
-    return core::Result<bool>::ok_value(true);
+    return core::Result<bool>::Ok(true);
 }
 
 MemoryStatus MemoryManagerWithAutoReindex::status() const {
@@ -191,7 +191,7 @@ MemoryStatus MemoryManagerWithAutoReindex::status() const {
 
 core::Result<bool> MemoryManagerWithAutoReindex::reindex(bool force) {
     if (!force && current_status_.reindex_in_progress) {
-        return core::Result<bool>::error("Reindex already in progress");
+        return core::Result<bool>::Err("Reindex already in progress");
     }
     
     current_status_.reindex_in_progress = true;
@@ -213,7 +213,7 @@ bool MemoryManagerWithAutoReindex::needs_reindex(const MemoryProviderInfo& new_p
     if (!result.is_ok()) {
         return false;
     }
-    return result.value().type != ReindexReason::None;
+    return result.value.type != ReindexReason::None;
 }
 
 core::Result<bool> MemoryManagerWithAutoReindex::do_full_reindex() {
@@ -235,7 +235,7 @@ core::Result<bool> MemoryManagerWithAutoReindex::do_full_reindex() {
     
     current_status_.reindex_in_progress = false;
     
-    return core::Result<bool>::ok_value(true);
+    return core::Result<bool>::Ok(true);
 }
 
 core::Result<bool> MemoryManagerWithAutoReindex::do_incremental_sync() {
@@ -245,7 +245,7 @@ core::Result<bool> MemoryManagerWithAutoReindex::do_incremental_sync() {
     // 3. Update embeddings
     // 4. Update database
     
-    return core::Result<bool>::ok_value(true);
+    return core::Result<bool>::Ok(true);
 }
 
 }  // namespace memory

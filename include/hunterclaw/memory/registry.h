@@ -176,7 +176,7 @@ public:
         const std::map<std::string, std::string>& metadata
     ) override;
     
-    core::Result<std::vector<Memory>> search_memories(
+    core::Result<std::vector<MemorySearchResult>> search_memories(
         const std::string& query,
         const SearchOptions& options
     ) override;

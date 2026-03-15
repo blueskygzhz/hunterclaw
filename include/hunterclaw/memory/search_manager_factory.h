@@ -21,11 +21,11 @@ struct MemorySearchManagerResult {
     std::shared_ptr<MemorySearchManager> manager;
     std::optional<std::string> error;
     
-    static MemorySearchManagerResult ok(std::shared_ptr<MemorySearchManager> mgr) {
+    static MemorySearchManagerResult Ok(std::shared_ptr<MemorySearchManager> mgr) {
         return { .manager = std::move(mgr), .error = std::nullopt };
     }
     
-    static MemorySearchManagerResult err(const std::string& msg) {
+    static MemorySearchManagerResult Err(const std::string& msg) {
         return { .manager = nullptr, .error = msg };
     }
 };

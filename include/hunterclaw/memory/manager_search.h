@@ -1,6 +1,7 @@
 #pragma once
 
 #include "hunterclaw/memory/types.h"
+#include "hunterclaw/core/result.h"  // 添加Result定义
 #include <string>
 #include <vector>
 
@@ -51,7 +52,7 @@ struct SourceFilter {
 class ManagerSearchOps {
 public:
     // 对齐 searchVector (manager-search.ts:20-94)
-    static Result<std::vector<SearchRowResult>> search_vector(
+    static core::Result<std::vector<SearchRowResult>> search_vector(
         SQLiteStorage* db,
         const std::string& vector_table,
         const std::string& provider_model,
@@ -64,7 +65,7 @@ public:
     );
 
     // 对齐 searchKeyword (manager-search.ts:129-171)
-    static Result<std::vector<SearchRowResult>> search_keyword(
+    static core::Result<std::vector<SearchRowResult>> search_keyword(
         SQLiteStorage* db,
         const std::string& raw_query,
         int limit,
@@ -74,7 +75,7 @@ public:
     );
 
     // 对齐 listChunks (manager-search.ts:96-127)
-    static Result<std::vector<ChunkWithEmbedding>> list_chunks(
+    static core::Result<std::vector<ChunkWithEmbedding>> list_chunks(
         SQLiteStorage* db,
         const std::string& provider_model,
         const SourceFilter& source_filter

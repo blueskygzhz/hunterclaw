@@ -2,7 +2,8 @@
 
 #include "hunterclaw/memory/manager_sync_ops.h"
 #include "hunterclaw/memory/types.h"
-#include "hunterclaw/core/result.h"
+#include "hunterclaw/memory/chunking.h"
+#include "hunterclaw/core/types.h"
 #include <vector>
 #include <string>
 #include <map>
@@ -71,10 +72,10 @@ struct VoyageBatchRequest : BatchRequestBase {
 
 // ============================================================================
 // Manager Embedding Operations
-// (继承自 ManagerSyncOps,添加 embedding 批处理能力)
+// (TODO: 原本应继承自 ManagerSyncOps，但该类还未实现，暂时移除继承)
 // ============================================================================
 
-class ManagerEmbeddingOps : public ManagerSyncOps {
+class ManagerEmbeddingOps {
 protected:
     // Batch failure tracking (对齐 manager-embedding-ops.ts:50-53)
     int batch_failure_count_ = 0;
@@ -85,7 +86,7 @@ protected:
 
 public:
     explicit ManagerEmbeddingOps(
-        SQLiteStorage* storage,
+        SQLiteVectorStorage* storage,
         const MemoryConfig& config
     );
     virtual ~ManagerEmbeddingOps() = default;
@@ -119,7 +120,7 @@ public:
     // ========================================================================
 
     // 批量embedding (优先使用缓存) (对齐:185-226)
-    Result<std::vector<std::vector<float>>>
+    core::Result<std::vector<std::vector<float>>>
     embed_chunks_in_batches(const std::vector<MemoryChunk>& chunks);
 
     // 收集缓存的embeddings (对齐:288-307)
@@ -139,7 +140,7 @@ public:
     // ========================================================================
 
     // OpenAI batch (对齐:465-491)
-    Result<std::vector<std::vector<float>>>
+    core::Result<std::vector<std::vector<float>>>
     embed_chunks_with_openai_batch(
         const std::vector<MemoryChunk>& chunks,
         const MemoryFileEntry& entry,
@@ -147,7 +148,7 @@ public:
     );
 
     // Gemini batch (对齐:493-522)
-    Result<std::vector<std::vector<float>>>
+    core::Result<std::vector<std::vector<float>>>
     embed_chunks_with_gemini_batch(
         const std::vector<MemoryChunk>& chunks,
         const MemoryFileEntry& entry,
@@ -155,7 +156,7 @@ public:
     );
 
     // Voyage batch (对齐:442-463)
-    Result<std::vector<std::vector<float>>>
+    core::Result<std::vector<std::vector<float>>>
     embed_chunks_with_voyage_batch(
         const std::vector<MemoryChunk>& chunks,
         const MemoryFileEntry& entry,
@@ -163,7 +164,7 @@ public:
     );
 
     // 通用batch入口 (对齐:268-286)
-    Result<std::vector<std::vector<float>>>
+    core::Result<std::vector<std::vector<float>>>
     embed_chunks_with_batch(
         const std::vector<MemoryChunk>& chunks,
         const MemoryFileEntry& entry,
@@ -175,16 +176,16 @@ public:
     // ========================================================================
 
     // Batch retry (对齐:524-556)
-    Result<std::vector<std::vector<float>>>
+    core::Result<std::vector<std::vector<float>>>
     embed_batch_with_retry(const std::vector<std::string>& texts);
 
     // Query timeout (对齐:615-626)
-    Result<std::vector<float>>
+    core::Result<std::vector<float>>
     embed_query_with_timeout(const std::string& text);
 
     // Timeout wrapper (对齐:628-647)
     template<typename T>
-    Result<T> with_timeout(
+    core::Result<T> with_timeout(
         std::function<Result<T>()> func,
         int timeout_ms,
         const std::string& message
@@ -211,7 +212,7 @@ public:
 
     // Batch fallback (对齐:723-754)
     template<typename T>
-    Result<T> run_batch_with_fallback(
+    core::Result<T> run_batch_with_fallback(
         const std::string& provider,
         std::function<Result<T>()> run_func,
         std::function<Result<std::vector<std::vector<float>>>()> fallback_func
@@ -222,7 +223,7 @@ public:
     // ========================================================================
 
     // 索引单个文件 (核心方法) (对齐:803-924)
-    Result<void> index_file(
+    core::Result<void> index_file(
         const MemoryFileEntry& entry,
         MemorySource source,
         const std::optional<std::string>& content = std::nullopt

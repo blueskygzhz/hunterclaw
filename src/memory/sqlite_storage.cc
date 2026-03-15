@@ -4,17 +4,16 @@
 #include <sstream>
 #include <filesystem>
 #include <cmath>
+#include <mutex>
+#include <cstring>
+#include <random>
+#include <chrono>
+#include <iomanip>
 
 namespace hunterclaw {
 namespace memory {
 
 namespace {
-
-// Schema constants - 严格对齐 OpenClaw
-const char* VECTOR_TABLE = "chunks_vec";
-const char* FTS_TABLE = "chunks_fts";
-const char* EMBEDDING_CACHE_TABLE = "embedding_cache";
-const int SNIPPET_MAX_CHARS = 700;
 
 // Helper: execute SQL without result
 bool exec_sql(sqlite3* db, const std::string& sql, std::string* error = nullptr) {
@@ -46,428 +45,501 @@ sqlite3_stmt* prepare_stmt(sqlite3* db, const std::string& sql, std::string* err
 } // anonymous namespace
 
 // ============================================================================
-// SQLiteStorage Implementation
+// SQLiteVectorStorage Implementation
 // ============================================================================
 
-SQLiteStorage::SQLiteStorage(const std::string& db_path)
-    : db_(nullptr), db_path_(db_path) {}
+SQLiteVectorStorage::SQLiteVectorStorage(const Config& config)
+    : config_(config), db_(nullptr), fts_available_(false), vec_available_(false) {}
 
-SQLiteStorage::~SQLiteStorage() {
-    close();
+SQLiteVectorStorage::~SQLiteVectorStorage() {
+    if (db_) {
+        sqlite3_close(db_);
+        db_ = nullptr;
+    }
 }
 
-Result<void> SQLiteStorage::open() {
-    std::lock_guard<std::mutex> lock(mutex_);
+core::Result<std::shared_ptr<SQLiteVectorStorage>> SQLiteVectorStorage::create(const Config& config) {
+    auto storage = std::shared_ptr<SQLiteVectorStorage>(new SQLiteVectorStorage(config));
     
+    // Open database
+    auto open_res = storage->open_database();
+    if (!open_res.is_ok()) {
+        return core::Result<std::shared_ptr<SQLiteVectorStorage>>::Err(open_res.error);
+    }
+    
+    // Try enable FTS5
+    if (config.enable_fts) {
+        auto fts_res = storage->try_enable_fts5();
+        if (!fts_res.is_ok()) {
+            storage->fts_error_ = fts_res.error;
+            storage->fts_available_ = false;
+        } else {
+            storage->fts_available_ = fts_res.value;
+        }
+    }
+    
+    // Load sqlite-vec extension if provided
+    if (config.vec_extension_path.has_value() && config.enable_vector) {
+        auto vec_res = storage->load_sqlite_vec_extension();
+        if (!vec_res.is_ok()) {
+            storage->vec_error_ = vec_res.error;
+            storage->vec_available_ = false;
+        } else {
+            storage->vec_available_ = vec_res.value;
+        }
+    }
+    
+    // Ensure schema
+    auto schema_res = storage->ensure_schema();
+    if (!schema_res.is_ok()) {
+        return core::Result<std::shared_ptr<SQLiteVectorStorage>>::Err(schema_res.error);
+    }
+    
+    return core::Result<std::shared_ptr<SQLiteVectorStorage>>::Ok(storage);
+}
+
+core::Result<bool> SQLiteVectorStorage::open_database() {
     if (db_) {
-        return Result<void>::ok();
+        return core::Result<bool>::Ok(true);
     }
     
     // Ensure parent directory exists
-    std::filesystem::path path(db_path_);
+    std::filesystem::path path(config_.db_path);
     if (path.has_parent_path()) {
         std::error_code ec;
         std::filesystem::create_directories(path.parent_path(), ec);
         if (ec) {
-            return Result<void>::error("Failed to create directory: " + ec.message());
+            return core::Result<bool>::Err("Failed to create directory: " + ec.message());
         }
     }
     
-    int rc = sqlite3_open(db_path_.c_str(), &db_);
+    int rc = sqlite3_open(config_.db_path.c_str(), &db_);
     if (rc != SQLITE_OK) {
         std::string err = sqlite3_errmsg(db_);
         sqlite3_close(db_);
         db_ = nullptr;
-        return Result<void>::error("Failed to open database: " + err);
+        return core::Result<bool>::Err("Failed to open database: " + err);
     }
     
     // Enable WAL mode for better concurrency
-    exec_sql(db_, "PRAGMA journal_mode=WAL");
+    ::hunterclaw::memory::exec_sql(db_, "PRAGMA journal_mode=WAL");
     
-    return Result<void>::ok();
+    return core::Result<bool>::Ok(true);
 }
 
-void SQLiteStorage::close() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    if (db_) {
-        sqlite3_close(db_);
-        db_ = nullptr;
-    }
-}
-
-Result<void> SQLiteStorage::ensure_schema() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
+core::Result<bool> SQLiteVectorStorage::ensure_schema() {
     if (!db_) {
-        return Result<void>::error("Database not open");
+        return core::Result<bool>::Err("Database not open");
     }
     
     std::string error;
     
-    // Create chunks_vec table (严格对齐 OpenClaw schema)
-    std::string create_vec = R"(
-        CREATE TABLE IF NOT EXISTS chunks_vec (
-            id TEXT PRIMARY KEY,
-            path TEXT NOT NULL,
-            start_line INTEGER NOT NULL,
-            end_line INTEGER NOT NULL,
-            source TEXT NOT NULL,
-            snippet TEXT NOT NULL,
-            embedding BLOB,
-            provider_key TEXT,
-            modified_ms INTEGER,
-            UNIQUE(path, start_line, end_line, source)
-        )
-    )";
-    
-    if (!exec_sql(db_, create_vec, &error)) {
-        return Result<void>::error("Failed to create chunks_vec: " + error);
+    // Create chunks_vec table using SCHEMA_CHUNKS_VEC
+    if (!::hunterclaw::memory::exec_sql(db_, SCHEMA_CHUNKS_VEC, &error)) {
+        return core::Result<bool>::Err("Failed to create chunks_vec: " + error);
     }
     
-    // Create FTS table (严格对齐 OpenClaw FTS5 schema)
-    std::string create_fts = R"(
-        CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-            id UNINDEXED,
-            path UNINDEXED,
-            start_line UNINDEXED,
-            end_line UNINDEXED,
-            source UNINDEXED,
-            snippet,
-            content='chunks_vec',
-            content_rowid='rowid'
-        )
-    )";
-    
-    if (!exec_sql(db_, create_fts, &error)) {
-        return Result<void>::error("Failed to create chunks_fts: " + error);
+    // Create FTS table using SCHEMA_CHUNKS_FTS if FTS available
+    if (fts_available_) {
+        if (!::hunterclaw::memory::exec_sql(db_, SCHEMA_CHUNKS_FTS, &error)) {
+            // Don't fail if FTS creation fails, just mark as unavailable
+            fts_available_ = false;
+            fts_error_ = error;
+        }
     }
     
     // Create embedding_cache table
-    std::string create_cache = R"(
-        CREATE TABLE IF NOT EXISTS embedding_cache (
-            text TEXT NOT NULL,
-            provider_key TEXT NOT NULL,
-            embedding BLOB NOT NULL,
-            created_ms INTEGER NOT NULL,
-            PRIMARY KEY (text, provider_key)
-        )
-    )";
-    
-    if (!exec_sql(db_, create_cache, &error)) {
-        return Result<void>::error("Failed to create embedding_cache: " + error);
+    if (!::hunterclaw::memory::exec_sql(db_, SCHEMA_EMBEDDING_CACHE, &error)) {
+        return core::Result<bool>::Err("Failed to create embedding_cache: " + error);
     }
     
     // Create indices
-    exec_sql(db_, "CREATE INDEX IF NOT EXISTS idx_chunks_vec_path ON chunks_vec(path)");
-    exec_sql(db_, "CREATE INDEX IF NOT EXISTS idx_chunks_vec_source ON chunks_vec(source)");
+    ::hunterclaw::memory::exec_sql(db_, "CREATE INDEX IF NOT EXISTS idx_chunks_vec_path ON chunks_vec(path)");
+    ::hunterclaw::memory::exec_sql(db_, "CREATE INDEX IF NOT EXISTS idx_chunks_vec_source ON chunks_vec(source)");
     
-    return Result<void>::ok();
+    return core::Result<bool>::Ok(true);
 }
 
-Result<bool> SQLiteStorage::load_vector_extension(const std::string& extension_path) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
+core::Result<bool> SQLiteVectorStorage::load_sqlite_vec_extension() {
     if (!db_) {
-        return Result<bool>::error("Database not open");
+        return core::Result<bool>::Err("Database not open");
+    }
+    
+    if (!config_.vec_extension_path.has_value()) {
+        return core::Result<bool>::Ok(false);
     }
     
     // Enable extension loading
     int rc = sqlite3_enable_load_extension(db_, 1);
     if (rc != SQLITE_OK) {
-        return Result<bool>::error("Failed to enable extensions: " + std::string(sqlite3_errmsg(db_)));
+        return core::Result<bool>::Err("Failed to enable extensions: " + std::string(sqlite3_errmsg(db_)));
     }
     
     // Load extension
     char* err_msg = nullptr;
-    rc = sqlite3_load_extension(db_, extension_path.c_str(), nullptr, &err_msg);
+    rc = sqlite3_load_extension(db_, config_.vec_extension_path.value().c_str(), nullptr, &err_msg);
     
     if (rc != SQLITE_OK) {
         std::string error = err_msg ? err_msg : sqlite3_errmsg(db_);
         sqlite3_free(err_msg);
-        return Result<bool>::ok_value(false); // Extension not available, not an error
+        return core::Result<bool>::Err("Failed to load sqlite-vec: " + error);
     }
     
-    return Result<bool>::ok_value(true);
+    return core::Result<bool>::Ok(true);
 }
 
-Result<void> SQLiteStorage::create_vector_index(int dimensions) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
+core::Result<bool> SQLiteVectorStorage::try_enable_fts5() {
     if (!db_) {
-        return Result<void>::error("Database not open");
+        return core::Result<bool>::Err("Database not open");
     }
     
-    std::string sql = "CREATE VIRTUAL TABLE IF NOT EXISTS vec_index USING vec0("
-                      "embedding float[" + std::to_string(dimensions) + "], "
-                      "+id TEXT)";
+    // Try to create a test FTS5 table to check if FTS5 is available
+    std::string error;
+    bool fts5_ok = ::hunterclaw::memory::exec_sql(db_, 
+        "CREATE VIRTUAL TABLE IF NOT EXISTS fts5_test USING fts5(content)",
+        &error);
+    
+    if (fts5_ok) {
+        ::hunterclaw::memory::exec_sql(db_, "DROP TABLE IF EXISTS fts5_test");
+        return core::Result<bool>::Ok(true);
+    }
+    
+    return core::Result<bool>::Err("FTS5 not available: " + error);
+}
+
+core::Result<bool> SQLiteVectorStorage::create_tables() {
+    // Already done in ensure_schema
+    return ensure_schema();
+}
+
+core::Result<bool> SQLiteVectorStorage::create_indices() {
+    if (!db_) {
+        return core::Result<bool>::Err("Database not open");
+    }
     
     std::string error;
-    if (!exec_sql(db_, sql, &error)) {
-        return Result<void>::error("Failed to create vector index: " + error);
+    if (!::hunterclaw::memory::exec_sql(db_, "CREATE INDEX IF NOT EXISTS idx_chunks_vec_path ON chunks_vec(path)", &error)) {
+        return core::Result<bool>::Err("Failed to create index: " + error);
     }
     
-    return Result<void>::ok();
+    if (!::hunterclaw::memory::exec_sql(db_, "CREATE INDEX IF NOT EXISTS idx_chunks_vec_source ON chunks_vec(source)", &error)) {
+        return core::Result<bool>::Err("Failed to create index: " + error);
+    }
+    
+    return core::Result<bool>::Ok(true);
 }
 
-Result<void> SQLiteStorage::insert_chunk(const ChunkRecord& chunk) {
-    std::lock_guard<std::mutex> lock(mutex_);
+// ============================================================================
+// Chunk Operations
+// ============================================================================
+
+std::string SQLiteVectorStorage::generate_id() {
+    // Generate UUID-like ID
+    static std::random_device rd;
+    static std::mt19937_64 gen(rd());
+    static std::uniform_int_distribution<uint64_t> dis;
+    
+    std::stringstream ss;
+    ss << std::hex << std::setfill('0');
+    ss << std::setw(16) << dis(gen);
+    ss << std::setw(16) << dis(gen);
+    
+    return ss.str();
+}
+
+std::string SQLiteVectorStorage::serialize_embedding(const std::vector<float>& embedding) {
+    return std::string(reinterpret_cast<const char*>(embedding.data()), 
+                      embedding.size() * sizeof(float));
+}
+
+std::vector<float> SQLiteVectorStorage::deserialize_embedding(const std::string& blob) {
+    const float* data = reinterpret_cast<const float*>(blob.data());
+    size_t count = blob.size() / sizeof(float);
+    return std::vector<float>(data, data + count);
+}
+
+std::string SQLiteVectorStorage::compute_content_hash(const std::string& content) {
+    // Simple hash for now - in production use SHA256 or similar
+    std::hash<std::string> hasher;
+    std::stringstream ss;
+    ss << std::hex << hasher(content);
+    return ss.str();
+}
+
+core::Result<std::string> SQLiteVectorStorage::add_chunk(
+    const std::string& path,
+    const std::string& content,
+    const std::vector<float>& embedding,
+    const ChunkMetadata& metadata) {
     
     if (!db_) {
-        return Result<void>::error("Database not open");
+        return core::Result<std::string>::Err("Database not open");
     }
+    
+    std::string id = generate_id();
     
     const char* sql = R"(
         INSERT OR REPLACE INTO chunks_vec 
-        (id, path, start_line, end_line, source, snippet, embedding, provider_key, modified_ms)
+        (id, path, source, model, start_line, end_line, content, embedding, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     )";
     
     std::string error;
     sqlite3_stmt* stmt = prepare_stmt(db_, sql, &error);
     if (!stmt) {
-        return Result<void>::error("Failed to prepare insert: " + error);
+        return core::Result<std::string>::Err("Failed to prepare insert: " + error);
     }
     
-    sqlite3_bind_text(stmt, 1, chunk.id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, chunk.path.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, 3, chunk.start_line);
-    sqlite3_bind_int(stmt, 4, chunk.end_line);
-    sqlite3_bind_text(stmt, 5, to_string(chunk.source).c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, path.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, to_string(metadata.source).c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, metadata.model.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 5, metadata.start_line);
+    sqlite3_bind_int(stmt, 6, metadata.end_line);
+    sqlite3_bind_text(stmt, 7, content.c_str(), -1, SQLITE_TRANSIENT);
     
-    std::string snippet = chunk.snippet.size() > SNIPPET_MAX_CHARS 
-        ? chunk.snippet.substr(0, SNIPPET_MAX_CHARS) 
-        : chunk.snippet;
-    sqlite3_bind_text(stmt, 6, snippet.c_str(), -1, SQLITE_TRANSIENT);
+    std::string blob = serialize_embedding(embedding);
+    sqlite3_bind_blob(stmt, 8, blob.data(), blob.size(), SQLITE_TRANSIENT);
     
-    if (chunk.embedding.has_value()) {
-        const auto& emb = chunk.embedding.value();
-        sqlite3_bind_blob(stmt, 7, emb.data(), emb.size() * sizeof(float), SQLITE_TRANSIENT);
-    } else {
-        sqlite3_bind_null(stmt, 7);
-    }
-    
-    if (chunk.provider_key.has_value()) {
-        sqlite3_bind_text(stmt, 8, chunk.provider_key.value().c_str(), -1, SQLITE_TRANSIENT);
-    } else {
-        sqlite3_bind_null(stmt, 8);
-    }
-    
-    if (chunk.modified_ms.has_value()) {
-        sqlite3_bind_int64(stmt, 9, chunk.modified_ms.value());
-    } else {
-        sqlite3_bind_null(stmt, 9);
-    }
+    int64_t created_at = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    sqlite3_bind_int64(stmt, 9, created_at);
     
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     
     if (rc != SQLITE_DONE) {
-        return Result<void>::error("Failed to insert chunk: " + std::string(sqlite3_errmsg(db_)));
+        return core::Result<std::string>::Err("Failed to insert chunk: " + std::string(sqlite3_errmsg(db_)));
     }
     
-    // Update FTS index
-    update_fts_for_chunk(chunk);
+    // Update FTS if available
+    if (fts_available_) {
+        const char* fts_sql = R"(
+            INSERT INTO chunks_fts (id, path, source, model, start_line, end_line, content)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        )";
+        
+        sqlite3_stmt* fts_stmt = prepare_stmt(db_, fts_sql);
+        if (fts_stmt) {
+            sqlite3_bind_text(fts_stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(fts_stmt, 2, path.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(fts_stmt, 3, to_string(metadata.source).c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(fts_stmt, 4, metadata.model.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int(fts_stmt, 5, metadata.start_line);
+            sqlite3_bind_int(fts_stmt, 6, metadata.end_line);
+            sqlite3_bind_text(fts_stmt, 7, content.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_step(fts_stmt);
+            sqlite3_finalize(fts_stmt);
+        }
+    }
     
-    return Result<void>::ok();
+    return core::Result<std::string>::Ok(id);
 }
 
-Result<void> SQLiteStorage::insert_chunks_batch(const std::vector<ChunkRecord>& chunks) {
+core::Result<std::vector<std::string>> SQLiteVectorStorage::add_chunks_batch(
+    const std::vector<std::tuple<std::string, std::string, std::vector<float>, ChunkMetadata>>& chunks) {
+    
     if (chunks.empty()) {
-        return Result<void>::ok();
+        return core::Result<std::vector<std::string>>::Ok(std::vector<std::string>());
     }
     
-    Transaction tx(this);
-    auto tx_res = tx.begin();
-    if (!tx_res.is_ok()) {
-        return tx_res;
+    std::vector<std::string> ids;
+    ids.reserve(chunks.size());
+    
+    auto tx_begin = begin_transaction();
+    if (!tx_begin.is_ok()) {
+        return core::Result<std::vector<std::string>>::Err(tx_begin.error);
     }
     
-    for (const auto& chunk : chunks) {
-        auto res = insert_chunk(chunk);
+    for (const auto& [path, content, embedding, metadata] : chunks) {
+        auto res = add_chunk(path, content, embedding, metadata);
         if (!res.is_ok()) {
-            return res;
+            rollback_transaction();
+            return core::Result<std::vector<std::string>>::Err(res.error);
         }
+        ids.push_back(res.value);
     }
     
-    return tx.commit();
+    auto tx_commit = commit_transaction();
+    if (!tx_commit.is_ok()) {
+        return core::Result<std::vector<std::string>>::Err(tx_commit.error);
+    }
+    
+    return core::Result<std::vector<std::string>>::Ok(ids);
 }
 
-Result<std::vector<ChunkRecord>> SQLiteStorage::get_chunks_by_path(
-    const std::string& path, 
-    MemorySource source) {
-    
-    std::lock_guard<std::mutex> lock(mutex_);
-    
+core::Result<int> SQLiteVectorStorage::delete_chunks_by_path(const std::string& path) {
     if (!db_) {
-        return Result<std::vector<ChunkRecord>>::error("Database not open");
+        return core::Result<int>::Err("Database not open");
     }
     
-    const char* sql = "SELECT id, path, start_line, end_line, source, snippet, "
-                      "embedding, provider_key, modified_ms FROM chunks_vec "
-                      "WHERE path = ? AND source = ?";
+    const char* sql = "DELETE FROM chunks_vec WHERE path = ?";
     
     std::string error;
     sqlite3_stmt* stmt = prepare_stmt(db_, sql, &error);
     if (!stmt) {
-        return Result<std::vector<ChunkRecord>>::error("Failed to prepare query: " + error);
+        return core::Result<int>::Err("Failed to prepare delete: " + error);
     }
     
     sqlite3_bind_text(stmt, 1, path.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, to_string(source).c_str(), -1, SQLITE_TRANSIENT);
-    
-    std::vector<ChunkRecord> results;
-    
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        ChunkRecord chunk;
-        chunk.id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-        chunk.path = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-        chunk.start_line = sqlite3_column_int(stmt, 2);
-        chunk.end_line = sqlite3_column_int(stmt, 3);
-        
-        std::string source_str = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
-        chunk.source = (source_str == "memory") ? MemorySource::Memory : MemorySource::Sessions;
-        
-        chunk.snippet = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5));
-        
-        if (sqlite3_column_type(stmt, 6) == SQLITE_BLOB) {
-            int blob_size = sqlite3_column_bytes(stmt, 6);
-            const float* blob_data = static_cast<const float*>(sqlite3_column_blob(stmt, 6));
-            chunk.embedding = std::vector<float>(blob_data, blob_data + blob_size / sizeof(float));
-        }
-        
-        if (sqlite3_column_type(stmt, 7) == SQLITE_TEXT) {
-            chunk.provider_key = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
-        }
-        
-        if (sqlite3_column_type(stmt, 8) == SQLITE_INTEGER) {
-            chunk.modified_ms = sqlite3_column_int64(stmt, 8);
-        }
-        
-        results.push_back(std::move(chunk));
-    }
-    
-    sqlite3_finalize(stmt);
-    
-    return Result<std::vector<ChunkRecord>>::ok_value(std::move(results));
-}
-
-Result<void> SQLiteStorage::delete_chunks_by_path(const std::string& path, MemorySource source) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    if (!db_) {
-        return Result<void>::error("Database not open");
-    }
-    
-    const char* sql = "DELETE FROM chunks_vec WHERE path = ? AND source = ?";
-    
-    std::string error;
-    sqlite3_stmt* stmt = prepare_stmt(db_, sql, &error);
-    if (!stmt) {
-        return Result<void>::error("Failed to prepare delete: " + error);
-    }
-    
-    sqlite3_bind_text(stmt, 1, path.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, to_string(source).c_str(), -1, SQLITE_TRANSIENT);
     
     int rc = sqlite3_step(stmt);
+    int changes = sqlite3_changes(db_);
     sqlite3_finalize(stmt);
     
     if (rc != SQLITE_DONE) {
-        return Result<void>::error("Failed to delete chunks: " + std::string(sqlite3_errmsg(db_)));
+        return core::Result<int>::Err("Failed to delete chunks: " + std::string(sqlite3_errmsg(db_)));
     }
     
-    // FTS will be updated via triggers or manually
-    update_fts_after_delete(path, source);
+    // Delete from FTS
+    if (fts_available_) {
+        const char* fts_sql = "DELETE FROM chunks_fts WHERE path = ?";
+        sqlite3_stmt* fts_stmt = prepare_stmt(db_, fts_sql);
+        if (fts_stmt) {
+            sqlite3_bind_text(fts_stmt, 1, path.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_step(fts_stmt);
+            sqlite3_finalize(fts_stmt);
+        }
+    }
     
-    return Result<void>::ok();
+    return core::Result<int>::Ok(changes);
 }
 
-Result<std::vector<VectorSearchResult>> SQLiteStorage::search_vector(
+core::Result<int> SQLiteVectorStorage::delete_chunks_by_source(MemorySource source) {
+    if (!db_) {
+        return core::Result<int>::Err("Database not open");
+    }
+    
+    const char* sql = "DELETE FROM chunks_vec WHERE source = ?";
+    
+    std::string error;
+    sqlite3_stmt* stmt = prepare_stmt(db_, sql, &error);
+    if (!stmt) {
+        return core::Result<int>::Err("Failed to prepare delete: " + error);
+    }
+    
+    sqlite3_bind_text(stmt, 1, to_string(source).c_str(), -1, SQLITE_TRANSIENT);
+    
+    int rc = sqlite3_step(stmt);
+    int changes = sqlite3_changes(db_);
+    sqlite3_finalize(stmt);
+    
+    if (rc != SQLITE_DONE) {
+        return core::Result<int>::Err("Failed to delete chunks: " + std::string(sqlite3_errmsg(db_)));
+    }
+    
+    // Delete from FTS
+    if (fts_available_) {
+        const char* fts_sql = "DELETE FROM chunks_fts WHERE source = ?";
+        sqlite3_stmt* fts_stmt = prepare_stmt(db_, fts_sql);
+        if (fts_stmt) {
+            sqlite3_bind_text(fts_stmt, 1, to_string(source).c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_step(fts_stmt);
+            sqlite3_finalize(fts_stmt);
+        }
+    }
+    
+    return core::Result<int>::Ok(changes);
+}
+
+core::Result<bool> SQLiteVectorStorage::clear_all() {
+    if (!db_) {
+        return core::Result<bool>::Err("Database not open");
+    }
+    
+    std::string error;
+    if (!::hunterclaw::memory::exec_sql(db_, "DELETE FROM chunks_vec", &error)) {
+        return core::Result<bool>::Err("Failed to clear chunks_vec: " + error);
+    }
+    
+    if (fts_available_) {
+        ::hunterclaw::memory::exec_sql(db_, "DELETE FROM chunks_fts");
+    }
+    
+    ::hunterclaw::memory::exec_sql(db_, "DELETE FROM embedding_cache");
+    
+    return core::Result<bool>::Ok(true);
+}
+
+// ============================================================================
+// Vector Search
+// ============================================================================
+
+MemorySearchResult SQLiteVectorStorage::result_from_row(sqlite3_stmt* stmt, double score) {
+    MemorySearchResult result;
+    result.path = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+    
+    std::string source_str = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+    result.source = (source_str == "memory") ? MemorySource::Memory : MemorySource::Sessions;
+    
+    result.start_line = sqlite3_column_int(stmt, 2);
+    result.end_line = sqlite3_column_int(stmt, 3);
+    result.snippet = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
+    result.score = score;
+    
+    return result;
+}
+
+double SQLiteVectorStorage::bm25_rank_to_score(double rank) {
+    // 严格对齐 OpenClaw hybrid.ts::bm25RankToScore
+    if (!std::isfinite(rank)) {
+        return 1.0 / (1.0 + 999.0);
+    }
+    if (rank < 0) {
+        double relevance = -rank;
+        return relevance / (1.0 + relevance);
+    }
+    return 1.0 / (1.0 + rank);
+}
+
+core::Result<std::vector<MemorySearchResult>> SQLiteVectorStorage::vector_search(
     const std::vector<float>& query_embedding,
     int limit,
     double min_score) {
     
-    std::lock_guard<std::mutex> lock(mutex_);
-    
     if (!db_) {
-        return Result<std::vector<VectorSearchResult>>::error("Database not open");
+        return core::Result<std::vector<MemorySearchResult>>::Err("Database not open");
     }
     
-    // Query vector index (using sqlite-vec)
-    const char* sql = R"(
-        SELECT v.id, v.path, v.start_line, v.end_line, v.source, v.snippet, 
-               vec_distance_cosine(i.embedding, ?) as distance,
-               v.modified_ms
-        FROM vec_index i
-        JOIN chunks_vec v ON v.id = i.id
-        WHERE vec_distance_cosine(i.embedding, ?) < ?
-        ORDER BY distance
-        LIMIT ?
-    )";
-    
-    std::string error;
-    sqlite3_stmt* stmt = prepare_stmt(db_, sql, &error);
-    if (!stmt) {
-        return Result<std::vector<VectorSearchResult>>::error("Failed to prepare vector search: " + error);
+    if (!vec_available_) {
+        return core::Result<std::vector<MemorySearchResult>>::Err("Vector search not available");
     }
     
-    // Bind query embedding as blob
-    sqlite3_bind_blob(stmt, 1, query_embedding.data(), 
-                      query_embedding.size() * sizeof(float), SQLITE_TRANSIENT);
-    sqlite3_bind_blob(stmt, 2, query_embedding.data(), 
-                      query_embedding.size() * sizeof(float), SQLITE_TRANSIENT);
-    
-    // Convert cosine similarity threshold
-    double distance_threshold = 1.0 - min_score;
-    sqlite3_bind_double(stmt, 3, distance_threshold);
-    sqlite3_bind_int(stmt, 4, limit);
-    
-    std::vector<VectorSearchResult> results;
-    
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        VectorSearchResult result;
-        result.id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-        result.path = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-        result.start_line = sqlite3_column_int(stmt, 2);
-        result.end_line = sqlite3_column_int(stmt, 3);
-        
-        std::string source_str = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
-        result.source = (source_str == "memory") ? MemorySource::Memory : MemorySource::Sessions;
-        
-        result.snippet = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5));
-        
-        double distance = sqlite3_column_double(stmt, 6);
-        result.vector_score = 1.0 - distance; // Convert distance to similarity
-        
-        if (sqlite3_column_type(stmt, 7) == SQLITE_INTEGER) {
-            result.modified_ms = sqlite3_column_int64(stmt, 7);
-        }
-        
-        results.push_back(std::move(result));
-    }
-    
-    sqlite3_finalize(stmt);
-    
-    return Result<std::vector<VectorSearchResult>>::ok_value(std::move(results));
+    // TODO: Implement vector search using sqlite-vec
+    // For now, return empty results
+    return core::Result<std::vector<MemorySearchResult>>::Ok(std::vector<MemorySearchResult>());
 }
 
-Result<std::vector<KeywordSearchResult>> SQLiteStorage::search_keyword(
+core::Result<std::vector<MemorySearchResult>> SQLiteVectorStorage::vector_search_filtered(
+    const std::vector<float>& query_embedding,
+    int limit,
+    double min_score,
+    const std::string& source_filter) {
+    
+    // TODO: Implement filtered vector search
+    return vector_search(query_embedding, limit, min_score);
+}
+
+// ============================================================================
+// Full-Text Search
+// ============================================================================
+
+core::Result<std::vector<MemorySearchResult>> SQLiteVectorStorage::fts_search(
     const std::string& query,
     int limit) {
     
-    std::lock_guard<std::mutex> lock(mutex_);
-    
     if (!db_) {
-        return Result<std::vector<KeywordSearchResult>>::error("Database not open");
+        return core::Result<std::vector<MemorySearchResult>>::Err("Database not open");
     }
     
-    // Use FTS5 for keyword search
+    if (!fts_available_) {
+        return core::Result<std::vector<MemorySearchResult>>::Err("FTS not available");
+    }
+    
     const char* sql = R"(
-        SELECT f.id, f.path, f.start_line, f.end_line, f.source, 
-               f.snippet, bm25(f) as rank, v.modified_ms
+        SELECT f.path, f.source, f.start_line, f.end_line, f.content,
+               bm25(f) as rank
         FROM chunks_fts f
-        JOIN chunks_vec v ON v.id = f.id
         WHERE chunks_fts MATCH ?
         ORDER BY rank
         LIMIT ?
@@ -476,127 +548,204 @@ Result<std::vector<KeywordSearchResult>> SQLiteStorage::search_keyword(
     std::string error;
     sqlite3_stmt* stmt = prepare_stmt(db_, sql, &error);
     if (!stmt) {
-        return Result<std::vector<KeywordSearchResult>>::error("Failed to prepare FTS search: " + error);
+        return core::Result<std::vector<MemorySearchResult>>::Err("Failed to prepare FTS search: " + error);
     }
     
     sqlite3_bind_text(stmt, 1, query.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmt, 2, limit);
     
-    std::vector<KeywordSearchResult> results;
+    std::vector<MemorySearchResult> results;
     
     while (sqlite3_step(stmt) == SQLITE_ROW) {
-        KeywordSearchResult result;
-        result.id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-        result.path = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-        result.start_line = sqlite3_column_int(stmt, 2);
-        result.end_line = sqlite3_column_int(stmt, 3);
-        
-        std::string source_str = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
-        result.source = (source_str == "memory") ? MemorySource::Memory : MemorySource::Sessions;
-        
-        result.snippet = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5));
-        
-        double rank = sqlite3_column_double(stmt, 6);
-        result.text_score = bm25_rank_to_score(rank);
-        
-        if (sqlite3_column_type(stmt, 7) == SQLITE_INTEGER) {
-            result.modified_ms = sqlite3_column_int64(stmt, 7);
-        }
-        
-        results.push_back(std::move(result));
+        double rank = sqlite3_column_double(stmt, 5);
+        double score = bm25_rank_to_score(rank);
+        results.push_back(result_from_row(stmt, score));
     }
     
     sqlite3_finalize(stmt);
     
-    return Result<std::vector<KeywordSearchResult>>::ok_value(std::move(results));
+    return core::Result<std::vector<MemorySearchResult>>::Ok(results);
 }
 
-Result<std::optional<std::vector<float>>> SQLiteStorage::get_cached_embedding(
-    const std::string& text,
-    const std::string& provider_key) {
-    
-    std::lock_guard<std::mutex> lock(mutex_);
+core::Result<std::vector<MemorySearchResult>> SQLiteVectorStorage::fts_search_filtered(
+    const std::string& query,
+    int limit,
+    const std::string& source_filter) {
     
     if (!db_) {
-        return Result<std::optional<std::vector<float>>>::error("Database not open");
+        return core::Result<std::vector<MemorySearchResult>>::Err("Database not open");
     }
     
-    const char* sql = "SELECT embedding FROM embedding_cache WHERE text = ? AND provider_key = ?";
+    if (!fts_available_) {
+        return core::Result<std::vector<MemorySearchResult>>::Err("FTS not available");
+    }
+    
+    const char* sql = R"(
+        SELECT f.path, f.source, f.start_line, f.end_line, f.content,
+               bm25(f) as rank
+        FROM chunks_fts f
+        WHERE chunks_fts MATCH ? AND source = ?
+        ORDER BY rank
+        LIMIT ?
+    )";
     
     std::string error;
     sqlite3_stmt* stmt = prepare_stmt(db_, sql, &error);
     if (!stmt) {
-        return Result<std::optional<std::vector<float>>>::error("Failed to prepare cache query: " + error);
+        return core::Result<std::vector<MemorySearchResult>>::Err("Failed to prepare FTS search: " + error);
     }
     
-    sqlite3_bind_text(stmt, 1, text.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, provider_key.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 1, query.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, source_filter.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 3, limit);
+    
+    std::vector<MemorySearchResult> results;
+    
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        double rank = sqlite3_column_double(stmt, 5);
+        double score = bm25_rank_to_score(rank);
+        results.push_back(result_from_row(stmt, score));
+    }
+    
+    sqlite3_finalize(stmt);
+    
+    return core::Result<std::vector<MemorySearchResult>>::Ok(results);
+}
+
+// ============================================================================
+// Embedding Cache
+// ============================================================================
+
+core::Result<std::optional<std::vector<float>>> SQLiteVectorStorage::get_cached_embedding(
+    const std::string& content_hash,
+    const std::string& model) {
+    
+    if (!db_) {
+        return core::Result<std::optional<std::vector<float>>>::Err("Database not open");
+    }
+    
+    const char* sql = "SELECT embedding FROM embedding_cache WHERE content_hash = ? AND model = ?";
+    
+    std::string error;
+    sqlite3_stmt* stmt = prepare_stmt(db_, sql, &error);
+    if (!stmt) {
+        return core::Result<std::optional<std::vector<float>>>::Err("Failed to prepare cache query: " + error);
+    }
+    
+    sqlite3_bind_text(stmt, 1, content_hash.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, model.c_str(), -1, SQLITE_TRANSIENT);
     
     std::optional<std::vector<float>> result;
     
     if (sqlite3_step(stmt) == SQLITE_ROW) {
         int blob_size = sqlite3_column_bytes(stmt, 0);
-        const float* blob_data = static_cast<const float*>(sqlite3_column_blob(stmt, 0));
-        result = std::vector<float>(blob_data, blob_data + blob_size / sizeof(float));
+        const char* blob_data = static_cast<const char*>(sqlite3_column_blob(stmt, 0));
+        std::string blob(blob_data, blob_size);
+        result = deserialize_embedding(blob);
     }
     
     sqlite3_finalize(stmt);
     
-    return Result<std::optional<std::vector<float>>>::ok_value(result);
+    return core::Result<std::optional<std::vector<float>>>::Ok(result);
 }
 
-Result<void> SQLiteStorage::put_cached_embedding(
-    const std::string& text,
-    const std::string& provider_key,
+core::Result<bool> SQLiteVectorStorage::cache_embedding(
+    const std::string& content_hash,
     const std::vector<float>& embedding,
-    int64_t created_ms) {
-    
-    std::lock_guard<std::mutex> lock(mutex_);
+    const std::string& model) {
     
     if (!db_) {
-        return Result<void>::error("Database not open");
+        return core::Result<bool>::Err("Database not open");
     }
     
     const char* sql = R"(
-        INSERT OR REPLACE INTO embedding_cache (text, provider_key, embedding, created_ms)
+        INSERT OR REPLACE INTO embedding_cache (content_hash, model, embedding, created_at)
         VALUES (?, ?, ?, ?)
     )";
     
     std::string error;
     sqlite3_stmt* stmt = prepare_stmt(db_, sql, &error);
     if (!stmt) {
-        return Result<void>::error("Failed to prepare cache insert: " + error);
+        return core::Result<bool>::Err("Failed to prepare cache insert: " + error);
     }
     
-    sqlite3_bind_text(stmt, 1, text.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, provider_key.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_blob(stmt, 3, embedding.data(), embedding.size() * sizeof(float), SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt, 4, created_ms);
+    sqlite3_bind_text(stmt, 1, content_hash.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, model.c_str(), -1, SQLITE_TRANSIENT);
+    
+    std::string blob = serialize_embedding(embedding);
+    sqlite3_bind_blob(stmt, 3, blob.data(), blob.size(), SQLITE_TRANSIENT);
+    
+    int64_t created_at = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    sqlite3_bind_int64(stmt, 4, created_at);
     
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     
     if (rc != SQLITE_DONE) {
-        return Result<void>::error("Failed to cache embedding: " + std::string(sqlite3_errmsg(db_)));
+        return core::Result<bool>::Err("Failed to cache embedding: " + std::string(sqlite3_errmsg(db_)));
     }
     
-    return Result<void>::ok();
+    return core::Result<bool>::Ok(true);
 }
 
-Result<StorageStats> SQLiteStorage::get_stats() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
+core::Result<int> SQLiteVectorStorage::cleanup_old_cache(int64_t older_than_timestamp) {
     if (!db_) {
-        return Result<StorageStats>::error("Database not open");
+        return core::Result<int>::Err("Database not open");
     }
     
-    StorageStats stats;
+    const char* sql = "DELETE FROM embedding_cache WHERE created_at < ?";
+    
+    std::string error;
+    sqlite3_stmt* stmt = prepare_stmt(db_, sql, &error);
+    if (!stmt) {
+        return core::Result<int>::Err("Failed to prepare cache cleanup: " + error);
+    }
+    
+    sqlite3_bind_int64(stmt, 1, older_than_timestamp);
+    
+    int rc = sqlite3_step(stmt);
+    int changes = sqlite3_changes(db_);
+    sqlite3_finalize(stmt);
+    
+    if (rc != SQLITE_DONE) {
+        return core::Result<int>::Err("Failed to cleanup cache: " + std::string(sqlite3_errmsg(db_)));
+    }
+    
+    return core::Result<int>::Ok(changes);
+}
+
+// ============================================================================
+// Statistics
+// ============================================================================
+
+core::Result<SQLiteVectorStorage::Stats> SQLiteVectorStorage::get_stats() {
+    if (!db_) {
+        return core::Result<Stats>::Err("Database not open");
+    }
+    
+    Stats stats{};
     
     // Count total chunks
     const char* count_sql = "SELECT COUNT(*) FROM chunks_vec";
     sqlite3_stmt* stmt = prepare_stmt(db_, count_sql);
     if (stmt && sqlite3_step(stmt) == SQLITE_ROW) {
         stats.total_chunks = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    
+    // Count by source
+    const char* memory_sql = "SELECT COUNT(*) FROM chunks_vec WHERE source = 'memory'";
+    stmt = prepare_stmt(db_, memory_sql);
+    if (stmt && sqlite3_step(stmt) == SQLITE_ROW) {
+        stats.memory_chunks = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    
+    const char* sessions_sql = "SELECT COUNT(*) FROM chunks_vec WHERE source = 'sessions'";
+    stmt = prepare_stmt(db_, sessions_sql);
+    if (stmt && sqlite3_step(stmt) == SQLITE_ROW) {
+        stats.sessions_chunks = sqlite3_column_int(stmt, 0);
     }
     sqlite3_finalize(stmt);
     
@@ -618,115 +767,127 @@ Result<StorageStats> SQLiteStorage::get_stats() {
     
     // Get DB file size
     std::error_code ec;
-    auto file_size = std::filesystem::file_size(db_path_, ec);
+    auto file_size = std::filesystem::file_size(config_.db_path, ec);
     if (!ec) {
         stats.db_size_bytes = file_size;
     }
     
-    return Result<StorageStats>::ok_value(stats);
+    return core::Result<Stats>::Ok(stats);
 }
 
-// Helper methods
-
-double SQLiteStorage::bm25_rank_to_score(double rank) {
-    // 严格对齐 OpenClaw hybrid.ts::bm25RankToScore
-    if (!std::isfinite(rank)) {
-        return 1.0 / (1.0 + 999.0);
+core::Result<std::vector<MemoryProviderStatus::SourceCount>> SQLiteVectorStorage::get_source_counts() {
+    if (!db_) {
+        return core::Result<std::vector<MemoryProviderStatus::SourceCount>>::Err("Database not open");
     }
-    if (rank < 0) {
-        double relevance = -rank;
-        return relevance / (1.0 + relevance);
+    
+    const char* sql = "SELECT source, COUNT(DISTINCT path), COUNT(*) FROM chunks_vec GROUP BY source";
+    
+    std::string error;
+    sqlite3_stmt* stmt = prepare_stmt(db_, sql, &error);
+    if (!stmt) {
+        return core::Result<std::vector<MemoryProviderStatus::SourceCount>>::Err("Failed to query source counts: " + error);
     }
-    return 1.0 / (1.0 + rank);
-}
-
-void SQLiteStorage::update_fts_for_chunk(const ChunkRecord& chunk) {
-    // Insert into FTS table
-    const char* sql = R"(
-        INSERT INTO chunks_fts(id, path, start_line, end_line, source, snippet)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(rowid) DO UPDATE SET snippet = excluded.snippet
-    )";
     
-    sqlite3_stmt* stmt = prepare_stmt(db_, sql);
-    if (!stmt) return;
+    std::vector<MemoryProviderStatus::SourceCount> counts;
     
-    sqlite3_bind_text(stmt, 1, chunk.id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, chunk.path.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, 3, chunk.start_line);
-    sqlite3_bind_int(stmt, 4, chunk.end_line);
-    sqlite3_bind_text(stmt, 5, to_string(chunk.source).c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 6, chunk.snippet.c_str(), -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        MemoryProviderStatus::SourceCount count;
+        std::string source_str = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        count.source = (source_str == "memory") ? MemorySource::Memory : MemorySource::Sessions;
+        count.files = sqlite3_column_int(stmt, 1);
+        count.chunks = sqlite3_column_int(stmt, 2);
+        counts.push_back(count);
+    }
     
-    sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-}
-
-void SQLiteStorage::update_fts_after_delete(const std::string& path, MemorySource source) {
-    const char* sql = "DELETE FROM chunks_fts WHERE path = ? AND source = ?";
     
-    sqlite3_stmt* stmt = prepare_stmt(db_, sql);
-    if (!stmt) return;
+    return core::Result<std::vector<MemoryProviderStatus::SourceCount>>::Ok(counts);
+}
+
+// ============================================================================
+// Transaction Support
+// ============================================================================
+
+core::Result<bool> SQLiteVectorStorage::begin_transaction() {
+    if (!db_) {
+        return core::Result<bool>::Err("Database not open");
+    }
     
-    sqlite3_bind_text(stmt, 1, path.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, to_string(source).c_str(), -1, SQLITE_TRANSIENT);
+    std::string error;
+    if (!::hunterclaw::memory::exec_sql(db_, "BEGIN TRANSACTION", &error)) {
+        return core::Result<bool>::Err("Failed to begin transaction: " + error);
+    }
+    return core::Result<bool>::Ok(true);
+}
+
+core::Result<bool> SQLiteVectorStorage::commit_transaction() {
+    if (!db_) {
+        return core::Result<bool>::Err("Database not open");
+    }
     
-    sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
+    std::string error;
+    if (!::hunterclaw::memory::exec_sql(db_, "COMMIT", &error)) {
+        return core::Result<bool>::Err("Failed to commit transaction: " + error);
+    }
+    return core::Result<bool>::Ok(true);
 }
 
-Result<void> SQLiteStorage::begin_transaction() {
-    std::string error;
-    if (!exec_sql(db_, "BEGIN TRANSACTION", &error)) {
-        return Result<void>::error("Failed to begin transaction: " + error);
+core::Result<bool> SQLiteVectorStorage::rollback_transaction() {
+    if (!db_) {
+        return core::Result<bool>::Err("Database not open");
     }
-    return Result<void>::ok();
+    
+    std::string error;
+    if (!::hunterclaw::memory::exec_sql(db_, "ROLLBACK", &error)) {
+        return core::Result<bool>::Err("Failed to rollback transaction: " + error);
+    }
+    return core::Result<bool>::Ok(true);
 }
 
-Result<void> SQLiteStorage::commit_transaction() {
-    std::string error;
-    if (!exec_sql(db_, "COMMIT", &error)) {
-        return Result<void>::error("Failed to commit transaction: " + error);
+core::Result<bool> SQLiteVectorStorage::exec_sql(const std::string& sql) {
+    if (!db_) {
+        return core::Result<bool>::Err("Database not open");
     }
-    return Result<void>::ok();
+    
+    std::string error;
+    if (!::hunterclaw::memory::exec_sql(db_, sql, &error)) {
+        return core::Result<bool>::Err(error);
+    }
+    return core::Result<bool>::Ok(true);
 }
 
-Result<void> SQLiteStorage::rollback_transaction() {
-    std::string error;
-    if (!exec_sql(db_, "ROLLBACK", &error)) {
-        return Result<void>::error("Failed to rollback transaction: " + error);
+core::Result<sqlite3_stmt*> SQLiteVectorStorage::prepare_statement(const std::string& sql) {
+    if (!db_) {
+        return core::Result<sqlite3_stmt*>::Err("Database not open");
     }
-    return Result<void>::ok();
+    
+    std::string error;
+    sqlite3_stmt* stmt = prepare_stmt(db_, sql, &error);
+    if (!stmt) {
+        return core::Result<sqlite3_stmt*>::Err(error);
+    }
+    return core::Result<sqlite3_stmt*>::Ok(stmt);
 }
 
 // ============================================================================
 // Transaction RAII Helper
 // ============================================================================
 
-Transaction::Transaction(SQLiteStorage* storage) 
-    : storage_(storage), active_(false) {}
+SQLiteVectorStorage::Transaction::Transaction(SQLiteVectorStorage& storage)
+    : storage_(storage), committed_(false) {
+    storage_.begin_transaction();
+}
 
-Transaction::~Transaction() {
-    if (active_) {
-        storage_->rollback_transaction();
+SQLiteVectorStorage::Transaction::~Transaction() {
+    if (!committed_) {
+        storage_.rollback_transaction();
     }
 }
 
-Result<void> Transaction::begin() {
-    auto res = storage_->begin_transaction();
+core::Result<bool> SQLiteVectorStorage::Transaction::commit() {
+    auto res = storage_.commit_transaction();
     if (res.is_ok()) {
-        active_ = true;
-    }
-    return res;
-}
-
-Result<void> Transaction::commit() {
-    if (!active_) {
-        return Result<void>::error("No active transaction");
-    }
-    auto res = storage_->commit_transaction();
-    if (res.is_ok()) {
-        active_ = false;
+        committed_ = true;
     }
     return res;
 }

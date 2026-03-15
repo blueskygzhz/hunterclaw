@@ -1,21 +1,16 @@
 #pragma once
 
 #include "hunterclaw/core/result.h"
+#include "hunterclaw/memory/types.h"
 #include <string>
 #include <vector>
 #include <map>
 #include <memory>
 #include <optional>
-#include <cstdint>
+#include <cstdint>>
 
 namespace hunterclaw {
 namespace memory {
-
-// Forward declarations from types.h
-enum class MemorySource;
-struct MemorySearchResult;
-struct SearchOptions;
-struct MemoryProviderStatus;
 
 // ============================================================================
 // Memory - 基础记忆单元
@@ -27,6 +22,7 @@ struct Memory {
     int64_t created_at;                                // 创建时间戳
     int64_t updated_at;                                // 更新时间戳
     std::optional<std::vector<float>> embedding;       // 向量嵌入(可选)
+    double score = 0.0;                                // 搜索相关度分数
 };
 
 // ============================================================================
@@ -132,7 +128,7 @@ public:
         std::optional<int> offset = std::nullopt
     ) {
         // 默认实现: 返回空列表
-        return core::Result<std::vector<Memory>>::ok({});
+        return core::Result<std::vector<Memory>>::Ok({});
     }
     
     // ========================================
@@ -150,7 +146,7 @@ public:
         MemoryProviderStatus status;
         status.backend = "custom";
         status.provider = provider_id();
-        return core::Result<MemoryProviderStatus>::ok(status);
+        return core::Result<MemoryProviderStatus>::Ok(status);
     }
     
     // ========================================
@@ -164,7 +160,7 @@ public:
         const std::map<std::string, std::string>& config = {}
     ) {
         // 默认实现: 无需初始化
-        return core::Result<bool>::ok(true);
+        return core::Result<bool>::Ok(true);
     }
     
     // 关闭Provider (清理资源)

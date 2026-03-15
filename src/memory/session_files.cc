@@ -130,7 +130,7 @@ core::Result<std::vector<std::string>> list_session_files_for_agent(
     
     try {
         if (!fs::exists(dir) || !fs::is_directory(dir)) {
-            return core::Result<std::vector<std::string>>::ok_value(result);
+            return core::Result<std::vector<std::string>>::Ok(result);
         }
         
         for (const auto& entry : fs::directory_iterator(dir)) {
@@ -144,10 +144,10 @@ core::Result<std::vector<std::string>> list_session_files_for_agent(
             }
         }
         
-        return core::Result<std::vector<std::string>>::ok_value(result);
+        return core::Result<std::vector<std::string>>::Ok(result);
         
     } catch (const std::exception& e) {
-        return core::Result<std::vector<std::string>>::ok_value(result);
+        return core::Result<std::vector<std::string>>::Ok(result);
     }
 }
 
@@ -174,7 +174,7 @@ core::Result<SessionFileEntry> build_session_entry(const std::string& abs_path) 
     try {
         // Get file stats (对齐 session-files.ts:76)
         if (!fs::exists(abs_path)) {
-            return core::Result<SessionFileEntry>::error("File not found: " + abs_path);
+            return core::Result<SessionFileEntry>::Err("File not found: " + abs_path);
         }
         
         auto ftime = fs::last_write_time(abs_path);
@@ -190,7 +190,7 @@ core::Result<SessionFileEntry> build_session_entry(const std::string& abs_path) 
         // Read file (对齐 session-files.ts:77)
         std::ifstream file(abs_path);
         if (!file.is_open()) {
-            return core::Result<SessionFileEntry>::error("Cannot open file: " + abs_path);
+            return core::Result<SessionFileEntry>::Err("Cannot open file: " + abs_path);
         }
         
         std::string raw((std::istreambuf_iterator<char>(file)),
@@ -287,10 +287,10 @@ core::Result<SessionFileEntry> build_session_entry(const std::string& abs_path) 
         entry.content = content;
         entry.line_map = line_map;
         
-        return core::Result<SessionFileEntry>::ok_value(entry);
+        return core::Result<SessionFileEntry>::Ok(entry);
         
     } catch (const std::exception& e) {
-        return core::Result<SessionFileEntry>::error(
+        return core::Result<SessionFileEntry>::Err(
             std::string("Failed reading session file: ") + e.what()
         );
     }

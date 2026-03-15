@@ -1,5 +1,6 @@
 #include "hunterclaw/memory/registry.h"
 #include "hunterclaw/memory/memory.h"  // 使用现有的 MemoryManager
+#include "hunterclaw/memory/sqlite_storage.h"
 #include <stdexcept>
 #include <mutex>
 #include <chrono>
@@ -189,13 +190,15 @@ MemoryProviderRegistry::create_session_provider(
         return core::Result<std::shared_ptr<MemoryProvider>>::Err(provider_result.error);
     }
     
-    // 创建 Session-scoped Provider
-    auto session_provider = std::make_shared<SessionMemoryProvider>(
-        provider_result.value,
-        context
-    );
+    // TODO: 创建 Session-scoped Provider
+    // SessionMemoryProvider 需要单独实现
+    // auto session_provider = std::make_shared<SessionMemoryProvider>(
+    //     provider_result.value,
+    //     context
+    // );
     
-    return core::Result<std::shared_ptr<MemoryProvider>>::Ok(std::static_pointer_cast<MemoryProvider>(session_provider));
+    // 暂时直接返回底层provider
+    return provider_result;
 }
 
 void MemoryProviderRegistry::shutdown_all() {
@@ -225,8 +228,11 @@ SQLiteMemoryProvider::SQLiteMemoryProvider(
     impl_->embedding_provider = embedding_provider;
     impl_->config = config;
     
-    // 创建 storage
-    auto storage = SQLiteVectorStorage::create(db_path);
+    // 创建 storage 需要Config结构体
+    SQLiteVectorStorage::Config storage_config;
+    storage_config.db_path = db_path;
+    storage_config.vec_extension_path = std::nullopt;  // 修正字段名
+    auto storage = SQLiteVectorStorage::create(storage_config);
     
     // 创建 embedding provider (TODO: 从工厂创建)
     // auto embedding = EmbeddingProviderFactory::create_openai(config["api_key"]);
@@ -257,37 +263,34 @@ core::Result<std::string> SQLiteMemoryProvider::add_memory(
     }
 }
 
-core::Result<std::vector<Memory>> SQLiteMemoryProvider::search_memories(
+core::Result<std::vector<MemorySearchResult>> SQLiteMemoryProvider::search_memories(
     const std::string& query,
     const SearchOptions& options
 ) {
     if (!impl_->manager) {
-        return core::Result<std::vector<Memory>>::Err("Memory manager not initialized");
+        return core::Result<std::vector<MemorySearchResult>>::Err("Memory manager not initialized");
     }
     
     try {
         auto results = impl_->manager->search(query);
         
-        // 转换为 Memory 结构
-        std::vector<Memory> memories;
+        // 转换为 MemorySearchResult 结构
+        std::vector<MemorySearchResult> memories;
         for (const auto& result : results) {
-            Memory mem;
-            mem.id = result.id;
-            mem.content = result.content;
-            mem.metadata = result.metadata;
-            mem.embedding = result.embedding;
+            MemorySearchResult mem;
+            mem.path = result.id;  // 使用id作为path
+            mem.start_line = 0;
+            mem.end_line = 0;
             mem.score = result.score;
-            
-            // 从 timestamp 转换
-            mem.created_at = std::chrono::system_clock::from_time_t(result.timestamp / 1000);
-            mem.updated_at = mem.created_at;
+            mem.snippet = result.content;
+            mem.source = MemorySource::Memory;
             
             memories.push_back(mem);
         }
         
-        return core::Result<std::vector<Memory>>::Ok(memories);
+        return core::Result<std::vector<MemorySearchResult>>::Ok(memories);
     } catch (const std::exception& e) {
-        return core::Result<std::vector<Memory>>::Err(std::string("Failed to search memories: ") + e.what());
+        return core::Result<std::vector<MemorySearchResult>>::Err(std::string("Search failed: ") + e.what());
     }
 }
 
@@ -343,7 +346,8 @@ core::Result<MemoryStats> SQLiteMemoryProvider::get_stats() {
     // TODO: 从 MemoryManager 获取实际统计
     stats.total_memories = 0;
     stats.total_size = 0;
-    stats.last_updated = std::chrono::system_clock::now();
+    auto now = std::chrono::system_clock::now();
+    stats.last_updated = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
     
     return core::Result<MemoryStats>::Ok(stats);
 }
@@ -357,7 +361,7 @@ core::Result<Memory> SQLiteMemoryProvider::get_memory(const std::string& id) {
 // MemoryProviderFactory 实现
 // ========================================
 
-core::Result<std::shared_ptr<MemoryProvider>> MemoryProviderFactory::create_sqlite(
+core::Result<std::shared_ptr<MemoryProvider>> create_sqlite(
     const std::string& db_path,
     const std::string& embedding_provider,
     const std::map<std::string, std::string>& config
@@ -374,7 +378,7 @@ core::Result<std::shared_ptr<MemoryProvider>> MemoryProviderFactory::create_sqli
     }
 }
 
-core::Result<std::shared_ptr<MemoryProvider>> MemoryProviderFactory::create_memos_cloud(
+core::Result<std::shared_ptr<MemoryProvider>> create_memos_cloud(
     const std::string& api_key,
     const std::string& endpoint
 ) {
@@ -382,7 +386,7 @@ core::Result<std::shared_ptr<MemoryProvider>> MemoryProviderFactory::create_memo
     return core::Result<std::shared_ptr<MemoryProvider>>::Err("MemOS Cloud provider not implemented yet");
 }
 
-core::Result<std::shared_ptr<MemoryProvider>> MemoryProviderFactory::create_supabase(
+core::Result<std::shared_ptr<MemoryProvider>> create_supabase(
     const std::string& url,
     const std::string& api_key
 ) {
@@ -390,7 +394,7 @@ core::Result<std::shared_ptr<MemoryProvider>> MemoryProviderFactory::create_supa
     return core::Result<std::shared_ptr<MemoryProvider>>::Err("Supabase provider not implemented yet");
 }
 
-core::Result<std::shared_ptr<MemoryProvider>> MemoryProviderFactory::create_from_config(
+core::Result<std::shared_ptr<MemoryProvider>> create_from_config(
     const std::string& provider_type,
     const std::map<std::string, std::string>& config
 ) {

@@ -27,13 +27,13 @@ public:
         FileChangeCallback callback
     ) {
         if (active_) {
-            return Result<void>::error("Watcher already active");
+            return Result<void>::Err("Watcher already active");
         }
 
         // Initialize inotify
         fd_ = inotify_init1(IN_NONBLOCK);
         if (fd_ == -1) {
-            return Result<void>::error("Failed to init inotify: " + 
+            return Result<void>::Err("Failed to init inotify: " + 
                 std::string(strerror(errno)));
         }
 
@@ -51,7 +51,7 @@ public:
         if (watch_descriptors_.empty()) {
             close(fd_);
             fd_ = -1;
-            return Result<void>::error("No valid paths to watch");
+            return Result<void>::Err("No valid paths to watch");
         }
 
         // Start watch thread
@@ -59,12 +59,12 @@ public:
         active_ = true;
         watch_thread_ = std::thread([this]() { watch_loop(); });
 
-        return Result<void>::ok();
+        return Result<void>::Ok();
     }
 
     Result<void> stop() {
         if (!active_) {
-            return Result<void>::ok();
+            return Result<void>::Ok();
         }
 
         active_ = false;
@@ -84,7 +84,7 @@ public:
             fd_ = -1;
         }
 
-        return Result<void>::ok();
+        return Result<void>::Ok();
     }
 
     bool is_active() const {
@@ -173,14 +173,14 @@ InotifyFileWatcher::InotifyFileWatcher()
 
 InotifyFileWatcher::~InotifyFileWatcher() = default;
 
-Result<void> InotifyFileWatcher::start(
+core::Result<void> InotifyFileWatcher::start(
     const std::vector<std::string>& paths,
     FileChangeCallback callback
 ) {
     return impl_->start(paths, callback);
 }
 
-Result<void> InotifyFileWatcher::stop() {
+core::Result<void> InotifyFileWatcher::stop() {
     return impl_->stop();
 }
 

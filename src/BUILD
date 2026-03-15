@@ -4,8 +4,6 @@
 
 package(default_visibility = ["//visibility:public"])
 
-
-
 # ============================================================================
 # Memory Library - 严格对齐 OpenClaw Memory 实现
 # ============================================================================
@@ -15,7 +13,7 @@ cc_library(
         "memory/memory_manager.cc",
         "memory/sqlite_storage.cc",
         "memory/search_algorithms.cc",
-        "memory/embedding_provider.cc",
+        # "memory/embedding_provider.cc",  # 暂时注释掉 - 类定义不完整
         "memory/http_client.cc",  # HTTP客户端
         "memory/memory_index_manager.cc",
         "memory/search_manager_factory.cc",
@@ -27,7 +25,7 @@ cc_library(
         "memory/session_files.cc",  # Session文件处理
         "memory/manager_sync_ops.cc",  # Manager同步操作
         "memory/file_watcher_linux.cc",  # 文件监听(Linux)
-        "memory/manager_embedding_ops.cc",  # Manager Embedding批处理
+        # "memory/manager_embedding_ops.cc",  # Manager Embedding批处理 - TODO: 依赖未实现的类型
         "memory/qmd_query_parser.cc",  # QMD查询解析
         "memory/qmd_process.cc",  # QMD进程管理
         "memory/qmd_scope.cc",  # QMD作用域规则

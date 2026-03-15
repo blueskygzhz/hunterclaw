@@ -1,6 +1,7 @@
 #pragma once
 
 #include "hunterclaw/memory/types.h"
+#include "hunterclaw/memory/chunking.h"
 #include "hunterclaw/core/types.h"
 #include <string>
 #include <vector>
@@ -10,6 +11,9 @@
 
 namespace hunterclaw {
 namespace memory {
+
+// Use MemoryChunk::EmbeddingInput as EmbeddingInput
+using EmbeddingInput = MemoryChunk::EmbeddingInput;
 
 // 严格对齐 OpenClaw src/memory/embeddings.ts
 
@@ -45,7 +49,9 @@ public:
         std::vector<std::string> texts;
         texts.reserve(inputs.size());
         for (const auto& input : inputs) {
-            texts.push_back(input.text);
+            if (input.text.has_value()) {
+                texts.push_back(input.text.value());
+            }
         }
         return embed_batch(texts);
     }
@@ -88,37 +94,6 @@ inline std::optional<EmbeddingProviderId> parse_provider_id(const std::string& s
 // ============================================================================
 // EmbeddingProviderResult (embeddings.ts:47-58)
 // ============================================================================
-struct EmbeddingProviderResult {
-    std::shared_ptr<EmbeddingProvider> provider;  // null if all failed
-    std::string requested_provider;                // "auto" or specific id
-    std::optional<EmbeddingProviderId> fallback_from;
-    std::optional<std::string> fallback_reason;
-    std::optional<std::string> provider_unavailable_reason;
-    
-    // Provider-specific clients (for advanced features)
-    // 注: 这些是可选的强类型客户端,对齐embeddings.ts:53-57
-    // 暂时使用void*,后续可以替换为具体类型
-    std::shared_ptr<void> openai_client;
-    std::shared_ptr<void> gemini_client;
-    std::shared_ptr<void> voyage_client;
-    std::shared_ptr<void> mistral_client;
-    std::shared_ptr<void> ollama_client;
-};
-
-// ============================================================================
-// EmbeddingProviderOptions (embeddings.ts:60-79)
-// ============================================================================
-struct RemoteEmbeddingOptions {
-    std::optional<std::string> base_url;
-    std::optional<std::string> api_key;
-    std::map<std::string, std::string> headers;
-};
-
-struct LocalEmbeddingOptions {
-    std::optional<std::string> model_path;
-    std::optional<std::string> model_cache_dir;
-};
-
 enum class GeminiTaskType {
     RetrievalQuery,      // "retrieval_query"
     RetrievalDocument,   // "retrieval_document"
@@ -134,10 +109,12 @@ struct EmbeddingProviderOptions {
     std::string fallback;  // provider id or "none"
     
     // Remote provider options (embeddings.ts:64-67)
-    std::optional<RemoteEmbeddingOptions> remote;
+    // TODO: Define RemoteEmbeddingOptions
+    // std::optional<RemoteEmbeddingOptions> remote;
     
     // Local provider options (embeddings.ts:71-74)
-    std::optional<LocalEmbeddingOptions> local;
+    // TODO: Define LocalEmbeddingOptions  
+    // std::optional<LocalEmbeddingOptions> local;
     
     // Gemini-specific options
     std::optional<int> output_dimensionality;  // 768, 1536, or 3072

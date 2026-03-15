@@ -168,7 +168,7 @@ AgentMessage MemoryCompactor::create_summary_message(
     return summary_msg;
 }
 
-Result<std::string> MemoryCompactor::summarize_chunk(
+core::Result<std::string> MemoryCompactor::summarize_chunk(
     const std::vector<AgentMessage>& chunk,
     const std::string& model_id,
     const std::string& api_key,
@@ -257,7 +257,7 @@ Result<std::string> MemoryCompactor::summarize_chunk(
     return Result<std::string>::ok(summary);
 }
 
-Result<CompactionResult> MemoryCompactor::summarize_in_stages(
+core::Result<CompactionResult> MemoryCompactor::summarize_in_stages(
     const std::vector<AgentMessage>& messages,
     const std::string& model_id,
     const std::string& api_key
@@ -367,7 +367,7 @@ bool MemoryFlusher::should_flush(
     return token_threshold_met || size_threshold_met;
 }
 
-Result<bool> MemoryFlusher::flush_if_needed(
+core::Result<bool> MemoryFlusher::flush_if_needed(
     int current_token_count,
     int context_window,
     int reserve_tokens_floor,

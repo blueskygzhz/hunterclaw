@@ -458,10 +458,10 @@ core::Result<std::vector<FileEntry>> scan_directory(
             files.push_back(file_entry);
         }
         
-        return core::Result<std::vector<FileEntry>>::ok_value(files);
+        return core::Result<std::vector<FileEntry>>::Ok(files);
         
     } catch (const std::exception& e) {
-        return core::Result<std::vector<FileEntry>>::error(
+        return core::Result<std::vector<FileEntry>>::Err(
             std::string("Failed to scan directory: ") + e.what()
         );
     }

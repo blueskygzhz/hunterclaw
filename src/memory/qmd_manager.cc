@@ -270,9 +270,9 @@ std::vector<MemorySearchResult> QmdMemoryManager::search(
     // Build QMD query args
     std::vector<std::string> args = {"query", normalized_query};
     
-    if (opts.max_results > 0) {
+    if (opts.max_results.has_value() && opts.max_results.value() > 0) {
         args.push_back("--limit");
-        args.push_back(std::to_string(opts.max_results));
+        args.push_back(std::to_string(opts.max_results.value()));
     }
     
     args.push_back("--json");

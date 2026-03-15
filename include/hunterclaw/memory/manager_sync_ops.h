@@ -3,6 +3,7 @@
 #include "hunterclaw/memory/types.h"
 #include "hunterclaw/memory/session_files.h"
 #include "hunterclaw/core/types.h"
+#include "hunterclaw/core/result.h"
 #include <string>
 #include <vector>
 #include <set>
@@ -10,6 +11,7 @@
 #include <functional>
 #include <thread>
 #include <mutex>
+#include <future>
 
 // 严格对齐 OpenClaw src/memory/manager-sync-ops.ts
 

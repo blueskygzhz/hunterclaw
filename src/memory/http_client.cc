@@ -123,10 +123,10 @@ core::Result<nlohmann::json> HttpClient::post_json(
     
     auto result = request(req);
     if (!result.is_ok()) {
-        return core::Result<nlohmann::json>::Err(result.error());
+        return core::Result<nlohmann::json>::Err(result.error);
     }
     
-    const auto& resp = result.value();
+    const auto& resp = result.value;
     if (!resp.is_success()) {
         std::stringstream ss;
         ss << "HTTP error " << resp.status_code << ": " << resp.body;
