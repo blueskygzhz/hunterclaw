@@ -6,6 +6,13 @@
 #include <chrono>
 #include "hunterclaw/core/result.h"
 
+// 前向声明
+namespace hunterclaw {
+namespace llm {
+    class LLMClient;
+}
+}
+
 namespace hunterclaw {
 namespace memory {
 
@@ -17,6 +24,9 @@ struct SummarizationInstructions {
         "preserving key information, decisions, and context:\n\n{content}";
     std::optional<std::string> previous_summary;
 };
+
+// 前向声明
+class MemoryFlusher;
 
 // 压缩配置
 struct CompactionConfig {
@@ -89,11 +99,6 @@ struct CompactionResult {
     std::string reason;                     // 失败原因（如果有）
 };
 
-// Forward declaration
-namespace llm {
-    class LLMClient;
-}
-
 /**
  * 记忆压缩器 - 对齐 OpenClaw 的压缩策略
  */
@@ -101,7 +106,7 @@ class MemoryCompactor {
 public:
     explicit MemoryCompactor(
         const CompactionConfig& config,
-        std::shared_ptr<llm::LLMClient> llm_client = nullptr
+        std::shared_ptr<hunterclaw::llm::LLMClient> llm_client = nullptr
     );
     
     // 估算消息的 Token 数（简化版：4 chars ≈ 1 token）
@@ -149,7 +154,7 @@ public:
 private:
     CompactionConfig config_;
     CompactionStats stats_;
-    std::shared_ptr<llm::LLMClient> llm_client_;  // LLM 客户端
+    std::shared_ptr<hunterclaw::llm::LLMClient> llm_client_;  // LLM 客户端
     
     // 格式化消息为文本（用于摘要）
     std::string format_messages_for_summary(

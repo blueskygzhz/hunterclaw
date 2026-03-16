@@ -5,12 +5,14 @@
 #include "hunterclaw/tools/tool.h"  // ToolManager is defined in tool.h
 #include "hunterclaw/llm/llm_client.h"
 #include "hunterclaw/llm/provider.h"  // For Response, ToolCall, Usage
+#include "hunterclaw/memory/compaction_manager.h"  // ✅ 新增: Compaction 支持
 #include <string>
 #include <vector>
 #include <memory>
 #include <functional>
 #include <chrono>
 #include <future>
+#include <optional>
 
 namespace hunterclaw {
 namespace react {
@@ -269,6 +271,24 @@ private:
     std::string strip_thinking_tags(const std::string& text);
     std::string trim_end(const std::string& text);
     
+    // ✅ 新增: Token 估算 (对齐 OpenClaw)
+    int estimate_conversation_tokens(const std::vector<LLMMessage>& messages) const;
+    
+    // ✅ 新增: Overflow 检测 (对齐 OpenClaw)
+    bool is_context_overflow_error(const std::string& error_msg) const;
+    std::optional<int> extract_overflow_token_count(const std::string& error_msg) const;
+    
+    // ✅ 新增: Compaction 触发 (对齐 OpenClaw)
+    struct CompactionResult {
+        bool compacted = false;
+        std::vector<LLMMessage> compressed_messages;
+        std::string reason;
+        int messages_before = 0;
+        int messages_after = 0;
+        int tokens_saved = 0;
+    };
+    CompactionResult trigger_compaction(std::vector<LLMMessage>& messages);
+    
     std::shared_ptr<tools::ToolManager> tool_manager_;
     std::shared_ptr<llm::LLMClient> llm_client_;  // 向后兼容
     std::shared_ptr<llm::Provider> provider_;     // ✅ 直接 Provider 支持
@@ -283,6 +303,28 @@ private:
     
     // ✅ 全局线程池 (用于并行工具执行)
     static std::shared_ptr<core::ThreadPool>& get_thread_pool();
+    
+    // ✅ 新增: CompactionManager 集成 (对齐 OpenClaw)
+    std::shared_ptr<memory::CompactionManager> compaction_mgr_;
+    
+    // ✅ 新增: Context Window 配置 (对齐 OpenClaw)
+    struct ContextWindowConfig {
+        int context_window_tokens = 200000;
+        int reserve_tokens_floor = 20000;
+        int soft_threshold_tokens = 4000;
+    };
+    ContextWindowConfig context_window_config_;
+
+public:
+    // ✅ 新增: 设置 CompactionManager (从 AgentInstance 调用)
+    void set_compaction_manager(std::shared_ptr<memory::CompactionManager> mgr) {
+        compaction_mgr_ = mgr;
+    }
+    
+    // ✅ 新增: 配置 Context Window (对齐 OpenClaw)
+    void set_context_window_config(const ContextWindowConfig& cfg) {
+        context_window_config_ = cfg;
+    }
 };
 
 } // namespace react

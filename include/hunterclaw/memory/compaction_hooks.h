@@ -4,9 +4,13 @@
 #include <chrono>
 #include <functional>
 #include <map>
+#include <vector>
 
 namespace hunterclaw {
 namespace memory {
+
+// 前向声明
+struct AgentMessage;
 
 // ============================================================================
 // Compaction Metrics & Hooks (严格对齐 OpenClaw)

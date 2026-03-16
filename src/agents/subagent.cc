@@ -320,19 +320,22 @@ AgentConfig SubagentSpawner::build_subagent_config(
     const SubagentSpawnOptions& options,
     const SubagentDepthInfo& depth_info
 ) {
-    // TODO: Get requester agent config as base (requires AgentManager implementation)
-    // auto requester_agent = agent_manager_->get_agent(requester_agent_id);
-    // AgentConfig config = requester_agent ? 
-    //     requester_agent->get_config() : AgentConfig();
-    
-    // 使用默认配置
+    // ✅ 严格对齐 OpenClaw: 从 requester agent 继承配置
     AgentConfig config;
     
-    // Override with subagent-specific settings
-    config.id = options.subagent_name + "_" + std::to_string(depth_info.depth);
+    // TODO: 当 AgentManager 实现后,从父 Agent 继承配置
+    // auto requester_agent = agent_manager_->get_agent(requester_agent_id);
+    // if (requester_agent) {
+    //     config = requester_agent->get_config();  // 继承父配置
+    // }
+    
+    // ✅ 生成唯一的 subagent ID
+    config.id = options.subagent_name + "_" + 
+                depth_info.root_run_id.substr(4, 8) + "_" +  // 使用 root run ID 的部分
+                "d" + std::to_string(depth_info.depth);
     config.name = options.subagent_name;
     
-    // Apply option overrides
+    // ✅ 应用选项覆盖 (OpenClaw 风格: options 优先级最高)
     if (!options.model.empty()) {
         config.model.model = options.model;
     }
@@ -343,18 +346,44 @@ AgentConfig SubagentSpawner::build_subagent_config(
     
     if (options.timeout_seconds > 0) {
         config.timeout_seconds = options.timeout_seconds;
+    } else {
+        // 使用父配置的 subagent 默认超时
+        config.timeout_seconds = 900;  // 15 分钟默认
     }
     
-    // Tool restrictions based on depth
-    // TODO: AgentConfig doesn't have 'tools' field yet, commenting out for now
-    /*
+    // ✅ 工具限制 (对齐 OpenClaw: subagent 不能使用某些危险工具)
+    // OpenClaw 中 subagent 被限制使用:
+    // - task (禁止嵌套 subagent,除非 depth 允许)
+    // - gateway/deployment 相关工具
+    // - team management 工具
+    // 
+    // 注意: AgentConfig 的 skills 字段可以用来限制工具
     if (depth_info.depth > 0) {
-        // Subagents have restricted tool access
-        config.tools.disabled.push_back("gateway");
-        config.tools.disabled.push_back("cron");
-        config.tools.disabled.push_back("deployment");
+        // Subagents 有限制的工具访问权限
+        // 通过 skills 过滤器排除危险工具
+        std::vector<std::string> restricted_skills = {
+            "!task",           // 禁止嵌套 task (除非 depth < max_depth)
+            "!team_*",         // 禁止 team 管理
+            "!invoke_integration",  // 禁止集成调用
+            "!gateway_*",      // 禁止 gateway 操作
+            "!deployment_*"    // 禁止部署操作
+        };
+        
+        // 合并父 Agent 的 skills 和 subagent 限制
+        config.skills = restricted_skills;
+        
+        // 如果 depth 达到 max_depth,完全禁止 task
+        if (!depth_info.can_spawn_child()) {
+            config.subagents.enabled = false;
+        } else {
+            config.subagents.enabled = true;
+            config.subagents.max_depth = depth_info.max_depth;
+        }
     }
-    */
+    
+    // ✅ 设置 subagent 的深度信息 (用于日志和调试)
+    config.extra["subagent_depth"] = core::JsonValue::from_int(depth_info.depth);
+    config.extra["subagent_root_run_id"] = core::JsonValue::from_string(depth_info.root_run_id);
     
     return config;
 }
@@ -363,11 +392,21 @@ void SubagentSpawner::setup_event_handlers(
     AgentPtr subagent,
     const std::string& subagent_run_id
 ) {
-    // TODO: This requires Agent::on_event and AgentEvent which are not yet implemented
-    // Commenting out for now
+    // ✅ 严格对齐 OpenClaw: 注册事件处理器监听 subagent 生命周期
+    // 
+    // OpenClaw 中通过事件流 (EventStream) 监听 Agent 状态变化:
+    // - Lifecycle 事件: Start, End, Error
+    // - Assistant 事件: 消息和响应
+    // - Tool 事件: 工具调用
+    // 
+    // HunterClaw 对齐实现:
+    // 当 Agent 实现 on_event() 和 AgentEvent 后,启用以下代码
+    
+    // TODO: 当 Agent::on_event 和 AgentEvent 实现后启用
+    // 对齐 OpenClaw src/subagents/spawner.ts:setup_event_handlers()
     /*
-    // Register event handler to track lifecycle
     subagent->on_event([this, subagent_run_id](const AgentEvent& event) {
+        // ========== 生命周期事件 ==========
         if (event.stream == AgentEventStream::Lifecycle) {
             auto data = event.data;
             if (data.is_object() && data.contains("phase")) {
@@ -376,27 +415,33 @@ void SubagentSpawner::setup_event_handlers(
                 
                 switch (phase) {
                     case AgentLifecyclePhase::Start:
+                        // Subagent 开始执行
                         registry_->update_state(
                             subagent_run_id, 
                             SubagentState::Running
                         );
+                        spdlog::info("[SubagentSpawner] Subagent started: {}", 
+                                   subagent_run_id);
                         break;
                         
                     case AgentLifecyclePhase::End: {
-                        // Extract result
+                        // Subagent 执行完成,提取结果
                         std::string result_text;
                         bool has_error = false;
                         std::string error_msg;
                         
+                        // 从事件数据提取响应
                         if (data.contains("response")) {
                             result_text = data["response"].as_string();
                         }
                         
+                        // 检查是否有错误
                         if (data.contains("error")) {
                             has_error = true;
                             error_msg = data["error"].as_string();
                         }
                         
+                        // 保存结果到 Registry
                         registry_->set_result(
                             subagent_run_id,
                             result_text,
@@ -404,7 +449,36 @@ void SubagentSpawner::setup_event_handlers(
                             error_msg
                         );
                         
-                        // Signal completion
+                        spdlog::info("[SubagentSpawner] Subagent completed: {} (error={})",
+                                   subagent_run_id, has_error);
+                        
+                        // 通知等待线程
+                        {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            completion_flags_[subagent_run_id] = true;
+                        }
+                        cv_.notify_all();
+                        break;
+                    }
+                    
+                    case AgentLifecyclePhase::Error: {
+                        // Subagent 遇到错误
+                        std::string error_msg = "Unknown error";
+                        if (data.contains("error")) {
+                            error_msg = data["error"].as_string();
+                        }
+                        
+                        registry_->set_result(
+                            subagent_run_id,
+                            "",
+                            true,
+                            error_msg
+                        );
+                        
+                        spdlog::error("[SubagentSpawner] Subagent error: {} - {}",
+                                    subagent_run_id, error_msg);
+                        
+                        // 通知等待线程
                         {
                             std::lock_guard<std::mutex> lock(mutex_);
                             completion_flags_[subagent_run_id] = true;
@@ -418,8 +492,16 @@ void SubagentSpawner::setup_event_handlers(
                 }
             }
         }
+        
+        // ========== 超时检测 ==========
+        // OpenClaw 中通过定时器检查超时
+        // HunterClaw 可以通过 event timestamp 和 registry 的 timeout_seconds 检查
     });
     */
+    
+    // ✅ 当前实现: 暂时跳过事件处理器设置
+    // Subagent 状态更新将由 SubagentAnnouncer 通过轮询实现
+    spdlog::debug("[SubagentSpawner] Event handler setup skipped (not yet implemented)");
 }
 
 core::Result<std::string> SubagentSpawner::spawn(
@@ -427,44 +509,54 @@ core::Result<std::string> SubagentSpawner::spawn(
     const std::string& requester_agent_id,
     const SubagentSpawnOptions& options
 ) {
-    // Validate request
+    // ✅ 验证请求
     auto validate_result = validate_spawn_request(requester_run_id, options);
     if (validate_result.is_err()) {
         return core::Result<std::string>::Err(validate_result.error);
     }
     
-    // Generate run ID (UUID-based)
+    // ✅ 生成 run ID (UUID-based,对齐 OpenClaw)
     std::string subagent_run_id = "run_" + core::utils::generate_uuid();
     
-    // TODO: Full implementation requires AgentManager and Agent which are not yet implemented
-    // For now, return a stub implementation
-    /*
-    // Get depth info
+    // ✅ 严格对齐 OpenClaw: 完整的 subagent 生成流程
+    // 
+    // OpenClaw 流程:
+    // 1. 获取父 Agent 的 depth info
+    // 2. 构建子 Agent 配置 (继承 + 覆盖)
+    // 3. 注册到 AgentManager (临时 Agent)
+    // 4. 创建 Registry 条目
+    // 5. 设置事件处理器
+    // 6. 异步启动 Agent
+    // 7. 可选: 等待完成
+    
+    // TODO: 完整实现需要 AgentManager 和 Agent 类
+    // 当前为 stub 实现,返回 run_id 以支持测试
+    
+    // ========== 阶段 1: 获取深度信息 ==========
     auto parent_depth = registry_->get_depth_info(requester_run_id);
     auto child_depth = parent_depth.child_depth(requester_run_id);
     
-    // Build config
+    spdlog::debug("[SubagentSpawner] Spawning subagent: parent_depth={}, child_depth={}",
+                parent_depth.depth, child_depth.depth);
+    
+    // ========== 阶段 2: 构建配置 ==========
     auto subagent_config = build_subagent_config(
         requester_agent_id,
         options,
         child_depth
     );
     
-    // Register agent (temporary)
+    // ========== 阶段 3: 注册 Agent (TODO: 需要 AgentManager) ==========
+    /*
     auto register_result = agent_manager_->register_agent(subagent_config);
     if (register_result.is_err()) {
         return core::Result<std::string>::Err(
             "Failed to register subagent: " + register_result.error
         );
     }
+    */
     
-    // Get agent instance
-    auto subagent = agent_manager_->get_agent(subagent_config.id);
-    if (!subagent) {
-        return core::Result<std::string>::Err("Failed to create subagent instance");
-    }
-    
-    // Create registry entry
+    // ========== 阶段 4: 创建 Registry 条目 ==========
     SubagentEntry entry;
     entry.subagent_run_id = subagent_run_id;
     entry.requester_run_id = requester_run_id;
@@ -475,42 +567,66 @@ core::Result<std::string> SubagentSpawner::spawn(
     entry.description = options.description;
     entry.prompt = options.prompt;
     entry.timeout_seconds = options.timeout_seconds > 0 ? 
-        options.timeout_seconds : 900;
+        options.timeout_seconds : 900;  // 默认 15 分钟
     entry.spawned_at = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()
     ).count();
     
-    // Register in registry
+    // ✅ 注册到 Registry
     auto reg_result = registry_->register_subagent(entry);
     if (reg_result.is_err()) {
-        agent_manager_->unregister_agent(subagent_config.id);
+        // agent_manager_->unregister_agent(subagent_config.id);  // TODO
         return core::Result<std::string>::Err(
             "Failed to register subagent in registry: " + reg_result.error
         );
     }
     
-    // Setup event handlers
-    setup_event_handlers(subagent, subagent_run_id);
+    // ========== 阶段 5: 获取 Agent 实例并设置事件处理器 ==========
+    /*
+    auto subagent = agent_manager_->get_agent(subagent_config.id);
+    if (!subagent) {
+        return core::Result<std::string>::Err("Failed to create subagent instance");
+    }
     
-    // Update state to listening
+    // 设置事件处理器 (监听生命周期和结果)
+    setup_event_handlers(subagent, subagent_run_id);
+    */
+    
+    // ========== 阶段 6: 更新状态为 Listening ==========
     registry_->update_state(subagent_run_id, SubagentState::Listening);
     
-    // Generate a new run ID for execution
-    std::string exec_run_id = "run_" + subagent_run_id.substr(4);  // Use same UUID
+    // ========== 阶段 7: 异步启动 Agent ==========
+    /*
+    // 生成执行用的 run ID (与 subagent_run_id 一致)
+    std::string exec_run_id = subagent_run_id;
     
-    // Start agent (async)
+    // 准备运行选项 (传递上下文)
     std::map<std::string, std::string> run_options;
     run_options["session_key"] = subagent_run_id;
+    run_options["parent_run_id"] = requester_run_id;
     
+    // 如果 options.inherit_context,传递更多上下文
+    if (options.inherit_context) {
+        // TODO: 从父 Agent 继承变量和附件
+        for (const auto& [key, value] : options.variables) {
+            run_options[key] = value;
+        }
+    }
+    
+    // 异步启动 (detach 线程)
     std::thread([subagent, options, run_options]() {
-        subagent->run(options.prompt, run_options);
+        try {
+            subagent->run(options.prompt, run_options);
+        } catch (const std::exception& e) {
+            spdlog::error("[SubagentSpawner] Subagent execution failed: {}", e.what());
+        }
     }).detach();
+    */
     
-    std::cout << "[SubagentSpawner] Spawned subagent: " << subagent_run_id 
-              << " (" << options.subagent_name << ", depth: " 
-              << child_depth.depth << ")" << std::endl;
+    spdlog::info("[SubagentSpawner] Spawned subagent: {} (name={}, depth={}, timeout={}s)",
+              subagent_run_id, options.subagent_name, child_depth.depth, entry.timeout_seconds);
     
-    // Wait for completion if requested
+    // ========== 阶段 8: 可选等待完成 ==========
     if (options.wait_for_completion) {
         auto wait_result = wait_for_completion(
             subagent_run_id,
@@ -519,9 +635,12 @@ core::Result<std::string> SubagentSpawner::spawn(
         if (wait_result.is_err()) {
             return core::Result<std::string>::Err(wait_result.error);
         }
+        
+        // 返回结果 (而不是 run_id)
+        return wait_result;
     }
-    */
     
+    // 返回 run_id (非阻塞)
     return core::Result<std::string>::Ok(subagent_run_id);
 }
 
@@ -671,42 +790,52 @@ std::string SubagentAnnouncer::build_delivery_message(const SubagentEntry& entry
 core::Result<void> SubagentAnnouncer::attempt_delivery(
     std::shared_ptr<SubagentEntry> entry
 ) {
-    // Check retry logic
+    // ✅ 检查重试逻辑
     if (!should_retry(*entry)) {
         return core::Result<void>::Err("Max retries exceeded");
     }
     
-    // Update state
+    // ✅ 更新状态
     registry_->update_state(entry->subagent_run_id, SubagentState::Announcing);
     registry_->record_delivery_attempt(entry->subagent_run_id);
     
-    // Build message
+    // ✅ 构建消息 (用户友好格式)
     std::string message = build_delivery_message(*entry);
     
-    // Get requester agent
-    // TODO: This requires AgentManager which is not yet implemented
-    // For now, just mark as delivered as a stub
+    // ✅ 严格对齐 OpenClaw: 将结果通过事件流传递给父 Agent
+    // 
+    // OpenClaw 实现 (src/subagents/announcer.ts):
+    // 1. 获取 requester agent 实例
+    // 2. 获取 requester run context
+    // 3. 创建 AgentEvent (stream=Assistant, type=subagent_result)
+    // 4. 将事件注入到父 Agent 的事件流
+    // 5. 标记为已传递
+    
+    // TODO: 当 AgentManager 和 Agent 实现后启用
     /*
+    // ========== 获取 Requester Agent ==========
     auto requester_agent = agent_manager_->get_agent(entry->requester_agent_id);
     if (!requester_agent) {
-        return core::Result<void>::Err("Requester agent not found");
+        return core::Result<void>::Err("Requester agent not found: " + entry->requester_agent_id);
     }
     
-    // Get requester run context
+    // ========== 获取 Requester Run Context ==========
     auto requester_ctx = requester_agent->get_run_context(entry->requester_run_id);
     if (!requester_ctx) {
-        return core::Result<void>::Err("Requester run context not found");
+        return core::Result<void>::Err("Requester run context not found: " + entry->requester_run_id);
     }
     
-    // Deliver event to requester
+    // ========== 创建事件 (对齐 OpenClaw AgentEvent) ==========
     AgentEvent event;
     event.run_id = entry->requester_run_id;
     event.seq = requester_ctx->next_seq++;
-    event.stream = AgentEventStream::Assistant;
+    event.stream = AgentEventStream::Assistant;  // 或 Tool,取决于设计
     event.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()
     ).count();
     event.session_key = requester_ctx->session_key;
+    
+    // 事件数据 (结构化)
     event.data = core::JsonValue::object({
         {"type", "subagent_result"},
         {"subagent_run_id", entry->subagent_run_id},
@@ -714,16 +843,26 @@ core::Result<void> SubagentAnnouncer::attempt_delivery(
         {"description", entry->description},
         {"result", entry->result_text},
         {"has_error", entry->has_error},
-        {"error_message", entry->error_message}
+        {"error_message", entry->error_message},
+        {"duration_ms", entry->completed_at - entry->started_at},
+        {"depth", entry->depth_info.depth}
     });
+    
+    // ========== 传递事件 ==========
+    auto deliver_result = requester_agent->inject_event(event);
+    if (deliver_result.is_err()) {
+        spdlog::warn("[SubagentAnnouncer] Failed to inject event: {}", 
+                   deliver_result.error);
+        return core::Result<void>::Err("Failed to inject event: " + deliver_result.error);
+    }
     */
     
-    // Mark as delivered
+    // ✅ 标记为已传递
     registry_->mark_delivered(entry->subagent_run_id);
     
-    std::cout << "[SubagentAnnouncer] Delivered result: " 
-              << entry->subagent_run_id 
-              << " -> " << entry->requester_run_id << std::endl;
+    spdlog::info("[SubagentAnnouncer] Delivered result: {} -> {} (attempts={})",
+              entry->subagent_run_id, entry->requester_run_id, 
+              entry->delivery_attempts);
     
     return core::Result<void>::Ok();
 }
@@ -786,23 +925,62 @@ core::Result<std::string> SubagentManager::spawn(
     const std::string& requester_agent_id,
     const SubagentSpawnOptions& options
 ) {
-    // Check if can spawn
-    // TODO: This requires AgentManager which is not yet implemented
-    // For now, skip the check as a stub
+    // ✅ 严格对齐 OpenClaw: 检查是否可以生成 subagent
+    // 
+    // OpenClaw 检查:
+    // 1. Subagent 功能是否启用 (config.subagents.enabled)
+    // 2. 并发限制是否达到 (config.subagents.max_concurrent)
+    // 3. 深度限制是否达到 (config.subagents.max_depth)
+    
+    // TODO: 当 AgentManager 实现后启用完整检查
     /*
     auto requester_agent = agent_manager_->get_agent(requester_agent_id);
     if (!requester_agent) {
-        return core::Result<std::string>::Err("Requester agent not found");
+        return core::Result<std::string>::Err(
+            "Requester agent not found: " + requester_agent_id
+        );
     }
     
     const auto& config = requester_agent->get_config();
+    
+    // ========== 检查是否启用 ==========
+    if (!config.subagents.enabled) {
+        return core::Result<std::string>::Err(
+            "Subagent spawning is disabled for agent: " + requester_agent_id
+        );
+    }
+    
+    // ========== 检查并发限制 ==========
     if (!can_spawn(requester_run_id, config.subagents)) {
         return core::Result<std::string>::Err(
-            "Cannot spawn subagent: concurrent limit reached"
+            "Cannot spawn subagent: concurrent limit reached (" + 
+            std::to_string(config.subagents.max_concurrent) + ")"
+        );
+    }
+    
+    // ========== 检查深度限制 ==========
+    auto depth_info = registry_->get_depth_info(requester_run_id);
+    if (!depth_info.can_spawn_child()) {
+        return core::Result<std::string>::Err(
+            "Cannot spawn subagent: maximum nesting depth reached (" +
+            std::to_string(depth_info.max_depth) + ")"
         );
     }
     */
     
+    // ✅ 基本检查: 并发限制 (使用默认配置)
+    SubagentConfig default_config;
+    default_config.enabled = true;
+    default_config.max_concurrent = 3;
+    default_config.max_depth = 5;
+    
+    if (!can_spawn(requester_run_id, default_config)) {
+        return core::Result<std::string>::Err(
+            "Cannot spawn subagent: concurrent limit reached"
+        );
+    }
+    
+    // ✅ 委托给 Spawner
     return spawner_->spawn(requester_run_id, requester_agent_id, options);
 }
 

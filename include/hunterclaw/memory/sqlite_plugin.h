@@ -119,6 +119,10 @@ public:
      */
     core::Result<bool> shutdown() override;
     
+    // Plugin 生命周期钩子
+    core::Result<bool> on_load() override { return core::Result<bool>::Ok(true); }
+    core::Result<bool> on_unload() override { return core::Result<bool>::Ok(true); }
+    
     // ========================================
     // 🎯 Plugin 元信息
     // ========================================
@@ -177,7 +181,7 @@ public:
         const std::map<std::string, std::string>& metadata = {}
     ) override;
     
-    core::Result<std::vector<Memory>> search_memories(
+    core::Result<std::vector<MemorySearchResult>> search_memories(
         const std::string& query,
         const SearchOptions& options = SearchOptions()
     ) override;
@@ -241,6 +245,22 @@ public:
     );
     
     /**
+     * MMR 重排 (MemorySearchResult 版本)
+     * 
+     * 严格对齐 OpenClaw mmr.ts 算法实现
+     * 
+     * @param results 搜索结果列表
+     * @param lambda 相关性vs多样性权重 (0.0-1.0, 默认0.7)
+     * @param max_results 最大结果数 (默认6)
+     * @return 重排后的结果
+     */
+    std::vector<MemorySearchResult> apply_mmr_to_search_results(
+        const std::vector<MemorySearchResult>& results,
+        double lambda = 0.7,
+        int max_results = 6
+    );
+    
+    /**
      * 时间衰减 (Temporal Decay)
      * 
      * 对齐 OpenClaw src/memory/temporal-decay.ts
@@ -252,7 +272,32 @@ public:
         int half_life_days = 30
     );
     
+    /**
+     * 时间衰减 (MemorySearchResult 版本)
+     * 
+     * 严格对齐 OpenClaw temporal-decay.ts 指数衰减算法
+     * 
+     * @param results 搜索结果列表
+     * @param half_life_days 半衰期天数 (默认30天)
+     */
+    void apply_temporal_decay_to_search_results(
+        std::vector<MemorySearchResult>& results,
+        int half_life_days = 30
+    );
+    
 private:
+    /**
+     * 辅助函数: 从数据库获取指定 path/id 的 embedding
+     * 用于 MMR 重排中的余弦相似度计算
+     */
+    std::optional<std::vector<float>> get_embedding_for_path(const std::string& path);
+    
+    /**
+     * 辅助函数: 从数据库获取指定 path/id 的 created_at 时间戳
+     * 用于时间衰减计算
+     */
+    std::optional<int64_t> get_timestamp_for_path(const std::string& path);
+    
     class Impl;
     std::unique_ptr<Impl> impl_;
 };

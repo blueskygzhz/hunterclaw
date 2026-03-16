@@ -95,7 +95,7 @@ public:
     /**
      * Plugin 类型 (固定为 "memory")
      */
-    std::string type() const override { return "memory"; }
+    std::string type() const { return "memory"; }
     
     /**
      * 🎯 OpenClaw 扩展: 支持热重载

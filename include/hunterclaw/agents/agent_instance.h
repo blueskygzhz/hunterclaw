@@ -4,6 +4,7 @@
 #include "hunterclaw/agents/types.h"
 #include "hunterclaw/skills/skill.h"
 #include "hunterclaw/channels/channel.h"
+#include "hunterclaw/memory/memory_manager.h"  // ✅ 新增: MemoryManager 支持
 #include <memory>
 #include <string>
 #include <vector>

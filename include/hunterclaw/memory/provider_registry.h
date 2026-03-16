@@ -155,54 +155,5 @@ private:
         static AutoRegisterFactory_##provider_type auto_register_factory_##provider_type; \
     }
 
-// ========================================
-// 内置 Provider 实现
-// ========================================
-
-// SQLite Memory Provider (本地存储)
-class SQLiteMemoryProvider : public MemoryProvider {
-public:
-    explicit SQLiteMemoryProvider(
-        const std::string& db_path,
-        const std::string& embedding_provider = "openai",
-        const std::map<std::string, std::string>& config = {}
-    );
-    
-    ~SQLiteMemoryProvider() override;
-    
-    // MemoryProvider 接口实现
-    core::Result<std::string> add_memory(
-        const std::string& content,
-        const std::map<std::string, std::string>& metadata
-    ) override;
-    
-    core::Result<std::vector<MemorySearchResult>> search_memories(
-        const std::string& query,
-        const SearchOptions& options
-    ) override;
-    
-    core::Result<bool> remove_memory(const std::string& id) override;
-    
-    core::Result<bool> update_memory(
-        const std::string& id,
-        const std::string& content,
-        const std::map<std::string, std::string>& metadata
-    ) override;
-    
-    core::Result<bool> clear_memories() override;
-    
-    core::Result<MemoryStats> get_stats() override;
-    
-    core::Result<Memory> get_memory(const std::string& id) override;
-    
-    std::string provider_id() const override { return "sqlite"; }
-    std::string provider_name() const override { return "SQLite Memory"; }
-    std::string provider_version() const override { return "1.0.0"; }
-
-private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
-};
-
 } // namespace memory
 } // namespace hunterclaw

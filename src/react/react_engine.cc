@@ -239,6 +239,46 @@ ReactResult ReactEngine::execute_loop(
     std::string accumulated_response;
     
     while (step_count < config_.max_steps && !cancelled_) {
+        // ✅ 新增: Token Overflow 检查 (对齐 OpenClaw)
+        if (compaction_mgr_) {
+            int current_tokens = estimate_conversation_tokens(messages);
+            int context_window = context_window_config_.context_window_tokens;
+            
+            // 转换 messages 为 AgentMessage (用于 should_compact 检查)
+            std::vector<memory::AgentMessage> agent_messages;
+            for (const auto& msg : messages) {
+                memory::AgentMessage am;
+                am.role = [&]() {
+                    switch (msg.role) {
+                        case llm::LLMMessageRole::User: return "user";
+                        case llm::LLMMessageRole::Assistant: return "assistant";
+                        case llm::LLMMessageRole::System: return "system";
+                        case llm::LLMMessageRole::Tool: return "toolResult";
+                        default: return "unknown";
+                    }
+                }();
+                am.content = msg.content;
+                agent_messages.push_back(am);
+            }
+            
+            // 检查是否需要 compaction
+            if (compaction_mgr_->should_compact(agent_messages, current_tokens, context_window)) {
+                log()->warn("[ReactEngine] Token overflow detected: {} >= threshold, triggering compaction",
+                           current_tokens);
+                
+                // 触发 compaction
+                auto compact_result = trigger_compaction(messages);
+                
+                if (compact_result.compacted) {
+                    log()->info("[ReactEngine] Compaction completed, continuing with {} messages",
+                               messages.size());
+                    // messages 已被 trigger_compaction 更新
+                } else {
+                    log()->warn("[ReactEngine] Compaction skipped: {}", compact_result.reason);
+                }
+            }
+        }
+        
         // 检查超时
         auto elapsed = std::chrono::steady_clock::now() - start_time_;
         if (elapsed > config_.total_timeout) {
@@ -964,6 +1004,147 @@ std::string ReactEngine::trim_end(const std::string& text) {
         return "";
     }
     return text.substr(0, end + 1);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ✅ Compaction 集成 (对齐 OpenClaw)
+// 参考: openclaw-analysis/src/agents/pi-embedded-runner/run.ts:980-1034
+// ═══════════════════════════════════════════════════════════════
+
+// Token 估算 (简化版: 1 token ≈ 4 chars)
+int ReactEngine::estimate_conversation_tokens(const std::vector<LLMMessage>& messages) const {
+    int total = 0;
+    for (const auto& msg : messages) {
+        // 估算消息内容 token
+        total += msg.content.size() / 4;
+        
+        // 估算角色和格式开销
+        total += 10;  // <role>content</role> 开销
+    }
+    return total;
+}
+
+// 检测 Context Overflow Error (对齐 OpenClaw: isLikelyContextOverflowError)
+bool ReactEngine::is_context_overflow_error(const std::string& error_msg) const {
+    std::string lower = error_msg;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    
+    return (
+        (lower.find("context") != std::string::npos && 
+         lower.find("overflow") != std::string::npos) ||
+        lower.find("too long") != std::string::npos ||
+        (lower.find("maximum") != std::string::npos && 
+         lower.find("token") != std::string::npos) ||
+        (lower.find("exceeds") != std::string::npos && 
+         lower.find("limit") != std::string::npos)
+    );
+}
+
+// 提取 Overflow Token Count (对齐 OpenClaw: extractObservedOverflowTokenCount)
+std::optional<int> ReactEngine::extract_overflow_token_count(const std::string& error_msg) const {
+    // 匹配 "277403 tokens > 200000 maximum"
+    std::regex token_count_re(R"((\d+)\s*tokens?\s*>\s*(\d+))");
+    std::smatch match;
+    
+    if (std::regex_search(error_msg, match, token_count_re)) {
+        return std::stoi(match[1].str());
+    }
+    
+    return std::nullopt;
+}
+
+// 触发 Compaction (对齐 OpenClaw)
+ReactEngine::CompactionResult ReactEngine::trigger_compaction(
+    std::vector<LLMMessage>& messages
+) {
+    CompactionResult result;
+    
+    if (!compaction_mgr_) {
+        result.reason = "CompactionManager not initialized";
+        return result;
+    }
+    
+    int messages_before = messages.size();
+    int current_tokens = estimate_conversation_tokens(messages);
+    
+    log()->info("[ReactEngine] Triggering compaction: {} messages, ~{} tokens",
+               messages_before, current_tokens);
+    
+    // 转换 LLMMessage → AgentMessage
+    std::vector<memory::AgentMessage> agent_messages;
+    for (const auto& msg : messages) {
+        memory::AgentMessage am;
+        am.role = [&]() {
+            switch (msg.role) {
+                case llm::LLMMessageRole::User: return "user";
+                case llm::LLMMessageRole::Assistant: return "assistant";
+                case llm::LLMMessageRole::System: return "system";
+                case llm::LLMMessageRole::Tool: return "toolResult";
+                default: return "unknown";
+            }
+        }();
+        am.content = msg.content;
+        agent_messages.push_back(am);
+    }
+    
+    // 构建 CompactionParams
+    memory::CompactionParams params;
+    params.messages = agent_messages;
+    params.current_token_count = current_tokens;
+    params.context_window_tokens = context_window_config_.context_window_tokens;
+    params.trigger = "overflow";
+    params.model_id = "claude-3-5-sonnet-20241022";  // TODO: 从配置读取
+    
+    // TODO: 设置 API key 和回调
+    // params.api_key = get_api_key();
+    // params.memory_flush_callback = ...
+    // params.post_compaction_sync_callback = ...
+    
+    // 执行 compaction
+    auto compact_result = compaction_mgr_->compact_session(params);
+    
+    if (!compact_result.is_ok()) {
+        log()->error("[ReactEngine] Compaction failed: {}", compact_result.error);
+        result.reason = compact_result.error;
+        return result;
+    }
+    
+    auto compact_data = compact_result.value();
+    
+    if (!compact_data.compacted) {
+        log()->info("[ReactEngine] Compaction skipped: {}", compact_data.reason);
+        result.reason = compact_data.reason;
+        return result;
+    }
+    
+    log()->info("[ReactEngine] Compaction successful:");
+    log()->info("  Messages: {} → {}", 
+               compact_data.messages_before,
+               compact_data.messages_after);
+    log()->info("  Tokens saved: {}", compact_data.tokens_saved);
+    
+    // ✅ 转换回 LLMMessage
+    messages.clear();
+    for (const auto& am : compact_data.compressed_messages) {
+        llm::LLMMessage msg;
+        msg.role = [&]() {
+            if (am.role == "user") return llm::LLMMessageRole::User;
+            if (am.role == "assistant") return llm::LLMMessageRole::Assistant;
+            if (am.role == "system") return llm::LLMMessageRole::System;
+            if (am.role == "toolResult") return llm::LLMMessageRole::Tool;
+            return llm::LLMMessageRole::User;
+        }();
+        msg.content = am.content;
+        messages.push_back(msg);
+    }
+    
+    result.compacted = true;
+    result.compressed_messages = messages;
+    result.messages_before = messages_before;
+    result.messages_after = messages.size();
+    result.tokens_saved = compact_data.tokens_saved;
+    
+    return result;
 }
 
 } // namespace react

@@ -3,7 +3,6 @@
 #include "hunterclaw/memory/provider.h"
 #include "hunterclaw/memory/storage.h"
 #include "hunterclaw/core/result.h"
-#include "hunterclaw/core/logging.h"
 #include <string>
 #include <vector>
 #include <optional>
@@ -54,21 +53,35 @@ public:
     
     virtual ~SessionMemoryProvider() = default;
     
+    // ========================================
     // MemoryProvider 接口实现
-    std::string provider_id() const override;
+    // ========================================
     
-    core::Result<std::vector<Memory>> search_memories(
+    // Provider identification
+    std::string provider_id() const override { return provider_id_; }
+    std::string provider_name() const override { return "SessionMemoryProvider"; }
+    std::string provider_version() const override { return "1.0.0"; }
+    
+    // Memory CRUD operations
+    core::Result<std::string> add_memory(
+        const std::string& content,
+        const std::map<std::string, std::string>& metadata = {}
+    ) override;
+    
+    core::Result<std::vector<MemorySearchResult>> search_memories(
         const std::string& query,
-        const SearchOptions& options
+        const SearchOptions& options = {}
     ) override;
     
-    core::Result<ProviderStats> get_stats() const override;
+    core::Result<bool> remove_memory(const std::string& id) override;
     
-    core::Result<void> sync(const SyncParams& params) override;
-    
-    core::Result<void> add_memories(
-        const std::vector<Memory>& memories
+    core::Result<bool> update_memory(
+        const std::string& id,
+        const std::string& content,
+        const std::map<std::string, std::string>& metadata = {}
     ) override;
+    
+    core::Result<bool> clear_memories() override;
     
     // ========================================
     // Session Memory 专属接口 (对齐 OpenClaw)
@@ -99,7 +112,6 @@ private:
     std::string provider_id_;
     std::shared_ptr<MemoryStorage> storage_;
     SessionMemoryConfig config_;
-    std::shared_ptr<core::Logger> logger_;
     
     // 生成 session 文件名
     // 对齐: sessionKeyToFilename (session-files.ts)

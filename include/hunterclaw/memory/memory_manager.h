@@ -142,6 +142,37 @@ public:
     );
     
     // ========================================
+    // P4 Priority: Direct Entry Management
+    // ========================================
+    
+    /**
+     * ✅ P4: 直接添加 memory entry (对齐 OpenClaw store)
+     * 
+     * 使用场景:
+     * - 添加对话记忆 (conversation memory)
+     * - 添加用户注释 (user annotations)
+     * - 添加自定义 metadata
+     * 
+     * OpenClaw 对齐: builtin-manager.ts store()
+     */
+    core::Result<void> add_entry(const MemoryEntry& entry);
+    
+    /**
+     * ✅ P4: 完整重建索引 (对齐 OpenClaw reindex)
+     * 
+     * 使用场景:
+     * - Provider 配置变更
+     * - Embedding model 变更
+     * - Chunking 设置变更
+     * - 修复索引损坏
+     * 
+     * OpenClaw 对齐: builtin-manager.ts reindex()
+     * 
+     * @param workspace_dir 工作空间路径 (可选,为空则只清空索引)
+     */
+    core::Result<void> reindex(const std::string& workspace_dir = "");
+    
+    // ========================================
     // Accessors
     // ========================================
     

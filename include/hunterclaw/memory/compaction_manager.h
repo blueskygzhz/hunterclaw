@@ -17,27 +17,7 @@ namespace memory {
 // CompactionManager - 严格对齐 OpenClaw compaction 机制
 // ============================================================================
 
-/**
- * Compaction 结果 (对齐 OpenClaw EmbeddedPiCompactResult)
- */
-struct CompactionResult {
-    bool compacted = false;                         // 是否执行了压缩
-    std::string reason;                             // 未压缩原因 (如果 compacted=false)
-    std::string summary;                            // 摘要内容
-    std::vector<AgentMessage> compressed_messages;  // 压缩后的消息列表
-    
-    // Token 统计 (对齐 OpenClaw)
-    int tokens_before = 0;                          // 压缩前 tokens
-    int tokens_after = 0;                           // 压缩后 tokens
-    int messages_before = 0;                        // 压缩前消息数
-    int messages_after = 0;                         // 压缩后消息数
-    int tokens_saved = 0;                           // 节省的 tokens
-    float compression_ratio = 0.0f;                 // 压缩比
-    
-    // 元数据
-    std::shared_ptr<std::string> first_kept_entry_id; // 首条保留消息 ID
-    int64_t duration_ms = 0;                        // 压缩耗时 (毫秒)
-};
+// 注意：CompactionResult 和 CompactionStats 已在 compaction.h 中定义
 
 /**
  * Compaction 参数 (对齐 OpenClaw CompactEmbeddedPiSessionParams)
@@ -74,17 +54,7 @@ struct PreCompactionFlushParams {
     std::function<core::Result<void>()> flush_callback;
 };
 
-/**
- * Compaction 统计 (对齐 OpenClaw session:compact:after hook)
- */
-struct CompactionStats {
-    int total_compactions = 0;                      // 总压缩次数
-    int total_memory_flushes = 0;                   // 总 memory flush 次数
-    int total_failures = 0;                         // 失败次数
-    int tokens_saved = 0;                           // 总节省 tokens
-    std::chrono::system_clock::time_point last_compaction;        // 最后压缩时间
-    std::chrono::system_clock::time_point last_memory_flush;      // 最后 flush 时间
-};
+// 注意：CompactionStats 已在 compaction.h 中定义
 
 /**
  * CompactionManager - 完整的 compaction 生命周期管理
@@ -99,7 +69,7 @@ class CompactionManager {
 public:
     CompactionManager(
         const CompactionConfig& config,
-        std::shared_ptr<llm::LLMClient> llm_client = nullptr,
+        std::shared_ptr<hunterclaw::llm::LLMClient> llm_client = nullptr,
         std::shared_ptr<MemoryProvider> memory_provider = nullptr
     );
     
