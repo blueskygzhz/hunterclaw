@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <functional>
 
 namespace hunterclaw {
 namespace agents {
@@ -133,11 +134,21 @@ public:
     // ========== 生命周期事件 ==========
     
     /**
-     * 注册事件回调
-     * TODO: Define AgentEvent type
+     * 注册事件回调 (OpenClaw 对齐)
+     * 
+     * @param callback 事件回调函数
+     * 
+     * 使用示例:
+     * ```cpp
+     * agent->on_event([](const AgentEvent& event) {
+     *     if (event.stream == AgentEventStream::Lifecycle) {
+     *         // 处理生命周期事件
+     *     }
+     * });
+     * ```
      */
-    // using EventCallback = std::function<void(const AgentEvent&)>;
-    // void on_event(EventCallback callback);
+    using EventCallback = std::function<void(const AgentEvent&)>;
+    void on_event(EventCallback callback);
     
 private:
     AgentInstanceContext ctx_;
@@ -149,9 +160,24 @@ private:
     std::shared_ptr<ReactEngine> react_engine_;
     std::shared_ptr<ToolRegistry> tool_registry_;
     
-    // 事件回调
-    // TODO: Define EventCallback type
-    // std::vector<EventCallback> event_callbacks_;
+    // ✅ OpenClaw 对齐: Reasoning stream 状态跟踪
+    std::string last_streamed_reasoning_;  // 用于去重和增量计算
+    
+    // ✅ OpenClaw 对齐: Assistant stream 状态跟踪
+    // 参考: openclaw-analysis/src/agents/pi-embedded-subscribe.ts:49-50
+    std::string assistant_buffer_;           // 累积所有 assistant delta (对应 deltaBuffer)
+    std::string last_streamed_assistant_;    // 上次发送的完整文本 (用于增量计算)
+    std::chrono::steady_clock::time_point last_assistant_emit_time_;  // 节流时间戳
+    
+    // ✅ OpenClaw 对齐: Block reply 状态跟踪
+    // 参考: openclaw-analysis/src/agents/pi-embedded-subscribe.ts:104-115, 480-533
+    std::string block_buffer_;               // 用于 block chunking 的缓冲区 (对应 blockBuffer)
+    std::string last_block_reply_text_;      // 上次发送的 block reply (去重用)
+    bool suppress_block_chunks_;             // 动态抑制 block chunks 发送
+    std::vector<std::string> messaging_tool_sent_texts_;  // 已通过 messaging tool 发送的文本
+    
+    // ✅ OpenClaw 对齐: 事件回调系统
+    std::vector<EventCallback> event_callbacks_;
     
     // 辅助方法
     void initialize_workspace();

@@ -19,17 +19,6 @@ namespace agents {
 class AgentInstance;
 
 /**
- * Agent 生命周期阶段
- */
-enum class AgentLifecyclePhase {
-    INITIALIZING,    // 初始化中
-    IDLE,            // 空闲
-    PROCESSING,      // 处理中
-    WAITING,         // 等待中
-    TERMINATING      // 终止中
-};
-
-/**
  * Agent 实例信息
  */
 struct AgentInstanceInfo {

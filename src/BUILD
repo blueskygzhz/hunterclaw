@@ -97,6 +97,162 @@ cc_library(
 )
 
 # ============================================================================
+# MCP Library - MCP Tool Integration
+# ============================================================================
+cc_library(
+    name = "hunterclaw_mcp",
+    srcs = glob(["mcp/*.cc"]),
+    deps = [
+        "//:hunterclaw_headers",
+        "@nlohmann_json//:json",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+    copts = [
+        "-std=c++17",
+        "-Wall",
+        "-Wextra",
+        "-I/usr/include/jsoncpp",
+        "-I/usr/include/spdlog",
+    ],
+    linkopts = [
+        "-lpthread",
+        "-ljsoncpp",
+    ],
+    linkstatic = False,
+    visibility = ["//visibility:public"],
+)
+
+# ============================================================================
+# Sessions Library - Transcript 清理和修复 (对齐 OpenClaw)
+# ============================================================================
+cc_library(
+    name = "hunterclaw_sessions",
+    srcs = glob(["sessions/*.cc"]),
+    deps = [
+        "//:hunterclaw_headers",
+        ":hunterclaw_llm",
+        "@nlohmann_json//:json",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+    copts = [
+        "-std=c++17",
+        "-Wall",
+        "-Wextra",
+        "-I/usr/include/jsoncpp",
+        "-I/usr/include/spdlog",
+    ],
+    linkopts = [
+        "-lpthread",
+        "-ljsoncpp",
+        "-lsqlite3",
+        "-luuid",
+    ],
+    linkstatic = False,
+    visibility = ["//visibility:public"],
+)
+
+# ============================================================================
+# Skill Library - Skill Manager, Plugin System, File Watcher
+# ============================================================================
+cc_library(
+    name = "hunterclaw_skills",
+    srcs = glob(["skills/*.cc"]),
+    deps = [
+        "//:hunterclaw_headers",
+        "@nlohmann_json//:json",
+        "@yaml_cpp//:yaml-cpp",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+    copts = [
+        "-std=c++17",
+        "-Wall",
+        "-Wextra",
+        "-I/usr/include/jsoncpp",
+        "-I/usr/include/spdlog",
+    ],
+    linkopts = [
+        "-lpthread",
+        "-ljsoncpp",
+        "-lsqlite3",
+        "-luuid",
+        "-ldl",  # For dynamic loading
+    ],
+    linkstatic = False,
+    visibility = ["//visibility:public"],
+)
+
+# ============================================================================
+# Core Aggregate Library - All HunterClaw modules
+# ============================================================================
+cc_library(
+    name = "hunterclaw_core",
+    srcs = glob([
+        "core/*.cc",
+        "utils/*.cc",
+        "config/*.cc",
+        "channels/*.cc",
+        "agents/*.cc",
+        "context/*.cc",
+        "react/*.cc",
+        "tools/*.cc",
+        "plugins/*.cc",
+        "process/*.cc",
+        "hooks/*.cc",
+        "routing/*.cc",
+        "queue/*.cc",
+        "pairing/*.cc",
+        "security/*.cc",
+        "secrets/*.cc",
+        "device/*.cc",
+        "auto_reply/*.cc",
+        "cron/*.cc",
+        "daemon/*.cc",
+        "observability/*.cc",
+        "infra/*.cc",
+        "logging/*.cc",
+        "markdown/*.cc",
+        "sandbox/*.cc",
+        "shared/*.cc",
+        "nodes/*.cc",
+        "cli/*.cc",
+    ], exclude = ["main.cc"]),
+    deps = [
+        ":hunterclaw_memory",
+        ":hunterclaw_llm",
+        ":hunterclaw_gateway",
+        ":hunterclaw_mcp",
+        ":hunterclaw_sessions",
+        ":hunterclaw_skill",
+        "//:hunterclaw_headers",
+        "//third_party:httplib",
+        "@nlohmann_json//:json",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+    copts = [
+        "-std=c++17",
+        "-Wall",
+        "-Wextra",
+        "-I/usr/include/jsoncpp",
+        "-I/usr/include/spdlog",
+    ],
+    linkopts = [
+        "-lpthread",
+        "-luuid",
+        "-lsqlite3",
+        "-ljsoncpp",
+        "-lcurl",
+        "-lssl",
+        "-lcrypto",
+    ],
+    linkstatic = False,
+    visibility = ["//visibility:public"],
+)
+
+# ============================================================================
 # Gateway Server Executable
 # ============================================================================
 cc_binary(

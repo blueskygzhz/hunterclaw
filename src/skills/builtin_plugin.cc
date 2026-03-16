@@ -1,5 +1,5 @@
 #include "hunterclaw/skills/builtin_plugin.h"
-#include "hunterclaw/skills/parser.h"
+#include "hunterclaw/skills/skill.h"
 #include "hunterclaw/core/utils.h"
 #include <spdlog/spdlog.h>
 #include <fstream>

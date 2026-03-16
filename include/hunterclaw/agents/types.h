@@ -152,5 +152,52 @@ core::Result<AgentResolution> resolve_agent(
     const std::string& explicit_agent_id = ""
 );
 
+// ============================================================================
+// Agent Events (OpenClaw-aligned)
+// ============================================================================
+
+/**
+ * Agent 生命周期阶段 (扩展)
+ */
+enum class AgentLifecyclePhase {
+    // 实例状态
+    INITIALIZING,    // 初始化中
+    IDLE,            // 空闲
+    PROCESSING,      // 处理中
+    WAITING,         // 等待中
+    TERMINATING,     // 终止中
+    
+    // ✅ OpenClaw 对齐: 执行阶段事件
+    Start,           // Agent 启动
+    End,             // Agent 结束
+    Reasoning,       // 推理中 (thinking)
+    Responding,      // 回复中 (assistant output streaming)
+    ToolExecution    // 工具执行
+};
+
+/**
+ * Agent 事件流类型 (OpenClaw 对齐)
+ */
+enum class AgentEventStream {
+    Lifecycle,       // 生命周期事件
+    Message,         // 消息事件
+    Tool,            // 工具事件
+    Memory,          // 内存事件
+    Error            // 错误事件
+};
+
+/**
+ * Agent 事件 (OpenClaw 对齐)
+ * 参考: openclaw-analysis/src/agents/agent.ts
+ */
+struct AgentEvent {
+    std::string run_id;              // 运行 ID
+    int seq;                         // 事件序列号
+    AgentEventStream stream;         // 事件流类型
+    int64_t timestamp_ms;            // 时间戳 (毫秒)
+    std::string session_key;         // Session Key
+    core::JsonValue data;            // 事件数据
+};
+
 } // namespace agents
 } // namespace hunterclaw

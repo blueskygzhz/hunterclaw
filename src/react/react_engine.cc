@@ -22,6 +22,23 @@ auto log() {
     return logger;
 }
 
+// ========== OpenClaw 对齐: 格式化推理消息 (不添加前缀) ==========
+// 注意: ReactEngine 内部只做流式提取，格式化由上层处理
+// 参考: openclaw-analysis/src/agents/pi-embedded-utils.ts:273-287
+std::string format_reasoning_text(const std::string& text) {
+    // ReactEngine 内部不添加 "Reasoning:" 前缀
+    // 只返回 trim 后的原始内容
+    std::string trimmed = text;
+    auto start = trimmed.find_first_not_of(" \t\n\r");
+    auto end = trimmed.find_last_not_of(" \t\n\r");
+    
+    if (start == std::string::npos) {
+        return "";
+    }
+    
+    return trimmed.substr(start, end - start + 1);
+}
+
 // 获取 CPU 核心数 (用于默认线程池大小)
 int get_hardware_concurrency() {
     int cores = std::thread::hardware_concurrency();
@@ -216,6 +233,10 @@ ReactResult ReactEngine::execute_loop(
     
     // 🎯 OpenClaw 对齐: 重置流式状态
     streaming_state_.reset();
+    
+    // ✅ OpenClaw 对齐: 重置 reasoning stream 累积状态
+    accumulated_reasoning_raw_.clear();
+    accumulated_reasoning_formatted_.clear();
     
     // 构建消息列表
     std::vector<llm::LLMMessage> messages = history;
@@ -461,9 +482,33 @@ ReactEngine::LLMResponseData ReactEngine::call_llm(
         // 1. 提取推理内容 (thinking tags)
         auto extraction = extract_reasoning(delta);
         
+        // ✅ 严格对齐 OpenClaw: Reasoning Stream 增量处理
+        // 参考: openclaw-analysis/src/agents/pi-embedded-subscribe.ts:556-586
         if (extraction.has_reasoning && callbacks.on_reasoning_stream) {
-            // 发送推理流
-            callbacks.on_reasoning_stream(extraction.reasoning);
+            // 累积原始 reasoning
+            accumulated_reasoning_raw_ += extraction.reasoning;
+            
+            // 格式化累积内容 (由回调层处理格式化，这里只发送原始内容)
+            std::string formatted = format_reasoning_text(accumulated_reasoning_raw_);
+            
+            // 计算相对于上次的增量
+            std::string delta_reasoning;
+            if (!accumulated_reasoning_formatted_.empty() &&
+                formatted.find(accumulated_reasoning_formatted_) == 0) {
+                // 新内容是旧内容的前缀扩展 → 只发送增量
+                delta_reasoning = formatted.substr(accumulated_reasoning_formatted_.length());
+            } else {
+                // 非前缀或首次 → 发送全量
+                delta_reasoning = formatted;
+            }
+            
+            accumulated_reasoning_formatted_ = formatted;
+            
+            // 只在有增量时发送
+            if (!delta_reasoning.empty()) {
+                callbacks.on_reasoning_stream(delta_reasoning);
+            }
+            
             accumulated_reasoning += extraction.reasoning;
         }
         

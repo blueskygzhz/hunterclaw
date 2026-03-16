@@ -114,6 +114,26 @@ ProcessResult MessageProcessor::process_message(
     auto start_time = std::chrono::steady_clock::now();
     
     try {
+        // ✅ OpenClaw 对齐: 根据渠道动态控制 block streaming
+        // 参考: openclaw-analysis/src/web/auto-reply/monitor/process-message.ts:455
+        // 
+        // 渠道策略:
+        // - WhatsApp, Signal, iMessage: 禁用 (不支持消息更新)
+        // - Telegram, Discord, Slack: 启用 (支持消息编辑)
+        // - Web UI: 启用 (WebSocket 推送)
+        bool is_streaming_channel = 
+            (message.channel == "telegram") ||
+            (message.channel == "discord") ||
+            (message.channel == "slack") ||
+            (message.channel == "websocket");
+        
+        if (!is_streaming_channel && config_.react_config.block_reply.enabled) {
+            // 对于非 streaming 渠道，自动禁用 block streaming
+            config_.react_config.block_reply.disable_streaming = true;
+            spdlog::debug("[MessageProcessor] Block streaming disabled for channel: {}",
+                message.channel);
+        }
+        
         // 1. 预处理: 路由解析
         auto context = preprocess_message(message);
         
@@ -458,35 +478,59 @@ ReactResult MessageProcessor::execute_react_with_loop_detection(
     // 设置流式回调 (集成循环检测)
     StreamCallbacks callbacks;
     
-    // 🎯 OpenClaw 对齐: 配置推理流回调 (thinking 输出)
+    // ✅ 严格对齐 OpenClaw: 配置推理流回调 (thinking 输出)
+    // 参考: openclaw-analysis/src/agents/pi-embedded-subscribe.ts:556-586
     callbacks.on_reasoning_stream = [this, context](const std::string& reasoning) {
-        // 只在 Stream 模式下发送 thinking 到用户
+        // 1. 检查模式
         if (config_.reasoning_mode != ReactConfig::ReasoningMode::Stream) {
             return;
         }
         
-        // 格式化推理消息
+        // 2. 格式化 (OpenClaw 风格)
         std::string formatted = format_reasoning_message(reasoning);
         if (formatted.empty()) {
             return;
         }
         
-        // 创建投递请求
-        queue::DeliveryRequest delivery;
-        delivery.channel = context.message.channel;
-        delivery.to = context.message.sender_id;
+        // 3. 获取 session 的上次推理
+        std::string session_key = context.message.sender_id + ":" + context.message.chat_id;
+        std::string& last_reasoning = last_reasoning_by_session_[session_key];
         
-        // 如果是群组消息，发送到群组
-        if (context.message.chat_type == channels::ChatType::Group) {
-            delivery.to = context.message.chat_id;
+        // 4. 去重检查
+        if (formatted == last_reasoning) {
+            return;
         }
         
-        // 构造 thinking 消息 payload
-        queue::OutboundPayload payload;
-        payload.text = "💭 思考中...\n\n" + formatted;
+        // 5. 计算增量
+        std::string delta;
+        if (!last_reasoning.empty() && formatted.find(last_reasoning) == 0) {
+            // 新文本是旧文本的前缀扩展 → 只发送增量
+            delta = formatted.substr(last_reasoning.length());
+        } else {
+            // 非前缀或首次 → 发送全量
+            delta = formatted;
+        }
         
-        // 投递到消息队列
-        delivery_queue_->enqueue(delivery, {payload});
+        last_reasoning = formatted;
+        
+        // 6. 投递到队列 (只发送增量!)
+        if (!delta.empty()) {
+            queue::DeliveryRequest delivery;
+            delivery.channel = context.message.channel;
+            delivery.to = context.message.sender_id;
+            
+            // 如果是群组消息，发送到群组
+            if (context.message.chat_type == channels::ChatType::Group) {
+                delivery.to = context.message.chat_id;
+            }
+            
+            queue::OutboundPayload payload;
+            payload.text = delta;  // ✅ 只发送增量!
+            payload.metadata["type"] = "reasoning_stream";
+            payload.metadata["is_delta"] = "true";
+            
+            delivery_queue_->enqueue(delivery, {payload});
+        }
     };
     
     callbacks.on_tool_start = [loop_state, context](
@@ -514,7 +558,23 @@ ReactResult MessageProcessor::execute_react_with_loop_detection(
     };
     
     // 块回复投递
+    // ✅ OpenClaw 对齐: 根据渠道动态控制 block streaming
+    // 参考: openclaw-analysis/src/web/auto-reply/monitor/process-message.ts:405-410
     callbacks.on_block_reply = [this, context](const std::string& block) {
+        // 1. 检查是否禁用 block streaming
+        // 用于 WhatsApp, Signal 等不支持消息更新的渠道
+        if (config_.react_config.block_reply.disable_streaming) {
+            spdlog::trace("[MessageProcessor] Block reply suppressed: disable_streaming=true");
+            return;
+        }
+        
+        // 2. 检查是否启用 block reply
+        if (!config_.react_config.block_reply.enabled) {
+            spdlog::trace("[MessageProcessor] Block reply disabled in config");
+            return;
+        }
+        
+        // 3. 正常投递 block reply
         queue::DeliveryRequest delivery;
         delivery.channel = context.message.channel;
         delivery.to = context.message.sender_id;
@@ -523,6 +583,7 @@ ReactResult MessageProcessor::execute_react_with_loop_detection(
         payload.text = block;
         
         delivery_queue_->enqueue(delivery, {payload});
+        spdlog::debug("[MessageProcessor] Block reply delivered: {} chars", block.length());
     };
     
     // 执行 ReAct

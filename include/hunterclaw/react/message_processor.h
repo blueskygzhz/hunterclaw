@@ -201,6 +201,9 @@ private:
         int64_t timestamp_ms;
     };
     std::vector<EchoRecord> echo_cache_;
+    
+    // ✅ OpenClaw 对齐: 每个 session 的 reasoning stream 状态
+    std::unordered_map<std::string, std::string> last_reasoning_by_session_;
 };
 
 } // namespace react

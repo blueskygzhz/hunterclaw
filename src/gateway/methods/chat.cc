@@ -5,11 +5,13 @@
 #include "hunterclaw/agents/agent_instance.h"
 #include "hunterclaw/react/react_engine.h"
 #include "hunterclaw/tools/tool.h"
+#include "hunterclaw/sessions/transcript_io.h"
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 #include <algorithm>
 #include <thread>
 #include <chrono>
+#include <filesystem>
 
 using json = nlohmann::json;
 
@@ -119,7 +121,39 @@ core::Result<json> method_chat_send(
     }
     
     // ========================================================================
-    // Step 4: 生成 run_id (对齐 OpenClaw)
+    // Step 4: 注册事件监听器 (OpenClaw 对齐)
+    // 参考: openclaw-analysis/src/gateway/server-methods/agent-job.ts:212
+    // ========================================================================
+    
+    // ✅ 监听 Agent 生命周期事件
+    // OpenClaw: const unsubscribe = onAgentEvent((evt) => { ... })
+    agent->on_event([server, session_id](const agents::AgentEvent& evt) {
+        if (evt.stream != agents::AgentEventStream::Lifecycle) {
+            return;  // 只处理生命周期事件
+        }
+        
+        // ✅ 广播到所有连接的客户端
+        json event_payload;
+        event_payload["type"] = "agent.lifecycle";
+        event_payload["session_id"] = session_id;
+        event_payload["run_id"] = evt.run_id;
+        event_payload["seq"] = evt.seq;
+        event_payload["stream"] = "lifecycle";
+        event_payload["timestamp"] = evt.timestamp_ms;
+        event_payload["data"] = evt.data;
+        
+        core::EventFrame frame;
+        frame.type = "agent";
+        frame.payload = event_payload;
+        
+        server->broadcast(frame);
+        
+        spdlog::debug("[chat.send] Agent event: run_id={}, seq={}, phase={}",
+            evt.run_id, evt.seq, evt.data.value("phase", "unknown"));
+    });
+    
+    // ========================================================================
+    // Step 5: 生成 run_id (对齐 OpenClaw)
     // ========================================================================
     
     std::string run_id = generate_run_id();
@@ -130,11 +164,25 @@ core::Result<json> method_chat_send(
     // Step 5: 写入用户消息到 Transcript (对齐 OpenClaw)
     // ========================================================================
     
-    // TODO: 实现 Transcript 持久化
-    // std::string transcript_path = resolve_transcript_path(session_id, agent->context().agent_id);
-    // append_user_message(transcript_path, message, generate_uuid(), run_id);
+    std::string sessions_dir = std::filesystem::path(agent->context().workspace_dir).parent_path() / "sessions";
+    std::string transcript_path = sessions::resolve_transcript_path(
+        session_id, 
+        agent->context().agent_id,
+        sessions_dir
+    );
     
-    spdlog::debug("[chat.send] User message written to transcript: session={}", session_id);
+    auto append_result = sessions::append_user_message_to_transcript(
+        transcript_path, 
+        message, 
+        run_id
+    );
+    
+    if (!append_result.ok) {
+        spdlog::warn("[chat.send] Failed to write user message to transcript: {}", append_result.error);
+    } else {
+        spdlog::debug("[chat.send] User message written to transcript: session={}, message_id={}",
+            session_id, append_result.message_id);
+    }
     
     // ========================================================================
     // Step 6: 启动 Agent 异步执行 (ReAct Engine)
@@ -244,12 +292,24 @@ core::Result<json> method_chat_send(
     };
     
     // 异步启动 (不阻塞当前线程)
-    std::thread([react_engine, message, callbacks, run_id, session_id]() {
+    std::thread([react_engine, message, callbacks, run_id, session_id, transcript_path]() {
         try {
             auto result = react_engine->run(message, {}, callbacks);
             
-            // TODO: 写入 assistant 消息到 Transcript
-            // append_assistant_message(transcript_path, result.final_response, generate_uuid(), run_id);
+            // 写入 assistant 消息到 Transcript (对齐 OpenClaw)
+            sessions::AppendTranscriptOptions opts;
+            opts.message = result.final_response;
+            opts.create_if_missing = false;
+            
+            auto append_result = sessions::append_assistant_message_to_transcript(
+                transcript_path,
+                opts
+            );
+            
+            if (!append_result.ok) {
+                spdlog::warn("[chat.send] Failed to write assistant message to transcript: {}",
+                    append_result.error);
+            }
             
             spdlog::info("[chat.send] Agent completed: session={}, run_id={}, steps={}",
                 session_id, run_id, result.total_steps);
@@ -414,15 +474,49 @@ core::Result<json> method_chat_history(
     // Step 3: 读取 Transcript (对齐 OpenClaw)
     // ========================================================================
     
-    // TODO: 实现 Transcript 读取
-    // std::string transcript_path = resolve_transcript_path(session_id, agent->context().agent_id);
-    // auto messages = read_transcript_messages(transcript_path, limit);
+    std::string sessions_dir = std::filesystem::path(agent->context().workspace_dir).parent_path() / "sessions";
+    std::string transcript_path = sessions::resolve_transcript_path(
+        session_id,
+        agent->context().agent_id,
+        sessions_dir
+    );
     
-    // 当前返回空历史（占位）
+    auto messages = sessions::read_transcript_messages(transcript_path, limit);
+    
+    // 转换为 JSON
+    json messages_array = json::array();
+    for (const auto& msg : messages) {
+        json msg_json;
+        
+        // Role
+        switch (msg.role) {
+            case llm::LLMMessageRole::User:
+                msg_json["role"] = "user";
+                break;
+            case llm::LLMMessageRole::Assistant:
+                msg_json["role"] = "assistant";
+                break;
+            case llm::LLMMessageRole::System:
+                msg_json["role"] = "system";
+                break;
+            case llm::LLMMessageRole::Tool:
+                msg_json["role"] = "tool";
+                break;
+        }
+        
+        // Content
+        json content_item;
+        content_item["type"] = "text";
+        content_item["text"] = msg.content;
+        msg_json["content"] = json::array({ content_item });
+        
+        messages_array.push_back(msg_json);
+    }
+    
     json result;
     result["session_id"] = session_id;
     result["sessionId"] = session_id;
-    result["messages"] = json::array();
+    result["messages"] = messages_array;
     
     // 附加 Session 元数据 (对齐 OpenClaw)
     result["thinkingLevel"] = "default";
@@ -477,12 +571,32 @@ core::Result<json> method_chat_inject(
     // Step 3: 写入 Transcript (对齐 OpenClaw)
     // ========================================================================
     
-    // TODO: 实现 Transcript 注入
-    // std::string transcript_path = resolve_transcript_path(session_id, agent->context().agent_id);
-    // std::string message_id = generate_uuid();
-    // append_assistant_message(transcript_path, message, message_id, "", label);
+    std::string sessions_dir = std::filesystem::path(agent->context().workspace_dir).parent_path() / "sessions";
+    std::string transcript_path = sessions::resolve_transcript_path(
+        session_id,
+        agent->context().agent_id,
+        sessions_dir
+    );
     
-    std::string message_id = core::utils::generate_uuid();
+    sessions::AppendTranscriptOptions opts;
+    opts.message = message;
+    opts.label = label;
+    opts.create_if_missing = true;
+    
+    auto append_result = sessions::append_assistant_message_to_transcript(
+        transcript_path,
+        opts
+    );
+    
+    std::string message_id;
+    if (!append_result.ok) {
+        spdlog::warn("[chat.inject] Failed to write to transcript: {}", append_result.error);
+        message_id = core::utils::generate_uuid();
+    } else {
+        message_id = append_result.message_id;
+        spdlog::debug("[chat.inject] Written to transcript: session={}, message_id={}",
+            session_id, message_id);
+    }
     
     // ========================================================================
     // Step 4: 广播到客户端 (对齐 OpenClaw)

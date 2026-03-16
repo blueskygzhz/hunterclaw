@@ -130,6 +130,23 @@ struct ReactConfig {
             Newline,
             Sentence
         } break_preference = BreakPreference::Paragraph;
+        
+        // ✅ OpenClaw 对齐: Block streaming 控制
+        // 参考: openclaw-analysis/src/web/auto-reply/monitor/process-message.ts:455
+        // 
+        // 用途: 控制是否发送 block reply (中间响应)
+        // - false: 发送所有 block replies (Telegram, Slack, Web UI)
+        // - true: 只发送 final reply (WhatsApp, Signal, iMessage)
+        //
+        // 设计理由:
+        // - WhatsApp 等渠道不支持消息更新，发送 block 会造成消息洪水
+        // - 隐私保护: 避免在外部渠道泄露推理过程 (thinking)
+        //
+        // 使用示例:
+        // if (message.channel == Channel::WhatsApp) {
+        //     config.block_reply.disable_streaming = true;
+        // }
+        bool disable_streaming = false;
     } block_reply;
     
     // 工具执行配置
@@ -300,6 +317,10 @@ private:
     
     // ✅ 流式处理状态 (对齐 OpenClaw)
     StreamingState streaming_state_;
+    
+    // ✅ Reasoning Stream 累积状态 (对齐 OpenClaw)
+    std::string accumulated_reasoning_raw_;        // 原始累积 (未格式化)
+    std::string accumulated_reasoning_formatted_;  // 格式化累积 (用于增量计算)
     
     // ✅ 全局线程池 (用于并行工具执行)
     static std::shared_ptr<core::ThreadPool>& get_thread_pool();

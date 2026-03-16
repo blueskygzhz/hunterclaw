@@ -5,12 +5,58 @@
 #include "hunterclaw/core/logging.h"
 #include <spdlog/spdlog.h>
 #include <filesystem>
+#include <sstream>
+#include <vector>
 
 namespace hunterclaw {
 namespace agents {
 
 // Helper for logging
 inline auto log() { return core::get_logger("agent_instance"); }
+
+// ========== OpenClaw 对齐: 格式化推理消息 ==========
+// 参考: openclaw-analysis/src/agents/pi-embedded-utils.ts:273-287
+std::string format_reasoning_message_openclaw(const std::string& text) {
+    // 1. Trim 空白
+    std::string trimmed = text;
+    auto start = trimmed.find_first_not_of(" \t\n\r");
+    auto end = trimmed.find_last_not_of(" \t\n\r");
+    
+    if (start == std::string::npos) {
+        return "";  // 全是空白
+    }
+    
+    trimmed = trimmed.substr(start, end - start + 1);
+    
+    if (trimmed.empty()) {
+        return "";
+    }
+    
+    // 2. 按行包裹斜体 markdown (_line_)
+    // 原因: Telegram 的 _italic_ 不支持跨行，需要每行单独包裹
+    std::vector<std::string> lines;
+    std::stringstream ss(trimmed);
+    std::string line;
+    
+    while (std::getline(ss, line)) {
+        if (!line.empty()) {
+            lines.push_back("_" + line + "_");
+        } else {
+            lines.push_back("");  // 保留空行
+        }
+    }
+    
+    // 3. 拼接结果，添加 "Reasoning:" 前缀
+    std::string result = "Reasoning:\n";
+    for (size_t i = 0; i < lines.size(); ++i) {
+        result += lines[i];
+        if (i < lines.size() - 1) {
+            result += "\n";
+        }
+    }
+    
+    return result;
+}
 
 AgentInstance::AgentInstance(
     const std::string& session_id,
@@ -20,7 +66,9 @@ AgentInstance::AgentInstance(
     std::shared_ptr<channels::ChannelManager> channel_mgr
 ) : config_(config),
     skill_mgr_(skill_mgr),
-    channel_mgr_(channel_mgr) {
+    channel_mgr_(channel_mgr),
+    last_assistant_emit_time_(std::chrono::steady_clock::now()),  // ✅ 初始化时间戳
+    suppress_block_chunks_(false) {  // ✅ 初始化 block reply 抑制标志
     
     ctx_.session_id = session_id;
     ctx_.agent_id = agent_id;
@@ -435,12 +483,180 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
     react::StreamCallbacks callbacks;
     callbacks.session_id = ctx_.session_id;
     
+    // ✅ 严格对齐 OpenClaw: on_reasoning_stream 实现
+    // 参考: openclaw-analysis/src/agents/pi-embedded-subscribe.ts:556-586
     callbacks.on_reasoning_stream = [this](const std::string& reasoning) {
-        spdlog::debug("[AgentInstance] Reasoning: {}", reasoning);
+        // 1. 格式化推理消息 (添加 "Reasoning:" 前缀 + 斜体包裹)
+        std::string formatted = format_reasoning_message_openclaw(reasoning);
+        if (formatted.empty()) {
+            return;
+        }
+        
+        // 2. 去重检查 (避免重复发送)
+        if (formatted == last_streamed_reasoning_) {
+            spdlog::trace("[AgentInstance] Reasoning duplicate, skipping");
+            return;
+        }
+        
+        // 3. 计算增量 (只发送新增部分)
+        std::string prior = last_streamed_reasoning_;
+        std::string delta;
+        
+        if (!prior.empty() && formatted.find(prior) == 0) {
+            // 新文本是旧文本的前缀扩展 → 只发送增量
+            delta = formatted.substr(prior.length());
+        } else {
+            // 非前缀或首次 → 发送全量
+            delta = formatted;
+        }
+        
+        last_streamed_reasoning_ = formatted;
+        
+        // 4. 发射事件 (WebSocket 实时推送)
+        emit_lifecycle_event(AgentLifecyclePhase::Reasoning, {
+            {"stream", "thinking"},
+            {"text", formatted},    // 完整文本
+            {"delta", delta}        // 增量文本
+        });
+        
+        spdlog::debug("[AgentInstance] Reasoning stream: total_len={}, delta_len={}", 
+                     formatted.length(), delta.length());
     };
     
-    callbacks.on_assistant_delta = [this](const std::string& text) {
-        spdlog::trace("[AgentInstance] Delta: {}", text);
+    // ✅ 严格对齐 OpenClaw: on_assistant_delta 实现
+    // 参考: openclaw-analysis/src/agents/pi-embedded-subscribe.handlers.messages.ts:146-243
+    // 
+    // OpenClaw 实现要点:
+    // 1. 累积 delta 到 deltaBuffer
+    // 2. 剥离 <think> 标签 (stripBlockTags)
+    // 3. 计算增量 (delta = cleaned - previous)
+    // 4. 发射 WebSocket 事件 (emitAgentEvent)
+    // 5. 可选: Block Chunking (按段落/代码块切分)
+    //
+    // 本实现: 简化对齐版本 (带节流机制)
+    callbacks.on_assistant_delta = [this](const std::string& delta) {
+        // 1. 累积 delta (对齐 OpenClaw deltaBuffer)
+        assistant_buffer_ += delta;
+        
+        // 2. 节流检查 (100ms 最小间隔，避免过度推送)
+        // OpenClaw 没有显式节流，但通过 block chunking 实现了类似效果
+        auto now = std::chrono::steady_clock::now();
+        const auto MIN_EMIT_INTERVAL = std::chrono::milliseconds(100);
+        
+        if (now - last_assistant_emit_time_ < MIN_EMIT_INTERVAL) {
+            spdlog::trace("[AgentInstance] Assistant delta throttled: buffer_len={}", 
+                         assistant_buffer_.length());
+            return;  // 跳过本次发送
+        }
+        
+        // 3. TODO: 剥离 <think> 标签 (OpenClaw stripBlockTags)
+        // 简化版本: 暂时不处理 <think> 标签
+        std::string cleaned = assistant_buffer_;
+        
+        // 4. 计算增量 (对齐 OpenClaw)
+        std::string delta_text;
+        if (!last_streamed_assistant_.empty() && 
+            cleaned.find(last_streamed_assistant_) == 0) {
+            // 新文本是旧文本的前缀扩展 → 只发送增量
+            delta_text = cleaned.substr(last_streamed_assistant_.length());
+        } else {
+            // 非前缀或首次 → 发送全量
+            delta_text = cleaned;
+        }
+        
+        // 5. 发射 WebSocket 事件 (对齐 OpenClaw emitAgentEvent)
+        if (!delta_text.empty()) {
+            emit_lifecycle_event(AgentLifecyclePhase::Responding, {
+                {"stream", "assistant"},
+                {"text", cleaned},       // 完整文本
+                {"delta", delta_text}    // 增量文本
+            });
+            
+            last_streamed_assistant_ = cleaned;
+            last_assistant_emit_time_ = now;
+            
+            spdlog::debug("[AgentInstance] Assistant stream: total_len={}, delta_len={}", 
+                         cleaned.length(), delta_text.length());
+        } else {
+            spdlog::trace("[AgentInstance] Assistant delta no-op: no new text");
+        }
+    };
+    
+    // ✅ 严格对齐 OpenClaw: on_block_reply 实现
+    // 参考: openclaw-analysis/src/agents/pi-embedded-subscribe.ts:480-533
+    // 
+    // OpenClaw 实现要点:
+    // 1. Strip block tags (<think>, <final>) - 避免泄露推理内容
+    // 2. 去重检查 (与上次发送的 text 比较)
+    // 3. Messaging tool 冲突检测 (避免重复发送)
+    // 4. Parse reply directives (mediaUrls, audioAsVoice, replyToId 等)
+    // 5. 发射 WebSocket 事件 (emitBlockReplySafely)
+    //
+    // 本实现: 核心对齐版本 (简化了 reply directives 解析)
+    callbacks.on_block_reply = [this](const std::string& block) {
+        // 1. 动态抑制检测 (对齐 OpenClaw:478)
+        if (suppress_block_chunks_) {
+            spdlog::trace("[AgentInstance] Block reply suppressed by suppress_block_chunks_");
+            return;
+        }
+        
+        // 2. Strip <think> 和 <final> 标签 (对齐 OpenClaw:484)
+        // TODO: 实现完整的 stripBlockTags 逻辑
+        std::string cleaned = block;
+        // 简化版本: 移除 <think>...</think> 标签
+        // 正则表达式: <think>.*?</think>
+        // 暂时跳过，直接使用原始文本
+        
+        // Trim 结尾空白 (对齐 OpenClaw:484)
+        while (!cleaned.empty() && std::isspace(cleaned.back())) {
+            cleaned.pop_back();
+        }
+        
+        if (cleaned.empty()) {
+            spdlog::trace("[AgentInstance] Block reply empty after cleaning");
+            return;
+        }
+        
+        // 3. 去重检查 (对齐 OpenClaw:488-490)
+        if (cleaned == last_block_reply_text_) {
+            spdlog::trace("[AgentInstance] Block reply duplicate: already sent");
+            return;
+        }
+        
+        // 4. Messaging tool 冲突检测 (对齐 OpenClaw:494-498)
+        // 检查是否已通过 messaging tool 发送过
+        for (const auto& sent_text : messaging_tool_sent_texts_) {
+            if (cleaned == sent_text) {
+                spdlog::debug("[AgentInstance] Block reply skip: already sent via messaging tool");
+                return;
+            }
+        }
+        
+        // 5. 更新状态 (对齐 OpenClaw:504-506)
+        last_block_reply_text_ = cleaned;
+        // assistantTexts.push(chunk) - 对应 C++ 中可以记录到 memory
+        
+        // 6. TODO: Parse reply directives (对齐 OpenClaw:510-521)
+        // - replyDirectiveAccumulator.consume(chunk)
+        // - 提取 mediaUrls, audioAsVoice, replyToId 等
+        // 简化版本: 直接使用 text
+        
+        // 7. 跳过空 payload (对齐 OpenClaw:523-525)
+        // (已通过上面的 empty 检查)
+        
+        // 8. 发射 WebSocket 事件 (对齐 OpenClaw:526-533)
+        emit_lifecycle_event(AgentLifecyclePhase::Responding, {
+            {"type", "block_reply"},
+            {"text", cleaned},
+            // TODO: 添加可选字段
+            // {"mediaUrls", mediaUrls},
+            // {"audioAsVoice", audioAsVoice},
+            // {"replyToId", replyToId},
+            // {"replyToTag", replyToTag},
+            // {"replyToCurrent", replyToCurrent}
+        });
+        
+        spdlog::debug("[AgentInstance] Block reply sent: len={}", cleaned.length());
     };
     
     callbacks.on_tool_start = [this](const std::string& tool_name, const core::JsonValue& args) {

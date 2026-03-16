@@ -1,89 +1,58 @@
 #pragma once
 
 #include <string>
-#include <regex>
 #include <optional>
+#include <regex>
+#include "hunterclaw/react/verbose_reasoning_config.h"
 
 namespace hunterclaw {
 namespace auto_reply {
 
-// ═══════════════════════════════════════════════════════════════
-// ✅ 严格对齐 OpenClaw: src/auto-reply/command-detection.ts
-// 命令检测器 (Command Detection)
-// ═══════════════════════════════════════════════════════════════
+// ✅ OpenClaw 对齐: 消息指令解析
+// 参考: openclaw-analysis/src/auto-reply/reply/get-reply-directives.ts:97-165
 
-class CommandDetector {
-public:
-    // 命令类型
-    enum class CommandType {
-        None,
-        Slash,      // /command
-        Bang,       // !command
-        Inline      // 内联命令
-    };
+/// 消息中的内联指令
+struct MessageDirectives {
+    /// Verbose 级别 (来自 /verbose <level> 指令)
+    std::optional<react::VerboseLevel> verbose_level;
     
-    // 检测结果
-    struct DetectionResult {
-        CommandType type = CommandType::None;
-        std::string command;         // 命令名称 (例如: "status", "new")
-        std::string args;            // 命令参数
-        bool is_control_command = false;
-        bool needs_authorization = false;
-    };
+    /// Reasoning 级别 (来自 /reasoning <level> 指令)
+    std::optional<react::ReasoningLevel> reasoning_level;
     
-    // ✅ 对齐 OpenClaw: hasControlCommand
-    // 检测是否包含控制命令
-    static bool has_control_command(const std::string& text);
+    /// Thinking 级别 (来自 /think <level> 指令)
+    std::optional<react::ThinkingLevel> thinking_level;
     
-    // ✅ 对齐 OpenClaw: isControlCommandMessage
-    // 检测是否为控制命令消息
-    static bool is_control_command_message(const std::string& text);
+    /// 是否为纯指令消息 (没有其他内容)
+    bool is_directive_only = false;
     
-    // ✅ 对齐 OpenClaw: hasInlineCommandTokens
-    // 检测是否包含内联命令标记
-    static bool has_inline_command_tokens(const std::string& text);
-    
-    // ✅ 对齐 OpenClaw: shouldComputeCommandAuthorized
-    // 判断是否需要计算命令授权
-    static bool should_compute_command_authorized(
-        const std::string& text,
-        bool is_owner
-    );
-    
-    // ✅ 完整的命令检测 (增强版)
-    static DetectionResult detect_command(const std::string& text);
-    
-    // ✅ 检测是否为 owner-only 命令
-    static bool is_owner_only_command(const std::string& command);
-    
-private:
-    // 正则表达式 (对齐 OpenClaw)
-    
-    // ✅ 控制命令正则: /^\s*[!/]([a-z]+)/i
-    static std::regex control_command_regex_;
-    
-    // ✅ 内联命令正则: /[!/][a-z]/i
-    static std::regex inline_command_regex_;
-    
-    // ✅ owner-only 命令列表
-    static const std::vector<std::string> owner_only_commands_;
+    /// 原始消息文本 (移除指令后)
+    std::string text_without_directives;
 };
 
-// ═══════════════════════════════════════════════════════════════
-// ✅ 常用命令常量 (对齐 OpenClaw)
-// ═══════════════════════════════════════════════════════════════
-
-namespace commands {
-    constexpr const char* STATUS = "status";
-    constexpr const char* NEW = "new";
-    constexpr const char* RESET = "reset";
-    constexpr const char* HELP = "help";
-    constexpr const char* CONFIG = "config";
-    constexpr const char* LOGS = "logs";
-    constexpr const char* DEBUG = "debug";
-    constexpr const char* STOP = "stop";
-    constexpr const char* RESTART = "restart";
-} // namespace commands
+/// 命令检测器
+class CommandDetection {
+public:
+    /// 从消息文本中解析指令
+    /// @param text 原始消息文本
+    /// @return 解析出的指令
+    static MessageDirectives parse_directives(const std::string& text);
+    
+    /// 检测是否为纯指令消息 (只包含指令,没有其他内容)
+    /// @param text 原始消息文本
+    /// @return true 如果是纯指令消息
+    static bool is_directive_only_message(const std::string& text);
+    
+    /// 从文本中移除所有指令
+    /// @param text 原始消息文本
+    /// @return 移除指令后的文本
+    static std::string strip_directives(const std::string& text);
+    
+private:
+    // 正则表达式 (静态编译优化)
+    static const std::regex verbose_regex_;
+    static const std::regex reasoning_regex_;
+    static const std::regex thinking_regex_;
+};
 
 } // namespace auto_reply
 } // namespace hunterclaw

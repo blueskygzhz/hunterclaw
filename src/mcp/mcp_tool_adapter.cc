@@ -1,10 +1,12 @@
 #include "hunterclaw/mcp/mcp_tool_adapter.h"
+#include "hunterclaw/mcp/json_converter.h"
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <cctype>
 
 using json = nlohmann::json;
+using hunterclaw::mcp::converters::JsonConverter;
 
 namespace hunterclaw {
 namespace mcp {
@@ -16,31 +18,6 @@ namespace {
             logger = spdlog::stdout_logger_mt("mcp");
         }
         return logger;
-    }
-    
-    // 辅助函数: JsonValue -> nlohmann::json
-    json to_nlohmann_json(const core::JsonValue& jv) {
-        // 简化实现: 假设 JsonValue 包装的是 JSON 字符串
-        try {
-            // 如果 JsonValue 是字符串且看起来像 JSON, 解析它
-            if (jv.is_string()) {
-                std::string str = jv.as_string();
-                if (!str.empty() && (str[0] == '{' || str[0] == '[')) {
-                    return json::parse(str);
-                }
-            }
-            // 否则返回空对象
-            return json::object();
-        } catch (const std::exception& e) {
-            log()->warn("Failed to parse JsonValue as JSON: {}", e.what());
-            return json::object();
-        }
-    }
-    
-    // 辅助函数: nlohmann::json -> JsonValue
-    core::JsonValue to_json_value(const json& j) {
-        // 简化: 序列化为字符串
-        return core::JsonValue(j.dump());
     }
 }
 
@@ -91,22 +68,22 @@ tools::ToolResult McpToolAdapter::execute(const core::JsonValue& params) {
         );
     }
     
-    // 转换结果
+    // 转换结果 (对齐 OpenClaw 的结果处理)
     tools::ToolResult tool_result;
     tool_result.success = true;
     
-    // 处理结构化内容: 将 JsonValue 转换为 nlohmann::json
-    json structured_json = to_nlohmann_json(mcp_result.structured_content);
+    // 使用 JsonConverter 处理结构化内容
+    json structured_json = JsonConverter::to_nlohmann(mcp_result.structured_content);
     
     if (!structured_json.is_null() && !structured_json.empty()) {
         // 如果是对象/数组,返回 JSON
         if (structured_json.is_object() || structured_json.is_array()) {
             tools::ToolResultContent content;
             content.type = tools::ToolResultContent::Type::Json;
-            content.text = structured_json.dump(2);
+            content.text = JsonConverter::stringify(structured_json, 2);  // 美化输出
             
             tool_result.content.push_back(content);
-            tool_result.details = to_json_value(structured_json);
+            tool_result.details = JsonConverter::from_nlohmann(structured_json);
             
         } else if (structured_json.is_string()) {
             // 字符串内容
@@ -144,8 +121,8 @@ tools::Tool::Schema McpToolAdapter::convert_json_schema(
     Schema schema;
     schema.type = "object";
     
-    // 转换 JsonValue 到 nlohmann::json
-    json j = to_nlohmann_json(json_schema);
+    // 使用 JsonConverter 进行转换 (对齐 OpenClaw)
+    json j = JsonConverter::to_nlohmann(json_schema);
     
     if (j.is_null() || !j.is_object()) {
         return schema;
@@ -156,10 +133,10 @@ tools::Tool::Schema McpToolAdapter::convert_json_schema(
         schema.description = j["description"].get<std::string>();
     }
     
-    // 提取 properties
+    // 提取 properties (完整转换)
     if (j.contains("properties") && j["properties"].is_object()) {
         for (auto& [key, prop] : j["properties"].items()) {
-            schema.properties[key] = to_json_value(prop);
+            schema.properties[key] = JsonConverter::from_nlohmann(prop);
         }
     }
     

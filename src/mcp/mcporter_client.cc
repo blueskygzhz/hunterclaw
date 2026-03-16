@@ -1,4 +1,5 @@
 #include "hunterclaw/mcp/mcporter_client.h"
+#include "hunterclaw/mcp/json_converter.h"
 #include "hunterclaw/core/subprocess.h"
 #include "hunterclaw/core/utils.h"
 #include <spdlog/spdlog.h>
@@ -11,6 +12,7 @@
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
+using hunterclaw::mcp::converters::JsonConverter;
 
 namespace hunterclaw {
 namespace mcp {
@@ -324,18 +326,9 @@ public:
         
         auto cmd = resolve_mcporter_command();
         
-        // 构造参数: JsonValue 已经是字符串包装类型,尝试解析
-        json args_json;
-        try {
-            // 假设 JsonValue 存储的是 JSON 字符串
-            // 简化实现: 直接传递空对象
-            args_json = json::object();
-            // TODO: 实现 JsonValue -> nlohmann::json 转换
-        } catch (const std::exception& e) {
-            args_json = json::object();
-        }
-        
-        std::string args_str = args_json.dump();
+        // 使用 JsonConverter 转换参数 (对齐 OpenClaw)
+        json args_json = JsonConverter::to_nlohmann(args);
+        std::string args_str = JsonConverter::stringify(args_json, -1);  // 紧凑格式
         
         int timeout = config_.timeout_ms;
         
@@ -364,15 +357,21 @@ public:
             return core::Result<McporterResult>::Ok(mcp_result);
         }
         
-        // 解析结果
+        // 解析结果 (对齐 OpenClaw)
         try {
-            auto parsed = json::parse(result.stdout_output);
+            auto parsed = JsonConverter::parse_safe(result.stdout_output);
+            
+            if (parsed.is_null()) {
+                mcp_result.success = false;
+                mcp_result.error = "Failed to parse mcporter output as JSON";
+                return core::Result<McporterResult>::Ok(mcp_result);
+            }
             
             // mcporter 返回格式: { structuredContent: {...}, ... }
             if (parsed.is_object() && parsed.contains("structuredContent")) {
-                mcp_result.structured_content = core::JsonValue(parsed["structuredContent"].dump());
+                mcp_result.structured_content = JsonConverter::from_nlohmann(parsed["structuredContent"]);
             } else {
-                mcp_result.structured_content = core::JsonValue(parsed.dump());
+                mcp_result.structured_content = JsonConverter::from_nlohmann(parsed);
             }
             
             mcp_result.success = true;
@@ -433,8 +432,15 @@ public:
         }
         
         try {
-            auto j = json::parse(result.stdout_output);
-            return core::Result<core::JsonValue>::Ok(core::JsonValue(j.dump()));
+            auto j = JsonConverter::parse_safe(result.stdout_output);
+            
+            if (j.is_null()) {
+                return core::Result<core::JsonValue>::Err(
+                    "Failed to parse config JSON"
+                );
+            }
+            
+            return core::Result<core::JsonValue>::Ok(JsonConverter::from_nlohmann(j));
         } catch (const std::exception& e) {
             return core::Result<core::JsonValue>::Err(
                 "Failed to parse config: " + std::string(e.what())
@@ -534,7 +540,7 @@ public:
         }
         
         return core::Result<std::string>::Ok(
-            std::regex_replace(result.stdout_output, std::regex("^\s+|\s+$"), "")
+            std::regex_replace(result.stdout_output, std::regex(R"(^\s+|\s+$)"), "")
         );
     }
 
