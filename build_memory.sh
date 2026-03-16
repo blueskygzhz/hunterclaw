@@ -34,6 +34,8 @@ SOURCES=(
     "src/memory/compaction_manager.cc"
     "src/memory/compaction_hooks.cc"
     "src/memory/memory_manager.cc"
+    "src/memory/memory_manager_core.cc"
+    "src/memory/memory_provider_adapter.cc"
     "src/memory/session_memory_provider.cc"
 )
 

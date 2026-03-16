@@ -1,7 +1,5 @@
 #include "hunterclaw/memory/memory_provider_adapter.h"
 #include "hunterclaw/memory/types.h"
-#include "hunterclaw/memory/manager_search.h"
-#include <spdlog/spdlog.h>
 #include <chrono>
 
 namespace hunterclaw {
@@ -13,7 +11,7 @@ MemoryProviderAdapter::MemoryProviderAdapter(
     if (!memory_mgr_) {
         throw std::invalid_argument("MemoryManager cannot be null");
     }
-    spdlog::debug("[MemoryProviderAdapter] Created adapter for MemoryManager");
+    // TODO: Add logging
 }
 
 core::Result<std::vector<MemoryEntry>> MemoryProviderAdapter::search(
@@ -33,31 +31,33 @@ core::Result<std::vector<MemoryEntry>> MemoryProviderAdapter::search(
         opts.max_results = limit;
         opts.min_score = 0.0;  // 不过滤相似度 (由调用者决定)
         
-        // 调用 MemoryManager 的 search (返回 SearchRowResult)
-        auto search_results = memory_mgr_->search(query, opts);
+        // 调用 MemoryManager 的 search_memories (返回 Memory[])
+        auto result = memory_mgr_->search_memories(query, opts);
         
-        // 转换 SearchRowResult -> MemoryEntry
+        if (!result.is_ok()) {
+            return core::Result<std::vector<MemoryEntry>>::Err(result.error);
+        }
+        
+        // 转换 Memory -> MemoryEntry
         std::vector<MemoryEntry> entries;
-        entries.reserve(search_results.size());
+        entries.reserve(result.value.size());
         
-        for (const auto& result : search_results) {
+        for (const auto& memory : result.value) {
             MemoryEntry entry;
-            entry.id = result.id;
-            entry.content = result.snippet;  // 使用 snippet 作为 content
-            entry.file_path = result.path;
-            entry.timestamp = 0;  // SearchRowResult 没有 timestamp,使用当前时间
+            entry.id = memory.id;
+            entry.content = memory.content;
+            entry.file_path = memory.metadata.count("file_path") ? memory.metadata.at("file_path") : "";
+            entry.timestamp = memory.created_at;
             
             entries.push_back(entry);
         }
         
-        spdlog::debug("[MemoryProviderAdapter] Search returned {} results for query: {}",
-                    entries.size(), query.substr(0, 50));
-        
+        // TODO: Add logging
         return core::Result<std::vector<MemoryEntry>>::Ok(entries);
         
     } catch (const std::exception& e) {
         std::string error_msg = "Search failed: " + std::string(e.what());
-        spdlog::error("[MemoryProviderAdapter] {}", error_msg);
+        // TODO: Add logging
         return core::Result<std::vector<MemoryEntry>>::Err(error_msg);
     }
 }
@@ -74,18 +74,12 @@ core::Result<void> MemoryProviderAdapter::add_memory(const MemoryEntry& entry) {
         // ✅ 使用 MemoryManager 的 add_entry() 方法
         auto result = memory_mgr_->add_entry(entry);
         
-        if (result.is_ok()) {
-            spdlog::debug("[MemoryProviderAdapter] Added memory: id={}, content_len={}",
-                        entry.id, entry.content.length());
-        } else {
-            spdlog::error("[MemoryProviderAdapter] Failed to add memory: {}", result.error);
-        }
-        
+        // TODO: Add logging
         return result;
         
     } catch (const std::exception& e) {
         std::string error_msg = "Add memory failed: " + std::string(e.what());
-        spdlog::error("[MemoryProviderAdapter] {}", error_msg);
+        // TODO: Add logging
         return core::Result<void>::Err(error_msg);
     }
 }
@@ -102,17 +96,12 @@ core::Result<void> MemoryProviderAdapter::reindex() {
         // ✅ 使用 MemoryManager 的 reindex() 方法
         auto result = memory_mgr_->reindex();
         
-        if (result.is_ok()) {
-            spdlog::info("[MemoryProviderAdapter] Reindex completed successfully");
-        } else {
-            spdlog::error("[MemoryProviderAdapter] Reindex failed: {}", result.error);
-        }
-        
+        // TODO: Add logging
         return result;
         
     } catch (const std::exception& e) {
         std::string error_msg = "Reindex failed: " + std::string(e.what());
-        spdlog::error("[MemoryProviderAdapter] {}", error_msg);
+        // TODO: Add logging
         return core::Result<void>::Err(error_msg);
     }
 }

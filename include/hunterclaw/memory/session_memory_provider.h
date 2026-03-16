@@ -43,7 +43,7 @@ struct SessionMessage {
 // 参考: src/memory/builtin-manager.ts
 // ========================================
 
-class SessionMemoryProvider : public MemoryProvider {
+class SessionMemoryProvider {
 public:
     SessionMemoryProvider(
         const std::string& provider_id,
@@ -58,30 +58,30 @@ public:
     // ========================================
     
     // Provider identification
-    std::string provider_id() const override { return provider_id_; }
-    std::string provider_name() const override { return "SessionMemoryProvider"; }
-    std::string provider_version() const override { return "1.0.0"; }
+    std::string provider_id() const { return provider_id_; }
+    std::string provider_name() const { return "SessionMemoryProvider"; }
+    std::string provider_version() const { return "1.0.0"; }
     
     // Memory CRUD operations
     core::Result<std::string> add_memory(
         const std::string& content,
         const std::map<std::string, std::string>& metadata = {}
-    ) override;
+    );
     
     core::Result<std::vector<MemorySearchResult>> search_memories(
         const std::string& query,
         const SearchOptions& options = {}
-    ) override;
+    );
     
-    core::Result<bool> remove_memory(const std::string& id) override;
+    core::Result<bool> remove_memory(const std::string& id);
     
     core::Result<bool> update_memory(
         const std::string& id,
         const std::string& content,
         const std::map<std::string, std::string>& metadata = {}
-    ) override;
+    );
     
-    core::Result<bool> clear_memories() override;
+    core::Result<bool> clear_memories();
     
     // ========================================
     // Session Memory 专属接口 (对齐 OpenClaw)

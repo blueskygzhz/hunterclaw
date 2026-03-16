@@ -1,6 +1,6 @@
 #pragma once
 
-#include "hunterclaw/memory/memory_provider.h"
+#include "hunterclaw/memory/provider.h"  // Use full provider interface
 #include "hunterclaw/memory/memory_manager.h"
 #include "hunterclaw/core/result.h"
 #include <memory>
@@ -40,7 +40,7 @@ namespace memory {
  * 2. 解耦: MemoryManager 的复杂功能 (compaction, session) 隐藏在适配器后
  * 3. 兼容性: 未来可以切换不同的 Memory 实现 (如 QMD, remote memory)
  */
-class MemoryProviderAdapter : public MemoryProvider {
+class MemoryProviderAdapter {
 public:
     /**
      * 构造函数
@@ -48,7 +48,7 @@ public:
      */
     explicit MemoryProviderAdapter(std::shared_ptr<MemoryManager> memory_mgr);
     
-    ~MemoryProviderAdapter() override = default;
+    ~MemoryProviderAdapter() = default;
     
     // ========================================
     // MemoryProvider 接口实现
@@ -66,7 +66,7 @@ public:
     core::Result<std::vector<MemoryEntry>> search(
         const std::string& query,
         int limit = 10
-    ) override;
+    );
     
     /**
      * 添加 memory
@@ -76,7 +76,7 @@ public:
      * @param entry Memory 条目 (id, content, file_path, timestamp)
      * @return 成功/失败
      */
-    core::Result<void> add_memory(const MemoryEntry& entry) override;
+    core::Result<void> add_memory(const MemoryEntry& entry);
     
     /**
      * 重建索引
@@ -85,7 +85,7 @@ public:
      * 
      * @return 成功/失败
      */
-    core::Result<void> reindex() override;
+    core::Result<void> reindex();
     
     // ========================================
     // 扩展方法 (可选)

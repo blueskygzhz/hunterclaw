@@ -9,6 +9,9 @@
 namespace hunterclaw {
 namespace memory {
 
+// Forward declaration
+class EmbeddingProvider;
+
 /**
  * MemoryManager - 集成 compaction, session memory, embedding providers
  * 
@@ -36,6 +39,9 @@ public:
         std::string embedding_model;
         std::string embedding_base_url;
         std::string embedding_api_key;
+        
+        // Workspace 配置 (对齐 OpenClaw)
+        std::string workspace_dir;  // 工作空间根目录
     };
     
     explicit MemoryManager(
