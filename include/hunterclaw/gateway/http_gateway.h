@@ -233,8 +233,8 @@ private:
     
     MiddlewareChain middleware_chain_;
     
-    // OpenAI API adapter (initialized when LLM client is set)
-    std::shared_ptr<class OpenAIAdapter> openai_adapter_;
+    // OpenAI API compatibility layer (initialized when LLM client is set)
+    std::shared_ptr<http::OpenAICompat> openai_compat_;
 };
 
 // ============================================================================

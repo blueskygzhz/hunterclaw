@@ -68,6 +68,7 @@ cc_library(
     srcs = glob([
         "gateway/*.cc",
         "gateway/methods/*.cc",
+        "gateway/http/*.cc",  # ✅ OpenAI 兼容层
     ]),
     deps = [
         "//:hunterclaw_headers",

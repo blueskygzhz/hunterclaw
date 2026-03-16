@@ -1,5 +1,5 @@
 #include "hunterclaw/gateway/http_gateway.h"
-#include "hunterclaw/gateway/openai_adapter.h"
+#include "hunterclaw/gateway/http/openai_compat.h"
 #include "hunterclaw/gateway/session_device_id.h"  // ✅ Device ID 工具
 #include "hunterclaw/core/utils.h"
 #include <httplib.h>
@@ -258,8 +258,8 @@ bool HttpGateway::is_running() const {
 }
 
 void HttpGateway::set_llm_client(std::shared_ptr<llm::LLMClient> llm_client) {
-    openai_adapter_ = create_openai_adapter(llm_client);
-    log_info("[HTTP Gateway] OpenAI API adapter initialized");
+    openai_compat_ = http::create_openai_compat(llm_client);
+    log_info("[HTTP Gateway] OpenAI API compatibility layer initialized");
 }
 
 void HttpGateway::register_route(
@@ -663,7 +663,7 @@ void HttpGateway::handle_chat_completions(const httplib::Request& req, httplib::
             
         } else {
             // Non-streaming response
-            auto result = openai_adapter_->create_chat_completion(request);
+            auto result = openai_compat_->create_chat_completion(request);
             
             if (result.is_ok()) {
                 send_json(res, 200, result.value.to_json());
@@ -678,14 +678,14 @@ void HttpGateway::handle_chat_completions(const httplib::Request& req, httplib::
 }
 
 void HttpGateway::handle_list_models(const httplib::Request& req, httplib::Response& res) {
-    if (!openai_adapter_) {
+    if (!openai_compat_) {
         send_openai_error(res, 503, 
             "LLM client not configured",
             "server_error", "llm_not_configured");
         return;
     }
     
-    auto models = openai_adapter_->list_models();
+    auto models = openai_compat_->list_models();
     
     json::array_t models_json;
     for (const auto& model : models) {

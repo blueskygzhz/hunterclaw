@@ -10,6 +10,7 @@
 
 namespace hunterclaw {
 namespace gateway {
+namespace http {
 
 // ============================================================================
 // OpenAI API Request/Response Types (100% compatible)
@@ -17,7 +18,7 @@ namespace gateway {
 
 /// Chat Message
 struct ChatMessage {
-    std::string role;       // system, user, assistant, function
+    std::string role;       // system, user, assistant, function, tool
     std::string content;
     std::optional<std::string> name;
     
@@ -129,16 +130,29 @@ struct ModelInfo {
 };
 
 // ============================================================================
-// OpenAI API Adapter
+// OpenAI Compatibility Layer (对齐 OpenClaw 架构)
 // ============================================================================
 
-class OpenAIAdapter {
+/**
+ * OpenAI 兼容性层
+ * 
+ * 职责:
+ * - OpenAI 协议 <-> HunterClaw 内部协议转换
+ * - 数据格式转换 (不包含 HTTP 处理)
+ * - Token 估算和 Usage 统计
+ * 
+ * HTTP 层由 HttpGateway 处理:
+ * - 路由、认证、Session 管理
+ * - Request/Response 解析
+ * - SSE 流式传输
+ */
+class OpenAICompat {
 public:
     using StreamCallback = std::function<void(const ChatCompletionChunk&)>;
     using ErrorCallback = std::function<void(const std::string& error)>;
     
-    explicit OpenAIAdapter(std::shared_ptr<llm::LLMClient> llm_client);
-    ~OpenAIAdapter() = default;
+    explicit OpenAICompat(std::shared_ptr<llm::LLMClient> llm_client);
+    ~OpenAICompat() = default;
     
     /// Handle non-streaming chat completion
     core::Result<ChatCompletionResponse> create_chat_completion(
@@ -183,9 +197,10 @@ private:
 // Factory Function
 // ============================================================================
 
-std::shared_ptr<OpenAIAdapter> create_openai_adapter(
+std::shared_ptr<OpenAICompat> create_openai_compat(
     std::shared_ptr<llm::LLMClient> llm_client
 );
 
+} // namespace http
 } // namespace gateway
 } // namespace hunterclaw

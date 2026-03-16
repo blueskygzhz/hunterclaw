@@ -1,4 +1,4 @@
-#include "hunterclaw/gateway/openai_adapter.h"
+#include "hunterclaw/gateway/http/openai_compat.h"
 #include "hunterclaw/core/utils.h"
 #include <spdlog/spdlog.h>
 #include <ctime>
@@ -8,6 +8,7 @@ using json = nlohmann::json;
 
 namespace hunterclaw {
 namespace gateway {
+namespace http {
 
 // Helper for logging
 namespace {
@@ -219,10 +220,10 @@ json ModelInfo::to_json() const {
 }
 
 // ============================================================================
-// OpenAIAdapter Implementation
+// OpenAICompat Implementation
 // ============================================================================
 
-OpenAIAdapter::OpenAIAdapter(std::shared_ptr<llm::LLMClient> llm_client)
+OpenAICompat::OpenAICompat(std::shared_ptr<llm::LLMClient> llm_client)
     : llm_client_(llm_client)
 {
     // Setup default model mappings
@@ -239,7 +240,7 @@ OpenAIAdapter::OpenAIAdapter(std::shared_ptr<llm::LLMClient> llm_client)
     };
 }
 
-core::Result<ChatCompletionResponse> OpenAIAdapter::create_chat_completion(
+core::Result<ChatCompletionResponse> OpenAICompat::create_chat_completion(
     const ChatCompletionRequest& request
 ) {
     try {
@@ -260,12 +261,12 @@ core::Result<ChatCompletionResponse> OpenAIAdapter::create_chat_completion(
         
     } catch (const std::exception& e) {
         return core::Result<ChatCompletionResponse>::Err(
-            std::string("OpenAI adapter error: ") + e.what()
+            std::string("OpenAI compat error: ") + e.what()
         );
     }
 }
 
-core::Result<bool> OpenAIAdapter::create_chat_completion_stream(
+core::Result<bool> OpenAICompat::create_chat_completion_stream(
     const ChatCompletionRequest& request,
     StreamCallback on_chunk,
     ErrorCallback on_error
@@ -313,7 +314,7 @@ core::Result<bool> OpenAIAdapter::create_chat_completion_stream(
     }
 }
 
-std::vector<ModelInfo> OpenAIAdapter::list_models() const {
+std::vector<ModelInfo> OpenAICompat::list_models() const {
     std::vector<ModelInfo> models;
     
     int64_t now = std::time(nullptr);
@@ -333,7 +334,7 @@ std::vector<ModelInfo> OpenAIAdapter::list_models() const {
 
 // ========== Private Helper Methods ==========
 
-std::vector<llm::LLMMessage> OpenAIAdapter::convert_messages(
+std::vector<llm::LLMMessage> OpenAICompat::convert_messages(
     const std::vector<ChatMessage>& openai_messages
 ) {
     std::vector<llm::LLMMessage> llm_messages;
@@ -353,7 +354,7 @@ std::vector<llm::LLMMessage> OpenAIAdapter::convert_messages(
     return llm_messages;
 }
 
-ChatCompletionResponse OpenAIAdapter::convert_response(
+ChatCompletionResponse OpenAICompat::convert_response(
     const std::string& llm_response,
     const ChatCompletionRequest& original_request
 ) {
@@ -387,13 +388,13 @@ ChatCompletionResponse OpenAIAdapter::convert_response(
     return response;
 }
 
-std::string OpenAIAdapter::generate_completion_id() const {
+std::string OpenAICompat::generate_completion_id() const {
     // Generate ID like "chatcmpl-abc123xyz"
     std::string uuid = core::utils::generate_uuid();
     return "chatcmpl-" + uuid.substr(0, 8);
 }
 
-int OpenAIAdapter::estimate_tokens(const std::string& text) const {
+int OpenAICompat::estimate_tokens(const std::string& text) const {
     // Rough estimate: ~4 characters per token for English
     return static_cast<int>(text.length() / 4);
 }
@@ -402,11 +403,12 @@ int OpenAIAdapter::estimate_tokens(const std::string& text) const {
 // Factory Function
 // ============================================================================
 
-std::shared_ptr<OpenAIAdapter> create_openai_adapter(
+std::shared_ptr<OpenAICompat> create_openai_compat(
     std::shared_ptr<llm::LLMClient> llm_client
 ) {
-    return std::make_shared<OpenAIAdapter>(llm_client);
+    return std::make_shared<OpenAICompat>(llm_client);
 }
 
+} // namespace http
 } // namespace gateway
 } // namespace hunterclaw
