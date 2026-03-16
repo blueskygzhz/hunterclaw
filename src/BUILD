@@ -34,6 +34,33 @@ cc_library(
 )
 
 # ============================================================================
+# LLM Library - LLM Client and Provider Abstraction
+# ============================================================================
+cc_library(
+    name = "hunterclaw_llm",
+    srcs = glob(["llm/*.cc", "llm/providers/*.cc"]),
+    deps = [
+        "//:hunterclaw_headers",
+        "@nlohmann_json//:json",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+    copts = [
+        "-std=c++17",
+        "-Wall",
+        "-Wextra",
+        "-I/usr/include/jsoncpp",
+    ],
+    linkopts = [
+        "-lpthread",
+        "-lcurl",
+        "-ljsoncpp",
+    ],
+    linkstatic = False,
+    visibility = ["//visibility:public"],
+)
+
+# ============================================================================
 # Core Library
 # ============================================================================
 cc_library(

@@ -1,10 +1,20 @@
 #include "hunterclaw/llm/provider.h"
 #include "hunterclaw/core/logger.h"
+#include "hunterclaw/core/result.h"
 #include <curl/curl.h>
+#include <json/json.h>
+#include <nlohmann/json.hpp>
 #include <sstream>
 
 namespace hunterclaw {
 namespace llm {
+
+// HTTP 响应结构体
+struct HttpResponse {
+    std::string body;
+    long status_code = 0;
+    std::map<std::string, std::string> headers;
+};
 
 extern core::Result<HttpResponse> http_post(
     const std::string& url,
@@ -19,32 +29,32 @@ extern core::Result<HttpResponse> http_post(
 class OllamaProvider : public Provider {
 public:
     OllamaProvider(const ProviderConfig& config) : config_(config) {
-        HUNTERCLAW_LOG_INFO("OllamaProvider initialized: model={}, base_url={}", 
-            config.model, config.base_url);
+        // Logger initialized
+        (void)config;
     }
-    
+
     core::Result<GenerateResponse> generate(const GenerateOptions& options) override {
         auto request_json = build_request_json(options);
-        
+
         std::map<std::string, std::string> headers = {
             {"Content-Type", "application/json"}
         };
-        
+
         std::string url = config_.base_url + "/api/chat";
-        
+
         auto http_result = http_post(url, request_json, headers);
         if (!http_result.is_ok()) {
-            return core::Error(http_result.error().message());
+            return core::Result<GenerateResponse>::Err(http_result.error);
         }
-        
-        return parse_response(http_result.value());
+
+        return parse_response(http_result.value);
     }
     
     core::Result<GenerateResponse> generate_stream(
         const GenerateOptions& options,
         StreamCallback callback
     ) override {
-        return core::Error("Streaming not yet implemented for Ollama");
+        return core::Result<GenerateResponse>::Err("Streaming not yet implemented for Ollama");
     }
     
     int estimate_tokens(const std::string& text) const override {
@@ -60,34 +70,34 @@ public:
     // Ollama 特有功能: 列出本地模型
     core::Result<std::vector<std::string>> list_models() {
         std::string url = config_.base_url + "/api/tags";
-        
+
         CURL* curl = curl_easy_init();
         if (!curl) {
-            return core::Error("Failed to initialize CURL");
+            return core::Result<std::vector<std::string>>::Err("Failed to initialize CURL");
         }
-        
+
         std::string response_body;
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_body);
-        
+
         CURLcode res = curl_easy_perform(curl);
         curl_easy_cleanup(curl);
-        
+
         if (res != CURLE_OK) {
-            return core::Error(std::string("CURL error: ") + curl_easy_strerror(res));
+            return core::Result<std::vector<std::string>>::Err(std::string("CURL error: ") + curl_easy_strerror(res));
         }
-        
+
         // Parse response
         Json::CharReaderBuilder reader_builder;
         Json::Value root;
         std::string errs;
-        
+
         std::istringstream stream(response_body);
         if (!Json::parseFromStream(reader_builder, stream, &root, &errs)) {
-            return core::Error("Failed to parse JSON: " + errs);
+            return core::Result<std::vector<std::string>>::Err("Failed to parse JSON: " + errs);
         }
-        
+
         std::vector<std::string> models;
         const auto& models_json = root["models"];
         if (models_json.isArray()) {
@@ -95,8 +105,8 @@ public:
                 models.push_back(model["name"].asString());
             }
         }
-        
-        return models;
+
+        return core::Result<std::vector<std::string>>::Ok(models);
     }
     
 private:
@@ -154,7 +164,17 @@ private:
                 tool_json["type"] = "function";
                 tool_json["function"]["name"] = tool.name;
                 tool_json["function"]["description"] = tool.description;
-                tool_json["function"]["parameters"] = tool.input_schema.to_json();
+                
+                // Convert nlohmann::json to Json::Value
+                nlohmann::json schema_nlohmann = tool.input_schema.to_json();
+                std::string schema_str = schema_nlohmann.dump();
+                Json::CharReaderBuilder reader;
+                Json::Value schema_jsoncpp;
+                std::string errs;
+                std::istringstream schema_stream(schema_str);
+                Json::parseFromStream(reader, schema_stream, &schema_jsoncpp, &errs);
+                
+                tool_json["function"]["parameters"] = schema_jsoncpp;
                 tools_json.append(tool_json);
             }
             root["tools"] = tools_json;
@@ -171,7 +191,7 @@ private:
         
         std::istringstream stream(http_resp.body);
         if (!Json::parseFromStream(reader_builder, stream, &root, &errs)) {
-            return core::Error("Failed to parse JSON: " + errs);
+            return core::Result<GenerateResponse>::Err("Failed to parse JSON: " + errs);
         }
         
         GenerateResponse response;
@@ -189,14 +209,15 @@ private:
                     tool_call.name = call["function"]["name"].asString();
                     
                     std::string args_str = call["function"]["arguments"].asString();
-                    tool_call.input = core::JsonValue::parse(args_str);
+                    nlohmann::json args_nlohmann = nlohmann::json::parse(args_str);
+                    tool_call.input = core::JsonValue(args_nlohmann);
                     
                     response.tool_calls.push_back(tool_call);
                 }
             }
         }
         
-        return response;
+        return core::Result<GenerateResponse>::Ok(response);
     }
     
     static size_t write_callback(char* ptr, size_t size, size_t nmemb, void* userdata) {
@@ -209,7 +230,8 @@ private:
 };
 
 core::Result<Provider::Ptr> create_ollama_provider(const ProviderConfig& config) {
-    return std::make_shared<OllamaProvider>(config);
+    Provider::Ptr provider = std::make_shared<OllamaProvider>(config);
+    return core::Result<Provider::Ptr>::Ok(provider);
 }
 
 } // namespace llm
