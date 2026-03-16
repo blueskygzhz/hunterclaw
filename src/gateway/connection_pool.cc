@@ -1,13 +1,14 @@
 #include "hunterclaw/gateway/connection_pool.h"
 #include <spdlog/spdlog.h>
 #include <algorithm>
-#include <shared_mutex>
+
+using json = nlohmann::json;
 
 namespace hunterclaw {
 namespace gateway {
 
 // ============================================================================
-// ConnectionPool Implementation
+// Singleton
 // ============================================================================
 
 ConnectionPool& ConnectionPool::instance() {
@@ -16,182 +17,120 @@ ConnectionPool& ConnectionPool::instance() {
 }
 
 ConnectionPool::ConnectionPool() 
-    : next_subscription_id_(1),
-      next_connection_id_(1) {
+    : next_subscription_id_(1) {
 }
 
 ConnectionPool::~ConnectionPool() {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
-    connections_.clear();
+    std::lock_guard<std::mutex> lock(mutex_);
+    clients_.clear();
     subscriptions_.clear();
 }
 
-uint64_t ConnectionPool::register_connection(
-    const std::string& session_id,
-    const std::string& channel_id,
-    SendCallback send_callback
-) {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+// ============================================================================
+// Client Management
+// ============================================================================
+
+void ConnectionPool::add_client(std::shared_ptr<WsClient> client) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    clients_.insert(client);
     
-    uint64_t conn_id = next_connection_id_++;
-    
-    Connection conn;
-    conn.id = conn_id;
-    conn.session_id = session_id;
-    conn.channel_id = channel_id;
-    conn.send_callback = std::move(send_callback);
-    conn.connected_at = std::chrono::steady_clock::now();
-    conn.last_sent_at = conn.connected_at;
-    
-    connections_[conn_id] = std::move(conn);
-    
-    // 更新索引
-    session_connections_[session_id].insert(conn_id);
-    if (!channel_id.empty()) {
-        channel_connections_[channel_id].insert(conn_id);
+    auto logger = spdlog::get("console");
+    if (logger) {
+        logger->debug("[ConnectionPool] Added client: {} (total: {})", 
+                     client->conn_id, clients_.size());
     }
-    
-    spdlog::debug("[ConnectionPool] Registered connection {} (session: {}, channel: {})",
-        conn_id, session_id, channel_id);
-    
-    return conn_id;
 }
 
-void ConnectionPool::unregister_connection(uint64_t conn_id) {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+void ConnectionPool::remove_client(const std::string& conn_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
     
-    auto it = connections_.find(conn_id);
-    if (it == connections_.end()) {
-        return;
-    }
+    auto it = std::find_if(clients_.begin(), clients_.end(),
+        [&conn_id](const auto& client) { return client->conn_id == conn_id; });
     
-    const auto& conn = it->second;
-    
-    // 移除索引
-    session_connections_[conn.session_id].erase(conn_id);
-    if (session_connections_[conn.session_id].empty()) {
-        session_connections_.erase(conn.session_id);
-    }
-    
-    if (!conn.channel_id.empty()) {
-        channel_connections_[conn.channel_id].erase(conn_id);
-        if (channel_connections_[conn.channel_id].empty()) {
-            channel_connections_.erase(conn.channel_id);
+    if (it != clients_.end()) {
+        clients_.erase(it);
+        
+        auto logger = spdlog::get("console");
+        if (logger) {
+            logger->debug("[ConnectionPool] Removed client: {} (remaining: {})", 
+                         conn_id, clients_.size());
         }
     }
-    
-    spdlog::debug("[ConnectionPool] Unregistered connection {} (session: {})",
-        conn_id, conn.session_id);
-    
-    connections_.erase(it);
 }
+
+std::shared_ptr<WsClient> ConnectionPool::get_client(const std::string& conn_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    auto it = std::find_if(clients_.begin(), clients_.end(),
+        [&conn_id](const auto& client) { return client->conn_id == conn_id; });
+    
+    return (it != clients_.end()) ? *it : nullptr;
+}
+
+std::vector<std::shared_ptr<WsClient>> ConnectionPool::get_all_clients() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return std::vector<std::shared_ptr<WsClient>>(clients_.begin(), clients_.end());
+}
+
+size_t ConnectionPool::client_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return clients_.size();
+}
+
+// ============================================================================
+// Broadcasting
+// ============================================================================
 
 void ConnectionPool::broadcast(
     const std::string& event,
     const json& payload,
-    const BroadcastOptions& options
+    const BroadcastOptions& opts
 ) {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
-    
-    auto now = std::chrono::steady_clock::now();
-    
-    // 收集目标连接
-    std::vector<uint64_t> target_conn_ids;
-    
-    if (!options.target_sessions.empty()) {
-        // 仅发送到指定 session
-        for (const auto& session_id : options.target_sessions) {
-            auto it = session_connections_.find(session_id);
-            if (it != session_connections_.end()) {
-                for (uint64_t conn_id : it->second) {
-                    target_conn_ids.push_back(conn_id);
-                }
-            }
-        }
-    } else if (!options.target_channels.empty()) {
-        // 仅发送到指定 channel
-        for (const auto& channel_id : options.target_channels) {
-            auto it = channel_connections_.find(channel_id);
-            if (it != channel_connections_.end()) {
-                for (uint64_t conn_id : it->second) {
-                    target_conn_ids.push_back(conn_id);
-                }
-            }
-        }
-    } else {
-        // 发送到所有连接
-        for (const auto& [conn_id, _] : connections_) {
-            target_conn_ids.push_back(conn_id);
-        }
-    }
-    
-    // 发送消息
-    size_t sent_count = 0;
-    size_t dropped_count = 0;
-    
-    for (uint64_t conn_id : target_conn_ids) {
-        auto conn_it = connections_.find(conn_id);
-        if (conn_it == connections_.end()) {
-            continue;
-        }
-        
-        auto& conn = conn_it->second;
-        
-        // 慢速客户端检测
-        if (options.drop_if_slow) {
-            auto time_since_last_send = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - conn.last_sent_at
-            ).count();
-            
-            if (time_since_last_send > options.slow_threshold_ms) {
-                spdlog::warn("[ConnectionPool] Dropping message to slow connection {} "
-                    "({}ms since last send)", conn_id, time_since_last_send);
-                dropped_count++;
-                continue;
-            }
-        }
-        
-        // 发送消息
-        try {
-            conn.send_callback(event, payload);
-            conn.last_sent_at = now;
-            conn.messages_sent++;
-            sent_count++;
-        } catch (const std::exception& e) {
-            spdlog::error("[ConnectionPool] Failed to send to connection {}: {}",
-                conn_id, e.what());
-        }
-    }
-    
-    spdlog::debug("[ConnectionPool] Broadcast '{}': sent={}, dropped={}, targets={}",
-        event, sent_count, dropped_count, target_conn_ids.size());
-    
-    // 触发订阅者
-    lock.unlock();
-    notify_subscribers(event, payload);
+    broadcast_internal(event, payload, opts, nullptr, nullptr);
 }
+
+void ConnectionPool::broadcast_to(
+    const std::string& event,
+    const json& payload,
+    const std::set<std::string>& conn_ids,
+    const BroadcastOptions& opts
+) {
+    broadcast_internal(event, payload, opts, &conn_ids, nullptr);
+}
+
+void ConnectionPool::broadcast_if(
+    const std::string& event,
+    const json& payload,
+    std::function<bool(const WsClient&)> filter,
+    const BroadcastOptions& opts
+) {
+    broadcast_internal(event, payload, opts, nullptr, filter);
+}
+
+// ============================================================================
+// Event Subscription
+// ============================================================================
 
 uint64_t ConnectionPool::subscribe(
     const std::string& event_pattern,
     EventCallback callback,
     void* owner
 ) {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(mutex_);
     
     uint64_t sub_id = next_subscription_id_++;
     
-    Subscription sub;
-    sub.id = sub_id;
+    EventSubscription sub;
     sub.event_pattern = event_pattern;
     sub.callback = std::move(callback);
     sub.owner = owner;
-    sub.created_at = std::chrono::steady_clock::now();
     
     subscriptions_[sub_id] = std::move(sub);
     
-    auto logger = spdlog::get("connection_pool");
+    auto logger = spdlog::get("console");
     if (logger) {
-        logger->debug("[ConnectionPool] Subscribed to '{}' (id: {})", event_pattern, sub_id);
+        logger->debug("[ConnectionPool] Subscribed to event pattern: {} (sub_id: {})", 
+                     event_pattern, sub_id);
     }
     
     return sub_id;
@@ -202,35 +141,136 @@ void ConnectionPool::unsubscribe(uint64_t subscription_id) {
     
     auto it = subscriptions_.find(subscription_id);
     if (it != subscriptions_.end()) {
-        auto logger = spdlog::get("connection_pool");
-        if (logger) {
-            logger->debug("[ConnectionPool] Unsubscribed (id: {})", subscription_id);
-        }
         subscriptions_.erase(it);
+        
+        auto logger = spdlog::get("console");
+        if (logger) {
+            logger->debug("[ConnectionPool] Unsubscribed: {}", subscription_id);
+        }
     }
 }
 
-// TODO: 删除孤立的代码片段
-/*
-// bool ConnectionPool::match_event_pattern(
-//     const std::string& event,
-    const std::string& pattern
-) const {
-    // 简单的通配符匹配: "agent.*" 匹配 "agent.text", "agent.tool_call" 等
-    if (pattern == "*") {
-        return true;
+void ConnectionPool::unsubscribe_by_owner(void* owner) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    size_t removed = 0;
+    for (auto it = subscriptions_.begin(); it != subscriptions_.end(); ) {
+        if (it->second.owner == owner) {
+            it = subscriptions_.erase(it);
+            ++removed;
+        } else {
+            ++it;
+        }
     }
     
-    if (pattern.back() == '*') {
-        // 前缀匹配
-        std::string prefix = pattern.substr(0, pattern.size() - 1);
-        return event.compare(0, prefix.size(), prefix) == 0;
+    auto logger = spdlog::get("console");
+    if (logger && removed > 0) {
+        logger->debug("[ConnectionPool] Unsubscribed {} subscriptions by owner", removed);
     }
-    
-    // 精确匹配
-    return event == pattern;
 }
-*/
+
+// ============================================================================
+// Statistics
+// ============================================================================
+
+ConnectionPool::Statistics ConnectionPool::get_statistics() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return statistics_;
+}
+
+void ConnectionPool::reset_statistics() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    statistics_ = Statistics{};
+}
+
+// ============================================================================
+// Internal Helpers
+// ============================================================================
+
+bool ConnectionPool::has_event_scope(const WsClient& client, const std::string& event) const {
+    // 检查客户端是否有权接收该事件
+    // TODO: 实现基于 scope 的访问控制
+    return true;
+}
+
+bool ConnectionPool::match_event_pattern(const std::string& pattern, const std::string& event) const {
+    // 简单的通配符匹配
+    if (pattern == "*") return true;
+    
+    // TODO: 实现完整的模式匹配 (支持 agent.*, tool.* 等)
+    return pattern == event;
+}
+
+std::string ConnectionPool::create_event_frame(
+    const std::string& event,
+    const json& payload,
+    const BroadcastOptions& opts
+) const {
+    json frame;
+    frame["jsonrpc"] = "2.0";
+    frame["method"] = event;
+    frame["params"] = payload;
+    
+    return frame.dump();
+}
+
+void ConnectionPool::broadcast_internal(
+    const std::string& event,
+    const json& payload,
+    const BroadcastOptions& opts,
+    const std::set<std::string>* target_conn_ids,
+    std::function<bool(const WsClient&)> filter
+) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    std::string frame = create_event_frame(event, payload, opts);
+    size_t sent_count = 0;
+    
+    for (const auto& client : clients_) {
+        // 检查目标过滤
+        if (target_conn_ids && target_conn_ids->count(client->conn_id) == 0) {
+            continue;
+        }
+        
+        // 检查自定义过滤器
+        if (filter && !filter(*client)) {
+            continue;
+        }
+        
+        // 检查 scope 权限
+        if (!has_event_scope(*client, event)) {
+            continue;
+        }
+        
+        // TODO: 实际发送 WebSocket 消息
+        // client->send(frame);
+        
+        ++sent_count;
+    }
+    
+    // 更新统计
+    statistics_.events_sent += sent_count;
+    statistics_.events_by_type[event] += sent_count;
+    
+    auto logger = spdlog::get("console");
+    if (logger) {
+        logger->debug("[ConnectionPool] Broadcasted event '{}' to {} clients", 
+                     event, sent_count);
+    }
+    
+    // 触发订阅回调
+    for (const auto& [sub_id, sub] : subscriptions_) {
+        if (match_event_pattern(sub.event_pattern, event)) {
+            try {
+                sub.callback(payload);
+            } catch (const std::exception& e) {
+                if (logger) {
+                    logger->error("[ConnectionPool] Subscription callback failed: {}", e.what());
+                }
+            }
+        }
+    }
+}
 
 } // namespace gateway
 } // namespace hunterclaw

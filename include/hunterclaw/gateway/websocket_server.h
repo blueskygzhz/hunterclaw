@@ -99,11 +99,11 @@ struct WebSocketResponse {
     std::string type;              // "response" | "error"
     std::string id;                // 请求 ID
     nlohmann::json result;         // 成功结果
-    nlohmann::json error;          // 错误信息
+    nlohmann::json error_info;     // ✅ 改名: error → error_info (避免与静态方法冲突)
     
     static WebSocketResponse success(const std::string& id, const nlohmann::json& result);
-    static WebSocketResponse error(const std::string& id, const std::string& code, 
-                                   const std::string& message, const nlohmann::json& data = {});
+    static WebSocketResponse create_error(const std::string& id, const std::string& code, 
+                                         const std::string& message, const nlohmann::json& data = {});
     nlohmann::json to_json() const;
 };
 
@@ -332,9 +332,8 @@ public:
     Stats get_stats() const;
     
 private:
-    // 内部实现 (pImpl idiom)
-    class Impl;
-    std::unique_ptr<Impl> impl_;
+    WebSocketServerOptions options_;  // 配置参数
+    // TODO: 实现实际的 WebSocket 连接管理
 };
 
 } // namespace gateway

@@ -1,0 +1,37 @@
+{
+  "$schema": "https://hunterclaw.dev/schema/config.json",
+  "version": "0.1.0",
+  
+  "sessions": {
+    "reset": {
+      "mode": "none",
+      "comment": "禁用自动重置 (对齐 OpenClaw). 可选值: daily, idle, none"
+    },
+    "maintenance": {
+      "pruneAfter": "365d",
+      "maxEntries": 10000,
+      "mode": "warn"
+    },
+    "storage": {
+      "perAgent": true,
+      "deviceBased": true
+    }
+  },
+  
+  "gateway": {
+    "http": {
+      "host": "0.0.0.0",
+      "port": 8080,
+      "cors": {
+        "enabled": true,
+        "allowOrigin": "*"
+      }
+    }
+  },
+  
+  "agent": {
+    "id": "main",
+    "model": "claude-sonnet-4.5",
+    "maxTurns": 100
+  }
+}

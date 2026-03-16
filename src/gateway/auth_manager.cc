@@ -303,15 +303,17 @@ AuthResult AuthManager::authenticate_connect(
 // ========== Token 验证 ==========
 
 bool AuthManager::validate_bearer_token(const std::string& token) const {
-    if (!impl_->config->gateway.auth.enabled) {
+    const auto& auth_config = impl_->config->gateway.auth;
+    
+    if (!auth_config.enabled) {
         return true;
     }
     
-    if (impl_->config->gateway.auth.mode != "bearer") {
+    if (auth_config.mode != "bearer") {
         return true;
     }
     
-    std::string expected = impl_->config->gateway.auth.bearer_token;
+    std::string expected = auth_config.bearer_token;
     if (expected.empty()) {
         get_logger()->warn("[AuthManager] Bearer token not configured");
         return false;

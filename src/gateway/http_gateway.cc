@@ -1,5 +1,6 @@
 #include "hunterclaw/gateway/http_gateway.h"
 #include "hunterclaw/gateway/openai_adapter.h"
+#include "hunterclaw/gateway/session_device_id.h"  // ✅ Device ID 工具
 #include "hunterclaw/core/utils.h"
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -580,15 +581,33 @@ void HttpGateway::handle_chat_completions(const httplib::Request& req, httplib::
     }
     
     try {
-        // 🎯 OpenClaw 对齐: 支持通过 HTTP Header 覆盖 session key
+        // ========== 🎯 OpenClaw 对齐: Device ID + Session Key 解析 ==========
+        
         std::string session_key;
+        
+        // 方式 1: 显式指定 session key (兼容旧版)
         if (req.has_header("x-hunterclaw-session-key") || req.has_header("x-openclaw-session-key")) {
-            // 优先使用 HunterClaw 专用 header,兼容 OpenClaw header
             session_key = req.has_header("x-hunterclaw-session-key") 
                 ? req.get_header_value("x-hunterclaw-session-key")
                 : req.get_header_value("x-openclaw-session-key");
             
-            log_debug("[OpenAI API] Using custom session key: {}", session_key);
+            log_debug("[OpenAI API] Using explicit session key: {}", session_key);
+        }
+        // 方式 2: 基于 Device ID 自动构造 session key ✅
+        else {
+            // 提取 device_id
+            std::string device_id = extract_device_id_from_request(req);
+            
+            if (!device_id.empty() && is_valid_device_id(device_id)) {
+                // 构造 device-based session key
+                // 格式: agent:main:device:{deviceId}
+                session_key = build_device_session_key("main", device_id);
+                
+                log_debug("[OpenAI API] Built device-based session key: {} (device_id: {})", 
+                         session_key, device_id);
+            } else {
+                log_debug("[OpenAI API] Invalid or missing device_id, using default session");
+            }
         }
         
         auto body = json::parse(req.body);

@@ -61,6 +61,42 @@ cc_library(
 )
 
 # ============================================================================
+# Gateway Library - OpenClaw 对齐的 HTTP/WebSocket Gateway
+# ============================================================================
+cc_library(
+    name = "hunterclaw_gateway",
+    srcs = glob([
+        "gateway/*.cc",
+        "gateway/methods/*.cc",
+    ]),
+    deps = [
+        "//:hunterclaw_headers",
+        "//third_party:httplib",
+        "@nlohmann_json//:json",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+    copts = [
+        "-std=c++17",
+        "-Wall",
+        "-Wextra",
+        "-I/usr/include/jsoncpp",
+        "-I/usr/include/spdlog",  # spdlog 支持
+    ],
+    linkopts = [
+        "-lpthread",
+        "-lssl",       # OpenSSL (SHA256)
+        "-lcrypto",    # OpenSSL Crypto
+        "-lcurl",      # libcurl
+        "-ljsoncpp",   # JSON
+        # ✅ spdlog 是 header-only，不需要链接
+        # ✅ fmt 也是 header-only 或已包含在 spdlog 中
+    ],
+    linkstatic = False,
+    visibility = ["//visibility:public"],
+)
+
+# ============================================================================
 # Core Library
 # ============================================================================
 cc_library(

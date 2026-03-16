@@ -214,8 +214,8 @@ public:
     void reset_statistics();
     
 private:
-    ConnectionPool() = default;
-    ~ConnectionPool() = default;
+    ConnectionPool();
+    ~ConnectionPool();
     
     // Disable copy/move
     ConnectionPool(const ConnectionPool&) = delete;

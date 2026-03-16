@@ -105,18 +105,21 @@ enum class SessionMaintenanceMode {
 struct SessionConfig {
     routing::DmScope dm_scope = routing::DmScope::PerChannelPeer;  // 默认安全模式
     
-    // 会话重置
-    bool daily_reset = true;
-    int daily_reset_hour = 4;          // 本地时间 4:00 AM
-    std::optional<int> idle_minutes;   // 空闲超时
+    // 会话重置 (✅ 对齐 OpenClaw: 默认禁用自动重置)
+    bool daily_reset = false;          // ✅ 默认禁用每日重置
+    int daily_reset_hour = 4;          // 本地时间 4:00 AM (如果启用)
+    std::optional<int> idle_minutes;   // ✅ 默认不设置空闲超时 (nullopt = 禁用)
     
     // 会话维护
     SessionMaintenanceMode maintenance_mode = SessionMaintenanceMode::Warn;
-    int prune_after_days = 30;         // 清理旧会话 (天)
-    int max_entries = 500;             // 最大会话数
+    int prune_after_days = 365;        // ✅ 对齐 OpenClaw: 1年后清理 (默认30→365)
+    int max_entries = 10000;           // ✅ 对齐 OpenClaw: 增大限制 (默认500→10000)
     
     // Per-Agent Storage (对齐 OpenClaw)
     bool per_agent_storage = true;     // 是否按 Agent 分离存储
+    
+    // Device-based Sessions (对齐 OpenClaw)
+    bool device_based_sessions = true; // ✅ 启用基于 Device ID 的会话
 };
 
 // ============================================================================

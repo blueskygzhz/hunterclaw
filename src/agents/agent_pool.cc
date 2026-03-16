@@ -3,6 +3,8 @@
 #include "hunterclaw/agents/agent_scope.h"
 #include "hunterclaw/core/utils.h"
 #include <spdlog/spdlog.h>
+#include <nlohmann/json.hpp>
+#include <fstream>
 #include <algorithm>
 
 namespace hunterclaw {
@@ -329,25 +331,143 @@ std::optional<core::SessionInfo> AgentPool::get_session_info(
     const std::string& session_id
 ) {
     // ========== SessionManager 集成 (对齐 OpenClaw) ==========
+    // 
+    // 实现策略:
+    // 1. 优先从内存中的 Session 映射获取 (如果 SessionManager 已集成)
+    // 2. 从配置文件中的 sessions 数据获取 (OpenClaw 存储在 .openclaw/sessions.json)
+    // 3. 从 Agent 实例的元数据推断 (简化版)
+    //
+    // OpenClaw 参考:
+    // - src/config/sessions.ts: loadSessionStore(), updateSessionStore()
+    // - src/gateway/sessions-resolve.ts: resolveSessionKeyFromResolveParams()
+    // - src/sessions/session-key.ts: parseSessionKey()
+    // ========================================================================
     
-    // TODO: 从全局 SessionManager 获取 Session 信息
-    // 参考: openclaw-analysis/src/gateway/session-manager.ts
+    // Step 1: 检查是否已有对应的 Agent 实例 (可能包含 session 元数据)
+    auto agent = get_agent(session_id);
+    if (agent) {
+        const auto& ctx = agent->context();
+        
+        // 构造 SessionInfo (从 Agent context 推断)
+        core::SessionInfo info;
+        info.session_id = session_id;
+        
+        // 推断 session_key (格式: "agent_id:session_name")
+        // OpenClaw 格式: "main:default", "assistant:chat-123"
+        std::string session_key = ctx.agent_id + ":session-" + session_id.substr(0, 8);
+        info.key = core::SessionKey::from_string(session_key);
+        
+        info.created_at = ctx.created_at;
+        info.last_active_at = last_active_[session_id];
+        
+        // 添加元数据
+        info.metadata["agent_id"] = ctx.agent_id;
+        info.metadata["workspace"] = ctx.workspace_dir;
+        info.metadata["phase"] = std::to_string(static_cast<int>(ctx.phase));
+        
+        if (ctx.current_run_id) {
+            info.metadata["run_id"] = *ctx.current_run_id;
+        }
+        
+        spdlog::debug("[AgentPool] Resolved SessionInfo from Agent context: session={}, agent={}, key={}",
+            session_id, ctx.agent_id, session_key);
+        
+        return info;
+    }
     
-    // 方案 1: 全局单例
-    // auto& session_mgr = gateway::SessionManager::instance();
-    // return session_mgr.get_session(session_id);
+    // Step 2: 从持久化存储加载 (对齐 OpenClaw)
+    // OpenClaw 路径: ~/.openclaw/agents/{agent_id}/sessions/sessions.json
+    // HunterClaw 路径: ~/.hunterclaw/agents/{agent_id}/sessions/sessions.json
+    //
+    // 参考: openclaw-analysis/src/config/sessions/store.ts: loadSessionStore()
+    //       openclaw-analysis/src/config/sessions/paths.ts: resolveDefaultSessionStorePath()
     
-    // 方案 2: 依赖注入 (构造函数传入 SessionManager)
-    // if (session_mgr_) {
-    //     return session_mgr_->get_session(session_id);
-    // }
+    spdlog::debug("[AgentPool] Session not found in active agents, trying to load from disk: session={}", 
+        session_id);
     
-    // 方案 3: 通过 Config 查询 (简化版)
-    // Session 信息可能存储在配置文件或数据库中
+    try {
+        // 构造 sessions.json 路径
+        std::string state_dir = core::utils::get_home_dir() + "/.hunterclaw";
+        std::string default_agent = resolve_default_agent_id(*config_);
+        std::string sessions_path = state_dir + "/agents/" + default_agent + "/sessions/sessions.json";
+        
+        spdlog::debug("[AgentPool] Attempting to load sessions from: {}", sessions_path);
+        
+        // 检查文件是否存在
+        std::ifstream file(sessions_path);
+        if (!file.is_open()) {
+            spdlog::debug("[AgentPool] Sessions file not found: {}", sessions_path);
+            return std::nullopt;
+        }
+        
+        // 读取 JSON 文件
+        nlohmann::json sessions_store;
+        try {
+            file >> sessions_store;
+        } catch (const std::exception& e) {
+            spdlog::warn("[AgentPool] Failed to parse sessions.json: {}", e.what());
+            return std::nullopt;
+        }
+        
+        // 查找对应的 session entry
+        // OpenClaw 使用 session_key 作为键 (格式: "agent:id:name")
+        // 我们需要推断或构造 session_key
+        
+        // 策略 1: 遍历所有 entries，查找匹配的 sessionId
+        for (auto& [session_key, entry] : sessions_store.items()) {
+            if (!entry.contains("sessionId")) continue;
+            
+            std::string stored_session_id = entry["sessionId"].get<std::string>();
+            if (stored_session_id == session_id) {
+                // 找到匹配的 entry，构造 SessionInfo
+                core::SessionInfo info;
+                info.session_id = session_id;
+                info.key = core::SessionKey::from_string(session_key);
+                
+                // 填充时间戳
+                if (entry.contains("createdAt")) {
+                    info.created_at = core::TimePoint(
+                        std::chrono::milliseconds(entry["createdAt"].get<int64_t>())
+                    );
+                }
+                if (entry.contains("updatedAt")) {
+                    info.last_active_at = core::TimePoint(
+                        std::chrono::milliseconds(entry["updatedAt"].get<int64_t>())
+                    );
+                }
+                
+                // 填充元数据 (OpenClaw SessionEntry 的其他字段)
+                if (entry.contains("agentId")) {
+                    info.metadata["agent_id"] = entry["agentId"].get<std::string>();
+                }
+                if (entry.contains("displayName")) {
+                    info.metadata["displayName"] = entry["displayName"].get<std::string>();
+                }
+                if (entry.contains("model")) {
+                    info.metadata["model"] = entry["model"].get<std::string>();
+                }
+                if (entry.contains("modelProvider")) {
+                    info.metadata["modelProvider"] = entry["modelProvider"].get<std::string>();
+                }
+                if (entry.contains("workspace")) {
+                    info.metadata["workspace"] = entry["workspace"].get<std::string>();
+                }
+                
+                spdlog::info("[AgentPool] Loaded SessionInfo from disk: session={}, key={}, agent={}",
+                    session_id, session_key, info.metadata["agent_id"]);
+                
+                return info;
+            }
+        }
+        
+        spdlog::debug("[AgentPool] Session not found in sessions.json: session={}", session_id);
+        
+    } catch (const std::exception& e) {
+        spdlog::error("[AgentPool] Error loading session from disk: session={}, error={}",
+            session_id, e.what());
+    }
     
-    spdlog::debug("[AgentPool] SessionManager not integrated yet, returning empty SessionInfo");
-    
-    // 暂时返回空 (后续集成 SessionManager)
+    // Step 3: 返回空 (Session 不存在或未激活)
     return std::nullopt;
 }
 

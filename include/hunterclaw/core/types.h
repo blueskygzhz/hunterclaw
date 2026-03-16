@@ -281,9 +281,11 @@ struct GatewayConfig {
     std::string tls_key_path;
     
     struct Auth {
-        std::string password;              // Password authentication (OpenClaw: auth.password)
-        std::vector<std::string> tokens;   // Token list (OpenClaw: auth.tokens)
-        bool device_auth_enabled = true;   // Device pairing (OpenClaw: pairing system)
+        bool enabled = false;                  // OpenClaw: gateway.auth.enabled
+        std::string mode = "none";             // OpenClaw: gateway.auth.mode ("none", "bearer", "device", "challenge")
+        std::string bearer_token;              // OpenClaw: gateway.auth.bearerToken
+        std::string password;                  // OpenClaw: gateway.auth.password (legacy)
+        std::vector<std::string> scopes;       // OpenClaw: default scopes for authenticated clients
     } auth;
     
     size_t max_connections = 10000;

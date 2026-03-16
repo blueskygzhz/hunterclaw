@@ -18,7 +18,10 @@ Result<Config> load_config(const std::string& config_path) {
     config.gateway.host = "127.0.0.1";
     config.gateway.port = 18789;
     config.gateway.tls_enabled = false;
-    config.gateway.auth.device_auth_enabled = true;
+    
+    // Auth 配置 (对齐 OpenClaw)
+    config.gateway.auth.enabled = false;  // 默认不开启鉴权
+    config.gateway.auth.mode = "none";    // 鉴权模式: none, bearer, device, challenge
     
     return Result<Config>::Ok(std::move(config));
 }
@@ -38,7 +41,10 @@ Config create_default_config() {
     config.gateway.host = "0.0.0.0";
     config.gateway.port = 18789;
     config.gateway.tls_enabled = false;
-    config.gateway.auth.device_auth_enabled = true;
+    
+    // Auth 配置 (对齐 OpenClaw)
+    config.gateway.auth.enabled = false;  // 默认不开启鉴权
+    config.gateway.auth.mode = "none";    // 鉴权模式: none, bearer, device, challenge
     config.workspace_dir = ".";
     config.config_dir = "~/.hunterclaw";
     return config;

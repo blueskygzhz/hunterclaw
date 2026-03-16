@@ -602,6 +602,12 @@ bool FileSessionManager::is_past_daily_reset(const SessionEntry& session) const 
 }
 
 bool FileSessionManager::should_reset(const SessionEntry& session) const {
+    // ✅ 对齐 OpenClaw: 完全禁用重置时直接返回 false
+    if (!config_.daily_reset && !config_.idle_minutes.has_value()) {
+        return false;  // 两种重置机制都禁用 - 永不重置
+    }
+    
+    // 检查空闲超时或每日重置
     return is_idle(session) || is_past_daily_reset(session);
 }
 

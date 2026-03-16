@@ -7,6 +7,15 @@
 namespace hunterclaw {
 namespace gateway {
 
+// Helper function to get logger
+static inline std::shared_ptr<spdlog::logger> get_logger() {
+    auto logger = spdlog::get("console");
+    if (!logger) {
+        logger = spdlog::stdout_logger_mt("console");
+    }
+    return logger;
+}
+
 // ============================================================================
 // MethodGuard::Impl
 // ============================================================================
@@ -16,18 +25,18 @@ struct MethodGuard::Impl {
     
     // 方法 → 权限映射
     std::map<std::string, std::string> method_scopes;
-    std::shared_mutex method_scopes_mutex;
+    mutable std::shared_mutex method_scopes_mutex;
     
     // 资源所有权记录 (resource_type:resource_id → ResourceOwnership)
     std::map<std::string, ResourceOwnership> resource_ownership;
-    std::shared_mutex resource_ownership_mutex;
+    mutable std::shared_mutex resource_ownership_mutex;
     
     // 审计日志
     std::vector<json> audit_logs;
-    std::mutex audit_logs_mutex;
+    mutable std::mutex audit_logs_mutex;
     const size_t max_audit_logs = 10000;  // 最多保存 10000 条
     
-    Impl(std::shared_ptr<AuthManager> mgr) : auth_mgr(mgr) {
+    explicit Impl(std::shared_ptr<AuthManager> mgr) : auth_mgr(mgr) {
         // 初始化默认方法权限映射
         method_scopes = MethodGuard::get_default_method_scopes();
     }
@@ -47,7 +56,8 @@ struct MethodGuard::Impl {
 MethodGuard::MethodGuard(std::shared_ptr<AuthManager> auth_mgr)
     : impl_(std::make_unique<Impl>(auth_mgr))
 {
-    spdlog::info("[MethodGuard] Initialized with {} method scope mappings",
+    auto logger = get_logger();
+    logger->info("[MethodGuard] Initialized with {} method scope mappings",
         impl_->method_scopes.size());
 }
 
@@ -113,7 +123,8 @@ PermissionCheckResult MethodGuard::check_resource_access(
     
     if (!ownership_opt.has_value()) {
         // 资源不存在或未注册所有权 → 拒绝访问
-        spdlog::warn("[MethodGuard] Resource not found: {}:{}",
+        auto logger = get_logger();
+        logger->warn("[MethodGuard] Resource not found: {}:{}",
             resource_type, resource_id);
         return {
             false,
@@ -129,7 +140,8 @@ PermissionCheckResult MethodGuard::check_resource_access(
         case ResourceAccessPolicy::OWNER_ONLY:
             // 仅所有者可访问
             if (client_ctx.session_id != ownership.owner_session_id) {
-                spdlog::warn("[MethodGuard] Access denied: client {} tried to access resource {}:{} owned by {}",
+                auto logger = get_logger();
+                logger->warn("[MethodGuard] Access denied: client {} tried to access resource {}:{} owned by {}",
                     client_ctx.client_id, resource_type, resource_id,
                     ownership.owner_session_id);
                 return {
@@ -181,7 +193,8 @@ void MethodGuard::register_resource_ownership(
     std::string key = impl_->make_resource_key(resource_type, resource_id);
     impl_->resource_ownership[key] = owner;
     
-    spdlog::debug("[MethodGuard] Registered ownership: {}:{} → session={}",
+    auto logger = get_logger();
+    logger->debug("[MethodGuard] Registered ownership: {}:{} → session={}",
         resource_type, resource_id, owner.owner_session_id);
 }
 
@@ -210,7 +223,8 @@ void MethodGuard::unregister_resource_ownership(
     std::string key = impl_->make_resource_key(resource_type, resource_id);
     impl_->resource_ownership.erase(key);
     
-    spdlog::debug("[MethodGuard] Unregistered ownership: {}:{}",
+    auto logger = get_logger();
+    logger->debug("[MethodGuard] Unregistered ownership: {}:{}",
         resource_type, resource_id);
 }
 
@@ -277,7 +291,8 @@ void MethodGuard::log_audit(
         );
     }
     
-    spdlog::info("[Audit] {} by client {} (session={})",
+    auto logger = get_logger();
+    logger->info("[Audit] {} by client {} (session={})",
         method, client_ctx.client_id, client_ctx.session_id);
 }
 

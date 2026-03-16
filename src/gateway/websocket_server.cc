@@ -1,14 +1,5 @@
 #include "hunterclaw/gateway/websocket_server.h"
 #include <spdlog/spdlog.h>
-#include <chrono>
-#include <algorithm>
-#include <random>
-#include <sstream>
-#include <iomanip>
-
-// NOTE: This is a stub implementation
-// The original implementation requires Crow library which is not available
-// To enable WebSocket server functionality, add Crow to WORKSPACE and restore original implementation
 
 using json = nlohmann::json;
 
@@ -16,60 +7,8 @@ namespace hunterclaw {
 namespace gateway {
 
 // ============================================================================
-// Helper functions
+// WebSocketResponse 实现
 // ============================================================================
-
-static std::string generate_uuid() {
-    // Simple UUID v4 generation
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dis(0, 15);
-    std::uniform_int_distribution<> dis2(8, 11);
-    
-    std::stringstream ss;
-    ss << std::hex << std::setfill('0');
-    
-    for (int i = 0; i < 8; i++) ss << std::setw(1) << dis(gen);
-    ss << "-";
-    for (int i = 0; i < 4; i++) ss << std::setw(1) << dis(gen);
-    ss << "-4"; // Version 4
-    for (int i = 0; i < 3; i++) ss << std::setw(1) << dis(gen);
-    ss << "-";
-    ss << std::setw(1) << dis2(gen); // Variant
-    for (int i = 0; i < 3; i++) ss << std::setw(1) << dis(gen);
-    ss << "-";
-    for (int i = 0; i < 12; i++) ss << std::setw(1) << dis(gen);
-    
-    return ss.str();
-}
-
-static int64_t now_ms() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()
-    ).count();
-}
-
-// ============================================================================
-// WebSocket Protocol Objects
-// ============================================================================
-
-WebSocketRequest WebSocketRequest::from_json(const json& j) {
-    WebSocketRequest req;
-    req.type = j.value("type", "");
-    req.id = j.value("id", "");
-    req.method = j.value("method", "");
-    req.params = j.value("params", json::object());
-    return req;
-}
-
-json WebSocketRequest::to_json() const {
-    return json{
-        {"type", type},
-        {"id", id},
-        {"method", method},
-        {"params", params}
-    };
-}
 
 WebSocketResponse WebSocketResponse::success(const std::string& id, const json& result) {
     WebSocketResponse res;
@@ -79,17 +18,17 @@ WebSocketResponse WebSocketResponse::success(const std::string& id, const json& 
     return res;
 }
 
-WebSocketResponse WebSocketResponse::error(const std::string& id, const std::string& code, 
-                                          const std::string& message, const json& data) {
+WebSocketResponse WebSocketResponse::create_error(const std::string& id, const std::string& code, 
+                                                  const std::string& message, const json& data) {
     WebSocketResponse res;
     res.type = "error";
     res.id = id;
-    res.error = json{
+    res.error_info = json{
         {"code", code},
         {"message", message}
     };
     if (!data.is_null() && !data.empty()) {
-        res.error["data"] = data;
+        res.error_info["data"] = data;
     }
     return res;
 }
@@ -99,7 +38,7 @@ json WebSocketResponse::to_json() const {
         return json{
             {"type", type},
             {"id", id},
-            {"error", error}
+            {"error", error_info}
         };
     } else {
         return json{
@@ -110,142 +49,129 @@ json WebSocketResponse::to_json() const {
     }
 }
 
+// ============================================================================
+// WebSocketEvent 实现
+// ============================================================================
+
 json WebSocketEvent::to_json() const {
-    return json{
-        {"type", type},
-        {"event", event},
-        {"payload", payload}
-    };
+    json j;
+    j["jsonrpc"] = "2.0";
+    j["method"] = event;
+    j["params"] = payload;
+    
+    return j;
 }
 
 // ============================================================================
-// WebSocketServer::Impl - Stub Implementation
-// ============================================================================
-
-class WebSocketServer::Impl {
-public:
-    explicit Impl(const WebSocketServerOptions& options)
-        : options_(options),
-          start_time_(now_ms()) {
-        spdlog::warn("[WebSocketServer] STUB IMPLEMENTATION - Crow library not available");
-        spdlog::info("[WebSocketServer] Would initialize on {}:{}", options.host, options.port);
-    }
-    
-    ~Impl() {
-        stop(0);
-    }
-    
-    bool start() {
-        spdlog::error("[WebSocketServer] Cannot start - stub implementation (Crow library required)");
-        return false;
-    }
-    
-    void stop(uint32_t shutdown_timeout_ms) {
-        if (running_) {
-            spdlog::info("[WebSocketServer] Stopping...");
-            running_ = false;
-        }
-    }
-    
-    void send_message(const std::string& conn_id, const std::string& message) {
-        spdlog::warn("[WebSocketServer] Stub send_message called for conn: {}", conn_id);
-    }
-    
-    void send_response(const std::string& conn_id, const WebSocketResponse& response) {
-        spdlog::warn("[WebSocketServer] Stub send_response called for conn: {}", conn_id);
-    }
-    
-    void broadcast(const std::string& message, const std::set<std::string>& exclude_conn_ids) {
-        spdlog::warn("[WebSocketServer] Stub broadcast called");
-    }
-    
-    void broadcast_event(const WebSocketEvent& event, const std::set<std::string>& exclude_conn_ids) {
-        spdlog::warn("[WebSocketServer] Stub broadcast_event called");
-    }
-    
-    void disconnect(const std::string& conn_id, const std::string& reason) {
-        spdlog::info("[WebSocketServer] Stub disconnect called for conn: {}", conn_id);
-    }
-    
-    bool is_running() const {
-        return running_;
-    }
-    
-    ServerStats get_stats() const {
-        ServerStats stats;
-        stats.active_connections = 0;
-        stats.total_messages_received = 0;
-        stats.total_messages_sent = 0;
-        stats.uptime_ms = now_ms() - start_time_;
-        return stats;
-    }
-    
-    std::vector<WebSocketClient> get_all_clients() const {
-        return {};
-    }
-    
-    void register_method_handler(const std::string& method, MethodHandler handler) {
-        method_handlers_[method] = std::move(handler);
-    }
-    
-    void set_connection_handler(ConnectionHandler handler) {
-        connection_handler_ = std::move(handler);
-    }
-    
-    void set_disconnection_handler(DisconnectionHandler handler) {
-        disconnection_handler_ = std::move(handler);
-    }
-
-private:
-    WebSocketServerOptions options_;
-    bool running_{false};
-    int64_t start_time_;
-    
-    std::unordered_map<std::string, MethodHandler> method_handlers_;
-    ConnectionHandler connection_handler_;
-    DisconnectionHandler disconnection_handler_;
-};
-
-// ============================================================================
-// WebSocketServer - Public API
+// WebSocketServer 实现 (STUB - Crow 库未安装)
 // ============================================================================
 
 WebSocketServer::WebSocketServer(const WebSocketServerOptions& options)
-    : impl_(std::make_unique<Impl>(options)) {
+    : options_(options) {
+    auto logger = spdlog::get("console");
+    if (logger) {
+        logger->warn("[WebSocketServer] STUB IMPLEMENTATION - Crow library not available");
+        logger->info("[WebSocketServer] Would initialize on {}:{}", options.host, options.port);
+    }
 }
 
 WebSocketServer::~WebSocketServer() = default;
 
+// ========================================================================
+// 启动和停止
+// ========================================================================
+
 bool WebSocketServer::start() {
-    return impl_->start();
+    auto logger = spdlog::get("console");
+    if (logger) {
+        logger->error("[WebSocketServer] Cannot start - stub implementation (Crow library required)");
+    }
+    return false;
 }
 
-void WebSocketServer::stop(uint32_t shutdown_timeout_ms) {
-    impl_->stop(shutdown_timeout_ms);
-}
-
-void WebSocketServer::send_message(const std::string& conn_id, const std::string& message) {
-    impl_->send_message(conn_id, message);
-}
-
-void WebSocketServer::send_response(const std::string& conn_id, const WebSocketResponse& response) {
-    impl_->send_response(conn_id, response);
-}
-
-void WebSocketServer::broadcast(const std::string& message, const std::set<std::string>& exclude_conn_ids) {
-    impl_->broadcast(message, exclude_conn_ids);
-}
-
-void WebSocketServer::broadcast_event(const WebSocketEvent& event, const std::set<std::string>& exclude_conn_ids) {
-    impl_->broadcast_event(event, exclude_conn_ids);
-}
-
-void WebSocketServer::disconnect(const std::string& conn_id, const std::string& reason) {
-    impl_->disconnect(conn_id, reason);
+void WebSocketServer::stop(int timeout_ms) {
+    auto logger = spdlog::get("console");
+    if (logger) {
+        logger->info("[WebSocketServer] Stop called (stub)");
+    }
 }
 
 bool WebSocketServer::is_running() const {
-    return impl_->is_running();
+    return false;
 }
 
+// ========================================================================
+// 广播和事件 (对齐 OpenClaw)
+// ========================================================================
+
+void WebSocketServer::broadcast_event(
+    const std::string& event,
+    const nlohmann::json& payload,
+    bool drop_if_slow
+) {
+    auto logger = spdlog::get("console");
+    if (logger) {
+        logger->debug("[WebSocketServer] Broadcast event: {} (stub)", event);
+    }
+}
+
+bool WebSocketServer::send_event(
+    const std::string& conn_id,
+    const std::string& event,
+    const nlohmann::json& payload
+) {
+    auto logger = spdlog::get("console");
+    if (logger) {
+        logger->debug("[WebSocketServer] Send event to {}: {} (stub)", conn_id, event);
+    }
+    return false;
+}
+
+void WebSocketServer::send_to_session(
+    const std::string& session_key,
+    const std::string& event,
+    const nlohmann::json& payload
+) {
+    auto logger = spdlog::get("console");
+    if (logger) {
+        logger->debug("[WebSocketServer] Send to session {}: {} (stub)", session_key, event);
+    }
+}
+
+// ========================================================================
+// 连接管理
+// ========================================================================
+
+std::vector<std::shared_ptr<WebSocketClient>> WebSocketServer::get_clients() const {
+    return {};
+}
+
+size_t WebSocketServer::get_authenticated_count() const {
+    return 0;
+}
+
+std::shared_ptr<WebSocketClient> WebSocketServer::get_client(const std::string& conn_id) const {
+    return nullptr;
+}
+
+void WebSocketServer::disconnect_client(
+    const std::string& conn_id,
+    int code,
+    const std::string& reason
+) {
+    auto logger = spdlog::get("console");
+    if (logger) {
+        logger->debug("[WebSocketServer] Disconnect client {}: {} (stub)", conn_id, reason);
+    }
+}
+
+// ========================================================================
+// 统计信息
+// ========================================================================
+
+WebSocketServer::Stats WebSocketServer::get_stats() const {
+    return Stats{};
+}
+
+}  // namespace gateway
 }  // namespace hunterclaw
