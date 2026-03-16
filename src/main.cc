@@ -6,8 +6,8 @@
 #include "hunterclaw/channels/channel.h"
 #include "hunterclaw/channels/manager.h"
 #include "hunterclaw/agents/types.h"
-#include "hunterclaw/cli/command.h"
-#include "hunterclaw/cli/daemon_commands.h"
+// #include "hunterclaw/cli/command.h"  // Temporarily disabled
+// #include "hunterclaw/cli/daemon_commands.h"  // Temporarily disabled
 #include <iostream>
 #include <csignal>
 #include <atomic>
@@ -59,6 +59,8 @@ void print_help() {
 }
 
 int main(int argc, char** argv) {
+    // Temporarily disabled CLI commands
+    /*
     // Register daemon CLI commands
     cli::register_daemon_commands();
     
@@ -89,6 +91,7 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    */
     
     // Parse command line arguments for direct execution
     std::string config_path = core::utils::expand_path("~/.hunterclaw/config.json");

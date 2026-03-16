@@ -280,13 +280,33 @@ struct GatewayConfig {
     std::string tls_cert_path;
     std::string tls_key_path;
     
+    // 🎯 100% 对齐 OpenClaw: Gateway Authentication
     struct Auth {
         bool enabled = false;                  // OpenClaw: gateway.auth.enabled
-        std::string mode = "none";             // OpenClaw: gateway.auth.mode ("none", "bearer", "device", "challenge")
+        std::string mode = "none";             // OpenClaw: gateway.auth.mode ("none", "bearer", "device", "challenge", "trusted-proxy")
         std::string bearer_token;              // OpenClaw: gateway.auth.bearerToken
         std::string password;                  // OpenClaw: gateway.auth.password (legacy)
         std::vector<std::string> scopes;       // OpenClaw: default scopes for authenticated clients
+        bool allow_tailscale = false;          // OpenClaw: gateway.auth.allowTailscale (future)
+        
+        // 🎯 新增: Trusted Proxy 配置 (对齐 OpenClaw)
+        struct TrustedProxy {
+            std::string user_header = "x-forwarded-user";  // OpenClaw: gateway.auth.trustedProxy.userHeader
+            std::vector<std::string> required_headers;      // OpenClaw: gateway.auth.trustedProxy.requiredHeaders
+            std::vector<std::string> allow_users;           // OpenClaw: gateway.auth.trustedProxy.allowUsers
+        } trusted_proxy;
+        
+        // 🎯 新增: 速率限制配置 (对齐 OpenClaw)
+        struct RateLimit {
+            int max_attempts = 10;              // OpenClaw: gateway.auth.rateLimit.maxAttempts
+            int64_t window_ms = 60000;          // OpenClaw: gateway.auth.rateLimit.windowMs (1 min)
+            int64_t lockout_ms = 300000;        // OpenClaw: gateway.auth.rateLimit.lockoutMs (5 min)
+            bool exempt_loopback = true;        // OpenClaw: gateway.auth.rateLimit.exemptLoopback
+        } rate_limit;
     } auth;
+    
+    // 🎯 新增: 受信任代理 IP 列表 (对齐 OpenClaw)
+    std::vector<std::string> trusted_proxies;  // OpenClaw: gateway.trustedProxies
     
     size_t max_connections = 10000;
     size_t max_payload_bytes = 25 * 1024 * 1024;  // 25MB

@@ -15,6 +15,7 @@ namespace gateway {
 
 // Forward declarations
 class WebSocketConnection;
+class IWebSocketConnection;
 
 // ============================================================================
 // Broadcast Options
@@ -43,7 +44,7 @@ struct WsClient {
     std::string conn_id;
     
     /// WebSocket connection
-    std::shared_ptr<WebSocketConnection> socket;
+    std::shared_ptr<IWebSocketConnection> socket;
     
     /// Client role (e.g., "operator", "agent", "channel")
     std::string role;
@@ -64,6 +65,13 @@ struct WsClient {
     
     /// Last activity timestamp
     std::chrono::steady_clock::time_point last_activity;
+    
+    /// 🎯 OpenClaw 对齐: 慢速消费者检测
+    /// Send queue size (pending bytes)
+    std::atomic<size_t> send_queue_size{0};
+    
+    /// Number of consecutive slow sends
+    std::atomic<int> slow_send_count{0};
 };
 
 // ============================================================================
@@ -203,10 +211,10 @@ public:
     // ========== Statistics ==========
     
     struct Statistics {
-        size_t total_clients = 0;
-        size_t events_sent = 0;
-        size_t events_dropped = 0;  // Slow consumers
-        size_t slow_consumers_disconnected = 0;
+        std::atomic<size_t> total_clients{0};
+        std::atomic<size_t> events_sent{0};
+        std::atomic<size_t> events_dropped{0};  // Slow consumers
+        std::atomic<size_t> slow_consumers_disconnected{0};
         std::map<std::string, size_t> events_by_type;
     };
     
@@ -228,6 +236,12 @@ private:
     
     /// Check if event pattern matches event name
     bool match_event_pattern(const std::string& pattern, const std::string& event) const;
+    
+    /// 🎯 OpenClaw 严格对齐: 慢速消费者检测
+    bool is_send_buffer_full(const std::shared_ptr<WsClient>& client) const;
+    
+    /// 🎯 OpenClaw 严格对齐: 慢速消费者自动断连
+    void disconnect_slow_consumer(const std::shared_ptr<WsClient>& client, const std::string& reason);
     
     /// Create event frame (JSON-RPC 2.0 format)
     std::string create_event_frame(

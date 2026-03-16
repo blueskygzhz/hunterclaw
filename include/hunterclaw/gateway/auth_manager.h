@@ -3,6 +3,7 @@
 #include "hunterclaw/core/types.h"
 #include "hunterclaw/core/result.h"
 #include "hunterclaw/core/utils.h"
+#include "hunterclaw/gateway/auth_rate_limiter.h"
 #include <nlohmann/json.hpp>
 #include <memory>
 #include <string>
@@ -26,12 +27,20 @@ using json = nlohmann::json;
  * - device_id: 设备标识
  * - scopes: 权限列表
  * - reason: 失败原因 (对齐 OpenClaw 错误码)
+ * - method: 鉴权方法 (对齐 OpenClaw)
+ * - user: 用户标识 (Trusted Proxy 模式)
+ * - rate_limited: 是否因速率限制被拒绝
+ * - retry_after_ms: 重试等待时间
  */
 struct AuthResult {
     bool ok = false;
     std::string device_id;
     std::vector<std::string> scopes;
-    std::string reason;  // "NOT_AUTHENTICATED", "DEVICE_TOKEN_MISMATCH", etc.
+    std::string reason;  // "NOT_AUTHENTICATED", "DEVICE_TOKEN_MISMATCH", "RATE_LIMITED", etc.
+    std::string method;  // "none", "bearer", "device", "challenge", "trusted-proxy"
+    std::string user;    // 用户标识 (Trusted Proxy 模式)
+    bool rate_limited = false;
+    int64_t retry_after_ms = 0;
 };
 
 /**
@@ -113,6 +122,11 @@ struct DeviceChallenge {
  *    - 适用于高安全场景
  *    - 需要客户端持有私钥
  * 
+ * 5. **Trusted Proxy** (mode: "trusted-proxy") 🎯 新增
+ *    - 委托给反向代理（Pomerium, Caddy, nginx + OAuth）
+ *    - 适用于企业级部署
+ *    - 通过 HTTP Header 传递用户身份
+ * 
  * 使用示例:
  * 
  * ```cpp
@@ -154,6 +168,7 @@ public:
      * - mode: "bearer" → 验证 Bearer Token
      * - mode: "device" → 验证 device_id + device_token
      * - mode: "challenge" → 验证签名
+     * - mode: "trusted-proxy" → 验证反向代理传递的用户身份
      * 
      * @param params connect() RPC 参数
      *               - token: Bearer Token (可选)
@@ -162,12 +177,21 @@ public:
      *               - nonce: 挑战 nonce (可选)
      *               - signature: 签名 (可选)
      * @param nonce 连接的 nonce (用于挑战-响应)
+     * @param headers HTTP 请求头 (用于 Trusted Proxy)
+     * @param client_ip 客户端 IP 地址 (用于速率限制和 Trusted Proxy 验证)
      * @return AuthResult 鉴权结果
      * 
      * OpenClaw 对齐:
      * ```typescript
      * async function authenticate(params: ConnectParams): Promise<AuthResult> {
+     *   // 1. 速率限制检查
+     *   const limiter = getRateLimiter();
+     *   const check = limiter.check(clientIp);
+     *   if (!check.allowed) return { ok: false, reason: 'RATE_LIMITED' };
+     *   
+     *   // 2. 鉴权模式检查
      *   if (config.auth.mode === 'none') return { ok: true };
+     *   if (config.auth.mode === 'trusted-proxy') return validateTrustedProxy(headers, clientIp);
      *   if (config.auth.mode === 'bearer') return validateBearerToken(params.token);
      *   if (config.auth.mode === 'device') return validateDevice(params);
      *   return { ok: false, reason: 'INVALID_AUTH_MODE' };
@@ -176,7 +200,9 @@ public:
      */
     AuthResult authenticate_connect(
         const json& params,
-        const std::string& nonce = ""
+        const std::string& nonce = "",
+        const std::map<std::string, std::string>& headers = {},
+        const std::string& client_ip = ""
     );
     
     // ========== Token 验证 ==========
@@ -419,6 +445,68 @@ public:
         const std::string& required_scope
     );
     
+    // ========== Trusted Proxy 鉴权 (🎯 新增) ==========
+    
+    /**
+     * 验证 Trusted Proxy 请求
+     * 
+     * @param headers HTTP 请求头
+     * @param client_ip 客户端 IP 地址
+     * @return 鉴权结果 (包含用户标识)
+     * 
+     * OpenClaw 对齐:
+     * ```typescript
+     * function authorizeTrustedProxy(params: {
+     *   req?: IncomingMessage;
+     *   trustedProxies?: string[];
+     *   trustedProxyConfig: GatewayTrustedProxyConfig;
+     * }): { user: string } | { reason: string } {
+     *   // 1. 验证请求来自受信任的代理 IP
+     *   if (!isTrustedProxyAddress(remoteAddr, trustedProxies)) {
+     *     return { reason: "trusted_proxy_untrusted_source" };
+     *   }
+     *   
+     *   // 2. 验证必需的 HTTP 头存在
+     *   for (const header of requiredHeaders) {
+     *     if (!req.headers[header]) {
+     *       return { reason: `trusted_proxy_missing_header_${header}` };
+     *     }
+     *   }
+     *   
+     *   // 3. 提取用户身份
+     *   const user = req.headers[userHeader];
+     *   if (!user) {
+     *     return { reason: "trusted_proxy_user_missing" };
+     *   }
+     *   
+     *   // 4. 检查用户白名单
+     *   if (allowUsers.length > 0 && !allowUsers.includes(user)) {
+     *     return { reason: "trusted_proxy_user_not_allowed" };
+     *   }
+     *   
+     *   return { user };
+     * }
+     * ```
+     */
+    AuthResult authenticate_trusted_proxy(
+        const std::map<std::string, std::string>& headers,
+        const std::string& client_ip
+    );
+    
+    // ========== 速率限制器 (🎯 新增) ==========
+    
+    /**
+     * 获取速率限制器实例
+     * @return 速率限制器 (可能为空)
+     */
+    std::shared_ptr<AuthRateLimiter> get_rate_limiter() const;
+    
+    /**
+     * 设置速率限制器
+     * @param limiter 速率限制器实例
+     */
+    void set_rate_limiter(std::shared_ptr<AuthRateLimiter> limiter);
+    
     // ========== 持久化 ==========
     
     /**
@@ -482,6 +570,15 @@ namespace auth_errors {
     constexpr const char* TOKEN_EXPIRED = "TOKEN_EXPIRED";
     constexpr const char* DEVICE_REVOKED = "DEVICE_REVOKED";
     constexpr const char* INVALID_AUTH_MODE = "INVALID_AUTH_MODE";
+    
+    // 🎯 新增: Trusted Proxy 错误码 (对齐 OpenClaw)
+    constexpr const char* TRUSTED_PROXY_UNTRUSTED_SOURCE = "TRUSTED_PROXY_UNTRUSTED_SOURCE";
+    constexpr const char* TRUSTED_PROXY_USER_MISSING = "TRUSTED_PROXY_USER_MISSING";
+    constexpr const char* TRUSTED_PROXY_USER_NOT_ALLOWED = "TRUSTED_PROXY_USER_NOT_ALLOWED";
+    constexpr const char* TRUSTED_PROXY_MISSING_HEADER = "TRUSTED_PROXY_MISSING_HEADER";
+    
+    // 🎯 新增: 速率限制错误码
+    constexpr const char* RATE_LIMITED = "RATE_LIMITED";
 }
 
 } // namespace gateway

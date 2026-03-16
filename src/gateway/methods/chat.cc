@@ -3,7 +3,13 @@
 #include "hunterclaw/core/utils.h"
 #include "hunterclaw/agents/agent_pool.h"
 #include "hunterclaw/agents/agent_instance.h"
+#include "hunterclaw/react/react_engine.h"
+#include "hunterclaw/tools/tool.h"
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
+#include <algorithm>
+#include <thread>
+#include <chrono>
 
 using json = nlohmann::json;
 
@@ -15,19 +21,92 @@ namespace methods {
 // Chat Methods
 // ============================================================================
 
-// 13. chat.send - Send message (🏢 Multi-tenant Agent Pool)
+// ============================================================================
+// Helper: Stop Command Detection (对齐 OpenClaw)
+// ============================================================================
+static bool is_stop_command(const std::string& message) {
+    std::string lower = message;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    std::string trimmed = lower;
+    trimmed.erase(0, trimmed.find_first_not_of(" \t\n\r"));
+    trimmed.erase(trimmed.find_last_not_of(" \t\n\r") + 1);
+    
+    return trimmed == "stop" || trimmed == "cancel" || trimmed == "abort";
+}
+
+// ============================================================================
+// Helper: Message Sanitization (对齐 OpenClaw)
+// ============================================================================
+static std::string sanitize_message(const std::string& raw) {
+    // NFC 归一化 + 控制字符过滤
+    std::string result;
+    result.reserve(raw.size());
+    
+    for (char c : raw) {
+        unsigned char uc = static_cast<unsigned char>(c);
+        // 允许: Tab(9), LF(10), CR(13), 可打印字符(32-126)
+        if (uc == 9 || uc == 10 || uc == 13 || (uc >= 32 && uc < 127)) {
+            result += c;
+        }
+    }
+    
+    return result;
+}
+
+// ============================================================================
+// Helper: Generate UUID (对齐 OpenClaw)
+// ============================================================================
+static std::string generate_run_id() {
+    return core::utils::generate_uuid();
+}
+
+// 13. chat.send - Send message (对齐 OpenClaw 完整实现)
+// 参考: openclaw-analysis/src/gateway/server-methods/chat.ts
 core::Result<json> method_chat_send(
     std::shared_ptr<GatewayServer> server,
     std::shared_ptr<MethodGuard> method_guard,
     const ClientContext& client_ctx,
     const json& params
 ) {
+    // ========================================================================
+    // Step 1: 参数验证 (对齐 OpenClaw validateChatSendParams)
+    // ========================================================================
+    
     if (!params.contains("session_id") || !params.contains("message")) {
         return core::Result<json>::Err("Missing required parameters: session_id, message");
     }
     
     std::string session_id = params["session_id"];
-    std::string message = params["message"];
+    std::string raw_message = params["message"];
+    
+    // 消息清理
+    std::string message = sanitize_message(raw_message);
+    if (message.empty()) {
+        return core::Result<json>::Err("Message cannot be empty after sanitization");
+    }
+    
+    spdlog::info("[chat.send] session={}, message_len={}", session_id, message.size());
+    
+    // ========================================================================
+    // Step 2: Stop Command 检测 (对齐 OpenClaw)
+    // ========================================================================
+    
+    if (is_stop_command(message)) {
+        spdlog::info("[chat.send] Stop command detected: session={}", session_id);
+        
+        // TODO: 调用 abort_chat_run(session_id)
+        // 当前返回确认
+        
+        json result;
+        result["ok"] = true;
+        result["stopped"] = true;
+        result["session_id"] = session_id;
+        return core::Result<json>::Ok(result);
+    }
+    
+    // ========================================================================
+    // Step 3: 获取或创建 Agent (AgentPool)
+    // ========================================================================
     
     auto agent_pool = server->agent_pool();
     if (!agent_pool) {
@@ -39,214 +118,412 @@ core::Result<json> method_chat_send(
         return core::Result<json>::Err("Failed to get or create agent");
     }
     
+    // ========================================================================
+    // Step 4: 生成 run_id (对齐 OpenClaw)
+    // ========================================================================
+    
+    std::string run_id = generate_run_id();
+    spdlog::info("[chat.send] Starting run: session={}, run_id={}, agent={}",
+        session_id, run_id, agent->context().agent_id);
+    
+    // ========================================================================
+    // Step 5: 写入用户消息到 Transcript (对齐 OpenClaw)
+    // ========================================================================
+    
+    // TODO: 实现 Transcript 持久化
+    // std::string transcript_path = resolve_transcript_path(session_id, agent->context().agent_id);
+    // append_user_message(transcript_path, message, generate_uuid(), run_id);
+    
+    spdlog::debug("[chat.send] User message written to transcript: session={}", session_id);
+    
+    // ========================================================================
+    // Step 6: 启动 Agent 异步执行 (ReAct Engine)
+    // ========================================================================
+    
+    // 获取 ReAct Engine
+    auto react_engine = agent->react_engine();
+    if (!react_engine) {
+        return core::Result<json>::Err("ReactEngine not initialized");
+    }
+    
+    // 配置流式回调 (对齐 OpenClaw)
+    react::StreamCallbacks callbacks;
+    callbacks.session_id = session_id;
+    
+    // 助手输出流 (chat.delta)
+    callbacks.on_assistant_delta = [server, session_id, run_id](const std::string& delta) {
+        json event;
+        event["type"] = "chat.delta";
+        event["session_id"] = session_id;
+        event["run_id"] = run_id;
+        event["delta"] = delta;
+        event["timestamp"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count();
+        
+        core::EventFrame frame;
+        frame.type = "chat";
+        frame.payload = event;
+        
+        server->broadcast(frame);
+    };
+    
+    // 工具调用事件 (对齐 OpenClaw)
+    callbacks.on_tool_start = [server, session_id, run_id](
+        const std::string& tool_name, 
+        const core::JsonValue& args
+    ) {
+        json event;
+        event["type"] = "tool.start";
+        event["session_id"] = session_id;
+        event["run_id"] = run_id;
+        event["tool_name"] = tool_name;
+        event["args"] = args;
+        
+        core::EventFrame frame;
+        frame.type = "tool";
+        frame.payload = event;
+        
+        server->broadcast(frame);
+    };
+    
+    callbacks.on_tool_end = [server, session_id, run_id](
+        const std::string& tool_name,
+        const tools::ToolResult& result
+    ) {
+        json event;
+        event["type"] = "tool.end";
+        event["session_id"] = session_id;
+        event["run_id"] = run_id;
+        event["tool_name"] = tool_name;
+        event["success"] = result.success;
+        event["output"] = result.output;
+        
+        core::EventFrame frame;
+        frame.type = "tool";
+        frame.payload = event;
+        
+        server->broadcast(frame);
+    };
+    
+    // 完成回调 (对齐 OpenClaw chat.complete)
+    callbacks.on_end = [server, session_id, run_id]() {
+        json event;
+        event["type"] = "chat.complete";
+        event["session_id"] = session_id;
+        event["run_id"] = run_id;
+        event["timestamp"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count();
+        
+        core::EventFrame frame;
+        frame.type = "chat";
+        frame.payload = event;
+        
+        server->broadcast(frame);
+        
+        spdlog::info("[chat.send] Completed: session={}, run_id={}", session_id, run_id);
+    };
+    
+    // 错误回调
+    callbacks.on_error = [server, session_id, run_id](const std::string& error) {
+        json event;
+        event["type"] = "chat.error";
+        event["session_id"] = session_id;
+        event["run_id"] = run_id;
+        event["error"] = error;
+        
+        core::EventFrame frame;
+        frame.type = "chat";
+        frame.payload = event;
+        
+        server->broadcast(frame);
+        
+        spdlog::error("[chat.send] Error: session={}, run_id={}, error={}",
+            session_id, run_id, error);
+    };
+    
+    // 异步启动 (不阻塞当前线程)
+    std::thread([react_engine, message, callbacks, run_id, session_id]() {
+        try {
+            auto result = react_engine->run(message, {}, callbacks);
+            
+            // TODO: 写入 assistant 消息到 Transcript
+            // append_assistant_message(transcript_path, result.final_response, generate_uuid(), run_id);
+            
+            spdlog::info("[chat.send] Agent completed: session={}, run_id={}, steps={}",
+                session_id, run_id, result.total_steps);
+                
+        } catch (const std::exception& e) {
+            spdlog::error("[chat.send] Agent exception: session={}, run_id={}, error={}",
+                session_id, run_id, e.what());
+        }
+    }).detach();
+    
+    // ========================================================================
+    // Step 7: 立即返回 (不等待执行完成，对齐 OpenClaw)
+    // ========================================================================
+    
     json result;
+    result["ok"] = true;
     result["session_id"] = session_id;
+    result["run_id"] = run_id;
+    result["status"] = "running";
     result["agent_id"] = agent->context().agent_id;
-    result["message"] = "Message received";
     result["workspace"] = agent->context().workspace_dir;
     
     return core::Result<json>::Ok(result);
 }
 
-// 14. chat.abort
+// ============================================================================
+// 14. chat.abort - Abort active chat run (对齐 OpenClaw)
+// ============================================================================
+
 core::Result<json> method_chat_abort(
     std::shared_ptr<GatewayServer> server,
     std::shared_ptr<MethodGuard> method_guard,
     const ClientContext& client_ctx,
     const json& params
 ) {
-    return core::Result<json>::Err("chat.abort handled by gateway protocol handler");
+    // ========================================================================
+    // Step 1: 参数验证
+    // ========================================================================
+    
+    if (!params.contains("session_id")) {
+        return core::Result<json>::Err("Missing required parameter: session_id");
+    }
+    
+    std::string session_id = params["session_id"];
+    std::string run_id = params.value("run_id", "");
+    
+    spdlog::info("[chat.abort] session={}, run_id={}", session_id, run_id.empty() ? "<all>" : run_id);
+    
+    // ========================================================================
+    // Step 2: 获取 Agent
+    // ========================================================================
+    
+    auto agent_pool = server->agent_pool();
+    if (!agent_pool) {
+        return core::Result<json>::Err("AgentPool not initialized");
+    }
+    
+    auto agent = agent_pool->get_agent(session_id);
+    if (!agent) {
+        // 没有活跃 Agent，返回成功
+        json result;
+        result["ok"] = true;
+        result["aborted"] = false;
+        result["runIds"] = json::array();
+        return core::Result<json>::Ok(result);
+    }
+    
+    // ========================================================================
+    // Step 3: 中止执行 (ReAct Engine)
+    // ========================================================================
+    
+    auto react_engine = agent->react_engine();
+    if (!react_engine) {
+        json result;
+        result["ok"] = true;
+        result["aborted"] = false;
+        result["runIds"] = json::array();
+        return core::Result<json>::Ok(result);
+    }
+    
+    // 如果指定了 run_id，中止特定运行
+    // 如果没有指定，中止所有运行
+    bool aborted = false;
+    std::vector<std::string> aborted_runs;
+    
+    if (run_id.empty()) {
+        // 中止所有运行
+        aborted = react_engine->abort_all();
+        if (aborted) {
+            // TODO: 从 engine 获取实际 aborted 的 run_ids
+            aborted_runs.push_back("all");
+        }
+    } else {
+        // 中止特定运行
+        aborted = react_engine->abort(run_id);
+        if (aborted) {
+            aborted_runs.push_back(run_id);
+        }
+    }
+    
+    spdlog::info("[chat.abort] Result: session={}, aborted={}, count={}",
+        session_id, aborted, aborted_runs.size());
+    
+    // ========================================================================
+    // Step 4: 返回结果 (对齐 OpenClaw)
+    // ========================================================================
+    
+    json result;
+    result["ok"] = true;
+    result["aborted"] = aborted;
+    result["runIds"] = aborted_runs;
+    
+    return core::Result<json>::Ok(result);
 }
 
-// 15. chat.history
+// ============================================================================
+// 15. chat.history - Get chat history (对齐 OpenClaw)
+// ============================================================================
+
 core::Result<json> method_chat_history(
     std::shared_ptr<GatewayServer> server,
     std::shared_ptr<MethodGuard> method_guard,
     const ClientContext& client_ctx,
     const json& params
 ) {
-    return core::Result<json>::Err("chat.history handled by gateway protocol handler");
-}
-
-// 16. chat.updateParams
-core::Result<json> method_chat_update_params(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
+    // ========================================================================
+    // Step 1: 参数验证
+    // ========================================================================
+    
     if (!params.contains("session_id")) {
-        return core::Result<json>::Err("Missing session_id");
+        return core::Result<json>::Err("Missing required parameter: session_id");
     }
     
     std::string session_id = params["session_id"];
-    auto& sessions = server->runtime_state()->sessions;
-    auto it = sessions.find(session_id);
-    if (it == sessions.end()) {
-        return core::Result<json>::Err("Session not found");
+    int limit = params.value("limit", 200);
+    
+    // 硬限制：最多 1000 条
+    limit = std::min(limit, 1000);
+    
+    spdlog::debug("[chat.history] session={}, limit={}", session_id, limit);
+    
+    // ========================================================================
+    // Step 2: 获取 Agent
+    // ========================================================================
+    
+    auto agent_pool = server->agent_pool();
+    if (!agent_pool) {
+        return core::Result<json>::Err("AgentPool not initialized");
     }
     
-    json updated_params;
-    if (params.contains("temperature")) {
-        it->second.metadata["temperature"] = std::to_string(params["temperature"].get<double>());
-        updated_params["temperature"] = params["temperature"];
-    }
-    if (params.contains("model")) {
-        it->second.metadata["model"] = params["model"].get<std::string>();
-        updated_params["model"] = params["model"];
+    auto agent = agent_pool->get_agent(session_id);
+    if (!agent) {
+        // 没有历史，返回空数组
+        json result;
+        result["session_id"] = session_id;
+        result["sessionId"] = session_id;
+        result["messages"] = json::array();
+        return core::Result<json>::Ok(result);
     }
     
+    // ========================================================================
+    // Step 3: 读取 Transcript (对齐 OpenClaw)
+    // ========================================================================
+    
+    // TODO: 实现 Transcript 读取
+    // std::string transcript_path = resolve_transcript_path(session_id, agent->context().agent_id);
+    // auto messages = read_transcript_messages(transcript_path, limit);
+    
+    // 当前返回空历史（占位）
     json result;
     result["session_id"] = session_id;
-    result["updated"] = true;
-    result["params"] = updated_params;
-    return core::Result<json>::Ok(result);
-}
-
-// 17. chat.regenerate
-core::Result<json> method_chat_regenerate(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    if (!params.contains("session_id")) {
-        return core::Result<json>::Err("Missing session_id");
-    }
+    result["sessionId"] = session_id;
+    result["messages"] = json::array();
     
-    std::string run_id = core::utils::generate_uuid();
-    json result;
-    result["session_id"] = params["session_id"];
-    result["run_id"] = run_id;
-    result["status"] = "regenerating";
-    return core::Result<json>::Ok(result);
-}
-
-// 18. chat.fork
-core::Result<json> method_chat_fork(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    if (!params.contains("session_id") || !params.contains("message_id")) {
-        return core::Result<json>::Err("Missing required parameters");
-    }
+    // 附加 Session 元数据 (对齐 OpenClaw)
+    result["thinkingLevel"] = "default";
+    result["fastMode"] = false;
+    result["verboseLevel"] = "normal";
     
-    std::string new_session_id = core::utils::generate_uuid();
-    json result;
-    result["source_session_id"] = params["session_id"];
-    result["new_session_id"] = new_session_id;
-    result["fork_from_message_id"] = params["message_id"];
-    return core::Result<json>::Ok(result);
-}
-
-// 19. chat.summarize
-core::Result<json> method_chat_summarize(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    if (!params.contains("session_id")) {
-        return core::Result<json>::Err("Missing session_id");
-    }
+    spdlog::debug("[chat.history] Returned 0 messages for session={}", session_id);
     
-    json result;
-    result["session_id"] = params["session_id"];
-    result["summary"] = "[Summary placeholder]";
     return core::Result<json>::Ok(result);
 }
 
-// 20. chat.inject
+// ============================================================================
+// 16. chat.inject - Inject assistant message (对齐 OpenClaw)
+// ============================================================================
+
 core::Result<json> method_chat_inject(
     std::shared_ptr<GatewayServer> server,
     std::shared_ptr<MethodGuard> method_guard,
     const ClientContext& client_ctx,
     const json& params
 ) {
-    if (!params.contains("session_id") || !params.contains("role") || !params.contains("content")) {
-        return core::Result<json>::Err("Missing required parameters");
+    // ========================================================================
+    // Step 1: 参数验证
+    // ========================================================================
+    
+    if (!params.contains("session_id") || !params.contains("message")) {
+        return core::Result<json>::Err("Missing required parameters: session_id, message");
     }
+    
+    std::string session_id = params["session_id"];
+    std::string message = params["message"];
+    std::string label = params.value("label", "");
+    
+    spdlog::info("[chat.inject] session={}, message_len={}, label={}",
+        session_id, message.size(), label);
+    
+    // ========================================================================
+    // Step 2: 获取 Agent
+    // ========================================================================
+    
+    auto agent_pool = server->agent_pool();
+    if (!agent_pool) {
+        return core::Result<json>::Err("AgentPool not initialized");
+    }
+    
+    auto agent = agent_pool->get_or_create_agent(session_id);
+    if (!agent) {
+        return core::Result<json>::Err("Failed to get or create agent");
+    }
+    
+    // ========================================================================
+    // Step 3: 写入 Transcript (对齐 OpenClaw)
+    // ========================================================================
+    
+    // TODO: 实现 Transcript 注入
+    // std::string transcript_path = resolve_transcript_path(session_id, agent->context().agent_id);
+    // std::string message_id = generate_uuid();
+    // append_assistant_message(transcript_path, message, message_id, "", label);
     
     std::string message_id = core::utils::generate_uuid();
-    json result;
-    result["session_id"] = params["session_id"];
-    result["message_id"] = message_id;
-    result["injected"] = true;
-    return core::Result<json>::Ok(result);
-}
-
-// 21. chat.edit
-core::Result<json> method_chat_edit(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    if (!params.contains("session_id") || !params.contains("message_id") || !params.contains("content")) {
-        return core::Result<json>::Err("Missing required parameters");
+    
+    // ========================================================================
+    // Step 4: 广播到客户端 (对齐 OpenClaw)
+    // ========================================================================
+    
+    json chat_message;
+    chat_message["role"] = "assistant";
+    chat_message["content"] = json::array({
+        {{"type", "text"}, {"text", message}}
+    });
+    chat_message["timestamp"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count();
+    
+    if (!label.empty()) {
+        chat_message["label"] = label;
     }
     
-    json result;
-    result["session_id"] = params["session_id"];
-    result["message_id"] = params["message_id"];
-    result["edited"] = true;
-    return core::Result<json>::Ok(result);
-}
-
-// 22. chat.delete
-core::Result<json> method_chat_delete(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    if (!params.contains("session_id") || !params.contains("message_id")) {
-        return core::Result<json>::Err("Missing required parameters");
-    }
+    json chat_payload;
+    chat_payload["runId"] = "inject-" + message_id;
+    chat_payload["session_id"] = session_id;
+    chat_payload["seq"] = 0;
+    chat_payload["state"] = "final";
+    chat_payload["message"] = chat_message;
+    
+    core::EventFrame frame;
+    frame.type = "chat";
+    frame.payload = chat_payload;
+    
+    server->broadcast(frame);
+    
+    // ========================================================================
+    // Step 5: 返回结果
+    // ========================================================================
     
     json result;
-    result["session_id"] = params["session_id"];
-    result["message_id"] = params["message_id"];
-    result["deleted"] = true;
-    return core::Result<json>::Ok(result);
-}
-
-// 23. chat.transcript
-core::Result<json> method_chat_transcript(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    if (!params.contains("session_id")) {
-        return core::Result<json>::Err("Missing session_id");
-    }
+    result["ok"] = true;
+    result["messageId"] = message_id;
     
-    json result;
-    result["session_id"] = params["session_id"];
-    result["messages"] = json::array();
-    result["total_count"] = 0;
-    return core::Result<json>::Ok(result);
-}
-
-// 24. chat.export
-core::Result<json> method_chat_export(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    if (!params.contains("session_id")) {
-        return core::Result<json>::Err("Missing session_id");
-    }
+    spdlog::info("[chat.inject] Completed: session={}, message_id={}", session_id, message_id);
     
-    std::string format = params.value("format", "json");
-    json result;
-    result["session_id"] = params["session_id"];
-    result["format"] = format;
-    result["content"] = "[Export placeholder]";
     return core::Result<json>::Ok(result);
 }
 

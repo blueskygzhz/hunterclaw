@@ -1,4 +1,5 @@
 #include "hunterclaw/gateway/connection_pool.h"
+#include "hunterclaw/gateway/websocket_support.h"
 #include <spdlog/spdlog.h>
 #include <algorithm>
 
@@ -187,6 +188,54 @@ void ConnectionPool::reset_statistics() {
 // Internal Helpers
 // ============================================================================
 
+bool ConnectionPool::is_send_buffer_full(const std::shared_ptr<WsClient>& client) const {
+    // 🎯 OpenClaw 严格对齐: 慢速消费者检测
+    
+    // 1. 检查发送队列大小
+    constexpr size_t MAX_BUFFER_SIZE = 1024 * 1024;  // 1MB
+    size_t queue_size = client->send_queue_size.load();
+    
+    if (queue_size > MAX_BUFFER_SIZE) {
+        auto logger = spdlog::get("console");
+        if (logger) {
+            logger->warn("[ConnectionPool] Client {} send buffer full: {} bytes", 
+                        client->conn_id, queue_size);
+        }
+        return true;
+    }
+    
+    // 2. 检查连接是否仍然打开
+    if (!client->socket || !client->socket->is_open()) {
+        return true;  // 连接已关闭,视为"满"
+    }
+    
+    return false;
+}
+
+void ConnectionPool::disconnect_slow_consumer(
+    const std::shared_ptr<WsClient>& client, 
+    const std::string& reason
+) {
+    // 🎯 OpenClaw 严格对齐: 自动断连慢速消费者
+    
+    auto logger = spdlog::get("console");
+    if (logger) {
+        logger->warn("[ConnectionPool] Disconnecting slow consumer {} ({})", 
+                    client->conn_id, reason);
+    }
+    
+    // 关闭连接
+    if (client->socket && client->socket->is_open()) {
+        client->socket->close(1008, reason);  // 1008 = Policy Violation
+    }
+    
+    // 从连接池移除
+    remove_client(client->conn_id);
+    
+    // 更新统计
+    statistics_.slow_consumers_disconnected++;
+}
+
 bool ConnectionPool::has_event_scope(const WsClient& client, const std::string& event) const {
     // 检查客户端是否有权接收该事件
     // TODO: 实现基于 scope 的访问控制
@@ -223,42 +272,95 @@ void ConnectionPool::broadcast_internal(
 ) {
     std::lock_guard<std::mutex> lock(mutex_);
     
+    // 🎯 OpenClaw 严格对齐: 创建 JSON-RPC 2.0 事件帧
     std::string frame = create_event_frame(event, payload, opts);
     size_t sent_count = 0;
+    size_t dropped_count = 0;
+    
+    auto logger = spdlog::get("console");
+    
+    // 遍历所有客户端
+    std::vector<std::shared_ptr<WsClient>> slow_clients;
     
     for (const auto& client : clients_) {
-        // 检查目标过滤
+        // 1. 检查目标过滤
         if (target_conn_ids && target_conn_ids->count(client->conn_id) == 0) {
             continue;
         }
         
-        // 检查自定义过滤器
+        // 2. 检查自定义过滤器
         if (filter && !filter(*client)) {
             continue;
         }
         
-        // 检查 scope 权限
+        // 3. 检查 scope 权限
         if (!has_event_scope(*client, event)) {
             continue;
         }
         
-        // TODO: 实际发送 WebSocket 消息
-        // client->send(frame);
+        // 4. 🎯 OpenClaw 严格对齐: 慢速消费者检测
+        if (opts.drop_if_slow && is_send_buffer_full(client)) {
+            ++dropped_count;
+            
+            // 累计慢速次数
+            int slow_count = ++client->slow_send_count;
+            
+            // 连续 10 次慢速 → 自动断连
+            if (slow_count >= 10) {
+                slow_clients.push_back(client);
+            }
+            
+            if (logger) {
+                logger->debug("[ConnectionPool] Dropped event '{}' for slow client {} (count: {})", 
+                             event, client->conn_id, slow_count);
+            }
+            continue;
+        }
         
-        ++sent_count;
+        // 5. 🎯 OpenClaw 严格对齐: 实际发送 WebSocket 消息
+        try {
+            if (client->socket && client->socket->is_open()) {
+                // 创建 WebSocket 文本消息
+                WsMessage msg;
+                msg.type = WsMessageType::Text;
+                msg.payload = frame;
+                
+                // 发送
+                client->socket->send(msg);
+                
+                // 重置慢速计数
+                client->slow_send_count = 0;
+                
+                // 更新活动时间
+                client->last_activity = std::chrono::steady_clock::now();
+                
+                ++sent_count;
+            }
+        } catch (const std::exception& e) {
+            if (logger) {
+                logger->error("[ConnectionPool] Send failed for client {}: {}", 
+                             client->conn_id, e.what());
+            }
+            ++dropped_count;
+        }
     }
     
-    // 更新统计
+    // 6. 🎯 OpenClaw 严格对齐: 断连慢速消费者
+    for (const auto& client : slow_clients) {
+        disconnect_slow_consumer(client, "Too many slow sends");
+    }
+    
+    // 7. 更新统计
     statistics_.events_sent += sent_count;
+    statistics_.events_dropped += dropped_count;
     statistics_.events_by_type[event] += sent_count;
     
-    auto logger = spdlog::get("console");
     if (logger) {
-        logger->debug("[ConnectionPool] Broadcasted event '{}' to {} clients", 
-                     event, sent_count);
+        logger->debug("[ConnectionPool] Broadcasted '{}' → sent: {}, dropped: {}", 
+                     event, sent_count, dropped_count);
     }
     
-    // 触发订阅回调
+    // 8. 🎯 OpenClaw 严格对齐: 触发订阅回调
     for (const auto& [sub_id, sub] : subscriptions_) {
         if (match_event_pattern(sub.event_pattern, event)) {
             try {

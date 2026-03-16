@@ -1,5 +1,7 @@
 #include "hunterclaw/agents/subagent.h"
 #include "hunterclaw/core/utils.h"
+#include "hunterclaw/core/logging.h"
+#include <spdlog/spdlog.h>
 #include <iostream>
 #include <algorithm>
 #include <thread>
@@ -9,6 +11,9 @@
 
 namespace hunterclaw {
 namespace agents {
+
+// Helper for logging
+inline auto log() { return core::get_logger("subagent"); }
 
 // Type aliases for forward-declared types
 using AgentPtr = std::shared_ptr<Agent>;
@@ -382,8 +387,8 @@ AgentConfig SubagentSpawner::build_subagent_config(
     }
     
     // ✅ 设置 subagent 的深度信息 (用于日志和调试)
-    config.extra["subagent_depth"] = core::JsonValue::from_int(depth_info.depth);
-    config.extra["subagent_root_run_id"] = core::JsonValue::from_string(depth_info.root_run_id);
+    config.extra["subagent_depth"] = core::JsonValue(static_cast<int64_t>(depth_info.depth));
+    config.extra["subagent_root_run_id"] = core::JsonValue(depth_info.root_run_id);
     
     return config;
 }
@@ -420,7 +425,7 @@ void SubagentSpawner::setup_event_handlers(
                             subagent_run_id, 
                             SubagentState::Running
                         );
-                        spdlog::info("[SubagentSpawner] Subagent started: {}", 
+                        log()->info("[SubagentSpawner] Subagent started: {}", 
                                    subagent_run_id);
                         break;
                         
@@ -449,7 +454,7 @@ void SubagentSpawner::setup_event_handlers(
                             error_msg
                         );
                         
-                        spdlog::info("[SubagentSpawner] Subagent completed: {} (error={})",
+                        log()->info("[SubagentSpawner] Subagent completed: {} (error={})",
                                    subagent_run_id, has_error);
                         
                         // 通知等待线程
@@ -475,7 +480,7 @@ void SubagentSpawner::setup_event_handlers(
                             error_msg
                         );
                         
-                        spdlog::error("[SubagentSpawner] Subagent error: {} - {}",
+                        log()->error("[SubagentSpawner] Subagent error: {} - {}",
                                     subagent_run_id, error_msg);
                         
                         // 通知等待线程
@@ -501,7 +506,7 @@ void SubagentSpawner::setup_event_handlers(
     
     // ✅ 当前实现: 暂时跳过事件处理器设置
     // Subagent 状态更新将由 SubagentAnnouncer 通过轮询实现
-    spdlog::debug("[SubagentSpawner] Event handler setup skipped (not yet implemented)");
+    log()->debug("[SubagentSpawner] Event handler setup skipped (not yet implemented)");
 }
 
 core::Result<std::string> SubagentSpawner::spawn(
@@ -536,7 +541,7 @@ core::Result<std::string> SubagentSpawner::spawn(
     auto parent_depth = registry_->get_depth_info(requester_run_id);
     auto child_depth = parent_depth.child_depth(requester_run_id);
     
-    spdlog::debug("[SubagentSpawner] Spawning subagent: parent_depth={}, child_depth={}",
+    log()->debug("[SubagentSpawner] Spawning subagent: parent_depth={}, child_depth={}",
                 parent_depth.depth, child_depth.depth);
     
     // ========== 阶段 2: 构建配置 ==========
@@ -618,12 +623,12 @@ core::Result<std::string> SubagentSpawner::spawn(
         try {
             subagent->run(options.prompt, run_options);
         } catch (const std::exception& e) {
-            spdlog::error("[SubagentSpawner] Subagent execution failed: {}", e.what());
+            log()->error("[SubagentSpawner] Subagent execution failed: {}", e.what());
         }
     }).detach();
     */
     
-    spdlog::info("[SubagentSpawner] Spawned subagent: {} (name={}, depth={}, timeout={}s)",
+    log()->info("[SubagentSpawner] Spawned subagent: {} (name={}, depth={}, timeout={}s)",
               subagent_run_id, options.subagent_name, child_depth.depth, entry.timeout_seconds);
     
     // ========== 阶段 8: 可选等待完成 ==========
@@ -851,7 +856,7 @@ core::Result<void> SubagentAnnouncer::attempt_delivery(
     // ========== 传递事件 ==========
     auto deliver_result = requester_agent->inject_event(event);
     if (deliver_result.is_err()) {
-        spdlog::warn("[SubagentAnnouncer] Failed to inject event: {}", 
+        log()->warn("[SubagentAnnouncer] Failed to inject event: {}", 
                    deliver_result.error);
         return core::Result<void>::Err("Failed to inject event: " + deliver_result.error);
     }
@@ -860,7 +865,7 @@ core::Result<void> SubagentAnnouncer::attempt_delivery(
     // ✅ 标记为已传递
     registry_->mark_delivered(entry->subagent_run_id);
     
-    spdlog::info("[SubagentAnnouncer] Delivered result: {} -> {} (attempts={})",
+    log()->info("[SubagentAnnouncer] Delivered result: {} -> {} (attempts={})",
               entry->subagent_run_id, entry->requester_run_id, 
               entry->delivery_attempts);
     

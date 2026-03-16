@@ -59,9 +59,14 @@ public:
         auto action_prop = core::JsonValue::object();
         action_prop["type"] = "string";
         action_prop["description"] = "Action to perform";
-        action_prop["enum"] = core::JsonValue::array({
-            "status", "list", "add", "update", "remove", "run"
-        });
+        auto enum_array = core::JsonValue::array();
+        enum_array.push_back("status");
+        enum_array.push_back("list");
+        enum_array.push_back("add");
+        enum_array.push_back("update");
+        enum_array.push_back("remove");
+        enum_array.push_back("run");
+        action_prop["enum"] = enum_array;
         schema.properties["action"] = action_prop;
         
         // id (optional, required for update/remove/run)
@@ -109,7 +114,7 @@ public:
                 log()->error("CronTool error: {}", error);
                 
                 tools::ToolResult tool_result;
-                tool_result.ok = false;
+                tool_result.success = false;
                 tool_result.error = error;
                 return tool_result;
             }

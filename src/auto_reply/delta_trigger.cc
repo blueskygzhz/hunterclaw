@@ -15,7 +15,7 @@ namespace auto_reply {
 DeltaTrigger::DeltaTrigger(
     std::shared_ptr<memory::SessionMemoryProvider> session_provider
 ) : session_provider_(session_provider),
-    logger_(core::Logger::get()) {}
+    logger_(core::get_logger("delta_trigger")) {}
 
 core::Result<void> DeltaTrigger::trigger_on_message_batch(
     const std::string& session_key,
@@ -23,7 +23,7 @@ core::Result<void> DeltaTrigger::trigger_on_message_batch(
 ) {
     if (!session_provider_ || !session_provider_->config().enabled) {
         // Session memory 未启用,静默跳过
-        return core::Ok();
+        return core::Result<void>::Ok();
     }
     
     logger_->debug("Delta trigger: processing {} messages for session {}",
@@ -77,7 +77,7 @@ core::Result<void> trigger_delta_after_reply(
     std::shared_ptr<memory::SessionMemoryProvider> session_provider
 ) {
     if (!session_provider) {
-        return core::Ok();
+        return core::Result<void>::Ok();
     }
     
     DeltaTrigger trigger(session_provider);

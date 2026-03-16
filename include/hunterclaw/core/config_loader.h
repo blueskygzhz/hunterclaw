@@ -10,51 +10,8 @@
 namespace hunterclaw {
 namespace core {
 
-// Gateway 配置
-struct GatewayConfig {
-    std::string host = "127.0.0.1";
-    uint16_t port = 18789;
-    bool tls = false;
-    std::string token;
-};
-
-// Daemon 配置
-struct DaemonConfig {
-    bool auto_restart = true;
-    int restart_limit = 5;
-    int restart_interval = 60;  // seconds
-    std::string working_directory;
-};
-
-// 安全配置
-struct SecurityConfig {
-    std::string exec_policy = "allowlist";  // deny | allowlist | full
-    bool path_sandbox = true;
-    bool symlink_protection = true;
-};
-
-// 日志配置
-struct LogConfig {
-    std::string level = "info";  // debug | info | warn | error
-    std::string file;  // 空字符串 = stdout
-    std::string rotate_size = "10MB";
-    int rotate_count = 5;
-    std::string format = "console";  // json | console | syslog
-};
-
-// 完整配置
-struct Config {
-    GatewayConfig gateway;
-    DaemonConfig daemon;
-    SecurityConfig security;
-    LogConfig logging;
-    
-    // 从 JSON 解析
-    static Result<Config> FromJson(const nlohmann::json& json);
-    
-    // 转换为 JSON
-    nlohmann::json ToJson() const;
-};
+// Note: GatewayConfig and Config are defined in types.h
+// This file only declares the ConfigLoader utility class
 
 // 配置加载选项
 struct LoadOptions {

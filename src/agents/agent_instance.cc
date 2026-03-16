@@ -2,11 +2,15 @@
 #include "hunterclaw/agents/agent_scope.h"
 #include "hunterclaw/memory/memory_provider_adapter.h"  // ✅ P3: MemoryProviderAdapter
 #include "hunterclaw/core/utils.h"
+#include "hunterclaw/core/logging.h"
 #include <spdlog/spdlog.h>
 #include <filesystem>
 
 namespace hunterclaw {
 namespace agents {
+
+// Helper for logging
+inline auto log() { return core::get_logger("agent_instance"); }
 
 AgentInstance::AgentInstance(
     const std::string& session_id,

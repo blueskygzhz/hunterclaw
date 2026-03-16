@@ -97,73 +97,6 @@ cc_library(
 )
 
 # ============================================================================
-# Core Library
-# ============================================================================
-cc_library(
-    name = "hunterclaw_core",
-    srcs = glob(
-        [
-            "core/*.cc",
-            "agents/*.cc",
-            "llm/*.cc",
-            "channels/*.cc",
-            "gateway/*.cc",
-            "gateway/methods/*.cc",
-            "sessions/*.cc",
-            "queue/*.cc",
-            "routing/*.cc",
-            "cron/*.cc",
-            "auto_reply/*.cc",
-            "config/*.cc",
-            "memory/*.cc",
-        ],
-        exclude = [
-            "main.cc",
-            # Exclude files with missing dependencies
-            "plugins/**",
-            "skills/**",
-            "tools/**",
-            "mcp/**",
-            "react/**",
-            "sandbox/**",
-            # Exclude daemon implementations (platform-specific)
-            "daemon/*.cc",
-        ],
-    ),
-    deps = [
-        "//:hunterclaw_headers",
-        "//third_party:subprocess",
-        "//third_party:httplib",
-        "@nlohmann_json//:json",
-        "@yaml_cpp//:yaml-cpp",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:statusor",
-    ],
-    copts = [
-        "-std=c++17",
-        "-Wall",
-        "-Wextra",
-        "-Wpedantic",
-        "-I/usr/include/jsoncpp",  # For <json/json.h>
-    ],
-    linkopts = [
-        "-lpthread",
-        "-ldl",
-        "-luuid",
-        "-ljsoncpp",
-    ] + select({
-        "@platforms//os:linux": [
-            "-lssl",
-            "-lcrypto",
-            "-lcurl",
-        ],
-        "//conditions:default": [],
-    }),
-    linkstatic = False,
-    visibility = ["//visibility:public"],
-)
-
-# ============================================================================
 # Gateway Server Executable
 # ============================================================================
 cc_binary(
@@ -177,6 +110,9 @@ cc_binary(
     ],
     linkopts = [
         "-lpthread",
+        "-lstdc++",
+        "-lstdc++fs",  # C++17 filesystem
+        "-lboost_system",  # Boost.System
     ],
     visibility = ["//visibility:public"],
 )

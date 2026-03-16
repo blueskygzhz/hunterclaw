@@ -1,6 +1,7 @@
 #pragma once
 
 #include "hunterclaw/cron/service.h"
+#include "hunterclaw/cron/types.h"
 #include "hunterclaw/core/types.h"
 #include <nlohmann/json.hpp>
 #include <memory>

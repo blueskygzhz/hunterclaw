@@ -53,7 +53,7 @@ public:
 
 private:
     std::shared_ptr<memory::SessionMemoryProvider> session_provider_;
-    std::shared_ptr<core::Logger> logger_;
+    std::shared_ptr<spdlog::logger> logger_;
 };
 
 // ========================================

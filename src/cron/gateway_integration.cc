@@ -294,13 +294,13 @@ void GatewayCronIntegration::set_context(
     const std::string& agent_id,
     const std::optional<std::string>& session_key
 ) {
-    CronService::ExecutionContext ctx;
-    ctx.agent_id = agent_id;
-    ctx.session_key = session_key;
+    // TODO: ExecutionContext not yet implemented in CronService
+    // CronService::ExecutionContext ctx;
+    // ctx.agent_id = agent_id;
+    // ctx.session_key = session_key;
+    // service_->set_context(ctx);
     
-    service_->set_context(ctx);
-    
-    log()->debug("[Cron] Context set to agent_id={}", agent_id);
+    log()->debug("[Cron] Context set to agent_id={} (not yet implemented)", agent_id);
 }
 
 // ============================================================================

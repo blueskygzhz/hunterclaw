@@ -36,12 +36,24 @@ struct AuthManager::Impl {
     std::map<std::string, DeviceChallenge> challenges;
     mutable std::mutex challenges_mutex;
     
+    // 🎯 新增: 速率限制器
+    std::shared_ptr<AuthRateLimiter> rate_limiter;
+    
     // 数据文件路径
     std::string devices_file = "./data/auth/devices.json";
     
     explicit Impl(std::shared_ptr<core::Config> cfg) : config(cfg) {
         // 确保数据目录存在
         std::filesystem::create_directories("./data/auth");
+        
+        // 🎯 初始化速率限制器
+        AuthRateLimiterConfig rl_config{
+            .max_attempts = cfg->gateway.auth.rate_limit.max_attempts,
+            .window_ms = cfg->gateway.auth.rate_limit.window_ms,
+            .lockout_ms = cfg->gateway.auth.rate_limit.lockout_ms,
+            .exempt_loopback = cfg->gateway.auth.rate_limit.exempt_loopback
+        };
+        rate_limiter = std::make_shared<AuthRateLimiter>(rl_config);
         
         // 自动加载设备数据
         load_devices();
@@ -176,20 +188,37 @@ AuthManager::~AuthManager() = default;
 
 AuthResult AuthManager::authenticate_connect(
     const json& params,
-    const std::string& nonce
+    const std::string& nonce,
+    const std::map<std::string, std::string>& headers,
+    const std::string& client_ip
 ) {
     AuthResult result;
     
     // 获取鉴权配置
     auto& auth_config = impl_->config->gateway.auth;
     
-    get_logger()->debug("[AuthManager] Authenticating connection (mode: {})", 
-        auth_config.mode);
+    get_logger()->debug("[AuthManager] Authenticating connection (mode: {}, client_ip: {})", 
+        auth_config.mode, client_ip);
+    
+    // 🎯 0. 速率限制检查 (在鉴权前检查，对齐 OpenClaw)
+    if (impl_->rate_limiter && !client_ip.empty()) {
+        auto check = impl_->rate_limiter->check(client_ip, rate_limit_scopes::DEFAULT);
+        if (!check.allowed) {
+            get_logger()->warn("[AuthManager] Rate limited: client_ip={}, retry_after={}ms",
+                              client_ip, check.retry_after_ms);
+            result.ok = false;
+            result.reason = auth_errors::RATE_LIMITED;
+            result.rate_limited = true;
+            result.retry_after_ms = check.retry_after_ms;
+            return result;
+        }
+    }
     
     // 1. 无鉴权模式
     if (!auth_config.enabled || auth_config.mode == "none") {
         get_logger()->debug("[AuthManager] Auth disabled, granting default scopes");
         result.ok = true;
+        result.method = "none";
         result.device_id = params.value("deviceId", "anonymous");
         result.scopes = {
             scopes::AGENT_RUN,
@@ -199,7 +228,18 @@ AuthResult AuthManager::authenticate_connect(
         return result;
     }
     
-    // 2. Bearer Token 模式
+    // 🎯 2. Trusted Proxy 模式 (新增)
+    if (auth_config.mode == "trusted-proxy") {
+        result = authenticate_trusted_proxy(headers, client_ip);
+        if (!result.ok && impl_->rate_limiter && !client_ip.empty()) {
+            impl_->rate_limiter->record_failure(client_ip, rate_limit_scopes::DEFAULT);
+        } else if (result.ok && impl_->rate_limiter && !client_ip.empty()) {
+            impl_->rate_limiter->reset(client_ip, rate_limit_scopes::DEFAULT);
+        }
+        return result;
+    }
+    
+    // 3. Bearer Token 模式
     if (auth_config.mode == "bearer") {
         std::string token = params.value("token", "");
         
@@ -207,11 +247,18 @@ AuthResult AuthManager::authenticate_connect(
             get_logger()->warn("[AuthManager] Bearer token validation failed");
             result.ok = false;
             result.reason = auth_errors::NOT_AUTHENTICATED;
+            result.method = "bearer";
+            
+            // 记录失败
+            if (impl_->rate_limiter && !client_ip.empty()) {
+                impl_->rate_limiter->record_failure(client_ip, rate_limit_scopes::SHARED_SECRET);
+            }
             return result;
         }
         
         get_logger()->debug("[AuthManager] Bearer token validated");
         result.ok = true;
+        result.method = "bearer";
         result.device_id = params.value("deviceId", "authenticated");
         result.scopes = {
             scopes::AGENT_RUN,
@@ -221,10 +268,15 @@ AuthResult AuthManager::authenticate_connect(
             scopes::PLUGIN_INSTALL,
             scopes::ADMIN_FULL
         };
+        
+        // 重置速率限制
+        if (impl_->rate_limiter && !client_ip.empty()) {
+            impl_->rate_limiter->reset(client_ip, rate_limit_scopes::SHARED_SECRET);
+        }
         return result;
     }
     
-    // 3. 设备认证模式
+    // 4. 设备认证模式
     if (auth_config.mode == "device") {
         std::string device_id = params.value("deviceId", "");
         std::string device_token = params.value("deviceToken", "");
@@ -233,6 +285,11 @@ AuthResult AuthManager::authenticate_connect(
             get_logger()->warn("[AuthManager] Missing deviceId or deviceToken");
             result.ok = false;
             result.reason = auth_errors::NOT_AUTHENTICATED;
+            result.method = "device";
+            
+            if (impl_->rate_limiter && !client_ip.empty()) {
+                impl_->rate_limiter->record_failure(client_ip, rate_limit_scopes::DEVICE_TOKEN);
+            }
             return result;
         }
         
@@ -240,6 +297,11 @@ AuthResult AuthManager::authenticate_connect(
             get_logger()->warn("[AuthManager] Device verification failed: {}", device_id);
             result.ok = false;
             result.reason = auth_errors::DEVICE_TOKEN_MISMATCH;
+            result.method = "device";
+            
+            if (impl_->rate_limiter && !client_ip.empty()) {
+                impl_->rate_limiter->record_failure(client_ip, rate_limit_scopes::DEVICE_TOKEN);
+            }
             return result;
         }
         
@@ -248,17 +310,23 @@ AuthResult AuthManager::authenticate_connect(
         if (!device_opt.has_value()) {
             result.ok = false;
             result.reason = auth_errors::NOT_AUTHENTICATED;
+            result.method = "device";
             return result;
         }
         
         get_logger()->debug("[AuthManager] Device authenticated: {}", device_id);
         result.ok = true;
+        result.method = "device";
         result.device_id = device_id;
         result.scopes = device_opt->scopes;
+        
+        if (impl_->rate_limiter && !client_ip.empty()) {
+            impl_->rate_limiter->reset(client_ip, rate_limit_scopes::DEVICE_TOKEN);
+        }
         return result;
     }
     
-    // 4. 挑战-响应模式
+    // 5. 挑战-响应模式
     if (auth_config.mode == "challenge") {
         std::string device_id = params.value("deviceId", "");
         std::string nonce_param = params.value("nonce", nonce);
@@ -268,6 +336,11 @@ AuthResult AuthManager::authenticate_connect(
             get_logger()->warn("[AuthManager] Missing challenge parameters");
             result.ok = false;
             result.reason = auth_errors::NOT_AUTHENTICATED;
+            result.method = "challenge";
+            
+            if (impl_->rate_limiter && !client_ip.empty()) {
+                impl_->rate_limiter->record_failure(client_ip, rate_limit_scopes::DEVICE_TOKEN);
+            }
             return result;
         }
         
@@ -275,6 +348,11 @@ AuthResult AuthManager::authenticate_connect(
             get_logger()->warn("[AuthManager] Signature verification failed: {}", device_id);
             result.ok = false;
             result.reason = auth_errors::INVALID_SIGNATURE;
+            result.method = "challenge";
+            
+            if (impl_->rate_limiter && !client_ip.empty()) {
+                impl_->rate_limiter->record_failure(client_ip, rate_limit_scopes::DEVICE_TOKEN);
+            }
             return result;
         }
         
@@ -283,13 +361,19 @@ AuthResult AuthManager::authenticate_connect(
         if (!device_opt.has_value()) {
             result.ok = false;
             result.reason = auth_errors::NOT_AUTHENTICATED;
+            result.method = "challenge";
             return result;
         }
         
         get_logger()->debug("[AuthManager] Challenge-response authenticated: {}", device_id);
         result.ok = true;
+        result.method = "challenge";
         result.device_id = device_id;
         result.scopes = device_opt->scopes;
+        
+        if (impl_->rate_limiter && !client_ip.empty()) {
+            impl_->rate_limiter->reset(client_ip, rate_limit_scopes::DEVICE_TOKEN);
+        }
         return result;
     }
     
@@ -595,6 +679,145 @@ core::Result<bool> AuthManager::save_devices() {
 
 core::Result<bool> AuthManager::load_devices() {
     return impl_->load_devices();
+}
+
+// ========== Trusted Proxy 鉴权 (🎯 新增) ==========
+
+/**
+ * 检查 IP 是否在受信任列表中
+ */
+static bool is_trusted_proxy_ip(
+    const std::string& ip,
+    const std::vector<std::string>& trusted_proxies
+) {
+    if (trusted_proxies.empty()) {
+        return false;
+    }
+    
+    // 精确匹配
+    for (const auto& trusted_ip : trusted_proxies) {
+        if (ip == trusted_ip) {
+            return true;
+        }
+    }
+    
+    // TODO: 支持 CIDR 匹配 (10.0.0.0/8)
+    
+    return false;
+}
+
+/**
+ * 获取 HTTP Header 值
+ */
+static std::string get_header(
+    const std::map<std::string, std::string>& headers,
+    const std::string& name
+) {
+    // Header 名称不区分大小写
+    std::string lower_name = name;
+    std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::tolower);
+    
+    for (const auto& [key, value] : headers) {
+        std::string lower_key = key;
+        std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(), ::tolower);
+        
+        if (lower_key == lower_name) {
+            return value;
+        }
+    }
+    
+    return "";
+}
+
+AuthResult AuthManager::authenticate_trusted_proxy(
+    const std::map<std::string, std::string>& headers,
+    const std::string& client_ip
+) {
+    AuthResult result;
+    result.method = "trusted-proxy";
+    
+    auto& auth_config = impl_->config->gateway.auth;
+    auto& proxy_config = auth_config.trusted_proxy;
+    auto& trusted_proxies = impl_->config->gateway.trusted_proxies;
+    
+    get_logger()->debug("[AuthManager] Authenticating trusted proxy request from IP: {}", client_ip);
+    
+    // 1. 验证请求来自受信任的代理 IP
+    if (!is_trusted_proxy_ip(client_ip, trusted_proxies)) {
+        get_logger()->warn("[AuthManager] Trusted proxy: untrusted source IP: {}", client_ip);
+        result.ok = false;
+        result.reason = auth_errors::TRUSTED_PROXY_UNTRUSTED_SOURCE;
+        return result;
+    }
+    
+    // 2. 验证必需的 HTTP 头存在
+    for (const auto& required_header : proxy_config.required_headers) {
+        std::string header_value = get_header(headers, required_header);
+        if (header_value.empty()) {
+            get_logger()->warn("[AuthManager] Trusted proxy: missing required header: {}", required_header);
+            result.ok = false;
+            result.reason = auth_errors::TRUSTED_PROXY_MISSING_HEADER;
+            return result;
+        }
+    }
+    
+    // 3. 提取用户身份
+    std::string user = get_header(headers, proxy_config.user_header);
+    if (user.empty()) {
+        get_logger()->warn("[AuthManager] Trusted proxy: user header {} is missing or empty",
+                          proxy_config.user_header);
+        result.ok = false;
+        result.reason = auth_errors::TRUSTED_PROXY_USER_MISSING;
+        return result;
+    }
+    
+    // Trim whitespace
+    user.erase(0, user.find_first_not_of(" \t\n\r"));
+    user.erase(user.find_last_not_of(" \t\n\r") + 1);
+    
+    // 4. 检查用户白名单 (可选)
+    if (!proxy_config.allow_users.empty()) {
+        bool allowed = false;
+        for (const auto& allowed_user : proxy_config.allow_users) {
+            if (user == allowed_user) {
+                allowed = true;
+                break;
+            }
+        }
+        
+        if (!allowed) {
+            get_logger()->warn("[AuthManager] Trusted proxy: user {} not in allow list", user);
+            result.ok = false;
+            result.reason = auth_errors::TRUSTED_PROXY_USER_NOT_ALLOWED;
+            return result;
+        }
+    }
+    
+    // 鉴权成功
+    get_logger()->info("[AuthManager] Trusted proxy: authenticated user: {}", user);
+    result.ok = true;
+    result.user = user;
+    result.device_id = "proxy-" + user;  // 生成设备 ID
+    result.scopes = {
+        scopes::AGENT_RUN,
+        scopes::SESSION_READ,
+        scopes::SESSION_WRITE,
+        scopes::SKILL_INSTALL,
+        scopes::PLUGIN_INSTALL,
+        scopes::ADMIN_FULL
+    };
+    
+    return result;
+}
+
+// ========== 速率限制器 (🎯 新增) ==========
+
+std::shared_ptr<AuthRateLimiter> AuthManager::get_rate_limiter() const {
+    return impl_->rate_limiter;
+}
+
+void AuthManager::set_rate_limiter(std::shared_ptr<AuthRateLimiter> limiter) {
+    impl_->rate_limiter = limiter;
 }
 
 } // namespace gateway

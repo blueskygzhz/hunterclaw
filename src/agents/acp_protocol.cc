@@ -15,9 +15,9 @@ core::Result<SessionAcpMeta> SessionAcpMeta::from_json(const core::JsonValue& js
     try {
         // 1. Labels
         if (json.contains("labels") && json["labels"].is_object()) {
-            for (const auto& [key, value] : json["labels"].items()) {
-                if (value.is_string()) {
-                    meta.labels.labels[key] = value.get<std::string>();
+            for (const auto& [key, value_ptr] : json["labels"]) {
+                if (value_ptr && value_ptr->is_string()) {
+                    meta.labels.labels[key] = value_ptr->as_string();
                 }
             }
         }
@@ -420,19 +420,19 @@ core::Result<void> AcpProtocol::validate_meta(const SessionAcpMeta& meta) {
     }
     
     if (meta.limits.max_disk_mb && *meta.limits.max_disk_mb == 0) {
-        return core::Result<void>::err("max_disk_mb must be > 0");
+        return core::Result<void>::Err("max_disk_mb must be > 0");
     }
     
     if (meta.limits.max_concurrent_runs && *meta.limits.max_concurrent_runs <= 0) {
-        return core::Result<void>::err("max_concurrent_runs must be > 0");
+        return core::Result<void>::Err("max_concurrent_runs must be > 0");
     }
     
     if (meta.limits.max_turns_per_run && *meta.limits.max_turns_per_run <= 0) {
-        return core::Result<void>::err("max_turns_per_run must be > 0");
+        return core::Result<void>::Err("max_turns_per_run must be > 0");
     }
     
     if (meta.limits.timeout_seconds && *meta.limits.timeout_seconds <= 0) {
-        return core::Result<void>::err("timeout_seconds must be > 0");
+        return core::Result<void>::Err("timeout_seconds must be > 0");
     }
     
     // 验证作用域覆盖路径
@@ -441,27 +441,27 @@ core::Result<void> AcpProtocol::validate_meta(const SessionAcpMeta& meta) {
         
         // 1. 检查路径是否为空
         if (path.empty()) {
-            return core::Result<void>::err("workspace_override cannot be empty");
+            return core::Result<void>::Err("workspace_override cannot be empty");
         }
         
         // 2. 检查路径是否包含非法字符
         if (path.find("..") != std::string::npos) {
-            return core::Result<void>::err("workspace_override contains '..' (path traversal)");
+            return core::Result<void>::Err("workspace_override contains '..' (path traversal)");
         }
         
         // 3. 检查路径是否为绝对路径 (可选,根据需求)
         // if (!std::filesystem::path(path).is_absolute()) {
-        //     return core::Result<void>::err("workspace_override must be absolute path");
+        //     return core::Result<void>::Err("workspace_override must be absolute path");
         // }
         
         // 4. 检查路径是否存在且可访问 (可选)
         try {
             if (!std::filesystem::exists(path)) {
                 // 警告: 路径不存在 (但不阻止,可能稍后创建)
-                spdlog::warn("[AcpProtocol] workspace_override path does not exist: {}", path);
+                spdlog::get("")->warn("[AcpProtocol] workspace_override path does not exist: {}", path);
             }
         } catch (const std::exception& e) {
-            return core::Result<void>::err(std::string("workspace_override path check failed: ") + e.what());
+            return core::Result<void>::Err(std::string("workspace_override path check failed: ") + e.what());
         }
     }
     
@@ -470,11 +470,11 @@ core::Result<void> AcpProtocol::validate_meta(const SessionAcpMeta& meta) {
         const std::string& path = *meta.scope.memory_override;
         
         if (path.empty()) {
-            return core::Result<void>::err("memory_override cannot be empty");
+            return core::Result<void>::Err("memory_override cannot be empty");
         }
         
         if (path.find("..") != std::string::npos) {
-            return Error<void>("memory_override contains '..' (path traversal)");
+            return core::Result<void>::Err("memory_override contains '..' (path traversal)");
         }
         
         try {
@@ -485,11 +485,11 @@ core::Result<void> AcpProtocol::validate_meta(const SessionAcpMeta& meta) {
                 }
             }
         } catch (const std::exception& e) {
-            return Error<void>(std::string("memory_override path check failed: ") + e.what());
+            return core::Result<void>::Err(std::string("memory_override path check failed: ") + e.what());
         }
     }
     
-    return OkVoid();
+    return core::Result<void>::Ok();
 }
 
 AcpMessage AcpProtocol::create_message(

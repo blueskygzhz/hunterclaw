@@ -157,7 +157,7 @@ private:
             event->body_size_bytes = 0;
             event->remote_ip = "unknown";
             
-            observability::DiagnosticEventBus::instance().emit(event);
+            // observability::DiagnosticEventBus::instance().emit(event);
         } catch (const std::exception& e) {
             // 故障隔离: 永不阻塞主流程
         }
@@ -201,7 +201,7 @@ private:
                 received_event->body_size_bytes = payload.size();
                 received_event->remote_ip = "unknown";
 
-                observability::DiagnosticEventBus::instance().emit(received_event);
+                // observability::DiagnosticEventBus::instance().emit(received_event);
             } catch (...) {}
             
             // Parse request frame
@@ -245,11 +245,11 @@ private:
                     processed_event->status_code = response.ok ? 200 : 500;
                     processed_event->success = response.ok;
                     
-                    observability::DiagnosticEventBus::instance().emit(processed_event);
+                    // observability::DiagnosticEventBus::instance().emit(processed_event);
                     
                     // TODO: HTTP 请求事件 (需要HttpRequestEvent::create)
                     // auto http_event = std::make_shared<observability::HttpRequestEvent>();
-                    // observability::DiagnosticEventBus::instance().emit(http_event);
+                    // // observability::DiagnosticEventBus::instance().emit(http_event);
                 } catch (...) {}
                 
                 // Send response
@@ -281,7 +281,7 @@ private:
                 
                 // TODO: 待实现HttpRequestEvent
                 // auto error_event = std::make_shared<observability::HttpRequestEvent>();
-                // observability::DiagnosticEventBus::instance().emit(error_event);
+                // // observability::DiagnosticEventBus::instance().emit(error_event);
             } catch (...) {}
             
             // Send error response
