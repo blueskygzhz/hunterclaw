@@ -72,13 +72,89 @@ void MemoryManager::init_memory_provider() {
 void MemoryManager::init_embedding_provider() {
     // ✅ 严格对齐 OpenClaw: 初始化 EmbeddingProvider
     // 
-    // OpenClaw 实现:
-    // - ollama: OllamaEmbeddingProvider
-    // - gemini: GeminiEmbeddingProvider
-    // - openai: OpenAIEmbeddingProvider
+    // OpenClaw 实现 (embeddings.ts:168-269):
+    // - createEmbeddingProvider() 工厂方法
+    // - 支持 provider: "auto" | "openai" | "gemini" | "ollama" | "voyage" | "mistral" | "local"
+    // - 支持 fallback 机制
+    // - 支持 API key 缺失时降级到 FTS-only 模式
     
-    // TODO: Embedding Provider initialization not yet implemented
-    embedding_provider_ = nullptr;
+    try {
+        // 构建 EmbeddingProviderOptions
+        EmbeddingProviderOptions options;
+        options.agent_dir = config_.workspace_dir;
+        options.provider = config_.embedding.provider;        // "auto" or specific provider
+        options.model = config_.embedding.model;              // e.g. "text-embedding-3-small"
+        options.fallback = config_.embedding.fallback;        // e.g. "openai" or "none"
+        
+        // Gemini-specific options
+        if (config_.embedding.output_dimensionality.has_value()) {
+            options.output_dimensionality = config_.embedding.output_dimensionality;
+        }
+        if (config_.embedding.task_type.has_value()) {
+            options.task_type = config_.embedding.task_type;
+        }
+        
+        // 调用工厂方法创建 Provider (对齐 createEmbeddingProvider)
+        auto result = EmbeddingProviderFactory::create(options);
+        
+        if (result.is_err()) {
+            // spdlog::error("[MemoryManager] Failed to create embedding provider: {}", result.error);
+            throw std::runtime_error("Failed to create embedding provider: " + result.error);
+        }
+        
+        EmbeddingProviderResult provider_result = result.value;
+        
+        // 设置 Provider (可能为 nullptr 表示 FTS-only 模式)
+        embedding_provider_ = provider_result.provider;
+        
+        // 记录 Provider 信息
+        if (embedding_provider_) {
+            // spdlog::info(
+            //     "[MemoryManager] Embedding provider initialized: {} (model: {})",
+            //     embedding_provider_->get_id(),
+            //     embedding_provider_->get_model()
+            // );
+            
+            // 记录 fallback 信息
+            if (provider_result.fallback_from.has_value()) {
+                // spdlog::warn(
+                //     "[MemoryManager] Fell back from {} to {} due to: {}",
+                //     to_string(provider_result.fallback_from.value()),
+                //     embedding_provider_->get_id(),
+                //     provider_result.fallback_reason.value_or("unknown")
+                // );
+            }
+        } else {
+            // spdlog::warn(
+            //     "[MemoryManager] No embedding provider available, falling back to FTS-only mode"
+            // );
+            // spdlog::warn(
+            //     "[MemoryManager] Reason: {}",
+            //     provider_result.provider_unavailable_reason.value_or("Unknown")
+            // );
+        }
+        
+        // 保存客户端引用 (用于 Batch API)
+        if (provider_result.openai) {
+            openai_client_ = provider_result.openai;
+        }
+        if (provider_result.gemini) {
+            gemini_client_ = provider_result.gemini;
+        }
+        if (provider_result.ollama) {
+            ollama_client_ = provider_result.ollama;
+        }
+        if (provider_result.voyage) {
+            voyage_client_ = provider_result.voyage;
+        }
+        if (provider_result.mistral) {
+            mistral_client_ = provider_result.mistral;
+        }
+        
+    } catch (const std::exception& e) {
+        // spdlog::error("[MemoryManager] Failed to initialize embedding provider: {}", e.what());
+        throw;
+    }
 }
 
 void MemoryManager::init_compaction_manager() {

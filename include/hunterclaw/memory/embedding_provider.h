@@ -93,7 +93,7 @@ inline std::optional<EmbeddingProviderId> parse_provider_id(const std::string& s
 }
 
 // ============================================================================
-// EmbeddingProviderResult (embeddings.ts:47-58)
+// GeminiTaskType (embeddings-gemini.ts)
 // ============================================================================
 enum class GeminiTaskType {
     RetrievalQuery,      // "retrieval_query"
@@ -103,6 +103,18 @@ enum class GeminiTaskType {
     Clustering          // "clustering"
 };
 
+// Forward declarations for client types
+class OpenAiEmbeddingClient;
+class GeminiEmbeddingClient;
+class OllamaEmbeddingClient;
+class VoyageEmbeddingClient;
+class MistralEmbeddingClient;
+
+// EmbeddingProviderResult 在 types.h 中定义
+
+// ============================================================================
+// EmbeddingProviderOptions (embeddings.ts:60-79)
+// ============================================================================
 struct EmbeddingProviderOptions {
     std::string agent_dir;
     std::string provider;  // "auto" or specific provider id

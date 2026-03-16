@@ -3,14 +3,22 @@
 #include "hunterclaw/memory/compaction_manager.h"
 #include "hunterclaw/memory/memory_provider.h"
 #include "hunterclaw/memory/session_memory_provider.h"
+#include "hunterclaw/memory/embedding_provider.h"
 #include <memory>
 #include <string>
+#include <map>
+#include <optional>
 
 namespace hunterclaw {
 namespace memory {
 
-// Forward declaration
+// Forward declarations
 class EmbeddingProvider;
+class OpenAiEmbeddingClient;
+class GeminiEmbeddingClient;
+class OllamaEmbeddingClient;
+class VoyageEmbeddingClient;
+class MistralEmbeddingClient;
 
 /**
  * MemoryManager - 集成 compaction, session memory, embedding providers
@@ -22,6 +30,26 @@ class EmbeddingProvider;
  */
 class MemoryManager {
 public:
+    struct EmbeddingConfig {
+        // 对齐 OpenClaw EmbeddingProviderOptions (embeddings.ts:60-79)
+        std::string provider = "auto";  // "auto" | "openai" | "gemini" | "ollama" | "voyage" | "mistral" | "local"
+        std::string model;              // e.g. "text-embedding-3-small"
+        std::string fallback = "none";  // fallback provider or "none"
+        
+        // Remote provider 选项
+        std::string base_url;
+        std::string api_key;
+        std::map<std::string, std::string> headers;
+        
+        // Local provider 选项
+        std::string local_model_path;
+        std::string local_model_cache_dir;
+        
+        // Gemini-specific 选项
+        std::optional<int> output_dimensionality;  // 768, 1536, or 3072
+        std::optional<GeminiTaskType> task_type;
+    };
+    
     struct Config {
         // Compaction 配置
         CompactionConfig compaction;
@@ -34,11 +62,8 @@ public:
         std::string provider_base_url;
         std::string provider_api_key;
         
-        // Embedding Provider 配置
-        std::string embedding_provider = "ollama";  // "ollama", "gemini", "openai"
-        std::string embedding_model;
-        std::string embedding_base_url;
-        std::string embedding_api_key;
+        // Embedding Provider 配置 (对齐 OpenClaw)
+        EmbeddingConfig embedding;
         
         // Workspace 配置 (对齐 OpenClaw)
         std::string workspace_dir;  // 工作空间根目录
@@ -200,6 +225,14 @@ private:
     std::unique_ptr<SessionMemoryProvider> session_memory_provider_;
     std::shared_ptr<MemoryProvider> memory_provider_;
     std::shared_ptr<EmbeddingProvider> embedding_provider_;
+    
+    // Embedding clients (对齐 OpenClaw manager.ts:212-216)
+    // 用于 Batch API 和高级功能
+    std::shared_ptr<OpenAiEmbeddingClient> openai_client_;
+    std::shared_ptr<GeminiEmbeddingClient> gemini_client_;
+    std::shared_ptr<OllamaEmbeddingClient> ollama_client_;
+    std::shared_ptr<VoyageEmbeddingClient> voyage_client_;
+    std::shared_ptr<MistralEmbeddingClient> mistral_client_;
     
     // 初始化辅助
     void init_memory_provider();

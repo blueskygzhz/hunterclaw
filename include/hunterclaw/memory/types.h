@@ -7,6 +7,7 @@
 #include <set>
 #include <functional>
 #include <cstdint>
+#include <memory>
 
 namespace hunterclaw {
 namespace memory {
@@ -216,14 +217,32 @@ struct ChunkMetadata {
 };
 
 // ============================================================================
-// EmbeddingProviderResult (对齐 embeddings.ts)
+// EmbeddingProviderResult (对齐 embeddings.ts:47-58)
 // ============================================================================
+// Forward declarations
+class EmbeddingProvider;
+class OpenAiEmbeddingClient;
+class GeminiEmbeddingClient;
+class OllamaEmbeddingClient;
+class VoyageEmbeddingClient;
+class MistralEmbeddingClient;
+enum class EmbeddingProviderId;
+
 struct EmbeddingProviderResult {
-    std::string provider;
-    std::string model;
-    std::optional<std::string> fallback_from;
+    std::shared_ptr<EmbeddingProvider> provider;  // nullable (FTS-only mode)
+    std::string requested_provider;               // "auto" or specific provider
+    
+    // Fallback information
+    std::optional<EmbeddingProviderId> fallback_from;
     std::optional<std::string> fallback_reason;
-    std::optional<std::string> unavailable_reason;
+    std::optional<std::string> provider_unavailable_reason;
+    
+    // Client instances (对齐 OpenClaw embeddings.ts:53-57)
+    std::shared_ptr<OpenAiEmbeddingClient> openai;
+    std::shared_ptr<GeminiEmbeddingClient> gemini;
+    std::shared_ptr<OllamaEmbeddingClient> ollama;
+    std::shared_ptr<VoyageEmbeddingClient> voyage;
+    std::shared_ptr<MistralEmbeddingClient> mistral;
 };
 
 // ============================================================================
