@@ -157,7 +157,7 @@ cc_library(
 # Skill Library - Skill Manager, Plugin System, File Watcher
 # ============================================================================
 cc_library(
-    name = "hunterclaw_skills",
+    name = "hunterclaw_skill",
     srcs = glob(["skills/*.cc"]),
     deps = [
         "//:hunterclaw_headers",

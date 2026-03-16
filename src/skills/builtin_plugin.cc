@@ -164,14 +164,14 @@ std::vector<Skill> BuiltinSkillsPlugin::load_skills_from_dir(
             }
             
             // 解析 SKILL.md
-            auto result = SkillParser::parse_skill_file(skill_file);
+            auto result = SkillParser::parse_file(skill_file);
             if (result.is_err()) {
                 log()->warn("Failed to parse skill {}: {}", 
                            skill_file.string(), result.error);
                 continue;
             }
             
-            Skill skill = result.value();
+            Skill skill = result.value;
             skill.source = source;
             skill.base_dir = entry.path();
             

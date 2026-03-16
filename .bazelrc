@@ -2,6 +2,10 @@
 # Bazel Configuration for HunterClaw
 # ============================================================================
 
+# Compiler Configuration (devtoolset-11 for C++17 support)
+build --action_env=CC=/opt/rh/devtoolset-11/root/usr/bin/gcc
+build --action_env=CXX=/opt/rh/devtoolset-11/root/usr/bin/g++
+
 # C++ Standard
 build --cxxopt=-std=c++17
 build --host_cxxopt=-std=c++17

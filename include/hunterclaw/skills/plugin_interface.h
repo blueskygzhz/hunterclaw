@@ -7,6 +7,7 @@
 #include <memory>
 #include <map>
 #include <functional>
+#include <shared_mutex>
 
 namespace hunterclaw {
 namespace skills {
