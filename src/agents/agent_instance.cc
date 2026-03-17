@@ -3,6 +3,9 @@
 #include "hunterclaw/memory/memory_provider_adapter.h"  // ✅ P3: MemoryProviderAdapter
 #include "hunterclaw/core/utils.h"
 #include "hunterclaw/core/logging.h"
+#include "hunterclaw/react/react_engine.h"  // ✅ ReactEngine
+#include "hunterclaw/llm/llm_client.h"       // ✅ LLMClient
+#include "hunterclaw/tools/tool.h"            // ✅ ToolManager
 #include <spdlog/spdlog.h>
 #include <filesystem>
 #include <sstream>
@@ -13,6 +16,45 @@ namespace agents {
 
 // Helper for logging
 inline auto log() { return core::get_logger("agent_instance"); }
+
+// ========== OpenClaw 对齐: 剥离 Block 标签 ==========
+// 参考: openclaw-analysis/src/agents/block-utils.ts:48-85
+std::string strip_block_tags(const std::string& text) {
+    std::string result = text;
+    
+    // 移除 <think>...</think> 标签及内容
+    // 使用简单的字符串查找替换（避免引入正则表达式依赖）
+    size_t pos = 0;
+    while ((pos = result.find("<think>", pos)) != std::string::npos) {
+        size_t end_pos = result.find("</think>", pos);
+        if (end_pos != std::string::npos) {
+            // 找到匹配的闭合标签，删除整个块
+            result.erase(pos, end_pos - pos + 8);  // 8 = strlen("</think>")
+        } else {
+            // 没有闭合标签，只删除开始标签
+            result.erase(pos, 7);  // 7 = strlen("<think>")
+            break;
+        }
+    }
+    
+    // 移除 <final>...</final> 标签（但保留内容）
+    pos = 0;
+    while ((pos = result.find("<final>", pos)) != std::string::npos) {
+        result.erase(pos, 7);  // 删除开始标签
+        size_t end_pos = result.find("</final>", pos);
+        if (end_pos != std::string::npos) {
+            result.erase(end_pos, 8);  // 删除闭合标签
+        }
+    }
+    
+    // Trim 首尾空白
+    auto start = result.find_first_not_of(" \t\n\r");
+    if (start == std::string::npos) {
+        return "";
+    }
+    auto end = result.find_last_not_of(" \t\n\r");
+    return result.substr(start, end - start + 1);
+}
 
 // ========== OpenClaw 对齐: 格式化推理消息 ==========
 // 参考: openclaw-analysis/src/agents/pi-embedded-utils.ts:273-287
@@ -92,27 +134,35 @@ AgentInstance::AgentInstance(
     initialize_tools();
     
     // ========== 初始化 ReactEngine (对齐 OpenClaw) ==========
-    // TODO: 等待 tools/react/llm 模块实现后启用
-    /*
     try {
         // ✅ 创建 ToolManager (独立实例,不使用全局单例)
         tools::ToolContext tool_context;
         tool_context.workspace_dir = ctx_.workspace_dir;
-        tool_context.session_id = ctx_.session_id;
+        // TODO: ToolContext 使用 session_key，需要转换
+        // tool_context.session_key = core::SessionKey::from_string(ctx_.session_id);
         tool_context.agent_id = ctx_.agent_id;
         
         auto tool_mgr = tools::ToolManager::create(tool_context);
         
         // ✅ 从 Agent 配置创建 LLMClient
         llm::LLMConfig llm_config;
-        llm_config.provider = config_->llm.provider;
-        llm_config.model = ctx_.config.model;  // Agent 级别的 model 配置
-        llm_config.api_key = config_->llm.api_key;
-        llm_config.endpoint = config_->llm.endpoint;
-        llm_config.max_tokens = config_->llm.max_tokens > 0 
-            ? config_->llm.max_tokens 
-            : 4096;  // 默认值
-        llm_config.temperature = config_->llm.temperature;
+        
+        // 从 Agent ModelConfig 读取配置
+        llm_config.provider = ctx_.config.model.provider;
+        llm_config.model = ctx_.config.model.model;
+        
+        // TODO: 添加更多配置字段到 ModelConfig
+        // llm_config.api_key = ctx_.config.model.api_key;
+        // llm_config.endpoint = ctx_.config.model.endpoint;
+        // llm_config.max_tokens = ctx_.config.model.max_tokens;
+        // llm_config.temperature = ctx_.config.model.temperature;
+        
+        // 使用默认值
+        llm_config.max_tokens = 4096;
+        llm_config.temperature = 0.7;
+        
+        spdlog::get("default")->debug("[AgentInstance] Creating LLMClient: provider={}, model={}",
+            llm_config.provider, llm_config.model);
         
         auto llm_client = llm::LLMClientFactory::create(llm_config);
         
@@ -134,7 +184,6 @@ AgentInstance::AgentInstance(
         spdlog::get("default")->error("[AgentInstance] ReactEngine initialization failed: {}", e.what());
         // 不抛出异常,允许 Agent 在没有 ReactEngine 的情况下继续
     }
-    */
     
     spdlog::get("default")->info("[AgentInstance] Initialized: session={}, agent={}, workspace={}",
         session_id, agent_id, ctx_.workspace_dir);
@@ -151,10 +200,11 @@ core::Result<std::string> AgentInstance::process_message(
     const std::string& message,
     const std::map<std::string, std::string>& options
 ) {
-    // TODO: 等待 ReactEngine 实现后启用
-    return core::Result<std::string>::Err("ReactEngine not implemented yet");
     // ✅ 使用 Overflow 重试循环 (对齐 OpenClaw)
-    // return process_message_with_overflow_retry(message, options);
+    if (!react_engine_) {
+        return core::Result<std::string>::Err("ReactEngine not initialized");
+    }
+    return process_message_with_overflow_retry(message, options);
 }
 
 void AgentInstance::cleanup() {
@@ -168,38 +218,46 @@ void AgentInstance::cleanup() {
     
     // ========== 资源清理 (对齐 OpenClaw) ==========
     
-    // TODO: 等待 ReactEngine 实现后启用
-    /*
     // 1. 停止运行中的任务
     if (react_engine_) {
         try {
             react_engine_->cancel();
-            spdlog::get("default")->debug("[AgentInstance] Cancelled running ReactEngine tasks");
+            spdlog::get("default")->debug("[AgentInstance] ReactEngine cancelled");
         } catch (const std::exception& e) {
             spdlog::get("default")->error("[AgentInstance] Failed to cancel ReactEngine: {}", e.what());
         }
     }
-    */
     
-    // 2. 关闭 Memory 连接 (flush + close)
+    // 2. 关闭 Memory 连接 (通过 RAII 自动清理)
     if (ctx_.memory) {
         try {
-            // TODO: 调用 Memory 的 close/flush 方法
-            // ctx_.memory->flush();
-            // ctx_.memory->close();
-            ctx_.memory.reset();  // 释放智能指针
+            // MemoryProvider 依赖 RAII 自动清理
+            // 释放智能指针会触发析构函数
+            ctx_.memory.reset();
             spdlog::get("default")->debug("[AgentInstance] Closed memory connection");
         } catch (const std::exception& e) {
             spdlog::get("default")->error("[AgentInstance] Failed to close memory: {}", e.what());
         }
     }
     
-    // 3. 清理临时文件 (可选,取决于配置)
+    // 2.5 保存 MemoryManager 状态 (通过 RAII 自动清理)
+    if (memory_mgr_) {
+        try {
+            // MemoryManager 依赖 RAII 自动清理
+            // 析构函数会保存必要的状态
+            memory_mgr_.reset();
+            spdlog::get("default")->debug("[AgentInstance] Closed MemoryManager");
+        } catch (const std::exception& e) {
+            spdlog::get("default")->warn("[AgentInstance] Failed to close MemoryManager: {}", e.what());
+        }
+    }
+    
+    // 3. 清理临时文件 (默认启用，可从配置读取)
     bool cleanup_temp_files = true;  // 默认清理
     
-    // TODO: 从配置读取
-    // if (config_->workspace.cleanup_temp_files.has_value()) {
-    //     cleanup_temp_files = *config_->workspace.cleanup_temp_files;
+    // TODO: 在 Config 中添加 workspace.cleanup_temp_files 字段
+    // if (config_->workspace && config_->workspace->cleanup_temp_files) {
+    //     cleanup_temp_files = *config_->workspace->cleanup_temp_files;
     // }
     
     if (cleanup_temp_files) {
@@ -214,9 +272,8 @@ void AgentInstance::cleanup() {
         }
     }
     
-    // 4. 释放 ReactEngine 和 ToolRegistry
+    // 4. 释放 ReactEngine
     react_engine_.reset();
-    tool_registry_.reset();
     
     // 5. 更新生命周期状态
     ctx_.phase = AgentLifecyclePhase::End;
@@ -287,12 +344,13 @@ void AgentInstance::initialize_memory() {
         memory_config.embedding.model = "nomic-embed-text";
         memory_config.embedding.fallback = "none";
         
-        // TODO: 从全局配置读取 embedding 设置
-        // if (config_->memory.embedding_provider) {
-        //     memory_config.embedding.provider = *config_->memory.embedding_provider;
+        // 从配置读取 embedding 设置 (如果存在)
+        // TODO: 在 Config 中添加 memory 配置字段
+        // if (config_->memory && config_->memory->embedding_provider) {
+        //     memory_config.embedding.provider = *config_->memory->embedding_provider;
         // }
-        // if (config_->memory.embedding_model) {
-        //     memory_config.embedding.model = *config_->memory.embedding_model;
+        // if (config_->memory && config_->memory->embedding_model) {
+        //     memory_config.embedding.model = *config_->memory->embedding_model;
         // }
         
         // 3. 创建 MemoryManager (传入 LLMClient 用于 compaction)
@@ -318,29 +376,17 @@ void AgentInstance::initialize_memory() {
 }
 
 void AgentInstance::initialize_tools() {
-    // ========== 从 ToolRegistry 获取并过滤工具 (对齐 OpenClaw) ==========
+    // ========== 从配置获取并过滤工具 (对齐 OpenClaw) ==========
     
-    // 1. 获取全局 ToolRegistry (TODO: 实现全局单例或依赖注入)
-    // tool_registry_ = tools::ToolRegistry::instance();
+    // 1. 使用回退工具列表 (包含常用工具)
+    // TODO: 未来可以从 ToolManager 动态获取工具列表
+    std::vector<std::string> all_tools = {
+        "read_file", "write_file", "search_files", "list_dir",
+        "execute_command", "web_search", "web_fetch",
+        "calculator", "ask_followup_question"
+    };
     
-    std::vector<std::string> all_tools;
-    
-    // TODO: ToolRegistry 需要完整实现
-    if (tool_registry_) {
-        // 从 ToolRegistry 获取所有工具
-        // all_tools = tool_registry_->list_tools();
-        spdlog::get("default")->debug("[AgentInstance] ToolRegistry not implemented yet");
-    }
-    
-    if (all_tools.empty()) {
-        // 回退: 使用占位工具列表
-        all_tools = {
-            "read_file", "write_file", "search_files", "list_dir",
-            "execute_command", "web_search", "web_fetch",
-            "calculator", "ask_followup_question"
-        };
-        spdlog::get("default")->warn("[AgentInstance] ToolRegistry not available, using fallback tool list");
-    }
+    spdlog::get("default")->debug("[AgentInstance] Available tools: {} total", all_tools.size());
     
     // 2. 应用 Agent 的 skills 过滤器
     std::vector<std::string> filtered_tools;
@@ -437,15 +483,14 @@ void AgentInstance::emit_lifecycle_event(
 // 参考: openclaw-analysis/src/agents/pi-embedded-runner/run.ts:980-1034
 // ═══════════════════════════════════════════════════════════════
 
-// TODO: 等待 react/tools/llm 模块实现后启用
-/*
+// ✅ 已启用: 完整的 overflow 重试循环实现
 core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
     const std::string& message,
     const std::map<std::string, std::string>& options
 ) {
     touch();
     
-    spdlog::info("[AgentInstance] Processing message: session={}, message='{}'",
+    spdlog::get("default")->info("[AgentInstance] Processing message: session={}, message='{}'",
         ctx_.session_id, message);
     
     if (!react_engine_) {
@@ -470,7 +515,7 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
         
         // 2. 去重检查 (避免重复发送)
         if (formatted == last_streamed_reasoning_) {
-            spdlog::trace("[AgentInstance] Reasoning duplicate, skipping");
+            spdlog::get("default")->trace("[AgentInstance] Reasoning duplicate, skipping");
             return;
         }
         
@@ -489,13 +534,14 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
         last_streamed_reasoning_ = formatted;
         
         // 4. 发射事件 (WebSocket 实时推送)
-        emit_lifecycle_event(AgentLifecyclePhase::Reasoning, {
-            {"stream", "thinking"},
-            {"text", formatted},    // 完整文本
-            {"delta", delta}        // 增量文本
-        });
+        core::JsonValue data = core::JsonValue::object();
+        data["stream"] = "thinking";
+        data["text"] = formatted;
+        data["delta"] = delta;
         
-        spdlog::debug("[AgentInstance] Reasoning stream: total_len={}, delta_len={}", 
+        emit_lifecycle_event(AgentLifecyclePhase::Reasoning, data);
+        
+        spdlog::get("default")->debug("[AgentInstance] Reasoning stream: total_len={}, delta_len={}", 
                      formatted.length(), delta.length());
     };
     
@@ -520,14 +566,13 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
         const auto MIN_EMIT_INTERVAL = std::chrono::milliseconds(100);
         
         if (now - last_assistant_emit_time_ < MIN_EMIT_INTERVAL) {
-            spdlog::trace("[AgentInstance] Assistant delta throttled: buffer_len={}", 
+            spdlog::get("default")->trace("[AgentInstance] Assistant delta throttled: buffer_len={}", 
                          assistant_buffer_.length());
             return;  // 跳过本次发送
         }
         
-        // 3. TODO: 剥离 <think> 标签 (OpenClaw stripBlockTags)
-        // 简化版本: 暂时不处理 <think> 标签
-        std::string cleaned = assistant_buffer_;
+        // 3. 剥离 <think> 标签 (OpenClaw stripBlockTags)
+        std::string cleaned = strip_block_tags(assistant_buffer_);
         
         // 4. 计算增量 (对齐 OpenClaw)
         std::string delta_text;
@@ -542,19 +587,20 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
         
         // 5. 发射 WebSocket 事件 (对齐 OpenClaw emitAgentEvent)
         if (!delta_text.empty()) {
-            emit_lifecycle_event(AgentLifecyclePhase::Responding, {
-                {"stream", "assistant"},
-                {"text", cleaned},       // 完整文本
-                {"delta", delta_text}    // 增量文本
-            });
+            core::JsonValue data = core::JsonValue::object();
+            data["stream"] = "assistant";
+            data["text"] = cleaned;
+            data["delta"] = delta_text;
+            
+            emit_lifecycle_event(AgentLifecyclePhase::Responding, data);
             
             last_streamed_assistant_ = cleaned;
             last_assistant_emit_time_ = now;
             
-            spdlog::debug("[AgentInstance] Assistant stream: total_len={}, delta_len={}", 
+            spdlog::get("default")->debug("[AgentInstance] Assistant stream: total_len={}, delta_len={}", 
                          cleaned.length(), delta_text.length());
         } else {
-            spdlog::trace("[AgentInstance] Assistant delta no-op: no new text");
+            spdlog::get("default")->trace("[AgentInstance] Assistant delta no-op: no new text");
         }
     };
     
@@ -572,16 +618,12 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
     callbacks.on_block_reply = [this](const std::string& block) {
         // 1. 动态抑制检测 (对齐 OpenClaw:478)
         if (suppress_block_chunks_) {
-            spdlog::trace("[AgentInstance] Block reply suppressed by suppress_block_chunks_");
+            spdlog::get("default")->trace("[AgentInstance] Block reply suppressed by suppress_block_chunks_");
             return;
         }
         
         // 2. Strip <think> 和 <final> 标签 (对齐 OpenClaw:484)
-        // TODO: 实现完整的 stripBlockTags 逻辑
-        std::string cleaned = block;
-        // 简化版本: 移除 <think>...</think> 标签
-        // 正则表达式: <think>.*?</think>
-        // 暂时跳过，直接使用原始文本
+        std::string cleaned = strip_block_tags(block);
         
         // Trim 结尾空白 (对齐 OpenClaw:484)
         while (!cleaned.empty() && std::isspace(cleaned.back())) {
@@ -589,13 +631,13 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
         }
         
         if (cleaned.empty()) {
-            spdlog::trace("[AgentInstance] Block reply empty after cleaning");
+            spdlog::get("default")->trace("[AgentInstance] Block reply empty after cleaning");
             return;
         }
         
         // 3. 去重检查 (对齐 OpenClaw:488-490)
         if (cleaned == last_block_reply_text_) {
-            spdlog::trace("[AgentInstance] Block reply duplicate: already sent");
+            spdlog::get("default")->trace("[AgentInstance] Block reply duplicate: already sent");
             return;
         }
         
@@ -603,7 +645,7 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
         // 检查是否已通过 messaging tool 发送过
         for (const auto& sent_text : messaging_tool_sent_texts_) {
             if (cleaned == sent_text) {
-                spdlog::debug("[AgentInstance] Block reply skip: already sent via messaging tool");
+                spdlog::get("default")->debug("[AgentInstance] Block reply skip: already sent via messaging tool");
                 return;
             }
         }
@@ -621,93 +663,40 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
         // (已通过上面的 empty 检查)
         
         // 8. 发射 WebSocket 事件 (对齐 OpenClaw:526-533)
-        emit_lifecycle_event(AgentLifecyclePhase::Responding, {
-            {"type", "block_reply"},
-            {"text", cleaned},
-            // TODO: 添加可选字段
-            // {"mediaUrls", mediaUrls},
-            // {"audioAsVoice", audioAsVoice},
-            // {"replyToId", replyToId},
-            // {"replyToTag", replyToTag},
-            // {"replyToCurrent", replyToCurrent}
-        });
+        core::JsonValue data = core::JsonValue::object();
+        data["type"] = "block_reply";
+        data["text"] = cleaned;
         
-        spdlog::debug("[AgentInstance] Block reply sent: len={}", cleaned.length());
+        emit_lifecycle_event(AgentLifecyclePhase::Responding, data);
+        
+        spdlog::get("default")->debug("[AgentInstance] Block reply sent: len={}", cleaned.length());
     };
     
     callbacks.on_tool_start = [this](const std::string& tool_name, const core::JsonValue& args) {
-        spdlog::info("[AgentInstance] Tool start: {}", tool_name);
-        emit_lifecycle_event(AgentLifecyclePhase::ToolExecution, {
-            {"tool", tool_name},
-            {"action", "start"}
-        });
+        spdlog::get("default")->info("[AgentInstance] Tool start: {}", tool_name);
+        core::JsonValue data = core::JsonValue::object();
+        data["tool"] = tool_name;
+        data["action"] = "start";
+        emit_lifecycle_event(AgentLifecyclePhase::ToolExecution, data);
     };
     
     callbacks.on_tool_end = [this](const std::string& tool_name, const tools::ToolResult& result) {
-        spdlog::info("[AgentInstance] Tool end: {} (success={})", tool_name, result.success);
-        emit_lifecycle_event(AgentLifecyclePhase::ToolExecution, {
-            {"tool", tool_name},
-            {"action", "end"},
-            {"success", result.success}
-        });
+        spdlog::get("default")->info("[AgentInstance] Tool end: {} (success={})", tool_name, result.success);
+        core::JsonValue data = core::JsonValue::object();
+        data["tool"] = tool_name;
+        data["action"] = "end";
+        data["success"] = result.success;
+        emit_lifecycle_event(AgentLifecyclePhase::ToolExecution, data);
     };
     
     // ✅ 严格对齐 OpenClaw: 加载历史消息
     std::vector<react::LLMMessage> history;
-    if (memory_mgr_) {
-        // ✅ OpenClaw 风格: 通过 Vector Search 检索相关历史
-        // 
-        // OpenClaw 实现 (src/agents/agent.ts):
-        // 1. 使用当前消息作为查询
-        // 2. 搜索 top-K 相关历史对话
-        // 3. 按时间戳排序
-        // 4. 转换为 LLMMessage 格式
-        // 5. 限制总 token 数 (避免超出上下文窗口)
-        
-        try {
-            // 搜索相关历史 (使用当前消息作为查询)
-            memory::SearchOptions search_opts;
-            search_opts.max_results = 6;          // 最多 6 条相关记忆
-            search_opts.min_score = 0.35;         // 最低相似度 0.35
-            search_opts.filters["session_id"] = ctx_.session_id;  // 限制到当前会话
-            
-            auto search_result = memory_mgr_->search(message, search_opts);
-            
-            if (!search_result.empty()) {
-                // 按时间戳排序 (从旧到新)
-                std::vector<memory::MemoryItem> sorted_items = search_result;
-                std::sort(sorted_items.begin(), sorted_items.end(),
-                    [](const memory::MemoryItem& a, const memory::MemoryItem& b) {
-                        return a.timestamp_ms < b.timestamp_ms;
-                    });
-                
-                // 转换为 LLMMessage
-                for (const auto& item : sorted_items) {
-                    react::LLMMessage msg;
-                    
-                    // 从 metadata 获取角色
-                    std::string role = "user";  // 默认
-                    if (item.metadata.count("role")) {
-                        role = item.metadata.at("role");
-                    }
-                    
-                    msg.role = role;
-                    msg.content = item.content;
-                    
-                    history.push_back(msg);
-                }
-                
-                spdlog::debug("[AgentInstance] Loaded {} historical messages", history.size());
-            } else {
-                spdlog::debug("[AgentInstance] No relevant history found");
-            }
-        } catch (const std::exception& e) {
-            spdlog::warn("[AgentInstance] Failed to load history: {}", e.what());
-        }
-    } else {
-        // 没有 Memory,当前是独立对话
-        spdlog::debug("[AgentInstance] No memory available, starting fresh conversation");
-    }
+    
+    // TODO: MemoryManager API 需要完善
+    // MemoryManager 当前不支持 search()、add()、MemoryItem 等接口
+    // 需要等待 memory 模块完善后再启用历史消息加载
+    
+    spdlog::get("default")->debug("[AgentInstance] Starting fresh conversation (history loading not implemented)");
     
     // ✅ Overflow 重试循环 (对齐 OpenClaw)
     for (int attempt = 0; attempt < MAX_OVERFLOW_ATTEMPTS; ++attempt) {
@@ -717,44 +706,59 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
             
             // 检查是否成功
             if (result.success) {
-                // ✅ 保存到 Memory
-                if (memory_mgr_) {
+                // ✅ 保存到 Memory (对齐 OpenClaw)
+                if (ctx_.memory) {
                     try {
-                        // 保存用户消息和 Agent 响应
-                        memory::MemoryItem user_msg;
-                        user_msg.content = message;
-                        user_msg.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::system_clock::now().time_since_epoch()
-                        ).count();
-                        user_msg.metadata["role"] = "user";
-                        user_msg.metadata["session_id"] = ctx_.session_id;
+                        // 保存用户消息
+                        std::map<std::string, std::string> user_metadata;
+                        user_metadata["role"] = "user";
+                        user_metadata["session_id"] = ctx_.session_id;
+                        user_metadata["agent_id"] = ctx_.agent_id;
+                        user_metadata["timestamp"] = std::to_string(
+                            std::chrono::system_clock::now().time_since_epoch().count()
+                        );
                         
-                        memory::MemoryItem agent_msg;
-                        agent_msg.content = result.final_response;
-                        agent_msg.timestamp_ms = user_msg.timestamp_ms + result.duration_ms;
-                        agent_msg.metadata["role"] = "assistant";
-                        agent_msg.metadata["session_id"] = ctx_.session_id;
-                        agent_msg.metadata["steps"] = std::to_string(result.total_steps);
-                        agent_msg.metadata["tool_calls"] = std::to_string(result.tool_calls);
+                        auto user_result = ctx_.memory->add_memory(message, user_metadata);
+                        if (user_result.is_err()) {
+                            spdlog::get("default")->warn("[AgentInstance] Failed to save user message: {}", 
+                                         user_result.error);
+                        }
                         
-                        memory_mgr_->add(user_msg);
-                        memory_mgr_->add(agent_msg);
+                        // 保存助手回复
+                        std::map<std::string, std::string> assistant_metadata;
+                        assistant_metadata["role"] = "assistant";
+                        assistant_metadata["session_id"] = ctx_.session_id;
+                        assistant_metadata["agent_id"] = ctx_.agent_id;
+                        assistant_metadata["timestamp"] = std::to_string(
+                            std::chrono::system_clock::now().time_since_epoch().count()
+                        );
                         
-                        spdlog::debug("[AgentInstance] Saved conversation to memory");
+                        auto assistant_result = ctx_.memory->add_memory(
+                            result.final_response, 
+                            assistant_metadata
+                        );
+                        if (assistant_result.is_err()) {
+                            spdlog::get("default")->warn("[AgentInstance] Failed to save assistant message: {}", 
+                                         assistant_result.error);
+                        } else {
+                            spdlog::get("default")->debug("[AgentInstance] Conversation saved to memory");
+                        }
                     } catch (const std::exception& e) {
-                        spdlog::warn("[AgentInstance] Failed to save to memory: {}", e.what());
+                        spdlog::get("default")->warn("[AgentInstance] Exception saving to memory: {}", e.what());
                     }
                 }
                 
-                spdlog::info("[AgentInstance] Message processed: steps={}, tool_calls={}, duration={}ms",
+                spdlog::get("default")->info("[AgentInstance] Message processed: steps={}, tool_calls={}, duration={}ms",
                     result.total_steps, result.tool_calls, result.duration_ms);
                 
                 return core::Result<std::string>::Ok(result.final_response);
             }
             
             // ✅ 检测 Context Overflow Error (对齐 OpenClaw)
-            if (react_engine_->is_context_overflow_error(result.error)) {
-                spdlog::warn(
+            bool is_overflow = react_engine_->is_context_overflow_error(result.error);
+            
+            if (is_overflow) {
+                spdlog::get("default")->warn(
                     "[AgentInstance] Context overflow detected (attempt {}/{}): {}",
                     attempt + 1, MAX_OVERFLOW_ATTEMPTS, result.error
                 );
@@ -762,36 +766,39 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
                 // 提取 overflow token count (用于调试)
                 auto observed_tokens = react_engine_->extract_overflow_token_count(result.error);
                 if (observed_tokens.has_value()) {
-                    spdlog::info("[AgentInstance] Observed overflow token count: {}", *observed_tokens);
+                    spdlog::get("default")->info("[AgentInstance] Observed overflow token count: {}", *observed_tokens);
                 }
                 
                 // ✅ 触发 Compaction (对齐 OpenClaw)
-                if (memory_mgr_) {
-                    spdlog::info("[AgentInstance] Triggering compaction to resolve overflow...");
-                    
-                    // 直接调用 ReactEngine 的 trigger_compaction
-                    // (history 会被更新)
-                    auto compact_result = react_engine_->trigger_compaction(history);
-                    
-                    if (compact_result.compacted) {
-                        spdlog::info("[AgentInstance] Compaction successful, retrying (attempt {}/{})",
-                                   attempt + 1, MAX_OVERFLOW_ATTEMPTS);
-                        continue;  // 重试
-                    } else {
-                        spdlog::error("[AgentInstance] Compaction failed: {}", compact_result.reason);
-                    }
-                } else {
-                    spdlog::error("[AgentInstance] MemoryManager not initialized, cannot compact");
-                }
+                spdlog::get("default")->info("[AgentInstance] Triggering compaction to resolve overflow...");
                 
-                // Compaction 失败 - 如果还有重试机会则继续,否则返回错误
-                if (attempt + 1 < MAX_OVERFLOW_ATTEMPTS) {
+                auto compact_result = react_engine_->trigger_compaction(history);
+                
+                if (compact_result.compacted) {
+                    spdlog::get("default")->info(
+                        "[AgentInstance] Compaction successful: {} -> {} messages, saved {} tokens",
+                        compact_result.messages_before,
+                        compact_result.messages_after,
+                        compact_result.tokens_saved
+                    );
+                    
+                    // 重试
                     continue;
                 } else {
-                    return core::Result<std::string>::Err(
-                        "Context overflow after max compaction retries (" + 
-                        std::to_string(MAX_OVERFLOW_ATTEMPTS) + ")"
+                    spdlog::get("default")->error(
+                        "[AgentInstance] Compaction failed: {}",
+                        compact_result.reason
                     );
+                    
+                    // Compaction 失败 - 如果还有重试机会则继续,否则返回错误
+                    if (attempt + 1 < MAX_OVERFLOW_ATTEMPTS) {
+                        continue;
+                    } else {
+                        return core::Result<std::string>::Err(
+                            "Context overflow after max compaction retries (" + 
+                            std::to_string(MAX_OVERFLOW_ATTEMPTS) + "): " + compact_result.reason
+                        );
+                    }
                 }
             }
             
@@ -799,20 +806,26 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
             return core::Result<std::string>::Err(result.error);
             
         } catch (const std::exception& e) {
-            spdlog::error("[AgentInstance] ReactEngine exception: {}", e.what());
+            spdlog::get("default")->error("[AgentInstance] ReactEngine exception: {}", e.what());
             
             // 检测是否是 overflow 相关异常
             std::string error_msg = e.what();
-            if (react_engine_->is_context_overflow_error(error_msg)) {
-                spdlog::warn("[AgentInstance] Context overflow exception (attempt {}/{})",
+            bool is_overflow = react_engine_->is_context_overflow_error(error_msg);
+            
+            if (is_overflow && attempt + 1 < MAX_OVERFLOW_ATTEMPTS) {
+                spdlog::get("default")->warn("[AgentInstance] Context overflow exception (attempt {}/{})",
                            attempt + 1, MAX_OVERFLOW_ATTEMPTS);
                 
                 // 尝试 compaction 并重试
-                if (memory_mgr_ && attempt + 1 < MAX_OVERFLOW_ATTEMPTS) {
-                    auto compact_result = react_engine_->trigger_compaction(history);
-                    if (compact_result.compacted) {
-                        continue;  // 重试
-                    }
+                auto compact_result = react_engine_->trigger_compaction(history);
+                
+                if (compact_result.compacted) {
+                    spdlog::get("default")->info(
+                        "[AgentInstance] Compaction after exception: {} -> {} messages",
+                        compact_result.messages_before,
+                        compact_result.messages_after
+                    );
+                    continue;  // 重试
                 }
             }
             
@@ -829,7 +842,6 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
         std::to_string(MAX_OVERFLOW_ATTEMPTS) + ")"
     );
 }
-*/
 
 } // namespace agents
 } // namespace hunterclaw

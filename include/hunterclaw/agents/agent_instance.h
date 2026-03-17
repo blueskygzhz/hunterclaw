@@ -6,6 +6,7 @@
 #include "hunterclaw/skills/skill.h"
 #include "hunterclaw/channels/channel.h"
 #include "hunterclaw/memory/memory_manager.h"  // ✅ 新增: MemoryManager 支持
+#include "hunterclaw/react/react_engine.h"     // ✅ 新增: ReactEngine (直接包含，不使用前向声明)
 #include <memory>
 #include <string>
 #include <vector>
@@ -14,10 +15,6 @@
 
 namespace hunterclaw {
 namespace agents {
-
-// Forward declarations
-class ReactEngine;
-class ToolRegistry;
 
 /**
  * Agent 实例隔离上下文
@@ -157,8 +154,7 @@ private:
     std::shared_ptr<core::Config> config_;
     std::shared_ptr<skills::SkillManager> skill_mgr_;
     std::shared_ptr<channels::ChannelManager> channel_mgr_;
-    std::shared_ptr<ReactEngine> react_engine_;
-    std::shared_ptr<ToolRegistry> tool_registry_;
+    std::shared_ptr<react::ReactEngine> react_engine_;  // ✅ 使用完整命名空间
     std::shared_ptr<memory::MemoryManager> memory_mgr_;  // ✅ Memory 管理器
     
     // ✅ OpenClaw 对齐: Reasoning stream 状态跟踪
@@ -185,6 +181,12 @@ private:
     void initialize_memory();
     void initialize_tools();
     void emit_lifecycle_event(AgentLifecyclePhase phase, const core::JsonValue& data);
+    
+    // Overflow 重试循环 (对齐 OpenClaw)
+    core::Result<std::string> process_message_with_overflow_retry(
+        const std::string& message,
+        const std::map<std::string, std::string>& options
+    );
 };
 
 } // namespace agents

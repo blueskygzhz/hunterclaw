@@ -193,6 +193,24 @@ public:
     const ReactConfig& config() const { return config_; }
     ReactConfig& mutable_config() { return config_; }
     
+    // ✅ 新增: Token 估算 (对齐 OpenClaw) - 改为 public
+    int estimate_conversation_tokens(const std::vector<LLMMessage>& messages) const;
+    
+    // ✅ 新增: Overflow 检测 (对齐 OpenClaw) - 改为 public
+    bool is_context_overflow_error(const std::string& error_msg) const;
+    std::optional<int> extract_overflow_token_count(const std::string& error_msg) const;
+    
+    // ✅ 新增: Compaction 触发 (对齐 OpenClaw) - 改为 public
+    struct CompactionResult {
+        bool compacted = false;
+        std::vector<LLMMessage> compressed_messages;
+        std::string reason;
+        int messages_before = 0;
+        int messages_after = 0;
+        int tokens_saved = 0;
+    };
+    CompactionResult trigger_compaction(std::vector<LLMMessage>& messages);
+    
 private:
     ReactEngine(
         std::shared_ptr<tools::ToolManager> tool_manager,
@@ -287,24 +305,6 @@ private:
     bool is_messaging_tool_duplicate(const std::string& normalized_text);
     std::string strip_thinking_tags(const std::string& text);
     std::string trim_end(const std::string& text);
-    
-    // ✅ 新增: Token 估算 (对齐 OpenClaw)
-    int estimate_conversation_tokens(const std::vector<LLMMessage>& messages) const;
-    
-    // ✅ 新增: Overflow 检测 (对齐 OpenClaw)
-    bool is_context_overflow_error(const std::string& error_msg) const;
-    std::optional<int> extract_overflow_token_count(const std::string& error_msg) const;
-    
-    // ✅ 新增: Compaction 触发 (对齐 OpenClaw)
-    struct CompactionResult {
-        bool compacted = false;
-        std::vector<LLMMessage> compressed_messages;
-        std::string reason;
-        int messages_before = 0;
-        int messages_after = 0;
-        int tokens_saved = 0;
-    };
-    CompactionResult trigger_compaction(std::vector<LLMMessage>& messages);
     
     std::shared_ptr<tools::ToolManager> tool_manager_;
     std::shared_ptr<llm::LLMClient> llm_client_;  // 向后兼容
