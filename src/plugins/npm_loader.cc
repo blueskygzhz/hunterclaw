@@ -42,13 +42,13 @@ struct NpmPluginLoader::Impl {
         const std::string& target_dir
     ) {
         // 创建目标目录
-        if (!core::fs::create_directories(target_dir)) {
+        if (!fs::create_directories(target_dir)) {
             return core::Result<std::string>::Err("Failed to create target directory");
         }
         
         // 初始化 package.json
         std::string package_json_path = target_dir + "/package.json";
-        if (!core::fs::exists(package_json_path)) {
+        if (!fs::exists(package_json_path)) {
             std::ofstream ofs(package_json_path);
             ofs << R"({
   "name": "hunterclaw-plugin-temp",
@@ -62,7 +62,7 @@ struct NpmPluginLoader::Impl {
         std::string cmd = "cd " + target_dir + " && npm install --no-save " + package_spec;
         auto result = core::Process::execute(cmd);
         if (result.is_err()) {
-            return core::Result<std::string>::Err("Failed to execute npm install: " + result.unwrap_err());
+            return core::Result<std::string>::Err("Failed to execute npm install: " + result.error);
         }
         
         auto [stdout_content, stderr_content, exit_code] = result.unwrap();
@@ -75,7 +75,7 @@ struct NpmPluginLoader::Impl {
         std::string package_name = extract_package_name(package_spec);
         std::string install_path = node_modules + "/" + package_name;
         
-        if (!core::fs::exists(install_path)) {
+        if (!fs::exists(install_path)) {
             return core::Result<std::string>::Err("Package installed but not found: " + install_path);
         }
         
@@ -104,7 +104,7 @@ struct NpmPluginLoader::Impl {
     
     core::Result<core::JsonValue> read_package_json(const std::string& package_dir) {
         std::string package_json_path = package_dir + "/package.json";
-        if (!core::fs::exists(package_json_path)) {
+        if (!fs::exists(package_json_path)) {
             return core::Result<core::JsonValue>::Err("package.json not found");
         }
         
@@ -119,7 +119,7 @@ struct NpmPluginLoader::Impl {
         
         auto parse_result = core::Json::parse(ss.str());
         if (parse_result.is_err()) {
-            return core::Result<core::JsonValue>::Err("Failed to parse package.json: " + parse_result.unwrap_err());
+            return core::Result<core::JsonValue>::Err("Failed to parse package.json: " + parse_result.error);
         }
         
         return core::Result<core::JsonValue>::Ok(parse_result.unwrap());
@@ -135,7 +135,7 @@ struct NpmPluginLoader::Impl {
         if (package_json.has("hunterclaw") && package_json["hunterclaw"].has("main")) {
             std::string main_path = package_json["hunterclaw"]["main"].as_string();
             std::string full_path = package_dir + "/" + main_path;
-            if (core::fs::exists(full_path)) {
+            if (fs::exists(full_path)) {
                 return core::Result<std::string>::Ok(full_path);
             }
         }
@@ -144,14 +144,14 @@ struct NpmPluginLoader::Impl {
         if (package_json.has("main")) {
             std::string main_path = package_json["main"].as_string();
             std::string full_path = package_dir + "/" + main_path;
-            if (core::fs::exists(full_path)) {
+            if (fs::exists(full_path)) {
                 return core::Result<std::string>::Ok(full_path);
             }
         }
         
         // 3. 默认 index.js
         std::string default_path = package_dir + "/index.js";
-        if (core::fs::exists(default_path)) {
+        if (fs::exists(default_path)) {
             return core::Result<std::string>::Ok(default_path);
         }
         
@@ -178,7 +178,7 @@ NpmPluginLoader::NpmPluginLoader(std::shared_ptr<core::Config> config)
     }
     
     // 确保缓存目录存在
-    core::fs::create_directories(impl_->cache_dir);
+    fs::create_directories(impl_->cache_dir);
 }
 
 NpmPluginLoader::~NpmPluginLoader() = default;
@@ -190,7 +190,7 @@ core::Result<NpmPluginInfo> NpmPluginLoader::load(const std::string& package_spe
     auto cache_it = impl_->npm_cache.find(package_spec);
     if (cache_it != impl_->npm_cache.end()) {
         std::string cached_path = cache_it->second;
-        if (core::fs::exists(cached_path)) {
+        if (fs::exists(cached_path)) {
             // 从缓存加载
             return load_from_path(cached_path);
         } else {
@@ -202,7 +202,7 @@ core::Result<NpmPluginInfo> NpmPluginLoader::load(const std::string& package_spe
     // 2. 检查 npm 可用性
     auto npm_check = impl_->ensure_npm_available();
     if (npm_check.is_err()) {
-        return core::Result<NpmPluginInfo>::Err(npm_check.unwrap_err());
+        return core::Result<NpmPluginInfo>::Err(npm_check.error);
     }
     
     // 3. 安装 npm 包
@@ -211,7 +211,7 @@ core::Result<NpmPluginInfo> NpmPluginLoader::load(const std::string& package_spe
     
     auto install_result = impl_->install_npm_package(package_spec, target_dir);
     if (install_result.is_err()) {
-        return core::Result<NpmPluginInfo>::Err(install_result.unwrap_err());
+        return core::Result<NpmPluginInfo>::Err(install_result.error);
     }
     
     std::string install_path = install_result.unwrap();
@@ -230,7 +230,7 @@ core::Result<NpmPluginInfo> NpmPluginLoader::load_from_path(const std::string& p
     // 1. 读取 package.json
     auto package_json_result = impl_->read_package_json(package_dir);
     if (package_json_result.is_err()) {
-        return core::Result<NpmPluginInfo>::Err(package_json_result.unwrap_err());
+        return core::Result<NpmPluginInfo>::Err(package_json_result.error);
     }
     
     core::JsonValue package_json = package_json_result.unwrap();
@@ -238,7 +238,7 @@ core::Result<NpmPluginInfo> NpmPluginLoader::load_from_path(const std::string& p
     // 2. 解析入口点
     auto entry_result = impl_->resolve_entry_point(package_dir, package_json);
     if (entry_result.is_err()) {
-        return core::Result<NpmPluginInfo>::Err(entry_result.unwrap_err());
+        return core::Result<NpmPluginInfo>::Err(entry_result.error);
     }
     
     std::string entry_point = entry_result.unwrap();
@@ -247,9 +247,9 @@ core::Result<NpmPluginInfo> NpmPluginLoader::load_from_path(const std::string& p
     NpmPluginInfo info;
     info.package_dir = package_dir;
     info.entry_point = entry_point;
-    info.package_name = package_json.get("name", "unknown");
-    info.version = package_json.get("version", "0.0.0");
-    info.description = package_json.get("description", "");
+    info.package_name = package_json.get("name", std::string("unknown"));
+    info.version = package_json.get("version", std::string("0.0.0"));
+    info.description = package_json.get("description", std::string(""));
     
     // 4. 检查是否是 HunterClaw 插件
     if (package_json.has("hunterclaw")) {
@@ -285,8 +285,8 @@ core::Result<bool> NpmPluginLoader::uninstall(const std::string& package_spec) {
     std::string package_dir = cache_it->second;
     
     // 删除包目录
-    if (core::fs::exists(package_dir)) {
-        if (!core::fs::remove_all(package_dir)) {
+    if (fs::exists(package_dir)) {
+        if (!fs::remove_all(package_dir)) {
             return core::Result<bool>::Err("Failed to remove package directory");
         }
     }
@@ -303,9 +303,9 @@ void NpmPluginLoader::clear_cache() {
     impl_->npm_cache.clear();
     
     // 删除缓存目录
-    if (core::fs::exists(impl_->cache_dir)) {
-        core::fs::remove_all(impl_->cache_dir);
-        core::fs::create_directories(impl_->cache_dir);
+    if (fs::exists(impl_->cache_dir)) {
+        fs::remove_all(impl_->cache_dir);
+        fs::create_directories(impl_->cache_dir);
     }
 }
 
@@ -314,7 +314,7 @@ std::vector<std::string> NpmPluginLoader::list_installed() const {
     
     std::vector<std::string> installed;
     for (const auto& [package_spec, path] : impl_->npm_cache) {
-        if (core::fs::exists(path)) {
+        if (fs::exists(path)) {
             installed.push_back(package_spec);
         }
     }

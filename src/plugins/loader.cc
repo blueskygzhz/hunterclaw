@@ -6,7 +6,21 @@
 namespace hunterclaw {
 namespace plugins {
 
-// Plugin loader for native (.so/.dll) plugins
+// ============================================================================
+// HunterClawPlugin Definition (C plugin handle)
+// ============================================================================
+
+// Define the plugin structure
+struct HunterClawPlugin {
+    void* user_data;
+    int (*on_load)(HunterClawPlugin* plugin);
+    int (*on_unload)(HunterClawPlugin* plugin);
+};
+
+// ============================================================================
+// Native Plugin Loader
+// ============================================================================
+
 class NativePluginLoader {
 public:
     core::Result<std::shared_ptr<Plugin>> load(const std::string& path) {
@@ -50,10 +64,6 @@ public:
                 "Plugin missing hunterclaw_plugin_shutdown symbol");
         }
         
-        // Parse manifest
-        const char* manifest_json = get_manifest();
-        // TODO: Parse JSON manifest
-        
         // Initialize plugin
         HunterClawPlugin* plugin_ptr = init_fn("{}");
         if (!plugin_ptr) {
@@ -64,7 +74,7 @@ public:
         
         // Create wrapper
         auto plugin = std::make_shared<NativePlugin>(
-            handle, plugin_ptr, shutdown_fn);
+            handle, plugin_ptr, shutdown_fn, "native-plugin");
         
         return core::Result<std::shared_ptr<Plugin>>::Ok(plugin);
     }
@@ -72,8 +82,8 @@ public:
 private:
     class NativePlugin : public Plugin {
     public:
-        NativePlugin(void* handle, HunterClawPlugin* plugin, void (*shutdown)(HunterClawPlugin*))
-            : handle_(handle), plugin_(plugin), shutdown_fn_(shutdown) {}
+        NativePlugin(void* handle, HunterClawPlugin* plugin, void (*shutdown)(HunterClawPlugin*), const std::string& id)
+            : handle_(handle), plugin_(plugin), shutdown_fn_(shutdown), id_(id) {}
         
         ~NativePlugin() override {
             if (plugin_ && shutdown_fn_) {
@@ -82,6 +92,20 @@ private:
             if (handle_) {
                 dlclose(handle_);
             }
+        }
+        
+        // Required lifecycle methods
+        core::Result<bool> init(const PluginContext& ctx) override {
+            // Native plugins are initialized via C API
+            return core::Result<bool>::Ok(true);
+        }
+        
+        core::Result<bool> shutdown() override {
+            if (plugin_ && shutdown_fn_) {
+                shutdown_fn_(plugin_);
+                plugin_ = nullptr;
+            }
+            return core::Result<bool>::Ok(true);
         }
         
         core::Result<bool> on_load() override {
@@ -106,15 +130,16 @@ private:
             return core::Result<bool>::Ok(true);
         }
         
-        core::PluginManifest get_manifest() const override {
-            // TODO: Parse from plugin
-            return core::PluginManifest{};
-        }
+        // Metadata methods
+        std::string id() const override { return id_; }
+        std::string name() const override { return id_; }
+        std::string version() const override { return "1.0.0"; }
         
     private:
         void* handle_;
         HunterClawPlugin* plugin_;
         void (*shutdown_fn_)(HunterClawPlugin*);
+        std::string id_;
     };
 };
 

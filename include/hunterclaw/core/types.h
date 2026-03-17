@@ -284,29 +284,52 @@ private:
 template<typename T>
 struct Result {
     bool ok;
-    T value;
+    std::optional<T> value;
     std::string error;
     
     static Result<T> Ok(T val) {
-        return Result<T>{true, std::move(val), ""};
+        Result<T> r;
+        r.ok = true;
+        r.value = std::move(val);
+        r.error = "";
+        return r;
     }
     
     static Result<T> Err(std::string err) {
-        return Result<T>{false, T{}, std::move(err)};
+        Result<T> r;
+        r.ok = false;
+        r.value = std::nullopt;
+        r.error = std::move(err);
+        return r;
     }
     
     bool is_ok() const { return ok; }
     bool is_err() const { return !ok; }
     
+    // Get value reference (throws if error)
+    const T& get() const {
+        if (!ok || !value.has_value()) {
+            throw std::runtime_error("Result::get() called on Err: " + error);
+        }
+        return value.value();
+    }
+    
+    T& get() {
+        if (!ok || !value.has_value()) {
+            throw std::runtime_error("Result::get() called on Err: " + error);
+        }
+        return value.value();
+    }
+    
     T unwrap() const {
-        if (!ok) {
+        if (!ok || !value.has_value()) {
             throw std::runtime_error("Result::unwrap() called on Err: " + error);
         }
-        return value;
+        return value.value();
     }
     
     T unwrap_or(T default_val) const {
-        return ok ? value : default_val;
+        return (ok && value.has_value()) ? value.value() : default_val;
     }
 };
 

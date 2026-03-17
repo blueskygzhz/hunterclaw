@@ -61,7 +61,7 @@ struct AuthRateLimiter::Impl {
     
     Impl(const AuthRateLimiterConfig& cfg)
         : config(cfg)
-        , logger(spdlog::get("hunterclaw") ? spdlog::get("hunterclaw") : spdlog::default_logger())
+        , logger(spdlog::get("hunterclaw") ? spdlog::get("hunterclaw") : spdlog::default_logger_raw())
     {
         logger->debug("[AuthRateLimiter] Initialized with max_attempts={}, window_ms={}, lockout_ms={}",
                      config.max_attempts, config.window_ms, config.lockout_ms);

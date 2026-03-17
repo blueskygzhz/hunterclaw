@@ -2,6 +2,7 @@
 #include "hunterclaw/core/utils.h"
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <signal.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <fstream>
@@ -9,6 +10,8 @@
 
 namespace hunterclaw {
 namespace infra {
+
+using hunterclaw::core::Result;
 
 // ==================== 构造/析构 ====================
 
@@ -58,7 +61,9 @@ core::Result<InstanceLock> InstanceLock::Acquire(const std::string& name) {
     
     // 确保目录存在
     std::string dir = lock_path.substr(0, lock_path.find_last_of('/'));
-    core::utils::ensure_directory(dir);
+    if (!dir.empty()) {
+        std::filesystem::create_directories(dir);
+    }
     
     // 打开锁文件 (创建如果不存在)
     int fd = open(lock_path.c_str(), O_CREAT | O_RDWR, 0644);
@@ -94,7 +99,9 @@ core::Result<InstanceLock> InstanceLock::TryAcquire(const std::string& name) {
     
     // 确保目录存在
     std::string dir = lock_path.substr(0, lock_path.find_last_of('/'));
-    core::utils::ensure_directory(dir);
+    if (!dir.empty()) {
+        std::filesystem::create_directories(dir);
+    }
     
     // 打开锁文件
     int fd = open(lock_path.c_str(), O_CREAT | O_RDWR, 0644);

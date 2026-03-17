@@ -393,23 +393,22 @@ cc_library(
         "pairing/*.cc",
         "security/*.cc",
         "secrets/*.cc",
-        # "device/*.cc",  # ✅ 暂时排除 - 需要 OpenSSL 1.1.0+（EVP_PKEY_ED25519）
         "auto_reply/*.cc",
-        # "daemon/*.cc",  # ✅ 暂时排除 - 接口签名与基类不匹配，需重构
         "observability/*.cc",
         "infra/*.cc",
         "logging/*.cc",
         "markdown/*.cc",
         "shared/*.cc",
         "nodes/*.cc",
-        # "cli/*.cc",  # ✅ 暂时排除 - 依赖不存在的 AgentManager 类
-    ], exclude = ["main.cc"]),
+    ], exclude = [
+        "main.cc",
+        "infra/exec_approvals.cc",  # TODO: 需要更新以匹配新的 API
+    ]),
     deps = [
         ":hunterclaw_agents",    # ✅ 添加 agents 依赖
         ":hunterclaw_cron",      # ✅ 添加 cron 依赖
         ":hunterclaw_memory",
         ":hunterclaw_llm",
-        ":hunterclaw_gateway",
         ":hunterclaw_mcp",
         ":hunterclaw_sessions",
         ":hunterclaw_skills",  # ✅ 修正拼写错误
@@ -471,6 +470,38 @@ cc_binary(
 cc_binary(
     name = "hunterclaw_cli",
     srcs = ["cli_main.cc"],
+    deps = [
+        "//:hunterclaw_headers",
+        "@nlohmann_json//:json",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+    copts = [
+        "-std=c++17",
+        "-Wall",
+        "-Wextra",
+        "-I/usr/include/jsoncpp",
+        "-I/usr/include/spdlog",
+    ],
+    linkopts = [
+        "-lpthread",
+        "-lstdc++",
+        "-lstdc++fs",  # C++17 filesystem
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# ============================================================================
+# Daemon Executable - Service Management Tool
+# ============================================================================
+cc_binary(
+    name = "hunterclaw_daemon",
+    srcs = [
+        "daemon_main.cc",
+        "daemon/daemon_service.cc",
+        "daemon/daemon_system.cc",
+        "daemon/systemd_impl.cc",
+    ],
     deps = [
         "//:hunterclaw_headers",
         "@nlohmann_json//:json",

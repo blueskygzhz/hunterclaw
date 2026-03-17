@@ -33,7 +33,7 @@ struct PluginManager::Impl {
             return core::Result<bool>::Err(plugin_result.error);
         }
         
-        auto plugin = plugin_result.value;
+        auto plugin = plugin_result.get();
         
         // Call on_load
         auto load_result = plugin->on_load();

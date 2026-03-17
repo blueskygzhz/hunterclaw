@@ -124,6 +124,8 @@ struct ToolContext {
     std::string sandbox_id;  // 当前 Sandbox ID (如果启用)
 };
 
+// Forward declarations
+class ToolManager;
 class ToolHookManager;
 class ToolLoopDetector;
 class PolicyPipeline;
@@ -131,105 +133,7 @@ class ResultProcessingPipeline;
 struct ToolUpdate;
 using ToolUpdateCallback = std::function<void(const ToolUpdate&)>;
 
-// Tool Manager
-class ToolManager {
-public:
-    static std::shared_ptr<ToolManager> create(const ToolContext& context);
-    
-    // 注册Tool
-    void register_tool(std::shared_ptr<Tool> tool);
-    
-    // 获取Tool
-    std::shared_ptr<Tool> get_tool(const std::string& name);
-    
-    // 列出所有Tools
-    std::vector<std::string> list_tools() const;
-    
-    // 执行Tool
-    ToolResult execute_tool(const std::string& name, const core::JsonValue& params);
-    
-    // 执行Tool (带 Stream 回调)
-    ToolResult execute_tool(
-        const std::string& name,
-        const core::JsonValue& params,
-        ToolUpdateCallback on_update
-    );
-    
-    // 转换为LLM格式
-    struct LLMToolDefinition {
-        std::string name;
-        std::string description;
-        std::string parameters;  // JSON Schema字符串
-    };
-    std::vector<LLMToolDefinition> to_llm_format() const;
-    
-    // ========== MCP 集成 ==========
-    
-    /// 启用 MCP 工具发现
-    void enable_mcp(const mcp::McporterConfig& config);
-    
-    /// 刷新 MCP 工具列表
-    core::Result<int> refresh_mcp_tools();
-    
-    /// 获取 MCP client (如果已启用)
-    std::shared_ptr<mcp::McporterClient> get_mcp_client();
-    
-    /// 检查 MCP 是否已启用
-    bool is_mcp_enabled() const;
-    
-    // ========== Hook 系统 (100% 对齐 OpenClaw) ==========
-    
-    /// 获取 Hook Manager
-    std::shared_ptr<ToolHookManager> get_hook_manager();
-    
-    /// 启用内置 Hooks
-    void enable_builtin_hooks(bool logging = true, bool performance = true);
-    
-    // ========== 循环检测 (100% 对齐 OpenClaw) ==========
-    
-    /// 获取循环检测器
-    std::shared_ptr<ToolLoopDetector> get_loop_detector();
-    
-    /// 启用循环检测
-    void enable_loop_detection(bool enable = true);
-    
-    // ========== 策略管道 (100% 对齐 OpenClaw) ==========
-    
-    /// 获取策略管道
-    std::shared_ptr<PolicyPipeline> get_policy_pipeline();
-    
-    /// 启用策略管道
-    void enable_policy_pipeline(bool enable = true);
-    
-    /// 应用 Profile (策略预设)
-    void apply_profile(const std::string& profile_name);
-    
-    // ========== 结果处理 (100% 对齐 OpenClaw) ==========
-    
-    /// 获取结果处理管道
-    std::shared_ptr<ResultProcessingPipeline> get_result_pipeline();
-    
-    /// 启用结果规范化
-    void enable_result_normalization(bool enable = true);
-    
-    // ========== 审批系统 (100% 对齐 OpenClaw) ==========
-    
-    /// 获取审批管理器
-    std::shared_ptr<class ApprovalManager> get_approval_manager();
-    
-    /// 设置审批管理器
-    void set_approval_manager(std::shared_ptr<class ApprovalManager> manager);
-    
-    /// 启用审批系统
-    void enable_approval_system(const std::string& config_path = "");
-
-private:
-    ToolContext context_;
-    std::map<std::string, std::shared_ptr<Tool>> tools_;
-    
-    // MCP 支持
-    std::shared_ptr<hunterclaw::mcp::McporterClient> mcp_client_;
-    std::shared_ptr<hunterclaw::mcp::McpToolRegistry> mcp_registry_;
+// Note: ToolManager 的完整定义在 tool_manager.h 中
     
     // Hook 支持
     std::shared_ptr<ToolHookManager> hook_manager_;

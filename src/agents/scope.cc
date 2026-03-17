@@ -162,7 +162,7 @@ std::string resolve_agent_workspace_dir(
 ) {
     auto cfg_result = resolve_agent_config(config, agent_id);
     if (cfg_result.is_ok()) {
-        const auto& cfg = cfg_result.value;
+        const auto& cfg = cfg_result.get();
         if (!cfg.workspace.empty()) {
             return core::utils::expand_path(cfg.workspace);
         }
@@ -179,7 +179,7 @@ std::string resolve_agent_dir(
 ) {
     auto cfg_result = resolve_agent_config(config, agent_id);
     if (cfg_result.is_ok()) {
-        const auto& cfg = cfg_result.value;
+        const auto& cfg = cfg_result.get();
         if (!cfg.agent_dir.empty()) {
             return core::utils::expand_path(cfg.agent_dir);
         }
@@ -197,7 +197,7 @@ std::vector<std::string> resolve_agent_skills_filter(
 ) {
     auto cfg_result = resolve_agent_config(config, agent_id);
     if (cfg_result.is_ok()) {
-        return cfg_result.value.skills;
+        return cfg_result.get().skills;
     }
     
     // Default: allow all skills
@@ -258,7 +258,7 @@ core::Result<AgentContext> build_agent_context(
     
     AgentContext ctx;
     ctx.agent_id = agent_id;
-    ctx.config = cfg_result.value;
+    ctx.config = cfg_result.get();
     ctx.workspace_dir = resolve_agent_workspace_dir(config, agent_id);
     ctx.agent_dir = resolve_agent_dir(config, agent_id);
     ctx.skills_dir = ctx.workspace_dir + "/skills";
@@ -301,8 +301,8 @@ core::Result<AgentResolution> resolve_agent(
     AgentResolution resolution;
     resolution.agent_id = agent_id;
     resolution.session_key = session_key;
-    resolution.config = cfg_result.value;
-    resolution.context = ctx_result.value;
+    resolution.config = cfg_result.get();
+    resolution.context = ctx_result.get();
     
     return core::Result<AgentResolution>::Ok(resolution);
 }

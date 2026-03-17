@@ -10,6 +10,9 @@ namespace infra {
 // 单实例锁 (flock)
 class InstanceLock {
 public:
+    // 构造函数 (由工厂方法使用)
+    InstanceLock(int fd, const std::string& lock_path);
+    
     // 禁止拷贝
     InstanceLock(const InstanceLock&) = delete;
     InstanceLock& operator=(const InstanceLock&) = delete;
@@ -40,8 +43,6 @@ public:
     static core::Result<void> ForceRelease(const std::string& name);
     
 private:
-    InstanceLock(int fd, const std::string& lock_path);
-    
     int fd_ = -1;
     std::string lock_path_;
 };

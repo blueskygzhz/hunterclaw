@@ -42,7 +42,7 @@ core::Result<void> NodeRegistry::unregister_node(const std::string& node_id) {
     
     auto it = nodes_.find(node_id);
     if (it == nodes_.end()) {
-        return core::Error("Node not found: " + node_id);
+        return core::Result<void>::Err("Node not found: " + node_id);
     }
     
     nodes_.erase(it);
@@ -52,7 +52,7 @@ core::Result<void> NodeRegistry::unregister_node(const std::string& node_id) {
         event_callback_(node_id, "node.unregistered", "{}");
     }
     
-    return core::Ok();
+    return core::Result<void>::Ok();
 }
 
 void NodeRegistry::update_node_status(const std::string& node_id, NodeStatus status) {
@@ -206,7 +206,7 @@ core::Result<NodeInvokeResult> NodeRegistry::invoke(
 core::Result<std::string> NodeRegistry::describe(const std::string& node_id) const {
     auto node_opt = get_node(node_id);
     if (!node_opt) {
-        return core::Error("Node not found: " + node_id);
+        return core::Result<std::string>::Err("Node not found: " + node_id);
     }
     
     auto& node = *node_opt;
@@ -233,7 +233,7 @@ core::Result<std::string> NodeRegistry::describe(const std::string& node_id) con
     oss << "]";
     oss << "}";
     
-    return oss.str();
+    return core::Result<std::string>::Ok(oss.str());
 }
 
 void NodeRegistry::set_event_callback(NodeEventCallback callback) {
@@ -296,15 +296,15 @@ bool NodeRegistry::check_permission(const Node& node, const std::string& command
 
 core::Result<void> NodeRegistry::validate_node(const Node& node) const {
     if (node.node_id.empty()) {
-        return core::Error("Node ID cannot be empty");
+        return core::Result<void>::Err("Node ID cannot be empty");
     }
     if (node.platform.empty()) {
-        return core::Error("Platform cannot be empty");
+        return core::Result<void>::Err("Platform cannot be empty");
     }
     if (node.commands.empty()) {
-        return core::Error("Node must support at least one command");
+        return core::Result<void>::Err("Node must support at least one command");
     }
-    return core::Ok();
+    return core::Result<void>::Ok();
 }
 
 int64_t NodeRegistry::current_time_ms() const {

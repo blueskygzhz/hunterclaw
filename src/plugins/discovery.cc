@@ -43,17 +43,18 @@ struct PluginDiscovery::Impl {
         }
         
         // 从配置读取额外路径
-        auto custom_paths = config->get_string_list("plugins.loadPaths", {});
-        for (const auto& path : custom_paths) {
-            std::string expanded = path;
-            if (expanded[0] == '~' && home) {
-                expanded = std::string(home) + expanded.substr(1);
-            }
-            search_paths.push_back(expanded);
-        }
+        // TODO: Implement config->get_string_list when Config API is available
+        // auto custom_paths = config->get_string_list("plugins.loadPaths", {});
+        // for (const auto& path : custom_paths) {
+        //     std::string expanded = path;
+        //     if (expanded[0] == '~' && home) {
+        //         expanded = std::string(home) + expanded.substr(1);
+        //     }
+        //     search_paths.push_back(expanded);
+        // }
         
         // 工作空间插件目录
-        std::string workspace_dir = config->get_string("workspace_dir", ".");
+        std::string workspace_dir = config ? config->workspace_dir : ".";
         search_paths.push_back(workspace_dir + "/.hunterclaw/plugins");
     }
     
@@ -78,9 +79,9 @@ struct PluginDiscovery::Impl {
         ss << ifs.rdbuf();
         ifs.close();
         
-        auto parse_result = core::Json::parse(ss.str());
+        auto parse_result = JsonValue::parse(ss.str());
         if (parse_result.is_err()) {
-            return core::Result<PluginManifest>::Err("Failed to parse manifest: " + parse_result.unwrap_err());
+            return core::Result<PluginManifest>::Err("Failed to parse manifest: " + parse_result.error);
         }
         
         core::JsonValue root = parse_result.unwrap();
@@ -92,11 +93,11 @@ struct PluginDiscovery::Impl {
         
         PluginManifest manifest;
         manifest.id = root["id"].as_string();
-        manifest.name = root.get("name", manifest.id);
-        manifest.version = root.get("version", "0.0.0");
-        manifest.description = root.get("description", "");
-        manifest.type = root.get("type", "generic");
-        manifest.main = root.get("main", "");
+        manifest.name = root.get("name", std::string(manifest.id));
+        manifest.version = root.get("version", std::string("0.0.0"));
+        manifest.description = root.get("description", std::string(""));
+        manifest.type = root.get("type", std::string("generic"));
+        manifest.main = root.get("main", std::string(""));
         
         // 解析依赖
         if (root.has("dependencies")) {
