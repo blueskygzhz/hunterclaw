@@ -1,5 +1,5 @@
 #include "hunterclaw/device/device_manager.h"
-#include "hunterclaw/sandbox/sandbox_manager.h"
+#include "hunterclaw/sandbox/sandbox.h"  // ✅ SandboxManager 在 sandbox.h 中定义
 #include "hunterclaw/nodes/node_registry.h"
 #include "hunterclaw/nodes/node.h"
 #include <chrono>

@@ -1,9 +1,11 @@
 #include "hunterclaw/plugins/npm_loader.h"
 #include "hunterclaw/core/json.h"
-#include "hunterclaw/core/filesystem.h"
-#include "hunterclaw/core/process.h"
+#include <filesystem>  // ✅ 使用标准库而非自定义 filesystem.h
+#include "hunterclaw/core/subprocess.h"  // ✅ Process 在 subprocess.h 中定义
 #include <fstream>
 #include <sstream>
+
+namespace fs = std::filesystem;
 
 namespace hunterclaw {
 namespace plugins {

@@ -88,7 +88,7 @@ class SafeFileSystem {
  private:
   std::string workspace_root_;
 
-  // 验证文件身份 (防止 TOCTOU)
+  // 验证文件身份 (防止TOCTOU)
   // 对齐 OpenClaw sameFileIdentity()
   absl::Status VerifyFileIdentity(
       int fd,
@@ -105,6 +105,9 @@ class SafeFileSystem {
       absl::string_view path,
       absl::string_view content,
       mode_t mode);
+  
+  // 检查路径是否在工作区内  
+  bool IsPathInside(const std::string& root, const std::string& path) const;  // ✅ 添加缺失声明
 };
 
 // 全局工具函数

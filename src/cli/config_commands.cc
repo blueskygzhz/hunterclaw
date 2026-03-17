@@ -1,6 +1,6 @@
 #include "hunterclaw/cli/config_commands.h"
 #include "hunterclaw/cli/json_output.h"
-#include "hunterclaw/core/config.h"
+#include "hunterclaw/core/config_loader.h"  // ✅ 使用 config_loader.h 而非 config.h
 #include <iostream>
 #include <fstream>
 #include <cstdlib>

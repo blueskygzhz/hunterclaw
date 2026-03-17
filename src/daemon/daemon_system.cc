@@ -1,13 +1,11 @@
-#include "daemon/daemon_system.h"
+#include "hunterclaw/daemon/daemon_system.h"  // ✅ 修复路径
 #include <fstream>
 #include <sstream>
 #include <cstdlib>
 #include <unistd.h>
 #include <sys/stat.h>
 
-#ifdef __linux__
-#include <systemd/sd-daemon.h>
-#endif
+// ✅ 移除 systemd/sd-daemon.h - 代码中未实际使用
 
 namespace hunterclaw {
 namespace daemon {

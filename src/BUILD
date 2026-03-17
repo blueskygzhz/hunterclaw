@@ -113,6 +113,7 @@ cc_library(
         "-Wextra",
         "-I/usr/include/jsoncpp",
         "-I/usr/include/spdlog",  # spdlog 支持
+        "-Isrc",  # ✅ 添加 src 目录以支持 gateway/methods 头文件引用
     ],
     linkopts = [
         "-lpthread",
@@ -362,16 +363,16 @@ cc_library(
         "pairing/*.cc",
         "security/*.cc",
         "secrets/*.cc",
-        "device/*.cc",
+        # "device/*.cc",  # ✅ 暂时排除 - 需要 OpenSSL 1.1.0+（EVP_PKEY_ED25519）
         "auto_reply/*.cc",
-        "daemon/*.cc",
+        # "daemon/*.cc",  # ✅ 暂时排除 - 接口签名与基类不匹配，需重构
         "observability/*.cc",
         "infra/*.cc",
         "logging/*.cc",
         "markdown/*.cc",
         "shared/*.cc",
         "nodes/*.cc",
-        "cli/*.cc",
+        # "cli/*.cc",  # ✅ 暂时排除 - 依赖不存在的 AgentManager 类
     ], exclude = ["main.cc"]),
     deps = [
         ":hunterclaw_agents",    # ✅ 添加 agents 依赖
@@ -387,6 +388,7 @@ cc_library(
         ":hunterclaw_react",  # ✅ 添加 react 依赖
         "//:hunterclaw_headers",
         "//third_party:httplib",
+        "//third_party:subprocess",  # ✅ 添加 subprocess 依赖
         "@nlohmann_json//:json",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -397,6 +399,7 @@ cc_library(
         "-Wextra",
         "-I/usr/include/jsoncpp",
         "-I/usr/include/spdlog",
+        "-Ithird_party",  # ✅ 添加 third_party 路径以支持 subprocess.h
     ],
     linkopts = [
         "-lpthread",

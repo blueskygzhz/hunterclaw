@@ -8,6 +8,7 @@
 #include <signal.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <mutex>  // ✅ 添加缺失的 mutex 头文件
 
 namespace hunterclaw {
 namespace process {

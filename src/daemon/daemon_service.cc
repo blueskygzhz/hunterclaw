@@ -14,30 +14,71 @@
 namespace hunterclaw {
 namespace daemon {
 
-// Factory function to create platform-specific daemon service
-std::unique_ptr<DaemonService> DaemonService::Create() {
+// ============================================================================
+// Platform Detection
+// ============================================================================
+
+Platform DetectPlatform() {
 #ifdef __APPLE__
-  return std::make_unique<LaunchdService>();
+  return Platform::kMacOS;
 #elif defined(__linux__)
-  return std::make_unique<SystemdService>();
+  return Platform::kLinux;
 #elif defined(_WIN32)
-  return std::make_unique<ScheduledTaskService>();
+  return Platform::kWindows;
 #else
-  throw std::runtime_error(
-      "DaemonService not supported on this platform");
+  throw std::runtime_error("Unsupported platform");
 #endif
 }
 
-std::string DaemonService::GetPlatformLabel() const {
+// ============================================================================
+// Factory Functions
+// ============================================================================
+
+std::unique_ptr<DaemonService> CreateDaemonService(Platform platform) {
+  switch (platform) {
 #ifdef __APPLE__
-  return "LaunchAgent";
-#elif defined(__linux__)
-  return "systemd";
-#elif defined(_WIN32)
-  return "Scheduled Task";
-#else
-  return "unknown";
+    case Platform::kMacOS:
+      return std::make_unique<LaunchdService>();
 #endif
+#ifdef __linux__
+    case Platform::kLinux:
+      return std::make_unique<SystemdService>();
+#endif
+#ifdef _WIN32
+    case Platform::kWindows:
+      return std::make_unique<ScheduledTaskService>();
+#endif
+    default:
+      throw std::runtime_error("Platform not supported in this build");
+  }
+}
+
+std::unique_ptr<DaemonService> CreateDaemonServiceForCurrentPlatform() {
+  return CreateDaemonService(DetectPlatform());
+}
+
+// ============================================================================
+// Service Name Generators
+// ============================================================================
+
+std::string ResolveServiceName(Platform platform, const std::string& profile) {
+  std::string base_name = "hunterclaw-gateway";
+  if (!profile.empty() && profile != "default") {
+    base_name += "-" + profile;
+  }
+  return base_name;
+}
+
+std::string ResolveServiceDescription(const std::string& profile, 
+                                     const std::string& version) {
+  std::string desc = "HunterClaw Gateway";
+  if (!profile.empty() && profile != "default") {
+    desc += " (" + profile + ")";
+  }
+  if (!version.empty()) {
+    desc += " v" + version;
+  }
+  return desc;
 }
 
 }  // namespace daemon

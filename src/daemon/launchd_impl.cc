@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <unordered_map>  // ✅ 添加缺失的头文件
 
 namespace fs = std::filesystem;
 

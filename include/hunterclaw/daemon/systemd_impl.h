@@ -13,41 +13,31 @@ class SystemdService : public DaemonService {
   SystemdService() = default;
   ~SystemdService() override = default;
 
-  // Install systemd user service unit file and enable
-  void Install(const InstallConfig& config) override;
-
-  // Disable and remove systemd user service
-  void Uninstall(const ManageConfig& config) override;
-
-  // Stop systemd user service (systemctl --user stop)
-  void Stop(const ControlConfig& config) override;
-
-  // Restart systemd user service (systemctl --user restart)
-  void Restart(const ControlConfig& config) override;
-
-  // Check if systemd service is enabled
-  bool IsLoaded(const EnvConfig& config) override;
-
-  // Read command from systemd unit ExecStart
-  std::optional<CommandConfig> ReadCommand(
-      const std::unordered_map<std::string, std::string>& env) override;
-
-  // Read runtime status from systemctl --user show
-  ServiceRuntime ReadRuntime(
-      const std::unordered_map<std::string, std::string>& env) override;
+  // ✅ 对齐基类接口
+  absl::Status Install(const ServiceConfig& config) override;
+  absl::Status Uninstall(const std::string& profile = "") override;
+  absl::Status Start(const std::string& profile = "") override;
+  absl::Status Stop(const std::string& profile = "") override;
+  absl::Status Restart(const std::string& profile = "") override;
+  
+  absl::StatusOr<bool> IsLoaded(const std::string& profile = "") override;
+  absl::StatusOr<ServiceStatus> GetStatus(const std::string& profile = "") override;
+  absl::StatusOr<ServiceConfig> ReadConfig(const std::string& profile = "") override;
+  
+  std::string GetLabel() const override;
+  std::string GetLoadedText() const override;
+  std::string GetNotLoadedText() const override;
 
  private:
-  // Resolve systemd service name (e.g., "openclaw-gateway")
-  std::string ResolveSystemdServiceName(
-      const std::unordered_map<std::string, std::string>& env) const;
+  // Resolve systemd service name (e.g., "hunterclaw-gateway")
+  std::string ResolveSystemdServiceName(const std::string& profile = "") const;
 
   // Resolve systemd unit file path
-  // (e.g., "~/.config/systemd/user/openclaw-gateway.service")
-  std::string ResolveSystemdUnitPath(
-      const std::unordered_map<std::string, std::string>& env) const;
+  // (e.g., "~/.config/systemd/user/hunterclaw-gateway.service")
+  std::string ResolveSystemdUnitPath(const std::string& profile = "") const;
 
   // Build systemd unit file content
-  std::string BuildSystemdUnit(const InstallConfig& config) const;
+  std::string BuildSystemdUnit(const ServiceConfig& config) const;
 
   // Execute systemctl command
   struct SystemctlResult {

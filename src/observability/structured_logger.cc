@@ -1,8 +1,8 @@
 #include "hunterclaw/observability/observability.h"
 #include "hunterclaw/observability/diagnostic_events.h"
 #include <spdlog/spdlog.h>
-#include <spdlog/sinks/daily_file_sink.h>
-#include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/sinks/file_sinks.h>  // ✅ daily_file_sink 在此文件中定义
+#include <spdlog/sinks/stdout_sinks.h>  // ✅ 修正头文件名
 #include <nlohmann/json.hpp>
 #include <regex>
 

@@ -1,7 +1,6 @@
 #pragma once
 
-#include "hunterclaw/core/types.h"
-#include "hunterclaw/core/config.h"
+#include "hunterclaw/core/types.h"  // ✅ Config 定义在 types.h 中
 #include <functional>
 #include <thread>
 #include <atomic>

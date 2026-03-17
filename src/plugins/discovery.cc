@@ -1,10 +1,12 @@
 #include "hunterclaw/plugins/discovery.h"
 #include "hunterclaw/core/json.h"
-#include "hunterclaw/core/filesystem.h"
+#include <filesystem>  // ✅ 使用标准库而非自定义 filesystem.h
 #include <fstream>
 #include <sstream>
 #include <sys/stat.h>
 #include <unistd.h>
+
+namespace fs = std::filesystem;
 
 namespace hunterclaw {
 namespace plugins {

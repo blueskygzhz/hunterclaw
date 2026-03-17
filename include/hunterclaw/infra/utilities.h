@@ -51,8 +51,6 @@ TimeoutResult<T> with_timeout(
 // Safe JSON Utilities
 // ============================================================================
 
-struct JsonValue;  // Forward declaration for recursive type
-
 struct JsonValue {
     enum class Type {
         Null,

@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 #include <iomanip>
+#include <filesystem>  // ✅ 添加缺失的 filesystem 头文件
 
 #include <openssl/sha.h>
 #include <sys/stat.h>
@@ -19,6 +20,8 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <errno.h>
+
+namespace fs = std::filesystem;  // ✅ 添加命名空间别名
 
 // C++11 兼容的路径操作函数
 namespace path_utils {

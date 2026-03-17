@@ -22,10 +22,10 @@ public:
     ~InstanceLock();
     
     // 获取锁 (阻塞)
-    static Result<InstanceLock> Acquire(const std::string& name);
+    static core::Result<InstanceLock> Acquire(const std::string& name);
     
     // 尝试获取锁 (非阻塞)
-    static Result<InstanceLock> TryAcquire(const std::string& name);
+    static core::Result<InstanceLock> TryAcquire(const std::string& name);
     
     // 检查是否被锁
     static bool IsLocked(const std::string& name);
@@ -34,10 +34,10 @@ public:
     static std::string GetLockPath(const std::string& name);
     
     // 获取持有锁的 PID (如果可用)
-    static Result<uint32_t> GetLockOwner(const std::string& name);
+    static core::Result<uint32_t> GetLockOwner(const std::string& name);
     
     // 强制释放锁 (危险操作,仅在确认进程已死时使用)
-    static Result<void> ForceRelease(const std::string& name);
+    static core::Result<void> ForceRelease(const std::string& name);
     
 private:
     InstanceLock(int fd, const std::string& lock_path);

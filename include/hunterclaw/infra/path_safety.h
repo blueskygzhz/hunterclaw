@@ -50,6 +50,7 @@ class PathSafetyChecker {
   bool ContainsTraversalSequence(absl::string_view path) const;
   absl::StatusOr<std::string> ExpandHomePath(absl::string_view path) const;
   absl::StatusOr<std::string> ResolveCanonicalPath(absl::string_view path) const;
+  bool IsPathInside(const std::string& root, const std::string& path) const;  // ✅ 添加缺失声明
 };
 
 // 全局路径安全工具函数

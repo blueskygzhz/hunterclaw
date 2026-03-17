@@ -1,6 +1,6 @@
 #include "hunterclaw/nodes/node_registry.h"
 #include "hunterclaw/tools/tool_manager.h"
-#include "hunterclaw/sandbox/sandbox_manager.h"
+#include "hunterclaw/sandbox/sandbox.h"  // ✅ 修复: SandboxManager 在 sandbox.h 中
 #include <chrono>
 #include <sstream>
 
