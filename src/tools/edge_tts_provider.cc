@@ -7,8 +7,9 @@
 #include <fstream>
 
 namespace hunterclaw {
+namespace tools {
 
-EdgeTTSProvider::EdgeTTSProvider(std::shared_ptr<HttpClient> http_client)
+EdgeTTSProvider::EdgeTTSProvider(std::shared_ptr<infra::HttpClient> http_client)
     : http_client_(http_client) {
     // Check if edge-tts is installed
     if (!is_edge_tts_installed()) {
@@ -17,7 +18,7 @@ EdgeTTSProvider::EdgeTTSProvider(std::shared_ptr<HttpClient> http_client)
     }
 }
 
-JsonValue EdgeTTSProvider::synthesize(
+core::JsonValue EdgeTTSProvider::synthesize(
     const std::string& text,
     const std::string& voice,
     const std::string& format,
@@ -27,14 +28,14 @@ JsonValue EdgeTTSProvider::synthesize(
 ) {
     // Validate parameters
     if (text.empty()) {
-        JsonValue error = JsonValue::object();
+        core::JsonValue error = core::JsonValue::object();
         error["error"] = "Text cannot be empty";
         return error;
     }
     
     // Check if edge-tts is installed
     if (!is_edge_tts_installed()) {
-        JsonValue error = JsonValue::object();
+        core::JsonValue error = core::JsonValue::object();
         error["error"] = "edge-tts not installed";
         error["hint"] = "Install with: pip install edge-tts";
         return error;
@@ -96,7 +97,7 @@ JsonValue EdgeTTSProvider::synthesize(
     // Check if output file exists
     std::ifstream file(output_file, std::ios::binary);
     if (!file.good()) {
-        JsonValue error = JsonValue::object();
+        core::JsonValue error = core::JsonValue::object();
         error["error"] = "Failed to generate audio";
         error["details"] = output;
         return error;
@@ -115,14 +116,14 @@ JsonValue EdgeTTSProvider::synthesize(
     std::string audio_base64;  // TODO: Implement base64 encoding
     
     // Build result
-    JsonValue result = JsonValue::object();
+    core::JsonValue result = core::JsonValue::object();
     result["status"] = "success";
     result["provider"] = "edge";
     result["voice"] = voice;
     result["format"] = format;
     result["audio_path"] = output_file;
-    result["file_size"] = static_cast<int>(file_size);
-    result["duration_estimate"] = static_cast<int>(text.length() / 15);  // Rough estimate
+    result["file_size"] = static_cast<int64_t>(file_size);
+    result["duration_estimate"] = static_cast<int64_t>(text.length() / 15);  // Rough estimate
     
     if (!audio_base64.empty()) {
         result["audio_base64"] = audio_base64;
@@ -151,8 +152,8 @@ std::vector<std::string> EdgeTTSProvider::list_voices(const std::string& languag
     return voices;
 }
 
-JsonValue EdgeTTSProvider::get_voice_info(const std::string& voice_name) {
-    JsonValue info = JsonValue::object();
+core::JsonValue EdgeTTSProvider::get_voice_info(const std::string& voice_name) {
+    core::JsonValue info = core::JsonValue::object();
     
     // Find voice in popular list
     for (const auto& voice : POPULAR_EDGE_VOICES) {
@@ -280,4 +281,5 @@ std::string EdgeTTSProvider::install_edge_tts() {
     return result;
 }
 
+} // namespace tools
 } // namespace hunterclaw

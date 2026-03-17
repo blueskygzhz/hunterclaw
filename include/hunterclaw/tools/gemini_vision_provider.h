@@ -1,12 +1,14 @@
 #pragma once
 
-#include "tool.h"
-#include "../core/json_value.h"
-#include "../http/http_client.h"
+#include "hunterclaw/tools/tool.h"
+#include "hunterclaw/core/json.h"
+#include "hunterclaw/infra/http_client.h"
 #include <string>
 #include <memory>
 
 namespace hunterclaw {
+namespace tools {
+
 
 /**
  * Google Gemini Vision Provider
@@ -32,26 +34,26 @@ namespace hunterclaw {
 class GeminiVisionProvider {
 public:
     GeminiVisionProvider(
-        std::shared_ptr<HttpClient> http_client,
+        std::shared_ptr<infra::HttpClient> http_client,
         const std::string& api_key
     );
 
     // Analyze image
-    JsonValue analyze_image(
+    core::JsonValue analyze_image(
         const std::string& image_path,
         const std::string& prompt,
         const std::string& model = "gemini-2.0-flash-exp"
     );
 
     // Analyze video (native support!)
-    JsonValue analyze_video(
+    core::JsonValue analyze_video(
         const std::string& video_path,
         const std::string& prompt,
         const std::string& model = "gemini-2.0-flash-exp"
     );
 
     // Multi-image analysis
-    JsonValue analyze_images(
+    core::JsonValue analyze_images(
         const std::vector<std::string>& image_paths,
         const std::string& prompt,
         const std::string& model = "gemini-2.0-flash-exp"
@@ -61,21 +63,21 @@ public:
     std::vector<std::string> list_models();
 
 private:
-    std::shared_ptr<HttpClient> http_client_;
+    std::shared_ptr<infra::HttpClient> http_client_;
     std::string api_key_;
     std::string base_url_;
 
     // Helper methods
-    JsonValue call_gemini_api(
+    core::JsonValue call_gemini_api(
         const std::string& model,
-        const JsonValue& request_body
+        const core::JsonValue& request_body
     );
     
     std::string encode_file_to_base64(const std::string& file_path);
     
     std::string get_mime_type(const std::string& file_path);
     
-    JsonValue build_content_parts(
+    core::JsonValue build_content_parts(
         const std::string& prompt,
         const std::vector<std::string>& file_paths
     );
@@ -114,4 +116,5 @@ const std::vector<GeminiModel> GEMINI_MODELS = {
     },
 };
 
+} // namespace tools
 } // namespace hunterclaw

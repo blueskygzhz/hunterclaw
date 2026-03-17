@@ -13,7 +13,7 @@ namespace fs = std::filesystem;
 
 TtsTool::TtsTool(
     const ToolContext& context,
-    std::shared_ptr<http::HttpClient> http_client
+    std::shared_ptr<infra::HttpClient> http_client
 ) : context_(context), http_client_(http_client) {}
 
 std::string TtsTool::description() const {
@@ -298,7 +298,7 @@ std::string TtsTool::save_audio_to_temp(const std::string& audio_data, const std
         
         return audio_file.string();
     } catch (const std::exception& e) {
-        Logger::error("[TtsTool] Failed to save audio: " + std::string(e.what()));
+        fprintf(stderr, "[TtsTool] Failed to save audio: %s\n", e.what());
         return "";
     }
 }

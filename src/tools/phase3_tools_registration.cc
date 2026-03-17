@@ -1,4 +1,4 @@
-#include "hunterclaw/tools/builtin_tools.h"
+#include "hunterclaw/tools/tool.h"
 #include "hunterclaw/tools/screen_record_tool.h"
 #include "hunterclaw/tools/location_tool.h"
 #include "hunterclaw/tools/video_understanding_tool.h"
@@ -6,6 +6,7 @@
 #include "hunterclaw/tools/gemini_vision_provider.h"
 
 namespace hunterclaw {
+namespace tools {
 
 /**
  * Register Phase 3 Extended Media Tools
@@ -17,16 +18,13 @@ namespace hunterclaw {
  * - Video Understanding
  * - Google Gemini Vision
  */
-void BuiltinTools::register_phase3_tools(
+void register_phase3_tools(
     ToolManager& tool_manager,
-    std::shared_ptr<ExecutionContext> context,
-    std::shared_ptr<NodeRegistry> node_registry,
-    std::shared_ptr<HttpClient> http_client,
-    std::shared_ptr<LLMClient> llm_client
+    std::shared_ptr<nodes::NodeRegistry> node_registry,
+    std::shared_ptr<infra::HttpClient> http_client,
+    std::shared_ptr<llm::LLMClient> llm_client,
+    std::shared_ptr<ApprovalManager> approval_manager
 ) {
-    // Get approval manager from context
-    auto approval_manager = context->get_approval_manager();
-    
     // Register Screen Record Tool
     auto screen_record_tool = std::make_shared<ScreenRecordTool>(
         node_registry,
@@ -53,14 +51,17 @@ void BuiltinTools::register_phase3_tools(
     // See: tts_tool.cc and image_analysis_tool.cc for integration
 }
 
+// Helper functions for creating providers (not part of BuiltinTools class)
+// These are used by other tools that need TTS or vision capabilities
+
 /**
  * Create Edge TTS Provider
  * 
  * Returns a configured Edge TTS provider instance.
  * Edge TTS is FREE and requires no API key!
  */
-std::shared_ptr<EdgeTTSProvider> BuiltinTools::create_edge_tts_provider(
-    std::shared_ptr<HttpClient> http_client
+std::shared_ptr<EdgeTTSProvider> create_edge_tts_provider(
+    std::shared_ptr<infra::HttpClient> http_client
 ) {
     return std::make_shared<EdgeTTSProvider>(http_client);
 }
@@ -71,8 +72,8 @@ std::shared_ptr<EdgeTTSProvider> BuiltinTools::create_edge_tts_provider(
  * Returns a configured Gemini Vision provider instance.
  * Requires GEMINI_API_KEY environment variable.
  */
-std::shared_ptr<GeminiVisionProvider> BuiltinTools::create_gemini_vision_provider(
-    std::shared_ptr<HttpClient> http_client
+std::shared_ptr<GeminiVisionProvider> create_gemini_vision_provider(
+    std::shared_ptr<infra::HttpClient> http_client
 ) {
     // Get API key from environment
     const char* api_key_env = std::getenv("GEMINI_API_KEY");
@@ -86,4 +87,5 @@ std::shared_ptr<GeminiVisionProvider> BuiltinTools::create_gemini_vision_provide
     return std::make_shared<GeminiVisionProvider>(http_client, api_key);
 }
 
+} // namespace tools
 } // namespace hunterclaw

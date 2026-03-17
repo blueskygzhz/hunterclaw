@@ -1,13 +1,14 @@
 #pragma once
 
-#include "tool.h"
-#include "../core/json_value.h"
-#include "../http/http_client.h"
-#include "../llm/llm_client.h"
+#include "hunterclaw/tools/tool.h"
+#include "hunterclaw/core/json.h"
+#include "hunterclaw/infra/http_client.h"
+#include "hunterclaw/llm/llm_client.h"
 #include <string>
 #include <memory>
 
 namespace hunterclaw {
+namespace tools {
 
 /**
  * Video Understanding Tool
@@ -34,33 +35,33 @@ namespace hunterclaw {
 class VideoUnderstandingTool : public Tool {
 public:
     VideoUnderstandingTool(
-        std::shared_ptr<HttpClient> http_client,
-        std::shared_ptr<LLMClient> llm_client
+        std::shared_ptr<infra::HttpClient> http_client,
+        std::shared_ptr<llm::LLMClient> llm_client
     );
 
     std::string name() const override { return "video_understanding"; }
     std::string description() const override;
-    JsonValue schema() const override;
-    JsonValue execute(const JsonValue& params) override;
+    Schema parameters() const override;
+    ToolResult execute(const core::JsonValue& params) override;
 
 private:
-    std::shared_ptr<HttpClient> http_client_;
-    std::shared_ptr<LLMClient> llm_client_;
+    std::shared_ptr<infra::HttpClient> http_client_;
+    std::shared_ptr<llm::LLMClient> llm_client_;
 
     // Provider implementations
-    JsonValue analyze_with_openai(
+    core::JsonValue analyze_with_openai(
         const std::string& video_path,
         const std::string& prompt,
         int frame_count
     );
     
-    JsonValue analyze_with_claude(
+    core::JsonValue analyze_with_claude(
         const std::string& video_path,
         const std::string& prompt,
         int frame_count
     );
     
-    JsonValue analyze_with_gemini(
+    core::JsonValue analyze_with_gemini(
         const std::string& video_path,
         const std::string& prompt
     );
@@ -73,11 +74,12 @@ private:
     
     std::string encode_frame_to_base64(const std::string& frame_path);
     
-    JsonValue get_video_info(const std::string& video_path);
+    core::JsonValue get_video_info(const std::string& video_path);
     
     bool is_ffmpeg_installed();
     
     std::string get_provider_description(const std::string& provider);
 };
 
+} // namespace tools
 } // namespace hunterclaw

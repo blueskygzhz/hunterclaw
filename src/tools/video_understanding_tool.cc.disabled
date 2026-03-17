@@ -6,9 +6,10 @@
 #include <vector>
 
 namespace hunterclaw {
+namespace tools {
 
 VideoUnderstandingTool::VideoUnderstandingTool(
-    std::shared_ptr<HttpClient> http_client,
+    std::shared_ptr<infra::HttpClient> http_client,
     std::shared_ptr<LLMClient> llm_client
 ) : http_client_(http_client),
     llm_client_(llm_client) {
@@ -27,30 +28,30 @@ std::string VideoUnderstandingTool::description() const {
            "Requires ffmpeg for frame extraction.";
 }
 
-JsonValue VideoUnderstandingTool::schema() const {
-    JsonValue schema = JsonValue::object();
+core::JsonValue VideoUnderstandingTool::schema() const {
+    core::JsonValue schema = core::JsonValue::object();
     schema["type"] = "object";
     
-    JsonValue properties = JsonValue::object();
+    core::JsonValue properties = core::JsonValue::object();
     
     // video_path
-    JsonValue video_prop = JsonValue::object();
+    core::JsonValue video_prop = core::JsonValue::object();
     video_prop["type"] = "string";
     video_prop["description"] = "Path to video file (MP4, MOV, AVI, etc.)";
     properties["video_path"] = video_prop;
     
     // prompt
-    JsonValue prompt_prop = JsonValue::object();
+    core::JsonValue prompt_prop = core::JsonValue::object();
     prompt_prop["type"] = "string";
     prompt_prop["description"] = "Question or instruction about the video";
     prompt_prop["default"] = "Describe what happens in this video.";
     properties["prompt"] = prompt_prop;
     
     // provider
-    JsonValue provider_prop = JsonValue::object();
+    core::JsonValue provider_prop = core::JsonValue::object();
     provider_prop["type"] = "string";
     provider_prop["description"] = "AI provider to use";
-    JsonValue provider_enum = JsonValue::array();
+    core::JsonValue provider_enum = core::JsonValue::array();
     provider_enum.push_back("openai");      // GPT-4o via frames
     provider_enum.push_back("anthropic");   // Claude via frames
     provider_enum.push_back("gemini");      // Native video (TODO)
@@ -59,7 +60,7 @@ JsonValue VideoUnderstandingTool::schema() const {
     properties["provider"] = provider_prop;
     
     // frame_count
-    JsonValue frames_prop = JsonValue::object();
+    core::JsonValue frames_prop = core::JsonValue::object();
     frames_prop["type"] = "integer";
     frames_prop["description"] = "Number of frames to sample from video";
     frames_prop["default"] = 8;
@@ -68,24 +69,24 @@ JsonValue VideoUnderstandingTool::schema() const {
     properties["frame_count"] = frames_prop;
     
     // model (optional)
-    JsonValue model_prop = JsonValue::object();
+    core::JsonValue model_prop = core::JsonValue::object();
     model_prop["type"] = "string";
     model_prop["description"] = "Specific model to use (optional)";
     properties["model"] = model_prop;
     
     schema["properties"] = properties;
     
-    JsonValue required = JsonValue::array();
+    core::JsonValue required = core::JsonValue::array();
     required.push_back("video_path");
     schema["required"] = required;
     
     return schema;
 }
 
-JsonValue VideoUnderstandingTool::execute(const JsonValue& params) {
+core::JsonValue VideoUnderstandingTool::execute(const core::JsonValue& params) {
     // Validate video_path
     if (!params.has("video_path")) {
-        JsonValue error = JsonValue::object();
+        core::JsonValue error = core::JsonValue::object();
         error["error"] = "Missing required parameter: video_path";
         return error;
     }
@@ -101,7 +102,7 @@ JsonValue VideoUnderstandingTool::execute(const JsonValue& params) {
     // Check if video file exists
     std::ifstream file(video_path);
     if (!file.good()) {
-        JsonValue error = JsonValue::object();
+        core::JsonValue error = core::JsonValue::object();
         error["error"] = "Video file not found: " + video_path;
         return error;
     }
@@ -109,7 +110,7 @@ JsonValue VideoUnderstandingTool::execute(const JsonValue& params) {
     
     // Check ffmpeg
     if (!is_ffmpeg_installed()) {
-        JsonValue error = JsonValue::object();
+        core::JsonValue error = core::JsonValue::object();
         error["error"] = "ffmpeg not installed";
         error["hint"] = "Install ffmpeg to enable video analysis";
         return error;
@@ -119,7 +120,7 @@ JsonValue VideoUnderstandingTool::execute(const JsonValue& params) {
     auto video_info = get_video_info(video_path);
     
     // Route to provider
-    JsonValue result;
+    core::JsonValue result;
     if (provider == "openai") {
         result = analyze_with_openai(video_path, prompt, frame_count);
     } else if (provider == "anthropic" || provider == "claude") {
@@ -127,7 +128,7 @@ JsonValue VideoUnderstandingTool::execute(const JsonValue& params) {
     } else if (provider == "gemini") {
         result = analyze_with_gemini(video_path, prompt);
     } else {
-        JsonValue error = JsonValue::object();
+        core::JsonValue error = core::JsonValue::object();
         error["error"] = "Unknown provider: " + provider;
         return error;
     }
@@ -146,7 +147,7 @@ JsonValue VideoUnderstandingTool::execute(const JsonValue& params) {
     return result;
 }
 
-JsonValue VideoUnderstandingTool::analyze_with_openai(
+core::JsonValue VideoUnderstandingTool::analyze_with_openai(
     const std::string& video_path,
     const std::string& prompt,
     int frame_count
@@ -154,21 +155,21 @@ JsonValue VideoUnderstandingTool::analyze_with_openai(
     // Extract frames
     auto frames = extract_frames(video_path, frame_count);
     if (frames.empty()) {
-        JsonValue error = JsonValue::object();
+        core::JsonValue error = core::JsonValue::object();
         error["error"] = "Failed to extract frames from video";
         return error;
     }
     
     // Build messages for OpenAI
-    JsonValue messages = JsonValue::array();
+    core::JsonValue messages = core::JsonValue::array();
     
-    JsonValue user_msg = JsonValue::object();
+    core::JsonValue user_msg = core::JsonValue::object();
     user_msg["role"] = "user";
     
-    JsonValue content = JsonValue::array();
+    core::JsonValue content = core::JsonValue::array();
     
     // Add text prompt
-    JsonValue text_part = JsonValue::object();
+    core::JsonValue text_part = core::JsonValue::object();
     text_part["type"] = "text";
     text_part["text"] = prompt + "\n\nThis video has been sampled into " + 
                         std::to_string(frame_count) + " frames shown in temporal order.";
@@ -178,9 +179,9 @@ JsonValue VideoUnderstandingTool::analyze_with_openai(
     for (const auto& frame_path : frames) {
         std::string frame_base64 = encode_frame_to_base64(frame_path);
         if (!frame_base64.empty()) {
-            JsonValue image_part = JsonValue::object();
+            core::JsonValue image_part = core::JsonValue::object();
             image_part["type"] = "image_url";
-            JsonValue image_url = JsonValue::object();
+            core::JsonValue image_url = core::JsonValue::object();
             image_url["url"] = "data:image/jpeg;base64," + frame_base64;
             image_part["image_url"] = image_url;
             content.push_back(image_part);
@@ -191,7 +192,7 @@ JsonValue VideoUnderstandingTool::analyze_with_openai(
     messages.push_back(user_msg);
     
     // Call OpenAI
-    JsonValue request = JsonValue::object();
+    core::JsonValue request = core::JsonValue::object();
     request["model"] = "gpt-4o";
     request["messages"] = messages;
     request["max_tokens"] = 1000;
@@ -199,7 +200,7 @@ JsonValue VideoUnderstandingTool::analyze_with_openai(
     auto response = llm_client_->chat_completion(request);
     
     // Extract result
-    JsonValue result = JsonValue::object();
+    core::JsonValue result = core::JsonValue::object();
     result["status"] = "success";
     result["provider"] = "openai";
     result["model"] = "gpt-4o";
@@ -220,7 +221,7 @@ JsonValue VideoUnderstandingTool::analyze_with_openai(
     return result;
 }
 
-JsonValue VideoUnderstandingTool::analyze_with_claude(
+core::JsonValue VideoUnderstandingTool::analyze_with_claude(
     const std::string& video_path,
     const std::string& prompt,
     int frame_count
@@ -228,21 +229,21 @@ JsonValue VideoUnderstandingTool::analyze_with_claude(
     // Extract frames
     auto frames = extract_frames(video_path, frame_count);
     if (frames.empty()) {
-        JsonValue error = JsonValue::object();
+        core::JsonValue error = core::JsonValue::object();
         error["error"] = "Failed to extract frames from video";
         return error;
     }
     
     // Build messages for Claude
-    JsonValue messages = JsonValue::array();
+    core::JsonValue messages = core::JsonValue::array();
     
-    JsonValue user_msg = JsonValue::object();
+    core::JsonValue user_msg = core::JsonValue::object();
     user_msg["role"] = "user";
     
-    JsonValue content = JsonValue::array();
+    core::JsonValue content = core::JsonValue::array();
     
     // Add text prompt
-    JsonValue text_part = JsonValue::object();
+    core::JsonValue text_part = core::JsonValue::object();
     text_part["type"] = "text";
     text_part["text"] = prompt + "\n\nThis video has been sampled into " + 
                         std::to_string(frame_count) + " frames shown in temporal order.";
@@ -252,9 +253,9 @@ JsonValue VideoUnderstandingTool::analyze_with_claude(
     for (const auto& frame_path : frames) {
         std::string frame_base64 = encode_frame_to_base64(frame_path);
         if (!frame_base64.empty()) {
-            JsonValue image_part = JsonValue::object();
+            core::JsonValue image_part = core::JsonValue::object();
             image_part["type"] = "image";
-            JsonValue source = JsonValue::object();
+            core::JsonValue source = core::JsonValue::object();
             source["type"] = "base64";
             source["media_type"] = "image/jpeg";
             source["data"] = frame_base64;
@@ -267,7 +268,7 @@ JsonValue VideoUnderstandingTool::analyze_with_claude(
     messages.push_back(user_msg);
     
     // Call Claude
-    JsonValue request = JsonValue::object();
+    core::JsonValue request = core::JsonValue::object();
     request["model"] = "claude-3.5-sonnet";
     request["messages"] = messages;
     request["max_tokens"] = 1000;
@@ -275,7 +276,7 @@ JsonValue VideoUnderstandingTool::analyze_with_claude(
     auto response = llm_client_->chat_completion(request);
     
     // Extract result
-    JsonValue result = JsonValue::object();
+    core::JsonValue result = core::JsonValue::object();
     result["status"] = "success";
     result["provider"] = "anthropic";
     result["model"] = "claude-3.5-sonnet";
@@ -296,14 +297,14 @@ JsonValue VideoUnderstandingTool::analyze_with_claude(
     return result;
 }
 
-JsonValue VideoUnderstandingTool::analyze_with_gemini(
+core::JsonValue VideoUnderstandingTool::analyze_with_gemini(
     const std::string& video_path,
     const std::string& prompt
 ) {
     // TODO: Implement Gemini native video understanding
     // Gemini supports direct video upload without frame extraction
     
-    JsonValue error = JsonValue::object();
+    core::JsonValue error = core::JsonValue::object();
     error["error"] = "Gemini video understanding not yet implemented";
     error["hint"] = "Use 'openai' or 'anthropic' provider instead";
     return error;
@@ -359,8 +360,8 @@ std::string VideoUnderstandingTool::encode_frame_to_base64(
     return "";
 }
 
-JsonValue VideoUnderstandingTool::get_video_info(const std::string& video_path) {
-    JsonValue info = JsonValue::object();
+core::JsonValue VideoUnderstandingTool::get_video_info(const std::string& video_path) {
+    core::JsonValue info = core::JsonValue::object();
     
     // Use ffprobe to get video metadata
     std::stringstream cmd;
@@ -414,4 +415,5 @@ std::string VideoUnderstandingTool::get_provider_description(
     return provider;
 }
 
+} // namespace tools
 } // namespace hunterclaw

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "hunterclaw/core/common.h"
+#include "hunterclaw/core/types.h"
 #include "hunterclaw/core/json.h"
 #include "hunterclaw/core/result.h"
 #include <string>

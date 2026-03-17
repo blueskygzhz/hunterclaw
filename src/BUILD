@@ -158,7 +158,7 @@ cc_library(
 # Skill Library - Skill Manager, Plugin System, File Watcher
 # ============================================================================
 cc_library(
-    name = "hunterclaw_skill",
+    name = "hunterclaw_skills",
     srcs = glob(["skills/*.cc"]),
     deps = [
         "//:hunterclaw_headers",
@@ -186,6 +186,41 @@ cc_library(
 )
 
 # ============================================================================
+# Tools Library - Built-in Tools, MCP Tools, Tool Manager
+# ============================================================================
+cc_library(
+    name = "hunterclaw_tools",
+    srcs = glob(["tools/*.cc"]),
+    deps = [
+        "//:hunterclaw_headers",
+        ":hunterclaw_llm",
+        ":hunterclaw_memory",
+        ":hunterclaw_sessions",
+        "@nlohmann_json//:json",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+    copts = [
+        "-std=c++17",
+        "-Wall",
+        "-Wextra",
+        "-I/usr/include/jsoncpp",
+        "-I/usr/include/spdlog",
+    ],
+    linkopts = [
+        "-lpthread",
+        "-ljsoncpp",
+        "-lsqlite3",
+        "-luuid",
+        "-lcurl",
+        "-lssl",
+        "-lcrypto",
+    ],
+    linkstatic = False,
+    visibility = ["//visibility:public"],
+)
+
+# ============================================================================
 # Core Aggregate Library - All HunterClaw modules
 # ============================================================================
 cc_library(
@@ -198,7 +233,6 @@ cc_library(
         "agents/*.cc",
         "context/*.cc",
         "react/*.cc",
-        "tools/*.cc",
         "plugins/*.cc",
         "process/*.cc",
         "hooks/*.cc",
@@ -227,6 +261,7 @@ cc_library(
         ":hunterclaw_mcp",
         ":hunterclaw_sessions",
         ":hunterclaw_skill",
+        ":hunterclaw_tools",  # ✅ 添加 tools 依赖
         "//:hunterclaw_headers",
         "//third_party:httplib",
         "@nlohmann_json//:json",

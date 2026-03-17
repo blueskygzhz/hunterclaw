@@ -11,7 +11,7 @@ using namespace hunterclaw::core;
 
 ImageAnalysisTool::ImageAnalysisTool(
     const ToolContext& context,
-    std::shared_ptr<llm::LlmClient> llm_client
+    std::shared_ptr<llm::LLMClient> llm_client
 ) : context_(context), llm_client_(llm_client) {}
 
 std::string ImageAnalysisTool::description() const {

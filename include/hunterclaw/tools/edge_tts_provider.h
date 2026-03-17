@@ -1,13 +1,14 @@
 #pragma once
 
-#include "tool.h"
-#include "../core/json_value.h"
-#include "../http/http_client.h"
+#include "hunterclaw/tools/tool.h"
+#include "hunterclaw/core/json.h"
+#include "hunterclaw/infra/http_client.h"
 #include <string>
 #include <memory>
 #include <vector>
 
 namespace hunterclaw {
+namespace tools {
 
 /**
  * Edge TTS Provider
@@ -28,10 +29,10 @@ namespace hunterclaw {
  */
 class EdgeTTSProvider {
 public:
-    EdgeTTSProvider(std::shared_ptr<HttpClient> http_client);
+    EdgeTTSProvider(std::shared_ptr<infra::HttpClient> http_client);
 
     // Generate speech from text
-    JsonValue synthesize(
+    core::JsonValue synthesize(
         const std::string& text,
         const std::string& voice = "en-US-AriaNeural",
         const std::string& format = "mp3",
@@ -44,10 +45,10 @@ public:
     std::vector<std::string> list_voices(const std::string& language = "");
 
     // Get voice info
-    JsonValue get_voice_info(const std::string& voice_name);
+    core::JsonValue get_voice_info(const std::string& voice_name);
 
 private:
-    std::shared_ptr<HttpClient> http_client_;
+    std::shared_ptr<infra::HttpClient> http_client_;
 
     // Helper methods
     std::string build_ssml(
@@ -106,4 +107,5 @@ const std::vector<EdgeVoice> POPULAR_EDGE_VOICES = {
     {"de-DE-ConradNeural", "de-DE", "Male", "German male"},
 };
 
+} // namespace tools
 } // namespace hunterclaw

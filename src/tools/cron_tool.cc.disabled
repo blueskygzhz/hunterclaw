@@ -1,8 +1,11 @@
 #include "hunterclaw/tools/cron_tool.h"
-#include <json/json.h>
-<parameter name="chrono">
+#include <nlohmann/json.hpp>
+#include <chrono>
 #include <sstream>
 #include <algorithm>
+#include <mutex>
+
+using json = nlohmann::json;
 
 namespace hunterclaw {
 namespace tools {
@@ -15,7 +18,7 @@ struct CronJob {
     std::string name;
     std::string schedule;        // Cron 表达式 (e.g., "0 9 * * *")
     std::string command;          // 要执行的命令
-    Json::Value params;           // 命令参数
+    json params;           // 命令参数
     bool enabled;
     int64_t created_at_ms;
     int64_t last_run_ms;
@@ -34,7 +37,7 @@ public:
     }
 
     std::string CreateJob(const std::string& name, const std::string& schedule,
-                          const std::string& command, const Json::Value& params) {
+                          const std::string& command, const json& params) {
         std::lock_guard<std::mutex> lock(mutex_);
         
         // 生成唯一 ID
@@ -160,17 +163,17 @@ private:
 };
 
 // 将 CronJob 转换为 JSON
-Json::Value CronJobToJson(const CronJob& job) {
-    Json::Value json;
+json CronJobToJson(const CronJob& job) {
+    json json;
     json["id"] = job.id;
     json["name"] = job.name;
     json["schedule"] = job.schedule;
     json["command"] = job.command;
     json["params"] = job.params;
     json["enabled"] = job.enabled;
-    json["createdAtMs"] = Json::Int64(job.created_at_ms);
-    json["lastRunMs"] = Json::Int64(job.last_run_ms);
-    json["nextRunMs"] = Json::Int64(job.next_run_ms);
+    json["createdAtMs"] = json::Int64(job.created_at_ms);
+    json["lastRunMs"] = json::Int64(job.last_run_ms);
+    json["nextRunMs"] = json::Int64(job.next_run_ms);
     json["runCount"] = job.run_count;
     json["lastStatus"] = job.last_status;
     if (!job.last_error.empty()) {
@@ -236,10 +239,10 @@ ToolDefinition CronTool::GetDefinition() const {
         func.name = "cron_list";
         func.description = "列出所有已创建的定时任务,包括任务状态、调度信息、执行历史等";
         
-        Json::Value schema;
+        json schema;
         schema["type"] = "object";
-        schema["properties"] = Json::Value(Json::objectValue);
-        schema["required"] = Json::Value(Json::arrayValue);
+        schema["properties"] = json(json::objectValue);
+        schema["required"] = json(json::arrayValue);
         
         func.parameters = schema;
         def.functions.push_back(func);
@@ -251,10 +254,10 @@ ToolDefinition CronTool::GetDefinition() const {
         func.name = "cron_create";
         func.description = "创建新的定时任务,支持 Cron 表达式调度(如每天、每小时等)";
         
-        Json::Value schema;
+        json schema;
         schema["type"] = "object";
         
-        Json::Value properties;
+        json properties;
         properties["name"]["type"] = "string";
         properties["name"]["description"] = "任务名称 (必需)";
         properties["schedule"]["type"] = "string";
@@ -265,7 +268,7 @@ ToolDefinition CronTool::GetDefinition() const {
         properties["params"]["description"] = "命令参数 (可选)";
         schema["properties"] = properties;
         
-        Json::Value required;
+        json required;
         required.append("name");
         required.append("schedule");
         required.append("command");
@@ -281,15 +284,15 @@ ToolDefinition CronTool::GetDefinition() const {
         func.name = "cron_delete";
         func.description = "删除指定的定时任务";
         
-        Json::Value schema;
+        json schema;
         schema["type"] = "object";
         
-        Json::Value properties;
+        json properties;
         properties["id"]["type"] = "string";
         properties["id"]["description"] = "任务 ID (必需)";
         schema["properties"] = properties;
         
-        Json::Value required;
+        json required;
         required.append("id");
         schema["required"] = required;
         
@@ -301,7 +304,7 @@ ToolDefinition CronTool::GetDefinition() const {
 }
 
 ToolResult CronTool::Execute(const std::string& function_name,
-                              const Json::Value& arguments) {
+                              const json& arguments) {
     if (function_name == "cron_list") {
         return ExecuteCronList(arguments);
     } else if (function_name == "cron_create") {
@@ -313,15 +316,15 @@ ToolResult CronTool::Execute(const std::string& function_name,
     return ToolResult::Error("Unknown function: " + function_name);
 }
 
-ToolResult CronTool::ExecuteCronList(const Json::Value& arguments) {
+ToolResult CronTool::ExecuteCronList(const json& arguments) {
     auto& manager = CronJobManager::Instance();
     auto jobs = manager.ListJobs();
     
-    Json::Value result;
+    json result;
     result["totalJobs"] = static_cast<int>(jobs.size());
     
     int enabled_count = 0;
-    Json::Value jobs_json(Json::arrayValue);
+    json jobs_json(json::arrayValue);
     for (const auto& job : jobs) {
         if (job.enabled) {
             enabled_count++;
@@ -356,7 +359,7 @@ ToolResult CronTool::ExecuteCronList(const Json::Value& arguments) {
     return ToolResult::Success(result, summary.str());
 }
 
-ToolResult CronTool::ExecuteCronCreate(const Json::Value& arguments) {
+ToolResult CronTool::ExecuteCronCreate(const json& arguments) {
     // 验证必需参数
     if (!arguments.isMember("name") || !arguments["name"].isString()) {
         return ToolResult::Error("Missing required parameter: name");
@@ -371,7 +374,7 @@ ToolResult CronTool::ExecuteCronCreate(const Json::Value& arguments) {
     std::string name = arguments["name"].asString();
     std::string schedule = arguments["schedule"].asString();
     std::string command = arguments["command"].asString();
-    Json::Value params = arguments.get("params", Json::Value(Json::objectValue));
+    json params = arguments.get("params", json(json::objectValue));
     
     // 验证 Cron 表达式格式 (简化版)
     // 实际实现应该使用专业的 Cron 表达式解析器
@@ -388,7 +391,7 @@ ToolResult CronTool::ExecuteCronCreate(const Json::Value& arguments) {
         return ToolResult::Error("Failed to create cron job");
     }
     
-    Json::Value result = CronJobToJson(*job_opt);
+    json result = CronJobToJson(*job_opt);
     
     std::stringstream summary;
     summary << "Successfully created cron job:\n\n";
@@ -401,7 +404,7 @@ ToolResult CronTool::ExecuteCronCreate(const Json::Value& arguments) {
     return ToolResult::Success(result, summary.str());
 }
 
-ToolResult CronTool::ExecuteCronDelete(const Json::Value& arguments) {
+ToolResult CronTool::ExecuteCronDelete(const json& arguments) {
     // 验证必需参数
     if (!arguments.isMember("id") || !arguments["id"].isString()) {
         return ToolResult::Error("Missing required parameter: id");
@@ -425,7 +428,7 @@ ToolResult CronTool::ExecuteCronDelete(const Json::Value& arguments) {
         return ToolResult::Error("Failed to delete cron job: " + job_id);
     }
     
-    Json::Value result;
+    json result;
     result["deleted"] = true;
     result["id"] = job_id;
     result["name"] = job_name;

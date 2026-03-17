@@ -1,7 +1,7 @@
 #pragma once
 
 #include "hunterclaw/tools/tool.h"
-#include "hunterclaw/http/http_client.h"
+#include "hunterclaw/infra/http_client.h"
 #include <memory>
 
 namespace hunterclaw {
@@ -22,7 +22,7 @@ class TtsTool : public Tool {
 public:
     explicit TtsTool(
         const ToolContext& context,
-        std::shared_ptr<http::HttpClient> http_client
+        std::shared_ptr<infra::HttpClient> http_client
     );
     
     ~TtsTool() override = default;
@@ -58,7 +58,7 @@ private:
     std::string save_audio_to_temp(const std::string& audio_data, const std::string& format);
     
     ToolContext context_;
-    std::shared_ptr<http::HttpClient> http_client_;
+    std::shared_ptr<infra::HttpClient> http_client_;
 };
 
 } // namespace tools

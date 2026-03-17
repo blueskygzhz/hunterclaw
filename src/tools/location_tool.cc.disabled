@@ -4,9 +4,13 @@
 #include <cmath>
 
 namespace hunterclaw {
+namespace tools {
+namespace tools {
+
+using core::JsonValue = nlohmann::json;
 
 LocationTool::LocationTool(
-    std::shared_ptr<NodeRegistry> node_registry,
+    std::shared_ptr<nodes::nodes::NodeRegistry> node_registry,
     std::shared_ptr<ApprovalManager> approval_manager
 ) : node_registry_(node_registry),
     approval_manager_(approval_manager) {}
@@ -16,74 +20,59 @@ std::string LocationTool::description() const {
            "Supports iOS and Android. Requires user approval for privacy.";
 }
 
-JsonValue LocationTool::schema() const {
-    JsonValue schema = JsonValue::object();
-    schema["type"] = "object";
-    
-    JsonValue properties = JsonValue::object();
+Tool::Schema LocationTool::parameters() const {
+    Schema schema;
+    schema.type = "object";
+    schema.description = "Get device location parameters";
     
     // action
-    JsonValue action_prop = JsonValue::object();
+    core::JsonValue action_prop;
     action_prop["type"] = "string";
     action_prop["description"] = "Action to perform";
-    JsonValue action_enum = JsonValue::array();
-    action_enum.push_back("get_location");
-    action_enum.push_back("get_address");
-    action_enum.push_back("track_location");
-    action_enum.push_back("stop_tracking");
-    action_prop["enum"] = action_enum;
-    properties["action"] = action_prop;
+    action_prop["enum"] = core::JsonValue::array({"get_location", "get_address", "track_location", "stop_tracking"});
+    schema.properties["action"] = action_prop;
     
     // accuracy
-    JsonValue accuracy_prop = JsonValue::object();
+    core::JsonValue accuracy_prop;
     accuracy_prop["type"] = "string";
     accuracy_prop["description"] = "Location accuracy level";
-    JsonValue accuracy_enum = JsonValue::array();
-    accuracy_enum.push_back("low");         // ~1km, battery-friendly
-    accuracy_enum.push_back("balanced");    // ~100m, good balance
-    accuracy_enum.push_back("high");        // ~10m, GPS required
-    accuracy_enum.push_back("best");        // ~1m, highest accuracy
-    accuracy_prop["enum"] = accuracy_enum;
+    accuracy_prop["enum"] = core::JsonValue::array({"low", "balanced", "high", "best"});
     accuracy_prop["default"] = "balanced";
-    properties["accuracy"] = accuracy_prop;
+    schema.properties["accuracy"] = accuracy_prop;
     
     // timeout
-    JsonValue timeout_prop = JsonValue::object();
+    core::JsonValue timeout_prop;
     timeout_prop["type"] = "integer";
     timeout_prop["description"] = "Location request timeout in seconds";
     timeout_prop["default"] = 10;
     timeout_prop["minimum"] = 1;
     timeout_prop["maximum"] = 60;
-    properties["timeout"] = timeout_prop;
+    schema.properties["timeout"] = timeout_prop;
     
     // interval (for tracking)
-    JsonValue interval_prop = JsonValue::object();
+    core::JsonValue interval_prop;
     interval_prop["type"] = "integer";
     interval_prop["description"] = "Update interval in seconds for tracking";
     interval_prop["default"] = 5;
     interval_prop["minimum"] = 1;
     interval_prop["maximum"] = 300;
-    properties["interval"] = interval_prop;
+    schema.properties["interval"] = interval_prop;
     
     // node_id (optional)
-    JsonValue node_prop = JsonValue::object();
+    core::JsonValue node_prop;
     node_prop["type"] = "string";
     node_prop["description"] = "Target node ID (auto-select if not provided)";
-    properties["node_id"] = node_prop;
+    schema.properties["node_id"] = node_prop;
     
-    schema["properties"] = properties;
-    
-    JsonValue required = JsonValue::array();
-    required.push_back("action");
-    schema["required"] = required;
+    schema.required = {"action"};
     
     return schema;
 }
 
-JsonValue LocationTool::execute(const JsonValue& params) {
+core::JsonValue LocationTool::execute(const core::JsonValue& params) {
     // Extract action
     if (!params.has("action")) {
-        JsonValue error = JsonValue::object();
+        core::JsonValue error = core::JsonValue::object();
         error["error"] = "Missing required parameter: action";
         return error;
     }
@@ -100,13 +89,13 @@ JsonValue LocationTool::execute(const JsonValue& params) {
     } else if (action == "stop_tracking") {
         return stop_tracking(params);
     } else {
-        JsonValue error = JsonValue::object();
+        core::JsonValue error = core::JsonValue::object();
         error["error"] = "Unknown action: " + action;
         return error;
     }
 }
 
-JsonValue LocationTool::get_location(const JsonValue& params) {
+core::JsonValue LocationTool::get_location(const core::JsonValue& params) {
     std::string accuracy = params.has("accuracy") ? 
         params["accuracy"].as_string() : "balanced";
     
@@ -124,7 +113,7 @@ JsonValue LocationTool::get_location(const JsonValue& params) {
         );
         
         if (!approved) {
-            JsonValue result = JsonValue::object();
+            core::JsonValue result = core::JsonValue::object();
             result["status"] = "denied";
             result["message"] = "User denied location permission";
             return result;
@@ -134,7 +123,7 @@ JsonValue LocationTool::get_location(const JsonValue& params) {
     return route_to_node("get_location", params);
 }
 
-JsonValue LocationTool::get_address(const JsonValue& params) {
+core::JsonValue LocationTool::get_address(const core::JsonValue& params) {
     // get_address also needs location permission
     if (approval_manager_) {
         bool approved = approval_manager_->request_approval(
@@ -143,7 +132,7 @@ JsonValue LocationTool::get_address(const JsonValue& params) {
         );
         
         if (!approved) {
-            JsonValue result = JsonValue::object();
+            core::JsonValue result = core::JsonValue::object();
             result["status"] = "denied";
             result["message"] = "User denied location permission";
             return result;
@@ -153,7 +142,7 @@ JsonValue LocationTool::get_address(const JsonValue& params) {
     return route_to_node("get_address", params);
 }
 
-JsonValue LocationTool::track_location(const JsonValue& params) {
+core::JsonValue LocationTool::track_location(const core::JsonValue& params) {
     int interval = params.has("interval") ? params["interval"].as_int() : 5;
     
     std::stringstream approval_msg;
@@ -169,7 +158,7 @@ JsonValue LocationTool::track_location(const JsonValue& params) {
         );
         
         if (!approved) {
-            JsonValue result = JsonValue::object();
+            core::JsonValue result = core::JsonValue::object();
             result["status"] = "denied";
             result["message"] = "User denied location tracking permission";
             return result;
@@ -179,16 +168,16 @@ JsonValue LocationTool::track_location(const JsonValue& params) {
     return route_to_node("track_location", params);
 }
 
-JsonValue LocationTool::stop_tracking(const JsonValue& params) {
+core::JsonValue LocationTool::stop_tracking(const core::JsonValue& params) {
     return route_to_node("stop_tracking", params);
 }
 
-JsonValue LocationTool::route_to_node(
+core::JsonValue LocationTool::route_to_node(
     const std::string& action, 
-    const JsonValue& params
+    const core::JsonValue& params
 ) {
     if (!node_registry_) {
-        JsonValue error = JsonValue::object();
+        core::JsonValue error = core::JsonValue::object();
         error["error"] = "Node registry not available";
         return error;
     }
@@ -217,14 +206,14 @@ JsonValue LocationTool::route_to_node(
     }
     
     if (node_id.empty()) {
-        JsonValue error = JsonValue::object();
+        core::JsonValue error = core::JsonValue::object();
         error["error"] = "No available mobile device found";
         error["hint"] = "Please ensure an iOS or Android device is connected";
         return error;
     }
     
     // Send command to node
-    JsonValue command = JsonValue::object();
+    core::JsonValue command = core::JsonValue::object();
     command["tool"] = "location";
     command["action"] = action;
     
@@ -241,7 +230,7 @@ JsonValue LocationTool::route_to_node(
     auto response = node_registry_->send_to_node(node_id, command);
     
     // Format response
-    JsonValue result = JsonValue::object();
+    core::JsonValue result = core::JsonValue::object();
     result["status"] = "success";
     result["action"] = action;
     result["node_id"] = node_id;
@@ -324,4 +313,6 @@ std::string LocationTool::get_accuracy_description(const std::string& accuracy) 
     return accuracy;
 }
 
+} // namespace tools
+} // namespace tools
 } // namespace hunterclaw

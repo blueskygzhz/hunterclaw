@@ -4,6 +4,10 @@
 #include <filesystem>
 #include <chrono>
 #include <algorithm>
+#include <regex>
+#include <nlohmann/json.hpp>
+
+using json = nlohmann::json;
 
 namespace hunterclaw {
 namespace tools {

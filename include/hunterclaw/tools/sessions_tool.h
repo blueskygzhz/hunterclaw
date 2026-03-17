@@ -5,7 +5,7 @@
 #include <memory>
 #include <optional>
 #include <unordered_map>
-#include "hunterclaw/core/tool.h"
+#include "hunterclaw/tools/tool.h"
 #include "hunterclaw/core/json.h"
 
 namespace hunterclaw {

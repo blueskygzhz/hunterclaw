@@ -7,6 +7,7 @@
 #include <functional>
 #include <optional>
 #include <mutex>
+#include <atomic>
 
 namespace hunterclaw {
 

@@ -1,4 +1,4 @@
-#include "hunterclaw/tools/builtin_tools.h"
+#include "hunterclaw/tools/tool.h"
 #include "hunterclaw/tools/camera_tool.h"
 #include "hunterclaw/tools/tts_tool.h"
 #include "hunterclaw/tools/audio_transcription_tool.h"
@@ -7,13 +7,13 @@
 namespace hunterclaw {
 namespace tools {
 
-// 注册多媒体工具
-void BuiltinTools::register_media_tools(
+// 注册多媒体工具 (Helper function, not part of BuiltinTools class)
+void register_media_tools(
     ToolManager& manager,
     const ToolContext& context,
     std::shared_ptr<nodes::NodeRegistry> node_registry,
-    std::shared_ptr<http::HttpClient> http_client,
-    std::shared_ptr<llm::LlmClient> llm_client
+    std::shared_ptr<infra::HttpClient> http_client,
+    std::shared_ptr<llm::LLMClient> llm_client
 ) {
     // 1. Camera Tool
     if (node_registry) {

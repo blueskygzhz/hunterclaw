@@ -4,7 +4,7 @@
 #include <vector>
 #include <memory>
 #include <optional>
-#include "hunterclaw/core/tool.h"
+#include "hunterclaw/tools/tool.h"
 #include "hunterclaw/core/json.h"
 
 namespace hunterclaw {

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "hunterclaw/tools/tool.h"
-#include "hunterclaw/http/http_client.h"
+#include "hunterclaw/infra/http_client.h"
 #include "hunterclaw/llm/llm_client.h"
 #include <memory>
 
@@ -24,7 +24,7 @@ class ImageAnalysisTool : public Tool {
 public:
     explicit ImageAnalysisTool(
         const ToolContext& context,
-        std::shared_ptr<llm::LlmClient> llm_client
+        std::shared_ptr<llm::LLMClient> llm_client
     );
     
     ~ImageAnalysisTool() override = default;
@@ -72,7 +72,7 @@ private:
     std::string detect_mime_type(const std::string& image_data);
     
     ToolContext context_;
-    std::shared_ptr<llm::LlmClient> llm_client_;
+    std::shared_ptr<llm::LLMClient> llm_client_;
 };
 
 } // namespace tools

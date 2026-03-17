@@ -8,6 +8,10 @@
 
 using json = nlohmann::json;
 
+// ✅ Import OpenAI compat types
+using hunterclaw::gateway::http::ChatCompletionRequest;
+using hunterclaw::gateway::http::ChatCompletionChunk;
+
 // Helper for logging - use a simple no-op for now if logger not available
 namespace {
     inline void log_info(const std::string& msg) { 
@@ -575,7 +579,7 @@ void HttpGateway::handle_get_skill(const httplib::Request& req, httplib::Respons
 // ========== OpenAI API Endpoints ==========
 
 void HttpGateway::handle_chat_completions(const httplib::Request& req, httplib::Response& res) {
-    if (!openai_adapter_) {
+    if (!openai_compat_) {
         send_error(res, 503, "LLM client not configured. Please set LLM client first.");
         return;
     }
@@ -634,7 +638,7 @@ void HttpGateway::handle_chat_completions(const httplib::Request& req, httplib::
                 [this, request](size_t offset, httplib::DataSink& sink) {
                     bool stream_complete = false;
                     
-                    auto result = openai_adapter_->create_chat_completion_stream(
+                    auto result = openai_compat_->create_chat_completion_stream(
                         request,
                         // On chunk callback
                         [&](const ChatCompletionChunk& chunk) {

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "hunterclaw/tools/tool.h"
-#include "hunterclaw/http/http_client.h"
+#include "hunterclaw/infra/http_client.h"
 #include <memory>
 
 namespace hunterclaw {
@@ -23,7 +23,7 @@ class AudioTranscriptionTool : public Tool {
 public:
     explicit AudioTranscriptionTool(
         const ToolContext& context,
-        std::shared_ptr<http::HttpClient> http_client
+        std::shared_ptr<infra::HttpClient> http_client
     );
     
     ~AudioTranscriptionTool() override = default;
@@ -59,7 +59,7 @@ private:
     core::Result<std::string> decode_audio_base64(const std::string& base64);
     
     /// 上传音频文件 (multipart/form-data)
-    core::Result<http::HttpResponse> upload_audio(
+    core::Result<infra::HttpResponse> upload_audio(
         const std::string& url,
         const std::string& audio_data,
         const std::string& filename,
@@ -68,7 +68,7 @@ private:
     );
     
     ToolContext context_;
-    std::shared_ptr<http::HttpClient> http_client_;
+    std::shared_ptr<infra::HttpClient> http_client_;
 };
 
 } // namespace tools

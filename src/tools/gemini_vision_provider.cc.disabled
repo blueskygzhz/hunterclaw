@@ -3,9 +3,12 @@
 #include <fstream>
 
 namespace hunterclaw {
+namespace tools {
+
+using JsonValue = nlohmann::json;
 
 GeminiVisionProvider::GeminiVisionProvider(
-    std::shared_ptr<HttpClient> http_client,
+    std::shared_ptr<infra::HttpClient> http_client,
     const std::string& api_key
 ) : http_client_(http_client),
     api_key_(api_key),
@@ -261,4 +264,5 @@ JsonValue GeminiVisionProvider::build_content_parts(
     return parts;
 }
 
+} // namespace tools
 } // namespace hunterclaw

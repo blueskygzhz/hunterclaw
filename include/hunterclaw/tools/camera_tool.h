@@ -2,7 +2,7 @@
 
 #include "hunterclaw/tools/tool.h"
 #include "hunterclaw/nodes/node_registry.h"
-#include "hunterclaw/http/http_client.h"
+#include "hunterclaw/infra/http_client.h"
 #include <memory>
 
 namespace hunterclaw {

@@ -2,9 +2,10 @@
 #include <sstream>
 
 namespace hunterclaw {
+namespace tools {
 
 ScreenRecordTool::ScreenRecordTool(
-    std::shared_ptr<NodeRegistry> node_registry,
+    std::shared_ptr<nodes::NodeRegistry> node_registry,
     std::shared_ptr<ApprovalManager> approval_manager
 ) : node_registry_(node_registry),
     approval_manager_(approval_manager) {}
@@ -14,17 +15,17 @@ std::string ScreenRecordTool::description() const {
            "Requires user approval for privacy. Max duration: 60 seconds.";
 }
 
-JsonValue ScreenRecordTool::schema() const {
-    JsonValue schema = JsonValue::object();
+core::JsonValue ScreenRecordTool::schema() const {
+    core::JsonValue schema = core::JsonValue::object();
     schema["type"] = "object";
     
-    JsonValue properties = JsonValue::object();
+    core::JsonValue properties = core::JsonValue::object();
     
     // action
-    JsonValue action_prop = JsonValue::object();
+    core::JsonValue action_prop = core::JsonValue::object();
     action_prop["type"] = "string";
     action_prop["description"] = "Action to perform";
-    JsonValue action_enum = JsonValue::array();
+    core::JsonValue action_enum = core::JsonValue::array();
     action_enum.push_back("screen_record_start");
     action_enum.push_back("screen_record_stop");
     action_enum.push_back("screen_record_status");
@@ -32,7 +33,7 @@ JsonValue ScreenRecordTool::schema() const {
     properties["action"] = action_prop;
     
     // duration (for start)
-    JsonValue duration_prop = JsonValue::object();
+    core::JsonValue duration_prop = core::JsonValue::object();
     duration_prop["type"] = "integer";
     duration_prop["description"] = "Recording duration in seconds (1-60)";
     duration_prop["default"] = 10;
@@ -41,10 +42,10 @@ JsonValue ScreenRecordTool::schema() const {
     properties["duration"] = duration_prop;
     
     // quality
-    JsonValue quality_prop = JsonValue::object();
+    core::JsonValue quality_prop = core::JsonValue::object();
     quality_prop["type"] = "string";
     quality_prop["description"] = "Recording quality";
-    JsonValue quality_enum = JsonValue::array();
+    core::JsonValue quality_enum = core::JsonValue::array();
     quality_enum.push_back("low");      // 480p, smaller file
     quality_enum.push_back("medium");   // 720p, balanced
     quality_enum.push_back("high");     // 1080p, best quality
@@ -53,24 +54,24 @@ JsonValue ScreenRecordTool::schema() const {
     properties["quality"] = quality_prop;
     
     // node_id (optional, auto-select if not provided)
-    JsonValue node_prop = JsonValue::object();
+    core::JsonValue node_prop = core::JsonValue::object();
     node_prop["type"] = "string";
     node_prop["description"] = "Target node ID (auto-select if not provided)";
     properties["node_id"] = node_prop;
     
     schema["properties"] = properties;
     
-    JsonValue required = JsonValue::array();
+    core::JsonValue required = core::JsonValue::array();
     required.push_back("action");
     schema["required"] = required;
     
     return schema;
 }
 
-JsonValue ScreenRecordTool::execute(const JsonValue& params) {
+core::JsonValue ScreenRecordTool::execute(const core::JsonValue& params) {
     // Extract action
     if (!params.has("action")) {
-        JsonValue error = JsonValue::object();
+        core::JsonValue error = core::JsonValue::object();
         error["error"] = "Missing required parameter: action";
         return error;
     }
@@ -85,17 +86,17 @@ JsonValue ScreenRecordTool::execute(const JsonValue& params) {
     } else if (action == "screen_record_status") {
         return get_status(params);
     } else {
-        JsonValue error = JsonValue::object();
+        core::JsonValue error = core::JsonValue::object();
         error["error"] = "Unknown action: " + action;
         return error;
     }
 }
 
-JsonValue ScreenRecordTool::start_recording(const JsonValue& params) {
+core::JsonValue ScreenRecordTool::start_recording(const core::JsonValue& params) {
     // Validate duration
     int duration = params.has("duration") ? params["duration"].as_int() : 10;
     if (!validate_duration(duration)) {
-        JsonValue error = JsonValue::object();
+        core::JsonValue error = core::JsonValue::object();
         error["error"] = "Invalid duration. Must be between 1 and 60 seconds.";
         return error;
     }
@@ -119,7 +120,7 @@ JsonValue ScreenRecordTool::start_recording(const JsonValue& params) {
         );
         
         if (!approved) {
-            JsonValue result = JsonValue::object();
+            core::JsonValue result = core::JsonValue::object();
             result["status"] = "denied";
             result["message"] = "User denied screen recording permission";
             return result;
@@ -130,20 +131,20 @@ JsonValue ScreenRecordTool::start_recording(const JsonValue& params) {
     return route_to_node("screen_record_start", params);
 }
 
-JsonValue ScreenRecordTool::stop_recording(const JsonValue& params) {
+core::JsonValue ScreenRecordTool::stop_recording(const core::JsonValue& params) {
     return route_to_node("screen_record_stop", params);
 }
 
-JsonValue ScreenRecordTool::get_status(const JsonValue& params) {
+core::JsonValue ScreenRecordTool::get_status(const core::JsonValue& params) {
     return route_to_node("screen_record_status", params);
 }
 
-JsonValue ScreenRecordTool::route_to_node(
+core::JsonValue ScreenRecordTool::route_to_node(
     const std::string& action, 
-    const JsonValue& params
+    const core::JsonValue& params
 ) {
     if (!node_registry_) {
-        JsonValue error = JsonValue::object();
+        core::JsonValue error = core::JsonValue::object();
         error["error"] = "Node registry not available";
         return error;
     }
@@ -180,14 +181,14 @@ JsonValue ScreenRecordTool::route_to_node(
     }
     
     if (node_id.empty()) {
-        JsonValue error = JsonValue::object();
+        core::JsonValue error = core::JsonValue::object();
         error["error"] = "No available node found for screen recording";
         error["hint"] = "Please ensure a device (iOS/Android/macOS) is connected";
         return error;
     }
     
     // Send command to node
-    JsonValue command = JsonValue::object();
+    core::JsonValue command = core::JsonValue::object();
     command["tool"] = "screen_record";
     command["action"] = action;
     
@@ -201,7 +202,7 @@ JsonValue ScreenRecordTool::route_to_node(
     auto response = node_registry_->send_to_node(node_id, command);
     
     // Format response
-    JsonValue result = JsonValue::object();
+    core::JsonValue result = core::JsonValue::object();
     result["status"] = "success";
     result["action"] = action;
     result["node_id"] = node_id;
@@ -240,4 +241,5 @@ std::string ScreenRecordTool::get_quality_description(const std::string& quality
     return quality;
 }
 
+} // namespace tools
 } // namespace hunterclaw

@@ -12,7 +12,7 @@ using namespace hunterclaw::core;
 
 AudioTranscriptionTool::AudioTranscriptionTool(
     const ToolContext& context,
-    std::shared_ptr<http::HttpClient> http_client
+    std::shared_ptr<infra::HttpClient> http_client
 ) : context_(context), http_client_(http_client) {}
 
 std::string AudioTranscriptionTool::description() const {

@@ -27,7 +27,7 @@ core::JsonValue ToolCatalogEntry::to_json() const {
     if (!default_profiles.empty()) {
         core::JsonValue profiles_arr = core::JsonValue::array();
         for (const auto& p : default_profiles) {
-            profiles_arr.array_push(p);
+            profiles_arr.push_back(p);
         }
         obj["defaultProfiles"] = profiles_arr;
     } else {
@@ -53,7 +53,7 @@ core::JsonValue ToolCatalogGroup::to_json() const {
     
     core::JsonValue tools_arr = core::JsonValue::array();
     for (const auto& tool : tools) {
-        tools_arr.array_push(tool.to_json());
+        tools_arr.push_back(tool.to_json());
     }
     obj["tools"] = tools_arr;
     
@@ -169,7 +169,7 @@ core::JsonValue ToolCatalog::build_catalog(
         core::JsonValue profile_obj = core::JsonValue::object();
         profile_obj["id"] = profile.id;
         profile_obj["label"] = profile.label;
-        profiles_arr.array_push(profile_obj);
+        profiles_arr.push_back(profile_obj);
     }
     response["profiles"] = profiles_arr;
     
@@ -193,7 +193,7 @@ core::JsonValue ToolCatalog::build_catalog(
             group.tools.push_back(entry);
         }
         
-        groups_arr.array_push(group.to_json());
+        groups_arr.push_back(group.to_json());
     }
     
     // Add plugin tools if requested
@@ -215,7 +215,7 @@ core::JsonValue ToolCatalog::build_catalog(
             group.plugin_id = plugin_id;
             group.tools = tools;
             
-            groups_arr.array_push(group.to_json());
+            groups_arr.push_back(group.to_json());
         }
     }
     

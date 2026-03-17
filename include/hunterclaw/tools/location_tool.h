@@ -1,13 +1,16 @@
 #pragma once
 
-#include "tool.h"
-#include "../core/json_value.h"
-#include "../nodes/node_registry.h"
-#include "../approval/approval_manager.h"
+#include "hunterclaw/tools/tool.h"
+#include "hunterclaw/core/json.h"
+#include "hunterclaw/nodes/node_registry.h"
+#include "hunterclaw/tools/approval.h"
 #include <string>
 #include <memory>
 
 namespace hunterclaw {
+namespace tools {
+
+// Forward declarations
 
 /**
  * Location Tool
@@ -29,29 +32,30 @@ namespace hunterclaw {
 class LocationTool : public Tool {
 public:
     LocationTool(
-        std::shared_ptr<NodeRegistry> node_registry,
+        std::shared_ptr<nodes::NodeRegistry> node_registry,
         std::shared_ptr<ApprovalManager> approval_manager
     );
 
     std::string name() const override { return "location"; }
     std::string description() const override;
-    JsonValue schema() const override;
-    JsonValue execute(const JsonValue& params) override;
+    Schema parameters() const override;
+    ToolResult execute(const core::JsonValue& params) override;
 
 private:
-    std::shared_ptr<NodeRegistry> node_registry_;
+    std::shared_ptr<nodes::NodeRegistry> node_registry_;
     std::shared_ptr<ApprovalManager> approval_manager_;
 
     // Action handlers
-    JsonValue get_location(const JsonValue& params);
-    JsonValue get_address(const JsonValue& params);
-    JsonValue track_location(const JsonValue& params);
-    JsonValue stop_tracking(const JsonValue& params);
+    core::JsonValue get_location(const core::JsonValue& params);
+    core::JsonValue get_address(const core::JsonValue& params);
+    core::JsonValue track_location(const core::JsonValue& params);
+    core::JsonValue stop_tracking(const core::JsonValue& params);
 
     // Helper methods
-    JsonValue route_to_node(const std::string& action, const JsonValue& params);
+    core::JsonValue route_to_node(const std::string& action, const core::JsonValue& params);
     std::string format_coordinates(double latitude, double longitude);
     std::string get_accuracy_description(const std::string& accuracy);
 };
 
+} // namespace tools
 } // namespace hunterclaw

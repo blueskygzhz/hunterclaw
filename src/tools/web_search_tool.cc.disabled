@@ -1,5 +1,5 @@
 #include "hunterclaw/tools/web_search_tool.h"
-#include "hunterclaw/core/config.h"
+#include "hunterclaw/core/config_loader.h"
 #include <spdlog/spdlog.h>
 #include <regex>
 

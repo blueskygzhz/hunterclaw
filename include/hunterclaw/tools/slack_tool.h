@@ -1,10 +1,12 @@
 #pragma once
 
-#include <json/json.h>
+#include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
 #include <optional>
 #include <memory>
+
+using json = nlohmann::json;
 
 namespace hunterclaw {
 namespace tools {
