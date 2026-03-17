@@ -446,6 +446,7 @@ SandboxResult DockerSandbox::execute_background_command(const std::string& comma
 
 // 获取后台命令日志
 std::string DockerSandbox::get_background_command_logs(const std::string& command_id) {
+    (void)command_id;  // Suppress unused parameter warning
     if (!initialized_) {
         return "Sandbox not initialized";
     }
@@ -459,6 +460,8 @@ std::string DockerSandbox::get_background_command_logs(const std::string& comman
 
 // 中断代码执行
 bool DockerSandbox::interrupt_code(const std::string& execution_id) {
+    (void)execution_id;  // ✅ 避免 unused parameter 警告
+    
     if (!initialized_) {
         return false;
     }
@@ -710,6 +713,7 @@ bool DockerSandbox::interrupt_command(const std::string& command_id) {
 
 // 获取后台命令状态
 SandboxResult DockerSandbox::get_background_command_status(const std::string& command_id) {
+    (void)command_id;  // ✅ 避免 unused parameter 警告
     SandboxResult result;
     result.success = true;
     result.stdout_output = "Status check not implemented";
@@ -912,6 +916,7 @@ ResourceUsage DockerSandbox::get_metrics() {
 
 // 获取端点
 std::string DockerSandbox::get_endpoint(int port, bool resolve_internal) {
+    (void)resolve_internal;  // ✅ 标记为有意未使用
     if (!initialized_) {
         return "";
     }

@@ -6,6 +6,9 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+#include <chrono>                                   // 🎯 时间戳
+#include <iomanip>                                  // 🎯 格式化输出
+#include <sstream>                                  // 🎯 字符串流
 
 using json = nlohmann::json;
 
@@ -338,6 +341,11 @@ void HttpGateway::setup_routes() {
         handle_delete_session(req, res);
     });
     
+    // 🎯 OpenClaw 对齐: PATCH /api/v1/sessions/:id (sessions.patch)
+    http_server_->Patch("/api/v1/sessions/([\\w:]+)", [this](const auto& req, auto& res) {
+        handle_update_session(req, res);
+    });
+    
     // Channels
     register_route("GET", "/api/v1/channels", [this](const auto& req, auto& res) {
         handle_list_channels(req, res);
@@ -355,6 +363,28 @@ void HttpGateway::setup_routes() {
         handle_stop_channel(req, res);
     });
     
+    // ========== Agent CRUD Endpoints (🎯 OpenClaw 对齐 P1) ==========
+    
+    register_route("POST", "/api/v1/agents", [this](const auto& req, auto& res) {
+        handle_create_agent(req, res);
+    });
+    
+    register_route("GET", "/api/v1/agents", [this](const auto& req, auto& res) {
+        handle_list_agents(req, res);
+    });
+    
+    http_server_->Get("/api/v1/agents/([\\w\\-:]+)", [this](const auto& req, auto& res) {
+        handle_get_agent(req, res);
+    });
+    
+    http_server_->Patch("/api/v1/agents/([\\w\\-:]+)", [this](const auto& req, auto& res) {
+        handle_update_agent(req, res);
+    });
+    
+    http_server_->Delete("/api/v1/agents/([\\w\\-:]+)", [this](const auto& req, auto& res) {
+        handle_delete_agent(req, res);
+    });
+    
     // Skills
     register_route("GET", "/api/v1/skills", [this](const auto& req, auto& res) {
         handle_list_skills(req, res);
@@ -362,6 +392,12 @@ void HttpGateway::setup_routes() {
     
     http_server_->Get("/api/v1/skills/([\\w-]+)", [this](const auto& req, auto& res) {
         handle_get_skill(req, res);
+    });
+    
+    // ========== Webhook Endpoints (🎯 OpenClaw 对齐) ==========
+    
+    http_server_->Post("/hooks/(.+)", [this](const auto& req, auto& res) {
+        handle_webhook_hook(req, res);
     });
     
     // ========== OpenAI API Endpoints ==========
@@ -486,6 +522,55 @@ void HttpGateway::handle_delete_session(const httplib::Request& req, httplib::Re
     }
 }
 
+// 🎯 OpenClaw 对齐: PATCH /api/v1/sessions/:id (sessions.patch)
+void HttpGateway::handle_update_session(const httplib::Request& req, httplib::Response& res) {
+    std::string session_id = req.matches[1];
+    
+    try {
+        auto body = json::parse(req.body);
+        
+        // 构建 session.patch RPC 参数
+        json params = {{"key", session_id}};
+        
+        // 可选字段 (对齐 OpenClaw sessions.patch)
+        if (body.contains("label")) {
+            params["label"] = body["label"];
+        }
+        if (body.contains("model")) {
+            params["model"] = body["model"];
+        }
+        if (body.contains("agentId")) {
+            params["agentId"] = body["agentId"];
+        }
+        if (body.contains("toolPolicy")) {
+            params["toolPolicy"] = body["toolPolicy"];
+        }
+        if (body.contains("temperature")) {
+            params["temperature"] = body["temperature"];
+        }
+        if (body.contains("maxTokens")) {
+            params["maxTokens"] = body["maxTokens"];
+        }
+        if (body.contains("topP")) {
+            params["topP"] = body["topP"];
+        }
+        
+        log_debug("PATCH /api/v1/sessions/{} with params: {}", session_id, params.dump());
+        
+        // 调用 session.patch RPC
+        auto result = invoke_rpc("session.patch", params);
+        
+        if (result.is_ok()) {
+            send_json(res, 200, result.value);
+        } else {
+            send_error(res, 400, result.error);
+        }
+        
+    } catch (const std::exception& e) {
+        send_error(res, 400, std::string("Invalid request body: ") + e.what());
+    }
+}
+
 // ========== Channel Endpoints ==========
 
 void HttpGateway::handle_list_channels(const httplib::Request& req, httplib::Response& res) {
@@ -554,6 +639,155 @@ void HttpGateway::handle_stop_channel(const httplib::Request& req, httplib::Resp
         send_json(res, 200, result.value);
     } else {
         send_error(res, 400, result.error);
+    }
+}
+
+// ========== Agent CRUD Endpoints (🎯 OpenClaw 对齐 P1) ==========
+
+// POST /api/v1/agents (agents.create)
+void HttpGateway::handle_create_agent(const httplib::Request& req, httplib::Response& res) {
+    try {
+        auto body = json::parse(req.body);
+        
+        // 必需字段验证
+        if (!body.contains("agentId")) {
+            send_error(res, 400, "Missing required field: agentId");
+            return;
+        }
+        
+        // 构建 agents.create RPC 参数
+        json params = {
+            {"agentId", body["agentId"]}
+        };
+        
+        // 可选字段 (对齐 OpenClaw agents.create)
+        if (body.contains("name")) params["name"] = body["name"];
+        if (body.contains("model")) params["model"] = body["model"];
+        if (body.contains("systemPrompt")) params["systemPrompt"] = body["systemPrompt"];
+        if (body.contains("temperature")) params["temperature"] = body["temperature"];
+        if (body.contains("maxTokens")) params["maxTokens"] = body["maxTokens"];
+        if (body.contains("topP")) params["topP"] = body["topP"];
+        if (body.contains("toolPolicy")) params["toolPolicy"] = body["toolPolicy"];
+        if (body.contains("tools")) params["tools"] = body["tools"];
+        if (body.contains("skills")) params["skills"] = body["skills"];
+        if (body.contains("metadata")) params["metadata"] = body["metadata"];
+        
+        log_debug("POST /api/v1/agents: {}", params.dump());
+        
+        auto result = invoke_rpc("agents.create", params);
+        
+        if (result.is_ok()) {
+            send_json(res, 201, result.value);
+        } else {
+            send_error(res, 400, result.error);
+        }
+        
+    } catch (const std::exception& e) {
+        send_error(res, 400, std::string("Invalid request: ") + e.what());
+    }
+}
+
+// GET /api/v1/agents (agents.list)
+void HttpGateway::handle_list_agents(const httplib::Request& req, httplib::Response& res) {
+    json params = json::object();
+    
+    // 可选查询参数
+    if (req.has_param("limit")) {
+        try {
+            params["limit"] = std::stoi(req.get_param_value("limit"));
+        } catch (...) {
+            send_error(res, 400, "Invalid limit parameter");
+            return;
+        }
+    }
+    if (req.has_param("offset")) {
+        try {
+            params["offset"] = std::stoi(req.get_param_value("offset"));
+        } catch (...) {
+            send_error(res, 400, "Invalid offset parameter");
+            return;
+        }
+    }
+    if (req.has_param("filter")) {
+        params["filter"] = req.get_param_value("filter");
+    }
+    
+    log_debug("GET /api/v1/agents: {}", params.dump());
+    
+    auto result = invoke_rpc("agents.list", params);
+    
+    if (result.is_ok()) {
+        send_json(res, 200, result.value);
+    } else {
+        send_error(res, 500, result.error);
+    }
+}
+
+// GET /api/v1/agents/:id (agents.get)
+void HttpGateway::handle_get_agent(const httplib::Request& req, httplib::Response& res) {
+    std::string agent_id = req.matches[1];
+    
+    json params = {{"agentId", agent_id}};
+    log_debug("GET /api/v1/agents/{}", agent_id);
+    
+    auto result = invoke_rpc("agents.get", params);
+    
+    if (result.is_ok()) {
+        send_json(res, 200, result.value);
+    } else {
+        send_error(res, 404, result.error);
+    }
+}
+
+// PATCH /api/v1/agents/:id (agents.patch)
+void HttpGateway::handle_update_agent(const httplib::Request& req, httplib::Response& res) {
+    std::string agent_id = req.matches[1];
+    
+    try {
+        auto body = json::parse(req.body);
+        
+        json params = {{"agentId", agent_id}};
+        
+        // 可选字段 (对齐 OpenClaw agents.patch)
+        if (body.contains("name")) params["name"] = body["name"];
+        if (body.contains("model")) params["model"] = body["model"];
+        if (body.contains("systemPrompt")) params["systemPrompt"] = body["systemPrompt"];
+        if (body.contains("temperature")) params["temperature"] = body["temperature"];
+        if (body.contains("maxTokens")) params["maxTokens"] = body["maxTokens"];
+        if (body.contains("topP")) params["topP"] = body["topP"];
+        if (body.contains("toolPolicy")) params["toolPolicy"] = body["toolPolicy"];
+        if (body.contains("tools")) params["tools"] = body["tools"];
+        if (body.contains("skills")) params["skills"] = body["skills"];
+        if (body.contains("metadata")) params["metadata"] = body["metadata"];
+        
+        log_debug("PATCH /api/v1/agents/{}: {}", agent_id, params.dump());
+        
+        auto result = invoke_rpc("agents.patch", params);
+        
+        if (result.is_ok()) {
+            send_json(res, 200, result.value);
+        } else {
+            send_error(res, 400, result.error);
+        }
+        
+    } catch (const std::exception& e) {
+        send_error(res, 400, std::string("Invalid request: ") + e.what());
+    }
+}
+
+// DELETE /api/v1/agents/:id (agents.delete)
+void HttpGateway::handle_delete_agent(const httplib::Request& req, httplib::Response& res) {
+    std::string agent_id = req.matches[1];
+    
+    json params = {{"agentId", agent_id}};
+    log_debug("DELETE /api/v1/agents/{}", agent_id);
+    
+    auto result = invoke_rpc("agents.delete", params);
+    
+    if (result.is_ok()) {
+        send_json(res, 200, result.value);
+    } else {
+        send_error(res, 404, result.error);
     }
 }
 
@@ -742,6 +976,161 @@ void HttpGateway::send_openai_error(
 
 void HttpGateway::send_sse_chunk(httplib::Response& res, const std::string& data) {
     res.set_content("data: " + data + "\n\n", "text/event-stream");
+}
+
+// ========== Webhook Endpoints (🎯 OpenClaw 对齐) ==========
+
+void HttpGateway::handle_webhook_hook(const httplib::Request& req, httplib::Response& res) {
+    std::string hook_path = req.matches[1];
+    
+    log_info("Webhook hook: POST /hooks/{}", hook_path);
+    
+    // 🎯 安全机制 1: Token 认证 (Bearer / X-HunterClaw-Token)
+    std::string provided_token;
+    bool authenticated = false;
+    
+    // 方式 1: Bearer Token
+    if (req.has_header("Authorization")) {
+        std::string auth_header = req.get_header_value("Authorization");
+        if (auth_header.starts_with("Bearer ")) {
+            provided_token = auth_header.substr(7);
+        }
+    }
+    
+    // 方式 2: X-HunterClaw-Token Header
+    if (provided_token.empty() && req.has_header("X-HunterClaw-Token")) {
+        provided_token = req.get_header_value("X-HunterClaw-Token");
+    }
+    
+    // 🎯 常量时间比较 Token (防止时序攻击)
+    if (!provided_token.empty() && !bearer_token_.empty()) {
+        authenticated = hunterclaw::security::timing_safe_equal(provided_token, bearer_token_);
+    }
+    
+    if (!authenticated) {
+        // 🎯 认证失败时关闭连接
+        res.set_header("Connection", "close");
+        send_openai_error(res, 401, "Invalid or missing webhook token", 
+                          "invalid_request_error", "invalid_webhook_token");
+        return;
+    }
+    
+    // 解析请求体
+    try {
+        auto body = json::parse(req.body);
+        
+        // 🎯 多种 Webhook 格式解析
+        std::string text;
+        std::string from;
+        std::string channel = hook_path;  // 默认使用 hook_path 作为 channel
+        
+        // 格式 1: Telegram Webhook
+        if (body.contains("message")) {
+            auto message = body["message"];
+            if (message.contains("text")) {
+                text = message["text"].get<std::string>();
+            }
+            if (message.contains("from")) {
+                auto from_obj = message["from"];
+                if (from_obj.contains("username")) {
+                    from = from_obj["username"].get<std::string>();
+                } else if (from_obj.contains("first_name")) {
+                    from = from_obj["first_name"].get<std::string>();
+                }
+            }
+        }
+        // 格式 2: Discord Webhook
+        else if (body.contains("content")) {
+            text = body["content"].get<std::string>();
+            if (body.contains("author") && body["author"].contains("username")) {
+                from = body["author"]["username"].get<std::string>();
+            }
+        }
+        // 格式 3: Generic Webhook
+        else if (body.contains("text")) {
+            text = body["text"].get<std::string>();
+            if (body.contains("from")) {
+                from = body["from"].get<std::string>();
+            }
+        }
+        
+        if (text.empty()) {
+            send_error(res, 400, "Missing 'text' or 'message' field in webhook payload");
+            return;
+        }
+        
+        // 🎯 外部内容安全包装 (防止 Prompt Injection)
+        std::string wrapped_content = wrap_external_content(text, hook_path, from, channel);
+        
+        // 🎯 分发到 Agent (使用默认 Session Key)
+        json dispatch_params = {
+            {"session_key", "agent:main:device:webhook"},
+            {"content", wrapped_content},
+            {"metadata", {
+                {"source", "webhook"},
+                {"hook_path", hook_path},
+                {"from", from},
+                {"channel", channel}
+            }}
+        };
+        
+        log_debug("Dispatching webhook message to agent: {}", dispatch_params.dump());
+        
+        // 调用 message.dispatch RPC
+        auto result = invoke_rpc("message.dispatch", dispatch_params);
+        
+        if (result.is_ok()) {
+            json response = {
+                {"ok", true},
+                {"message", "Webhook message dispatched successfully"}
+            };
+            send_json(res, 200, response);
+        } else {
+            send_error(res, 500, result.error);
+        }
+        
+    } catch (const std::exception& e) {
+        send_error(res, 400, std::string("Invalid webhook payload: ") + e.what());
+    }
+}
+
+// 🎯 OpenClaw 对齐: 外部内容安全包装
+std::string HttpGateway::wrap_external_content(
+    const std::string& content,
+    const std::string& source,
+    const std::string& from,
+    const std::string& channel
+) {
+    // 生成唯一边界标记 (防止 Prompt Injection)
+    std::string marker_id = generate_marker_id();
+    std::string boundary = "===EXTERNAL_CONTENT_" + marker_id + "===";
+    
+    std::ostringstream oss;
+    oss << "\n" << boundary << "\n";
+    oss << "Source: " << source << "\n";
+    if (!from.empty()) {
+        oss << "From: " << from << "\n";
+    }
+    if (!channel.empty()) {
+        oss << "Channel: " << channel << "\n";
+    }
+    oss << "---\n";
+    oss << content << "\n";
+    oss << boundary << "\n";
+    
+    return oss.str();
+}
+
+// 🎯 OpenClaw 对齐: 生成唯一标记 ID
+std::string HttpGateway::generate_marker_id() {
+    static std::atomic<uint64_t> counter{0};
+    auto now = std::chrono::system_clock::now().time_since_epoch().count();
+    uint64_t id = counter.fetch_add(1) + now;
+    
+    // 转换为 16 进制字符串 (8 位)
+    std::ostringstream oss;
+    oss << std::hex << std::setw(8) << std::setfill('0') << (id & 0xFFFFFFFF);
+    return oss.str();
 }
 
 core::Result<json> HttpGateway::invoke_rpc(

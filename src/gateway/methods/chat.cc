@@ -216,6 +216,24 @@ core::Result<json> method_chat_send(
         server->broadcast(frame);
     };
     
+    // 推理流 (reasoning.delta) - 对齐 OpenClaw
+    callbacks.on_reasoning_stream = [server, session_id, run_id](const std::string& reasoning) {
+        json event;
+        event["type"] = "reasoning.delta";
+        event["session_id"] = session_id;
+        event["run_id"] = run_id;
+        event["reasoning"] = reasoning;
+        event["timestamp"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count();
+        
+        core::EventFrame frame;
+        frame.type = "reasoning";
+        frame.payload = event;
+        
+        server->broadcast(frame);
+    };
+    
     // 工具调用事件 (对齐 OpenClaw)
     callbacks.on_tool_start = [server, session_id, run_id](
         const std::string& tool_name, 

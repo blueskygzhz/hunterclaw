@@ -170,6 +170,9 @@ private:
     /// DELETE /api/v1/sessions/:id - Delete session
     void handle_delete_session(const httplib::Request& req, httplib::Response& res);
     
+    /// PATCH /api/v1/sessions/:id - Update session (🎯 OpenClaw 对齐)
+    void handle_update_session(const httplib::Request& req, httplib::Response& res);
+    
     /// GET /api/v1/channels - List channels
     void handle_list_channels(const httplib::Request& req, httplib::Response& res);
     
@@ -181,6 +184,23 @@ private:
     
     /// POST /api/v1/channels/:id/stop - Stop channel
     void handle_stop_channel(const httplib::Request& req, httplib::Response& res);
+    
+    // ========== Agent CRUD Endpoints (🎯 OpenClaw 对齐 P1) ==========
+    
+    /// POST /api/v1/agents - Create agent
+    void handle_create_agent(const httplib::Request& req, httplib::Response& res);
+    
+    /// GET /api/v1/agents - List agents
+    void handle_list_agents(const httplib::Request& req, httplib::Response& res);
+    
+    /// GET /api/v1/agents/:id - Get agent
+    void handle_get_agent(const httplib::Request& req, httplib::Response& res);
+    
+    /// PATCH /api/v1/agents/:id - Update agent
+    void handle_update_agent(const httplib::Request& req, httplib::Response& res);
+    
+    /// DELETE /api/v1/agents/:id - Delete agent
+    void handle_delete_agent(const httplib::Request& req, httplib::Response& res);
     
     /// GET /api/v1/skills - List skills
     void handle_list_skills(const httplib::Request& req, httplib::Response& res);
@@ -195,6 +215,11 @@ private:
     
     /// GET /v1/models - List available models
     void handle_list_models(const httplib::Request& req, httplib::Response& res);
+    
+    // ========== Webhook Endpoints (🎯 OpenClaw 对齐) ==========
+    
+    /// POST /hooks/:mapping - Webhook hook endpoint
+    void handle_webhook_hook(const httplib::Request& req, httplib::Response& res);
     
     // ========== Helper Methods ==========
     
@@ -224,6 +249,17 @@ private:
         const std::string& method,
         const nlohmann::json& params
     );
+    
+    /// 🎯 OpenClaw 对齐: 外部内容安全包装
+    std::string wrap_external_content(
+        const std::string& content,
+        const std::string& source,
+        const std::string& from,
+        const std::string& channel
+    );
+    
+    /// 🎯 OpenClaw 对齐: 生成唯一标记 ID
+    std::string generate_marker_id();
     
     std::shared_ptr<GatewayServer> gateway_server_;
     HttpGatewayOptions options_;
