@@ -61,7 +61,7 @@ std::shared_ptr<AgentInstance> AgentPool::get_or_create_agent(
         last_active_[session_id] = core::utils::now();
         it->second->touch();
         
-        spdlog::debug("[AgentPool] Reusing existing agent: session={}, agent={}",
+        spdlog::get("default")->debug("[AgentPool] Reusing existing agent: session={}, agent={}",
             session_id, it->second->context().agent_id);
         
         return it->second;
@@ -69,7 +69,7 @@ std::shared_ptr<AgentInstance> AgentPool::get_or_create_agent(
     
     // ========== Step 2: 检查实例数限制 ==========
     if (agents_.size() >= pool_config_.max_agents) {
-        spdlog::warn("[AgentPool] Max agents reached: {}/{}, attempting cleanup",
+        spdlog::get("default")->warn("[AgentPool] Max agents reached: {}/{}, attempting cleanup",
             agents_.size(), pool_config_.max_agents);
         
         // 强制清理最老的 Agent
@@ -229,7 +229,7 @@ size_t AgentPool::cleanup_idle_agents(std::optional<std::chrono::seconds> ttl_ov
                     now - last_active_[session_id]
                 );
                 
-                spdlog::debug("[AgentPool] Cleanup: session={}, agent={}, idle={}s",
+                spdlog::get("default")->debug("[AgentPool] Cleanup: session={}, agent={}, idle={}s",
                     session_id,
                     it->second->context().agent_id,
                     elapsed.count());
@@ -300,15 +300,18 @@ std::string AgentPool::resolve_agent_id(
 ) {
     // 策略 1: 显式指定
     if (agent_id_override && !agent_id_override->empty()) {
-        spdlog::debug("[AgentPool] Using explicit agent_id: {}", *agent_id_override);
+        spdlog::get("default")->debug("[AgentPool] Using explicit agent_id: {}", *agent_id_override);
         return *agent_id_override;
     }
     
     // 策略 2: 从 Session 获取
     auto session_info = get_session_info(session_id);
-    if (session_info && !session_info->agent_id.empty()) {
-        spdlog::debug("[AgentPool] Using session.agent_id: {}", session_info->agent_id);
-        return session_info->agent_id;
+    if (session_info && session_info->metadata.count("agent_id")) {
+        std::string agent_id_from_session = session_info->metadata.at("agent_id");
+        if (!agent_id_from_session.empty()) {
+            spdlog::get("default")->debug("[AgentPool] Using session.agent_id: {}", agent_id_from_session);
+            return agent_id_from_session;
+        }
     }
     
     // 策略 3: 从 Session Key 推断 (如果 session 中有 metadata)
@@ -316,14 +319,14 @@ std::string AgentPool::resolve_agent_id(
         std::string session_key = session_info->metadata.at("session_key");
         std::string inferred_agent = resolve_session_agent_id(session_key, *config_);
         if (!inferred_agent.empty()) {
-            spdlog::debug("[AgentPool] Inferred agent from session_key: {}", inferred_agent);
+            spdlog::get("default")->debug("[AgentPool] Inferred agent from session_key: {}", inferred_agent);
             return inferred_agent;
         }
     }
     
     // 策略 4: 默认 Agent
     std::string default_agent = resolve_default_agent_id(*config_);
-    spdlog::debug("[AgentPool] Using default agent: {}", default_agent);
+    spdlog::get("default")->debug("[AgentPool] Using default agent: {}", default_agent);
     return default_agent;
 }
 
@@ -369,7 +372,7 @@ std::optional<core::SessionInfo> AgentPool::get_session_info(
             info.metadata["run_id"] = *ctx.current_run_id;
         }
         
-        spdlog::debug("[AgentPool] Resolved SessionInfo from Agent context: session={}, agent={}, key={}",
+        spdlog::get("default")->debug("[AgentPool] Resolved SessionInfo from Agent context: session={}, agent={}, key={}",
             session_id, ctx.agent_id, session_key);
         
         return info;
@@ -382,7 +385,7 @@ std::optional<core::SessionInfo> AgentPool::get_session_info(
     // 参考: openclaw-analysis/src/config/sessions/store.ts: loadSessionStore()
     //       openclaw-analysis/src/config/sessions/paths.ts: resolveDefaultSessionStorePath()
     
-    spdlog::debug("[AgentPool] Session not found in active agents, trying to load from disk: session={}", 
+    spdlog::get("default")->debug("[AgentPool] Session not found in active agents, trying to load from disk: session={}", 
         session_id);
     
     try {
@@ -391,12 +394,12 @@ std::optional<core::SessionInfo> AgentPool::get_session_info(
         std::string default_agent = resolve_default_agent_id(*config_);
         std::string sessions_path = state_dir + "/agents/" + default_agent + "/sessions/sessions.json";
         
-        spdlog::debug("[AgentPool] Attempting to load sessions from: {}", sessions_path);
+        spdlog::get("default")->debug("[AgentPool] Attempting to load sessions from: {}", sessions_path);
         
         // 检查文件是否存在
         std::ifstream file(sessions_path);
         if (!file.is_open()) {
-            spdlog::debug("[AgentPool] Sessions file not found: {}", sessions_path);
+            spdlog::get("default")->debug("[AgentPool] Sessions file not found: {}", sessions_path);
             return std::nullopt;
         }
         
@@ -405,7 +408,7 @@ std::optional<core::SessionInfo> AgentPool::get_session_info(
         try {
             file >> sessions_store;
         } catch (const std::exception& e) {
-            spdlog::warn("[AgentPool] Failed to parse sessions.json: {}", e.what());
+            spdlog::get("default")->warn("[AgentPool] Failed to parse sessions.json: {}", e.what());
             return std::nullopt;
         }
         
@@ -426,12 +429,12 @@ std::optional<core::SessionInfo> AgentPool::get_session_info(
                 
                 // 填充时间戳
                 if (entry.contains("createdAt")) {
-                    info.created_at = core::TimePoint(
+                    info.created_at = core::Timestamp(
                         std::chrono::milliseconds(entry["createdAt"].get<int64_t>())
                     );
                 }
                 if (entry.contains("updatedAt")) {
-                    info.last_active_at = core::TimePoint(
+                    info.last_active_at = core::Timestamp(
                         std::chrono::milliseconds(entry["updatedAt"].get<int64_t>())
                     );
                 }
@@ -460,7 +463,7 @@ std::optional<core::SessionInfo> AgentPool::get_session_info(
             }
         }
         
-        spdlog::debug("[AgentPool] Session not found in sessions.json: session={}", session_id);
+        spdlog::get("default")->debug("[AgentPool] Session not found in sessions.json: session={}", session_id);
         
     } catch (const std::exception& e) {
         spdlog::get("default")->error("[AgentPool] Error loading session from disk: session={}, error={}",

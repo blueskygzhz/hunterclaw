@@ -76,7 +76,7 @@ AgentInstance::AgentInstance(
     ctx_.last_active_at = ctx_.created_at;
     ctx_.phase = AgentLifecyclePhase::Start;
     
-    spdlog::info("[AgentInstance] Initializing: session={}, agent={}",
+    spdlog::get("default")->info("[AgentInstance] Initializing: session={}, agent={}",
         session_id, agent_id);
     
     // 加载 Agent 配置
@@ -84,7 +84,7 @@ AgentInstance::AgentInstance(
     if (config_result.is_err()) {
         throw std::runtime_error("Failed to resolve agent config: " + config_result.error);
     }
-    ctx_.config = config_result.value();
+    ctx_.config = config_result.value;
     
     // 初始化资源
     initialize_workspace();
@@ -92,6 +92,8 @@ AgentInstance::AgentInstance(
     initialize_tools();
     
     // ========== 初始化 ReactEngine (对齐 OpenClaw) ==========
+    // TODO: 等待 tools/react/llm 模块实现后启用
+    /*
     try {
         // ✅ 创建 ToolManager (独立实例,不使用全局单例)
         tools::ToolContext tool_context;
@@ -125,15 +127,16 @@ AgentInstance::AgentInstance(
         react_config.parallel_tool_calls = false;
         
         react_engine_ = react::ReactEngine::create(tool_mgr, llm_client, react_config);
-        spdlog::info("[AgentInstance] ReactEngine initialized: model={}, provider={}", 
+        spdlog::get("default")->info("[AgentInstance] ReactEngine initialized: model={}, provider={}", 
                    llm_config.model, llm_config.provider);
         
     } catch (const std::exception& e) {
-        spdlog::error("[AgentInstance] ReactEngine initialization failed: {}", e.what());
+        spdlog::get("default")->error("[AgentInstance] ReactEngine initialization failed: {}", e.what());
         // 不抛出异常,允许 Agent 在没有 ReactEngine 的情况下继续
     }
+    */
     
-    spdlog::info("[AgentInstance] Initialized: session={}, agent={}, workspace={}",
+    spdlog::get("default")->info("[AgentInstance] Initialized: session={}, agent={}, workspace={}",
         session_id, agent_id, ctx_.workspace_dir);
     
     // 发射启动事件
@@ -148,30 +151,35 @@ core::Result<std::string> AgentInstance::process_message(
     const std::string& message,
     const std::map<std::string, std::string>& options
 ) {
+    // TODO: 等待 ReactEngine 实现后启用
+    return core::Result<std::string>::Err("ReactEngine not implemented yet");
     // ✅ 使用 Overflow 重试循环 (对齐 OpenClaw)
-    return process_message_with_overflow_retry(message, options);
+    // return process_message_with_overflow_retry(message, options);
 }
 
 void AgentInstance::cleanup() {
-    spdlog::info("[AgentInstance] Cleaning up: session={}, agent={}",
+    spdlog::get("default")->info("[AgentInstance] Cleaning up: session={}, agent={}",
         ctx_.session_id, ctx_.agent_id);
     
     // 发射结束事件
-    emit_lifecycle_event(AgentLifecyclePhase::End, {
-        {"reason", "cleanup"}
-    });
+    core::JsonValue data = core::JsonValue::object();
+    data["reason"] = "cleanup";
+    emit_lifecycle_event(AgentLifecyclePhase::End, data);
     
     // ========== 资源清理 (对齐 OpenClaw) ==========
     
+    // TODO: 等待 ReactEngine 实现后启用
+    /*
     // 1. 停止运行中的任务
     if (react_engine_) {
         try {
             react_engine_->cancel();
-            spdlog::debug("[AgentInstance] Cancelled running ReactEngine tasks");
+            spdlog::get("default")->debug("[AgentInstance] Cancelled running ReactEngine tasks");
         } catch (const std::exception& e) {
-            spdlog::error("[AgentInstance] Failed to cancel ReactEngine: {}", e.what());
+            spdlog::get("default")->error("[AgentInstance] Failed to cancel ReactEngine: {}", e.what());
         }
     }
+    */
     
     // 2. 关闭 Memory 连接 (flush + close)
     if (ctx_.memory) {
@@ -180,29 +188,29 @@ void AgentInstance::cleanup() {
             // ctx_.memory->flush();
             // ctx_.memory->close();
             ctx_.memory.reset();  // 释放智能指针
-            spdlog::debug("[AgentInstance] Closed memory connection");
+            spdlog::get("default")->debug("[AgentInstance] Closed memory connection");
         } catch (const std::exception& e) {
-            spdlog::error("[AgentInstance] Failed to close memory: {}", e.what());
+            spdlog::get("default")->error("[AgentInstance] Failed to close memory: {}", e.what());
         }
     }
     
     // 3. 清理临时文件 (可选,取决于配置)
     bool cleanup_temp_files = true;  // 默认清理
     
-    // ✅ 从配置读取
-    if (config_->workspace.cleanup_temp_files.has_value()) {
-        cleanup_temp_files = *config_->workspace.cleanup_temp_files;
-    }
+    // TODO: 从配置读取
+    // if (config_->workspace.cleanup_temp_files.has_value()) {
+    //     cleanup_temp_files = *config_->workspace.cleanup_temp_files;
+    // }
     
     if (cleanup_temp_files) {
         try {
             std::string temp_dir = ctx_.workspace_dir + "/temp";
             if (std::filesystem::exists(temp_dir)) {
                 std::filesystem::remove_all(temp_dir);
-                spdlog::debug("[AgentInstance] Cleaned temp directory: {}", temp_dir);
+                spdlog::get("default")->debug("[AgentInstance] Cleaned temp directory: {}", temp_dir);
             }
         } catch (const std::exception& e) {
-            spdlog::warn("[AgentInstance] Failed to clean temp files: {}", e.what());
+            spdlog::get("default")->warn("[AgentInstance] Failed to clean temp files: {}", e.what());
         }
     }
     
@@ -213,7 +221,7 @@ void AgentInstance::cleanup() {
     // 5. 更新生命周期状态
     ctx_.phase = AgentLifecyclePhase::End;
     
-    spdlog::info("[AgentInstance] Cleanup complete: session={}", ctx_.session_id);
+    spdlog::get("default")->info("[AgentInstance] Cleanup complete: session={}", ctx_.session_id);
 }
 
 void AgentInstance::on_event(EventCallback callback) {
@@ -230,12 +238,12 @@ void AgentInstance::initialize_workspace() {
     // 创建独立工作空间
     try {
         std::filesystem::create_directories(ctx_.workspace_dir);
-        std::filesystem::create_directories(ctx_.workspace_dir + "/files");
-        std::filesystem::create_directories(ctx_.workspace_dir + "/temp");
-        
-        spdlog::debug("[AgentInstance] Workspace created: {}", ctx_.workspace_dir);
-    } catch (const std::exception& e) {
-        spdlog::error("[AgentInstance] Failed to create workspace: {}", e.what());
+            std::filesystem::create_directories(ctx_.workspace_dir + "/files");
+            std::filesystem::create_directories(ctx_.workspace_dir + "/temp");
+            
+            spdlog::get("default")->debug("[AgentInstance] Workspace created: {}", ctx_.workspace_dir);
+        } catch (const std::exception& e) {
+            spdlog::get("default")->error("[AgentInstance] Failed to create workspace: {}", e.what());
         throw;
     }
 }
@@ -243,6 +251,8 @@ void AgentInstance::initialize_workspace() {
 void AgentInstance::initialize_memory() {
     // ========== 初始化 Session 级别 Memory (对齐 OpenClaw) ==========
     
+    // TODO: 等待 memory 模块完整实现后启用
+    /*
     try {
         // 1. 构建 Memory 存储路径
         // 格式: {workspace}/{agent_id}/memory/{session_id}.db
@@ -251,12 +261,12 @@ void AgentInstance::initialize_memory() {
         // 确保目录存在
         std::filesystem::create_directories(ctx_.workspace_dir + "/memory");
         
-        spdlog::info("[AgentInstance] Initializing memory: path={}", memory_db_path);
+        spdlog::get("default")->info("[AgentInstance] Initializing memory: path={}", memory_db_path);
         
         // 2. 创建 SQLite Vector Storage
         auto storage = memory::SQLiteVectorStorage::create(memory_db_path, 1536);
         if (!storage) {
-            spdlog::error("[AgentInstance] Failed to create SQLite storage");
+            spdlog::get("default")->error("[AgentInstance] Failed to create SQLite storage");
             return;
         }
         
@@ -267,23 +277,25 @@ void AgentInstance::initialize_memory() {
         std::string embedding_provider = "ollama";  // 默认 ollama
         std::string embedding_model = "nomic-embed-text";
         
+        // TODO: 从配置读取
         // 尝试从全局配置读取
-        if (config_->memory.embedding_provider.has_value()) {
-            embedding_provider = *config_->memory.embedding_provider;
-        }
-        if (config_->memory.embedding_model.has_value()) {
-            embedding_model = *config_->memory.embedding_model;
-        }
+        // if (config_->memory.embedding_provider.has_value()) {
+        //     embedding_provider = *config_->memory.embedding_provider;
+        // }
+        // if (config_->memory.embedding_model.has_value()) {
+        //     embedding_model = *config_->memory.embedding_model;
+        // }
         
         if (embedding_provider == "openai") {
-            std::string api_key = config_->llm.api_key;  // 复用 LLM API Key
-            embedding = memory::EmbeddingProviderFactory::create_openai(api_key, "text-embedding-3-small");
+            // std::string api_key = config_->llm.api_key;  // 复用 LLM API Key
+            // embedding = memory::EmbeddingProviderFactory::create_openai(api_key, "text-embedding-3-small");
+            spdlog::get("default")->warn("[AgentInstance] OpenAI embedding not configured");
         } else if (embedding_provider == "ollama") {
             embedding = memory::EmbeddingProviderFactory::create_ollama(embedding_model);
         }
         
         if (!embedding) {
-            spdlog::warn("[AgentInstance] Failed to create embedding provider, memory disabled");
+            spdlog::get("default")->warn("[AgentInstance] Failed to create embedding provider, memory disabled");
             return;
         }
         
@@ -300,58 +312,25 @@ void AgentInstance::initialize_memory() {
         // ✅ 保存 MemoryManager 引用
         memory_mgr_ = memory::MemoryManager::create(storage, embedding, search_config);
         
+        // TODO: 等待 ReactEngine 实现后启用
         // ✅ 传递 CompactionManager 给 ReactEngine (对齐 OpenClaw)
-        if (react_engine_ && memory_mgr_) {
-            // 获取 CompactionManager 引用
-            auto& compaction_mgr = memory_mgr_->compaction_manager();
-            
-            // 使用非拥有智能指针 (避免循环引用)
-            auto compaction_ptr = std::shared_ptr<memory::CompactionManager>(
-                &compaction_mgr,
-                [](auto*){} // 空 deleter - 不真正删除
-            );
-            
-            react_engine_->set_compaction_manager(compaction_ptr);
-            
-            // ✅ 配置 Context Window (对齐 OpenClaw)
-            react::ReactEngine::ContextWindowConfig ctx_config;
-            ctx_config.context_window_tokens = 200000;
-            ctx_config.reserve_tokens_floor = 20000;
-            ctx_config.soft_threshold_tokens = 4000;
-            react_engine_->set_context_window_config(ctx_config);
-            
-            spdlog::info("[AgentInstance] CompactionManager integrated with ReactEngine");
-        }
+        // if (react_engine_ && memory_mgr_) {
+        //     ...
+        // }
         
         // 5. 将 MemoryManager 转换为 MemoryProvider (适配)
-        // ✅ 严格对齐 OpenClaw: 创建 MemoryProvider 适配器 (P3 优先级实现)
-        // 
-        // OpenClaw 中使用统一的 MemoryProvider 接口:
-        // - store(item): 存储记忆
-        // - search(query, options): 搜索记忆
-        // - get(id): 获取记忆
-        // - delete(id): 删除记忆
-        // 
-        // HunterClaw 实现:
-        // - MemoryManager: 完整的 memory 管理器 (compaction, session, search)
-        // - MemoryProviderAdapter: 适配器模式,包装 MemoryManager 为 MemoryProvider
-        // - ctx_.memory: 统一接口,供 AgentInstanceContext 使用
-        // 
-        // 优势:
-        // 1. 统一接口: AgentInstanceContext 只依赖 MemoryProvider
-        // 2. 解耦: MemoryManager 的复杂功能隐藏在适配器后
-        // 3. 兼容性: 未来可切换不同的 Memory 实现 (QMD, remote)
-        
         // ✅ 创建适配器 (P3 优先级完成)
         ctx_.memory = std::make_shared<memory::MemoryProviderAdapter>(memory_mgr_);
         
-        spdlog::info("[AgentInstance] Memory initialized: session={}, db={}, adapter=enabled",
+        spdlog::get("default")->info("[AgentInstance] Memory initialized: session={}, db={}, adapter=enabled",
             ctx_.session_id, memory_db_path);
         
     } catch (const std::exception& e) {
-        spdlog::error("[AgentInstance] Memory initialization failed: {}", e.what());
+        spdlog::get("default")->error("[AgentInstance] Memory initialization failed: {}", e.what());
         // 不抛出异常,允许 Agent 在没有 Memory 的情况下运行
     }
+    */
+    spdlog::get("default")->info("[AgentInstance] Memory module not implemented yet, skipping initialization");
 }
 
 void AgentInstance::initialize_tools() {
@@ -362,18 +341,21 @@ void AgentInstance::initialize_tools() {
     
     std::vector<std::string> all_tools;
     
+    // TODO: ToolRegistry 需要完整实现
     if (tool_registry_) {
         // 从 ToolRegistry 获取所有工具
-        all_tools = tool_registry_->list_tools();
-        spdlog::debug("[AgentInstance] Loaded {} tools from registry", all_tools.size());
-    } else {
+        // all_tools = tool_registry_->list_tools();
+        spdlog::get("default")->debug("[AgentInstance] ToolRegistry not implemented yet");
+    }
+    
+    if (all_tools.empty()) {
         // 回退: 使用占位工具列表
         all_tools = {
             "read_file", "write_file", "search_files", "list_dir",
             "execute_command", "web_search", "web_fetch",
             "calculator", "ask_followup_question"
         };
-        spdlog::warn("[AgentInstance] ToolRegistry not available, using fallback tool list");
+        spdlog::get("default")->warn("[AgentInstance] ToolRegistry not available, using fallback tool list");
     }
     
     // 2. 应用 Agent 的 skills 过滤器
@@ -418,18 +400,19 @@ void AgentInstance::initialize_tools() {
     
     ctx_.tools = filtered_tools;
     
-    spdlog::info("[AgentInstance] Tools filtered: {} allowed (from {} total)",
+    spdlog::get("default")->info("[AgentInstance] Tools filtered: {} allowed (from {} total)",
         filtered_tools.size(), all_tools.size());
     
     // 3. 打印过滤后的工具列表 (调试)
-    if (spdlog::get_level() <= spdlog::level::debug) {
-        std::string tools_str;
-        for (const auto& tool : filtered_tools) {
-            if (!tools_str.empty()) tools_str += ", ";
-            tools_str += tool;
-        }
-        spdlog::debug("[AgentInstance] Available tools: [{}]", tools_str);
-    }
+    // TODO: 等待 spdlog logger 实例实现
+    // if (spdlog::get("default")->level() <= spdlog::level::debug) {
+    //     std::string tools_str;
+    //     for (const auto& tool : filtered_tools) {
+    //         if (!tools_str.empty()) tools_str += ", ";
+    //         tools_str += tool;
+    //     }
+    //     spdlog::get("default")->debug("[AgentInstance] Available tools: [{}]", tools_str);
+    // }
 }
 
 void AgentInstance::emit_lifecycle_event(
@@ -453,16 +436,25 @@ void AgentInstance::emit_lifecycle_event(
         try {
             callback(event);
         } catch (const std::exception& e) {
-            spdlog::error("[AgentInstance] Event callback error: {}", e.what());
+            spdlog::get("default")->error("[AgentInstance] Event callback error: {}", e.what());
         }
     }
 }
+
+// TODO: 删除重复的 touch() 定义，已在头文件中定义为 inline
+// void AgentInstance::touch() {
+//     ctx_.last_active_at = core::utils::now();
+// }
+
+// TODO: 等待 emit_lifecycle_event 完整实现
 
 // ═══════════════════════════════════════════════════════════════
 // ✅ Overflow 重试循环 (对齐 OpenClaw)
 // 参考: openclaw-analysis/src/agents/pi-embedded-runner/run.ts:980-1034
 // ═══════════════════════════════════════════════════════════════
 
+// TODO: 等待 react/tools/llm 模块实现后启用
+/*
 core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
     const std::string& message,
     const std::map<std::string, std::string>& options
@@ -853,6 +845,7 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
         std::to_string(MAX_OVERFLOW_ATTEMPTS) + ")"
     );
 }
+*/
 
 } // namespace agents
 } // namespace hunterclaw

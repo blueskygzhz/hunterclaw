@@ -1,6 +1,7 @@
 #pragma once
 
 #include "hunterclaw/core/types.h"
+#include "hunterclaw/core/utils.h"
 #include "hunterclaw/agents/types.h"
 #include "hunterclaw/skills/skill.h"
 #include "hunterclaw/channels/channel.h"
