@@ -1,5 +1,4 @@
 #include "hunterclaw/react/react_engine.h"
-#include "hunterclaw/gateway/connection_pool.h"
 #include "hunterclaw/observability/observability.h"  // ✅ Span, Tracer, SpanKind
 #include "hunterclaw/observability/diagnostic_events.h"  // ✅ 可观测性集成
 #include <regex>
@@ -516,14 +515,7 @@ ReactEngine::LLMResponseData ReactEngine::call_llm(
         if (!extraction.remaining_text.empty() && callbacks.on_assistant_delta) {
             callbacks.on_assistant_delta(extraction.remaining_text);
             
-            // 🎯 OpenClaw 对齐: 通过 ConnectionPool 直连推送
-            // 如果配置了 session_id，直接推送到客户端
             if (!callbacks.session_id.empty()) {
-                auto& pool = gateway::ConnectionPool::instance();
-                pool.broadcast("agent", {
-                    {"type", "assistant_delta"},
-                    {"text", extraction.remaining_text}
-                });
             }
         }
         
@@ -568,13 +560,7 @@ ReactEngine::LLMResponseData ReactEngine::call_llm(
             if (should_send_block) {
                 callbacks.on_block_reply(current_chunk_buffer);
                 
-                // 🎯 OpenClaw 对齐: 通过 ConnectionPool 直连推送块回复
                 if (!callbacks.session_id.empty()) {
-                    auto& pool = gateway::ConnectionPool::instance();
-                    pool.broadcast("agent", {
-                        {"type", "block_reply"},
-                        {"text", current_chunk_buffer}
-                    });
                 }
                 
                 current_chunk_buffer.clear();
@@ -659,11 +645,6 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                 callbacks.on_tool_start(tool_call.name, core::JsonValue{});
                 
                 if (!callbacks.session_id.empty()) {
-                    auto& pool = gateway::ConnectionPool::instance();
-                    pool.broadcast("agent", {
-                        {"type", "tool_start"},
-                        {"tool_name", tool_call.name}
-                    });
                 }
             }
             
@@ -727,105 +708,14 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                 // 发送工具完成事件
                 if (callbacks.on_tool_end) {
                     callbacks.on_tool_end(tool_call.name, result);
-                    
-                    if (!callbacks.session_id.empty()) {
-                        auto& pool = gateway::ConnectionPool::instance();
-                        nlohmann::json result_json;
-                        result_json["type"] = "tool_end";
-                        result_json["tool_name"] = tool_call.name;
-                        result_json["success"] = result.success;
-                        if (!result.success) {
-                            result_json["error"] = result.error;
-                        }
-                        pool.broadcast("agent", result_json);
-                    }
                 }
                 
+                // 记录结果
                 results[call_id] = result;
                 
             } catch (const std::exception& e) {
-                // Future 异常
-                log()->error("Tool '{}' future failed: {}", tool_call.name, e.what());
-                
-                tools::ToolResult error_result;
-                error_result.success = false;
-                error_result.error = std::string("Future exception: ") + e.what();
-                results[tool_call.id] = error_result;
-            }
-        }
-        
-        log()->info("Completed {} parallel tool executions", results.size());
-        
-    } else {
-        // ✅ 串行执行 (单个工具或禁用并行)
-        log()->debug("Executing {} tools sequentially", tool_calls.size());
-        
-        for (const auto& tool_call : tool_calls) {
-            if (cancelled_) break;
-            
-            // ✅ 可观测性: 工具执行 Span (串行模式, 对齐 OpenClaw)
-            std::unique_ptr<observability::Span> span;
-            try {
-                span = observability::Tracer::instance().start_span(
-                    "tool.execute", 
-                    observability::SpanKind::Client
-                );
-                span->set_attribute("tool_name", tool_call.name);
-                span->set_attribute("tool_call_id", tool_call.id);
-                span->set_attribute("execution_mode", "sequential");
-            } catch (...) {
-                // 故障隔离
-            }
-            
-            if (callbacks.on_tool_start) {
-                callbacks.on_tool_start(tool_call.name, 
-                                       core::JsonValue{});  // TODO: parse arguments
-                
-                // 🎯 OpenClaw 对齐: 通过 ConnectionPool 推送工具开始事件
-                if (!callbacks.session_id.empty()) {
-                    auto& pool = gateway::ConnectionPool::instance();
-                    pool.broadcast("agent", {
-                        {"type", "tool_start"},
-                        {"tool_name", tool_call.name}
-                    });
-                }
-            }
-            
-            try {
-                // TODO: 解析 tool_call.function.arguments (JSON string) 为 JsonValue
-                core::JsonValue args;
-                auto result = tool_manager_->execute_tool(tool_call.name, args);
-                
-                // ✅ Span 成功标记
-                if (span) {
-                    span->set_status(result.success, result.error);
-                }
-                
-                if (callbacks.on_tool_end) {
-                    callbacks.on_tool_end(tool_call.name, result);
-                    
-                    // 🎯 OpenClaw 对齐: 通过 ConnectionPool 推送工具完成事件
-                    if (!callbacks.session_id.empty()) {
-                        auto& pool = gateway::ConnectionPool::instance();
-                        nlohmann::json result_json;
-                        result_json["type"] = "tool_end";
-                        result_json["tool_name"] = tool_call.name;
-                        result_json["success"] = result.success;
-                        if (!result.success) {
-                            result_json["error"] = result.error;
-                        }
-                        pool.broadcast("agent", result_json);
-                    }
-                }
-                
-                results[tool_call.id] = result;
-                
-            } catch (const std::exception& e) {
-                // ✅ Span 失败标记
-                if (span) {
-                    span->set_status(false, e.what());
-                    span->add_event("error", {{"exception", e.what()}});
-                }
+                // 处理异常 (例如线程抛出的异常)
+                log()->error("Failed to get tool execution result: {}", e.what());
                 
                 // 记录错误结果
                 tools::ToolResult error_result;
@@ -1148,13 +1038,13 @@ ReactEngine::CompactionResult ReactEngine::trigger_compaction(
     // 执行 compaction
     auto compact_result = compaction_mgr_->compact_session(params);
     
-    if (!compact_result.is_ok()) {
+    if (!compact_result.ok) {
         log()->error("[ReactEngine] Compaction failed: {}", compact_result.error);
         result.reason = compact_result.error;
         return result;
     }
     
-    auto compact_data = compact_result.value();
+    auto& compact_data = compact_result.value;
     
     if (!compact_data.compacted) {
         log()->info("[ReactEngine] Compaction skipped: {}", compact_data.reason);

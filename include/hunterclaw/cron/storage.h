@@ -23,12 +23,12 @@ public:
     core::Result<void> save_jobs(const std::vector<Job>& jobs);
     
     // Run logs storage
-    core::Result<std::vector<RunLog>> load_run_logs(
+    core::Result<std::vector<RunLogEntry>> load_run_logs(
         const std::string& job_id,
         std::optional<int64_t> since_ms,
         std::optional<int> limit
     );
-    core::Result<void> save_run_log(const RunLog& log_entry);
+    core::Result<void> save_run_log(const RunLogEntry& log_entry);
     
     // Backup operations
     bool backup();

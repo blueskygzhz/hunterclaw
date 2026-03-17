@@ -122,9 +122,9 @@ private:
     std::shared_ptr<CronService> service_;
     
     // JSON conversion helpers
-    static nlohmann::json job_to_json(const Job& job);
-    static JobCreate json_to_job_create(const nlohmann::json& j);
-    static JobPatch json_to_job_patch(const nlohmann::json& j);
+    static nlohmann::json job_to_json(const CronJob& job);
+    static CronJobCreate json_to_job_create(const nlohmann::json& j);
+    static CronJobPatch json_to_job_patch(const nlohmann::json& j);
 };
 
 } // namespace cron

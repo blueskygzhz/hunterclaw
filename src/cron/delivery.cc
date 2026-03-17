@@ -110,17 +110,10 @@ core::Result<bool> DeliveryService::deliver_announce(
     }
     
     // Send through channel
+    // TODO: Implement channel message sending when Channel interface is ready
     try {
-        auto channel = deps_.channel_manager->get_channel(channel_id);
-        if (!channel) {
-            return core::Result<bool>::Err("Channel not found: " + channel_id);
-        }
-        
-        // Send message
-        // Note: Channel interface needs send_message method
-        // For now, use a workaround
-        
-        log()->info("Message sent to {} via channel {}", to, channel_id);
+        log()->info("Would send message to {} via channel {} (not yet implemented)", to, channel_id);
+        // For now, just log the delivery attempt
         return core::Result<bool>::Ok(true);
         
     } catch (const std::exception& e) {

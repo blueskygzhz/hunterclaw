@@ -8,6 +8,17 @@ using json = nlohmann::json;
 namespace hunterclaw {
 namespace react {
 
+namespace {
+// Logger
+auto log() {
+    static auto logger = spdlog::get("react");
+    if (!logger) {
+        logger = spdlog::stdout_logger_mt("react");
+    }
+    return logger;
+}
+} // anonymous namespace
+
 // ============================================================================
 // ModelCatalog 实现
 // ============================================================================
@@ -25,7 +36,7 @@ void ModelCatalog::register_model(const ModelCapabilities& caps) {
     std::string key = make_key(caps.provider, caps.model_id);
     catalog_[key] = caps;
     
-    spdlog::info("[ModelCatalog] Registered model: {}/{} (reasoning={}, tools={})",
+    log()->info("[ModelCatalog] Registered model: {}/{} (reasoning={}, tools={})",
         caps.provider, caps.model_id, 
         caps.supports_reasoning, caps.supports_tool_use);
 }
@@ -42,7 +53,7 @@ ModelCapabilities ModelCatalog::get_capabilities(
     }
     
     // 未找到,返回默认能力
-    spdlog::warn("[ModelCatalog] Model not found: {}/{}, using defaults",
+    log()->warn("[ModelCatalog] Model not found: {}/{}, using defaults",
         provider, model_id);
     return create_default_capabilities(provider, model_id);
 }
@@ -68,14 +79,14 @@ std::vector<ModelCapabilities> ModelCatalog::list_all_models() const {
 
 void ModelCatalog::clear() {
     catalog_.clear();
-    spdlog::info("[ModelCatalog] Cleared catalog");
+    log()->info("[ModelCatalog] Cleared catalog");
 }
 
 bool ModelCatalog::load_from_config(const std::string& config_path) {
     try {
         std::ifstream file(config_path);
         if (!file.is_open()) {
-            spdlog::error("[ModelCatalog] Failed to open config: {}", config_path);
+            log()->error("[ModelCatalog] Failed to open config: {}", config_path);
             return false;
         }
         
@@ -83,7 +94,7 @@ bool ModelCatalog::load_from_config(const std::string& config_path) {
         file >> j;
         
         if (!j.contains("models") || !j["models"].is_array()) {
-            spdlog::error("[ModelCatalog] Invalid config format");
+            log()->error("[ModelCatalog] Invalid config format");
             return false;
         }
         
@@ -104,11 +115,11 @@ bool ModelCatalog::load_from_config(const std::string& config_path) {
             }
         }
         
-        spdlog::info("[ModelCatalog] Loaded {} models from config", count);
+        log()->info("[ModelCatalog] Loaded {} models from config", count);
         return true;
         
     } catch (const std::exception& e) {
-        spdlog::error("[ModelCatalog] Failed to load config: {}", e.what());
+        log()->error("[ModelCatalog] Failed to load config: {}", e.what());
         return false;
     }
 }
@@ -289,7 +300,7 @@ void ModelCatalog::register_builtin_models() {
         .context_window = 64000
     });
     
-    spdlog::info("[ModelCatalog] Registered {} builtin models", catalog_.size());
+    log()->info("[ModelCatalog] Registered {} builtin models", catalog_.size());
 }
 
 // ============================================================================

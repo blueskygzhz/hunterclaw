@@ -5,6 +5,36 @@
 package(default_visibility = ["//visibility:public"])
 
 # ============================================================================
+# Cron Library - Cron Job Scheduling and Management
+# ============================================================================
+cc_library(
+    name = "hunterclaw_cron",
+    srcs = glob(["cron/*.cc"]),
+    deps = [
+        "//:hunterclaw_headers",
+        "@nlohmann_json//:json",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+    copts = [
+        "-std=c++17",
+        "-Wall",
+        "-Wextra",
+        "-I/usr/include/jsoncpp",
+        "-I/usr/include/spdlog",
+    ],
+    linkopts = [
+        "-lpthread",
+        "-lcurl",      # HTTP delivery
+        "-lssl",       # OpenSSL SHA256
+        "-lcrypto",    # OpenSSL Crypto
+        "-ljsoncpp",
+    ],
+    linkstatic = False,
+    visibility = ["//visibility:public"],
+)
+
+# ============================================================================
 # Memory Library - 严格对齐 OpenClaw Memory 实现
 # ============================================================================
 cc_library(
@@ -249,6 +279,39 @@ cc_library(
 )
 
 # ============================================================================
+# ReAct Library - ReAct Engine, Reasoning, Tool Orchestration (对齐 OpenClaw)
+# ============================================================================
+cc_library(
+    name = "hunterclaw_react",
+    srcs = glob(
+        ["react/*.cc"],
+        exclude = ["react/message_processor.cc"]  # MessageProcessor 依赖 sessions，属于更高层
+    ),
+    deps = [
+        "//:hunterclaw_headers",
+        ":hunterclaw_llm",
+        ":hunterclaw_tools",
+        ":hunterclaw_memory",
+        "@nlohmann_json//:json",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+    copts = [
+        "-std=c++17",
+        "-Wall",
+        "-Wextra",
+        "-I/usr/include/jsoncpp",
+        "-I/usr/include/spdlog",
+    ],
+    linkopts = [
+        "-lpthread",
+        "-ljsoncpp",
+    ],
+    linkstatic = False,
+    visibility = ["//visibility:public"],
+)
+
+# ============================================================================
 # Core Aggregate Library - All HunterClaw modules
 # ============================================================================
 cc_library(
@@ -260,7 +323,6 @@ cc_library(
         "channels/*.cc",
         "agents/*.cc",
         "context/*.cc",
-        "react/*.cc",
         "plugins/*.cc",
         "process/*.cc",
         "hooks/*.cc",
@@ -271,18 +333,17 @@ cc_library(
         "secrets/*.cc",
         "device/*.cc",
         "auto_reply/*.cc",
-        "cron/*.cc",
         "daemon/*.cc",
         "observability/*.cc",
         "infra/*.cc",
         "logging/*.cc",
         "markdown/*.cc",
-        "sandbox/*.cc",
         "shared/*.cc",
         "nodes/*.cc",
         "cli/*.cc",
     ], exclude = ["main.cc"]),
     deps = [
+        ":hunterclaw_cron",      # ✅ 添加 cron 依赖
         ":hunterclaw_memory",
         ":hunterclaw_llm",
         ":hunterclaw_gateway",
@@ -291,6 +352,7 @@ cc_library(
         ":hunterclaw_skills",  # ✅ 修正拼写错误
         ":hunterclaw_tools",  # ✅ 添加 tools 依赖
         ":hunterclaw_sandbox",  # ✅ 添加 sandbox 依赖
+        ":hunterclaw_react",  # ✅ 添加 react 依赖
         "//:hunterclaw_headers",
         "//third_party:httplib",
         "@nlohmann_json//:json",

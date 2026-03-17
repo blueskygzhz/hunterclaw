@@ -13,6 +13,15 @@ namespace react {
 
 namespace {
 
+// Logger
+auto log() {
+    static auto logger = spdlog::get("react");
+    if (!logger) {
+        logger = spdlog::stdout_logger_mt("react");
+    }
+    return logger;
+}
+
 // 🎯 OpenClaw 对齐: 格式化推理消息
 // 参考: openclaw-analysis/src/agents/pi-embedded-utils.ts:formatReasoningMessage
 std::string format_reasoning_message(const std::string& text) {
@@ -130,7 +139,7 @@ ProcessResult MessageProcessor::process_message(
         if (!is_streaming_channel && config_.react_config.block_reply.enabled) {
             // 对于非 streaming 渠道，自动禁用 block streaming
             config_.react_config.block_reply.disable_streaming = true;
-            spdlog::debug("[MessageProcessor] Block streaming disabled for channel: {}",
+            log()->debug("[MessageProcessor] Block streaming disabled for channel: {}",
                 message.channel);
         }
         
@@ -420,12 +429,12 @@ void MessageProcessor::send_ack_reaction(const MessageContext& context) {
         // 投递到队列 (立即发送,低优先级)
         delivery_queue_->enqueue(delivery, {payload}, queue::Priority::Low);
         
-        spdlog::debug("[MessageProcessor] ACK reaction sent: {} to message {}",
+        log()->debug("[MessageProcessor] ACK reaction sent: {} to message {}",
             config_.ack_emoji, context.message.message_id);
         
     } catch (const std::exception& e) {
         // ACK 发送失败不影响主流程
-        spdlog::warn("[MessageProcessor] Failed to send ACK reaction: {}", e.what());
+        log()->warn("[MessageProcessor] Failed to send ACK reaction: {}", e.what());
     }
 }
 
@@ -564,13 +573,13 @@ ReactResult MessageProcessor::execute_react_with_loop_detection(
         // 1. 检查是否禁用 block streaming
         // 用于 WhatsApp, Signal 等不支持消息更新的渠道
         if (config_.react_config.block_reply.disable_streaming) {
-            spdlog::trace("[MessageProcessor] Block reply suppressed: disable_streaming=true");
+            log()->trace("[MessageProcessor] Block reply suppressed: disable_streaming=true");
             return;
         }
         
         // 2. 检查是否启用 block reply
         if (!config_.react_config.block_reply.enabled) {
-            spdlog::trace("[MessageProcessor] Block reply disabled in config");
+            log()->trace("[MessageProcessor] Block reply disabled in config");
             return;
         }
         
@@ -583,7 +592,7 @@ ReactResult MessageProcessor::execute_react_with_loop_detection(
         payload.text = block;
         
         delivery_queue_->enqueue(delivery, {payload});
-        spdlog::debug("[MessageProcessor] Block reply delivered: {} chars", block.length());
+        log()->debug("[MessageProcessor] Block reply delivered: {} chars", block.length());
     };
     
     // 执行 ReAct
@@ -668,7 +677,7 @@ void MessageProcessor::deliver_response(
     if (!media_attachments.empty()) {
         payload.media = media_attachments;
         
-        spdlog::info("[MessageProcessor] Delivering {} media attachments",
+        log()->info("[MessageProcessor] Delivering {} media attachments",
             media_attachments.size());
     }
     
@@ -756,7 +765,7 @@ ReactResult MessageProcessor::execute_with_fallback(
             // ========== 切换 LLM 客户端的模型 (对齐 OpenClaw) ==========
             // 参考: openclaw-analysis/src/llm/client-fallback.ts
             
-            spdlog::info("[MessageProcessor] Attempting fallback to model: {}", fallback_model);
+            log()->info("[MessageProcessor] Attempting fallback to model: {}", fallback_model);
             
             // 方案 1: 动态切换模型 (如果 LLMClient 支持)
             if (llm_client_->supports_model_switch()) {
@@ -823,7 +832,7 @@ bool MessageProcessor::try_auto_compaction(MessageContext& context) {
             return false;  // 未达到阈值,不需要压缩
         }
         
-        spdlog::info("[MessageProcessor] Auto-compaction triggered: session={}, tokens={}/{}",
+        log()->info("[MessageProcessor] Auto-compaction triggered: session={}, tokens={}/{}",
             context.route.session_key, total_tokens, config_.compaction_threshold_tokens);
         
         // 3. 压缩策略: 保留最近 N 条消息 + 生成摘要
@@ -869,13 +878,13 @@ bool MessageProcessor::try_auto_compaction(MessageContext& context) {
         // 8. 更新会话
         session_manager_->update_session(session);
         
-        spdlog::info("[MessageProcessor] Compaction complete: compressed {} messages → 1 summary",
+        log()->info("[MessageProcessor] Compaction complete: compressed {} messages → 1 summary",
             compress_count);
         
         return true;
         
     } catch (const std::exception& e) {
-        spdlog::error("[MessageProcessor] Compaction failed: {}", e.what());
+        log()->error("[MessageProcessor] Compaction failed: {}", e.what());
         return false;
     }
 }

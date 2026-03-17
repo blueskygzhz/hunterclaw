@@ -1,0 +1,580 @@
+// 🎯 对齐 OpenClaw: src/agents/skills-install-download.ts (全文件 239 行)
+// 实现下载安装器，支持归档解压和 stripComponents
+
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+#include <algorithm>
+#include <fstream>
+#include <memory>
+#include <regex>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <iomanip>
+
+#include <openssl/sha.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <dirent.h>
+#include <errno.h>
+
+// C++11 兼容的路径操作函数
+namespace path_utils {
+
+inline bool is_absolute(const std::string& p) {
+    return !p.empty() && p[0] == '/';
+}
+
+inline std::string join(const std::string& a, const std::string& b) {
+    if (a.empty()) return b;
+    if (b.empty()) return a;
+    if (a[a.length() - 1] == '/') {
+        return a + b;
+    }
+    return a + "/" + b;
+}
+
+inline std::string basename(const std::string& path) {
+    size_t pos = path.find_last_of('/');
+    if (pos == std::string::npos) {
+        return path;
+    }
+    return path.substr(pos + 1);
+}
+
+inline std::string parent_path(const std::string& path) {
+    size_t pos = path.find_last_of('/');
+    if (pos == std::string::npos) {
+        return ".";
+    }
+    return path.substr(0, pos);
+}
+
+inline bool ends_with(const std::string& str, const std::string& suffix) {
+    if (suffix.length() > str.length()) return false;
+    return str.compare(str.length() - suffix.length(), suffix.length(), suffix) == 0;
+}
+
+inline bool starts_with(const std::string& str, const std::string& prefix) {
+    if (prefix.length() > str.length()) return false;
+    return str.compare(0, prefix.length(), prefix) == 0;
+}
+
+inline bool file_exists(const std::string& path) {
+    struct stat st;
+    return stat(path.c_str(), &st) == 0;
+}
+
+inline size_t file_size(const std::string& path) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return 0;
+    return st.st_size;
+}
+
+inline bool create_directories(const std::string& path) {
+    // 简化实现: 使用 mkdir -p
+    std::string cmd = "mkdir -p \"" + path + "\" 2>/dev/null";
+    return system(cmd.c_str()) == 0;
+}
+
+inline bool remove_file(const std::string& path) {
+    return unlink(path.c_str()) == 0 || errno == ENOENT;
+}
+
+inline bool rename_file(const std::string& from, const std::string& to) {
+    return rename(from.c_str(), to.c_str()) == 0;
+}
+
+inline std::string realpath_safe(const std::string& path) {
+    char* resolved = realpath(path.c_str(), nullptr);
+    if (!resolved) return path;
+    std::string result(resolved);
+    free(resolved);
+    return result;
+}
+
+inline std::string relative(const std::string& path, const std::string& base) {
+    // 简化实现: 检查前缀
+    if (starts_with(path, base)) {
+        size_t base_len = base.length();
+        if (base_len < path.length() && path[base_len] == '/') {
+            return path.substr(base_len + 1);
+        }
+        if (base_len == path.length()) {
+            return ".";
+        }
+    }
+    
+    // 包含 ".."
+    if (path.find("..") != std::string::npos) {
+        return "..";
+    }
+    
+    return path;
+}
+
+inline void to_lower(std::string& str) {
+    std::transform(str.begin(), str.end(), str.begin(), ::tolower);
+}
+
+}  // namespace path_utils
+
+namespace hunterclaw {
+namespace skills {
+
+// 🎯 对齐 OpenClaw line 19-21
+struct DownloadResult {
+    bool ok;
+    std::string message;
+    int code;
+    std::string stdout_output;
+    std::string stderr_output;
+    std::vector<std::string> warnings;
+};
+
+// 🎯 对齐 OpenClaw line 7-17: resolveSkillToolsRootDir
+// 返回每个 skill 的独立工具目录: ~/.hunterclaw/tools/<safe-key>
+std::string resolve_skill_tools_root_dir(
+    const std::string& skill_key,
+    const std::string& config_dir
+) {
+    // 简化的安全路径生成 (hash 前 10 位)
+    std::string safe_key = skill_key;
+    // 替换非法字符
+    std::replace(safe_key.begin(), safe_key.end(), '/', '-');
+    std::replace(safe_key.begin(), safe_key.end(), '\\', '-');
+    
+    // 计算 SHA256 hash (前 10 位)
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const unsigned char*>(skill_key.c_str()), 
+           skill_key.length(), hash);
+    
+    std::ostringstream hex_stream;
+    for (int i = 0; i < 5; ++i) {  // 10 个十六进制字符
+        hex_stream << std::hex << std::setw(2) << std::setfill('0') 
+                   << static_cast<int>(hash[i]);
+    }
+    
+    std::string safe_segment = safe_key.length() > 50 
+        ? safe_key.substr(0, 50) + "-" + hex_stream.str()
+        : safe_key;
+    
+    return config_dir + "/tools/" + safe_segment;
+}
+
+// 🎯 对齐 OpenClaw line 23-42: resolveDownloadTargetDir
+std::string resolve_download_target_dir(
+    const std::string& safe_root,
+    const std::string& target_dir_raw
+) {
+    using namespace path_utils;
+    
+    if (target_dir_raw.empty()) {
+        return safe_root;
+    }
+    
+    // 处理相对路径 (相对于 safe_root)
+    std::string resolved;
+    if (target_dir_raw[0] == '~' || is_absolute(target_dir_raw)) {
+        // 绝对路径或 ~ 开头
+        if (target_dir_raw[0] == '~') {
+            const char* home = getenv("HOME");
+            if (home) {
+                resolved = join(home, target_dir_raw.substr(1));
+            } else {
+                resolved = target_dir_raw;
+            }
+        } else {
+            resolved = target_dir_raw;
+        }
+    } else {
+        // 相对路径，基于 safe_root
+        resolved = join(safe_root, target_dir_raw);
+    }
+    
+    // 安全检查: 必须在 safe_root 内
+    std::string canonical_root = realpath_safe(safe_root);
+    std::string canonical_resolved = realpath_safe(resolved);
+    
+    std::string rel = relative(canonical_resolved, canonical_root);
+    if (rel.empty() || starts_with(rel, "..")) {
+        throw std::runtime_error(
+            "Refusing to install outside the skill tools directory. targetDir=\"" +
+            target_dir_raw + "\" resolves to \"" + resolved + 
+            "\". Allowed root: \"" + safe_root + "\"."
+        );
+    }
+    
+    return resolved;
+}
+
+// 🎯 对齐 OpenClaw line 44-60: resolveArchiveType
+std::string resolve_archive_type(
+    const std::string& explicit_type,
+    const std::string& filename
+) {
+    // 显式指定优先
+    if (!explicit_type.empty()) {
+        std::string lower = explicit_type;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        return lower;
+    }
+    
+    // 从文件名推断
+    std::string lower_filename = filename;
+    std::transform(lower_filename.begin(), lower_filename.end(), 
+                   lower_filename.begin(), ::tolower);
+    
+    if (lower_filename.ends_with(".tar.gz") || lower_filename.ends_with(".tgz")) {
+        return "tar.gz";
+    }
+    if (lower_filename.ends_with(".tar.bz2") || lower_filename.ends_with(".tbz2")) {
+        return "tar.bz2";
+    }
+    if (lower_filename.ends_with(".zip")) {
+        return "zip";
+    }
+    
+    return "";
+}
+
+// 🎯 对齐 OpenClaw line 62-102: downloadFile
+struct DownloadFileResult {
+    bool ok;
+    size_t bytes;
+    std::string error;
+};
+
+DownloadFileResult download_file(
+    const std::string& url,
+    const std::string& root_dir,
+    const std::string& relative_path,
+    int timeout_ms
+) {
+    // 🎯 对齐 OpenClaw line 68-76: 准备目录和临时文件
+    fs::path dest_path = fs::path(root_dir) / relative_path;
+    fs::path staging_dir = fs::path(root_dir) / ".hunterclaw-download-staging";
+    
+    try {
+        fs::create_directories(staging_dir);
+    } catch (const std::exception& e) {
+        return {false, 0, "Failed to create staging dir: " + std::string(e.what())};
+    }
+    
+    // 生成临时文件名
+    std::string temp_filename = "download-" + 
+        std::to_string(std::chrono::system_clock::now().time_since_epoch().count()) +
+        ".tmp";
+    fs::path temp_path = staging_dir / temp_filename;
+    
+    // 🎯 对齐 OpenClaw line 77-84: 使用 curl 下载 (SSRF 防护)
+    // TODO: 实现完整的 fetchWithSsrfGuard (SSRF 防护)
+    // 当前使用简化的 curl 实现
+    
+    std::string curl_cmd = "curl -L -s -S --max-time " + 
+        std::to_string(timeout_ms / 1000) + 
+        " -o \"" + temp_path.string() + "\" \"" + url + "\" 2>&1";
+    
+    FILE* pipe = popen(curl_cmd.c_str(), "r");
+    if (!pipe) {
+        return {false, 0, "Failed to execute curl"};
+    }
+    
+    std::string curl_output;
+    char buffer[256];
+    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        curl_output += buffer;
+    }
+    
+    int exit_code = pclose(pipe);
+    if (exit_code != 0) {
+        fs::remove(temp_path);
+        return {false, 0, "Download failed (curl exit " + 
+                std::to_string(exit_code) + "): " + curl_output};
+    }
+    
+    // 🎯 对齐 OpenClaw line 91-96: 安全移动文件到目标位置
+    try {
+        // 确保目标目录存在
+        fs::create_directories(dest_path.parent_path());
+        
+        // 原子移动 (rename)
+        if (fs::exists(dest_path)) {
+            fs::remove(dest_path);
+        }
+        fs::rename(temp_path, dest_path);
+        
+        // 获取文件大小
+        size_t bytes = fs::file_size(dest_path);
+        return {true, bytes, ""};
+        
+    } catch (const std::exception& e) {
+        fs::remove(temp_path);
+        return {false, 0, "Failed to move downloaded file: " + std::string(e.what())};
+    }
+}
+
+// 🎯 对齐 OpenClaw line 140-233: extractArchive
+struct ExtractResult {
+    bool ok;
+    int code;
+    std::string stdout_output;
+    std::string stderr_output;
+};
+
+ExtractResult extract_archive(
+    const std::string& archive_path,
+    const std::string& archive_type,
+    const std::string& target_dir,
+    int strip_components,
+    int timeout_ms
+) {
+    // 🎯 对齐 OpenClaw line 153-163: zip 解压
+    if (archive_type == "zip") {
+        std::string cmd = "unzip -o -q ";
+        if (strip_components > 0) {
+            // unzip 不直接支持 strip-components，需要特殊处理
+            // 这里简化处理: 解压到临时目录然后移动
+            cmd += "\"" + archive_path + "\" -d \"" + target_dir + "\" 2>&1";
+        } else {
+            cmd += "\"" + archive_path + "\" -d \"" + target_dir + "\" 2>&1";
+        }
+        
+        FILE* pipe = popen(cmd.c_str(), "r");
+        if (!pipe) {
+            return {false, -1, "", "Failed to execute unzip"};
+        }
+        
+        std::string output;
+        char buffer[256];
+        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            output += buffer;
+        }
+        
+        int exit_code = pclose(pipe);
+        if (exit_code != 0) {
+            return {false, exit_code, output, "unzip failed"};
+        }
+        
+        // TODO: 实现 strip_components 逻辑 (移动子目录内容到 target_dir)
+        if (strip_components > 0) {
+            // 警告: zip strip-components 未完全实现
+            return {false, -1, output, 
+                    "Warning: strip-components for zip not fully implemented"};
+        }
+        
+        return {true, 0, output, ""};
+    }
+    
+    // 🎯 对齐 OpenClaw line 165-175: tar.gz 解压
+    if (archive_type == "tar.gz") {
+        std::string cmd = "tar xzf \"" + archive_path + "\" -C \"" + target_dir + "\"";
+        if (strip_components > 0) {
+            cmd += " --strip-components=" + std::to_string(strip_components);
+        }
+        cmd += " 2>&1";
+        
+        FILE* pipe = popen(cmd.c_str(), "r");
+        if (!pipe) {
+            return {false, -1, "", "Failed to execute tar"};
+        }
+        
+        std::string output;
+        char buffer[256];
+        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            output += buffer;
+        }
+        
+        int exit_code = pclose(pipe);
+        if (exit_code != 0) {
+            return {false, exit_code, output, "tar extraction failed"};
+        }
+        
+        return {true, 0, output, ""};
+    }
+    
+    // 🎯 对齐 OpenClaw line 177-226: tar.bz2 解压
+    if (archive_type == "tar.bz2") {
+        // 检查 tar 命令是否存在
+        if (system("which tar > /dev/null 2>&1") != 0) {
+            return {false, -1, "", "tar not found on PATH"};
+        }
+        
+        std::string cmd = "tar xjf \"" + archive_path + "\" -C \"" + target_dir + "\"";
+        if (strip_components > 0) {
+            cmd += " --strip-components=" + std::to_string(strip_components);
+        }
+        cmd += " 2>&1";
+        
+        FILE* pipe = popen(cmd.c_str(), "r");
+        if (!pipe) {
+            return {false, -1, "", "Failed to execute tar"};
+        }
+        
+        std::string output;
+        char buffer[256];
+        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            output += buffer;
+        }
+        
+        int exit_code = pclose(pipe);
+        if (exit_code != 0) {
+            return {false, exit_code, output, "tar.bz2 extraction failed"};
+        }
+        
+        return {true, 0, output, ""};
+    }
+    
+    // 未支持的归档类型
+    return {false, -1, "", "unsupported archive type: " + archive_type};
+}
+
+// 🎯 对齐 OpenClaw line 104-238: installDownloadSpec (主函数)
+DownloadResult install_download_spec(
+    const std::string& skill_name,
+    const std::string& skill_key,
+    const std::string& url_raw,
+    const std::string& target_dir_raw,
+    const std::string& archive_type_explicit,
+    bool extract_requested,
+    int strip_components,
+    int timeout_ms,
+    const std::string& config_dir
+) {
+    // 🎯 对齐 OpenClaw line 110-120: 参数验证
+    std::string url = url_raw;
+    // trim
+    size_t start = url.find_first_not_of(" \t\n\r");
+    size_t end = url.find_last_not_of(" \t\n\r");
+    if (start != std::string::npos && end != std::string::npos) {
+        url = url.substr(start, end - start + 1);
+    }
+    
+    if (url.empty()) {
+        return {false, "missing download url", -1, "", "", {}};
+    }
+    
+    // 🎯 对齐 OpenClaw line 122-131: 从 URL 提取文件名
+    std::string filename;
+    try {
+        size_t last_slash = url.find_last_of('/');
+        if (last_slash != std::string::npos && last_slash < url.length() - 1) {
+            filename = url.substr(last_slash + 1);
+        }
+    } catch (...) {
+        filename = "download";
+    }
+    
+    if (filename.empty()) {
+        filename = "download";
+    }
+    
+    // 🎯 对齐 OpenClaw line 133-156: 安全目录准备
+    std::string safe_root;
+    std::string target_dir;
+    
+    try {
+        safe_root = resolve_skill_tools_root_dir(skill_key, config_dir);
+        fs::create_directories(safe_root);
+        
+        // 规范化 safe_root
+        safe_root = fs::canonical(safe_root).string();
+        
+        // 解析目标目录
+        std::string requested_target_dir = resolve_download_target_dir(
+            safe_root, target_dir_raw
+        );
+        fs::create_directories(requested_target_dir);
+        
+        // 再次规范化，确保在 safe_root 内
+        fs::path canonical_target = fs::canonical(requested_target_dir);
+        fs::path canonical_root = fs::canonical(safe_root);
+        
+        auto rel = fs::relative(canonical_target, canonical_root);
+        if (rel.empty() || rel.string().starts_with("..")) {
+            throw std::runtime_error("target directory outside allowed root");
+        }
+        
+        target_dir = canonical_target.string();
+        
+    } catch (const std::exception& e) {
+        return {false, std::string(e.what()), -1, "", std::string(e.what()), {}};
+    }
+    
+    // 🎯 对齐 OpenClaw line 158-173: 归档路径安全检查
+    fs::path archive_path = fs::path(target_dir) / filename;
+    fs::path archive_relative = fs::relative(archive_path, safe_root);
+    
+    if (archive_relative.empty() || 
+        archive_relative.string() == ".." ||
+        archive_relative.string().starts_with("..") ||
+        archive_relative.is_absolute()) {
+        return {false, "invalid download archive path", -1, "", 
+                "invalid download archive path", {}};
+    }
+    
+    // 🎯 对齐 OpenClaw line 174-186: 下载文件
+    size_t downloaded = 0;
+    try {
+        auto download_result = download_file(
+            url,
+            safe_root,
+            archive_relative.string(),
+            timeout_ms
+        );
+        
+        if (!download_result.ok) {
+            return {false, download_result.error, -1, "", download_result.error, {}};
+        }
+        
+        downloaded = download_result.bytes;
+        
+    } catch (const std::exception& e) {
+        return {false, std::string(e.what()), -1, "", std::string(e.what()), {}};
+    }
+    
+    // 🎯 对齐 OpenClaw line 188-198: 检测归档类型和是否解压
+    std::string archive_type = resolve_archive_type(archive_type_explicit, filename);
+    bool should_extract = extract_requested || !archive_type.empty();
+    
+    if (!should_extract) {
+        std::string msg = "Downloaded to " + archive_path.string();
+        std::string stdout_msg = "downloaded=" + std::to_string(downloaded);
+        return {true, msg, 0, stdout_msg, "", {}};
+    }
+    
+    if (archive_type.empty()) {
+        return {false, "extract requested but archive type could not be detected",
+                -1, "", "", {}};
+    }
+    
+    // 🎯 对齐 OpenClaw line 210-227: 解压归档
+    try {
+        auto extract_result = extract_archive(
+            archive_path.string(),
+            archive_type,
+            target_dir,
+            strip_components,
+            timeout_ms
+        );
+        
+        if (!extract_result.ok) {
+            return {false, "Extraction failed: " + extract_result.stderr_output,
+                    extract_result.code, extract_result.stdout_output, 
+                    extract_result.stderr_output, {}};
+        }
+        
+        // 🎯 对齐 OpenClaw line 228-237: 成功返回
+        std::string success_msg = "Downloaded and extracted to " + target_dir;
+        return {true, success_msg, 0, extract_result.stdout_output, 
+                extract_result.stderr_output, {}};
+        
+    } catch (const std::exception& e) {
+        return {false, std::string(e.what()), -1, "", std::string(e.what()), {}};
+    }
+}
+
+}  // namespace skills
+}  // namespace hunterclaw

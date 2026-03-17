@@ -11,7 +11,7 @@ namespace cli {
 // CronListCommand
 // ============================================================================
 
-CronListCommand::CronListCommand(std::shared_ptr<cron::CronManager> manager)
+CronListCommand::CronListCommand(std::shared_ptr<cron::CronService> manager)
     : manager_(manager) {}
 
 void CronListCommand::configure(CLI::App& app) {
@@ -86,7 +86,7 @@ core::Result<int> CronListCommand::execute(const CommandContext& ctx) {
 // CronAddCommand
 // ============================================================================
 
-CronAddCommand::CronAddCommand(std::shared_ptr<cron::CronManager> manager)
+CronAddCommand::CronAddCommand(std::shared_ptr<cron::CronService> manager)
     : manager_(manager) {}
 
 void CronAddCommand::configure(CLI::App& app) {
@@ -130,7 +130,7 @@ core::Result<int> CronAddCommand::execute(const CommandContext& ctx) {
 // CronRemoveCommand
 // ============================================================================
 
-CronRemoveCommand::CronRemoveCommand(std::shared_ptr<cron::CronManager> manager)
+CronRemoveCommand::CronRemoveCommand(std::shared_ptr<cron::CronService> manager)
     : manager_(manager) {}
 
 void CronRemoveCommand::configure(CLI::App& app) {
@@ -167,7 +167,7 @@ core::Result<int> CronRemoveCommand::execute(const CommandContext& ctx) {
 // CronInfoCommand
 // ============================================================================
 
-CronInfoCommand::CronInfoCommand(std::shared_ptr<cron::CronManager> manager)
+CronInfoCommand::CronInfoCommand(std::shared_ptr<cron::CronService> manager)
     : manager_(manager) {}
 
 void CronInfoCommand::configure(CLI::App& app) {
@@ -219,7 +219,7 @@ core::Result<int> CronInfoCommand::execute(const CommandContext& ctx) {
 // CronEnableCommand
 // ============================================================================
 
-CronEnableCommand::CronEnableCommand(std::shared_ptr<cron::CronManager> manager)
+CronEnableCommand::CronEnableCommand(std::shared_ptr<cron::CronService> manager)
     : manager_(manager) {}
 
 void CronEnableCommand::configure(CLI::App& app) {
@@ -249,7 +249,7 @@ core::Result<int> CronEnableCommand::execute(const CommandContext& ctx) {
 // CronDisableCommand
 // ============================================================================
 
-CronDisableCommand::CronDisableCommand(std::shared_ptr<cron::CronManager> manager)
+CronDisableCommand::CronDisableCommand(std::shared_ptr<cron::CronService> manager)
     : manager_(manager) {}
 
 void CronDisableCommand::configure(CLI::App& app) {
@@ -273,7 +273,7 @@ core::Result<int> CronDisableCommand::execute(const CommandContext& ctx) {
 // CronRunCommand
 // ============================================================================
 
-CronRunCommand::CronRunCommand(std::shared_ptr<cron::CronManager> manager)
+CronRunCommand::CronRunCommand(std::shared_ptr<cron::CronService> manager)
     : manager_(manager) {}
 
 void CronRunCommand::configure(CLI::App& app) {
@@ -301,7 +301,7 @@ core::Result<int> CronRunCommand::execute(const CommandContext& ctx) {
 
 void register_cron_commands(
     CLI::App& app,
-    std::shared_ptr<cron::CronManager> manager
+    std::shared_ptr<cron::CronService> manager
 ) {
     // Register all cron commands
     auto cron_list = std::make_shared<CronListCommand>(manager);

@@ -1,9 +1,22 @@
 #include "hunterclaw/gateway/heartbeat_monitor.h"
 #include "hunterclaw/core/utils.h"
 #include <thread>
+#include <mutex>
+#include <spdlog/spdlog.h>
 
 namespace hunterclaw {
 namespace gateway {
+
+namespace {
+// Logger
+auto get_logger() {
+    static auto logger = spdlog::get("gateway");
+    if (!logger) {
+        logger = spdlog::stdout_logger_mt("gateway");
+    }
+    return logger;
+}
+} // anonymous namespace
 
 int64_t HeartbeatMonitor::now_ms() const {
     auto now = std::chrono::system_clock::now();

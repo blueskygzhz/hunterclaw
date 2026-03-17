@@ -5,6 +5,17 @@
 namespace hunterclaw {
 namespace react {
 
+namespace {
+// Logger
+auto log() {
+    static auto logger = spdlog::get("react");
+    if (!logger) {
+        logger = spdlog::stdout_logger_mt("react");
+    }
+    return logger;
+}
+} // anonymous namespace
+
 // ============================================================================
 // 配置解析实现 (OpenClaw 严格对齐)
 // ============================================================================
@@ -26,27 +37,27 @@ VerboseLevel resolve_verbose_level(
 ) {
     // 优先级 1: 消息内联指令 (/verbose full)
     if (directives.verbose_level.has_value()) {
-        spdlog::debug("[VerboseConfig] Using inline directive: {}", 
+        log()->debug("[VerboseConfig] Using inline directive: {}", 
             to_string(*directives.verbose_level));
         return *directives.verbose_level;
     }
     
     // 优先级 2: 会话级别覆盖
     if (session_overrides && session_overrides->verbose_level.has_value()) {
-        spdlog::debug("[VerboseConfig] Using session override: {}", 
+        log()->debug("[VerboseConfig] Using session override: {}", 
             to_string(*session_overrides->verbose_level));
         return *session_overrides->verbose_level;
     }
     
     // 优先级 3: 全局默认配置 (verboseDefault) ✅
     if (agent_defaults.verbose_default.has_value()) {
-        spdlog::debug("[VerboseConfig] Using global default: {}", 
+        log()->debug("[VerboseConfig] Using global default: {}", 
             to_string(*agent_defaults.verbose_default));
         return *agent_defaults.verbose_default;
     }
     
     // 默认: Off
-    spdlog::debug("[VerboseConfig] Using fallback default: Off");
+    log()->debug("[VerboseConfig] Using fallback default: Off");
     return VerboseLevel::Off;
 }
 
@@ -82,14 +93,14 @@ ReasoningLevel resolve_reasoning_level(
     if (directives.reasoning_level.has_value()) {
         resolved = *directives.reasoning_level;
         explicitly_set = true;
-        spdlog::debug("[ReasoningConfig] Using inline directive: {}", 
+        log()->debug("[ReasoningConfig] Using inline directive: {}", 
             to_string(resolved));
     }
     // 优先级 2: 会话级别覆盖
     else if (session_overrides && session_overrides->reasoning_level.has_value()) {
         resolved = *session_overrides->reasoning_level;
         explicitly_set = true;
-        spdlog::debug("[ReasoningConfig] Using session override: {}", 
+        log()->debug("[ReasoningConfig] Using session override: {}", 
             to_string(resolved));
     }
     
@@ -106,12 +117,12 @@ ReasoningLevel resolve_reasoning_level(
         model_supports_reasoning(model_caps)) {
         
         resolved = ReasoningLevel::On;  // 自动启用 ✅
-        spdlog::info("[ReasoningConfig] Auto-enabled reasoning for capable model: {}/{}",
+        log()->info("[ReasoningConfig] Auto-enabled reasoning for capable model: {}/{}",
             model_caps.provider, model_caps.model_id);
     }
     
     if (resolved == ReasoningLevel::Off) {
-        spdlog::debug("[ReasoningConfig] Reasoning disabled (explicitly_set={}, thinking_active={})",
+        log()->debug("[ReasoningConfig] Reasoning disabled (explicitly_set={}, thinking_active={})",
             explicitly_set, thinking_active);
     }
     
@@ -161,7 +172,7 @@ ResolvedVerboseReasoningConfig resolve_verbose_reasoning_config(
     config.block_streaming_enabled = agent_defaults.block_streaming_default;
     config.streaming_break = agent_defaults.block_streaming_break;
     
-    spdlog::info("[Config] Resolved configuration: verbose={}, reasoning={}, "
+    log()->info("[Config] Resolved configuration: verbose={}, reasoning={}, "
         "block_streaming={}, break={}",
         to_string(config.verbose_level),
         to_string(config.reasoning_level),
@@ -205,20 +216,20 @@ bool should_include_tool_output(VerboseLevel verbose) {
 void filter_tool_event_data(ToolEventData& data, VerboseLevel verbose) {
     if (verbose == VerboseLevel::Off) {
         // Off: 完全不显示工具事件 (调用者应跳过此事件)
-        spdlog::trace("[ToolFilter] verbose=Off, event should be skipped");
+        log()->trace("[ToolFilter] verbose=Off, event should be skipped");
         return;
     }
     
     if (verbose == VerboseLevel::On) {
         // On: 只显示工具名称和参数,删除输出 ❌
-        spdlog::debug("[ToolFilter] verbose=On, removing tool output");
+        log()->debug("[ToolFilter] verbose=On, removing tool output");
         data.result = core::JsonValue();         // 清空 result
         data.partial_result = core::JsonValue(); // 清空 partialResult
     }
     
     // Full: 保留完整输出 ✅ (无需操作)
     if (verbose == VerboseLevel::Full) {
-        spdlog::trace("[ToolFilter] verbose=Full, keeping full output");
+        log()->trace("[ToolFilter] verbose=Full, keeping full output");
     }
 }
 
