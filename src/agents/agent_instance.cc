@@ -251,86 +251,70 @@ void AgentInstance::initialize_workspace() {
 void AgentInstance::initialize_memory() {
     // ========== 初始化 Session 级别 Memory (对齐 OpenClaw) ==========
     
-    // TODO: 等待 memory 模块完整实现后启用
-    /*
     try {
-        // 1. 构建 Memory 存储路径
-        // 格式: {workspace}/{agent_id}/memory/{session_id}.db
-        std::string memory_db_path = ctx_.workspace_dir + "/memory/" + ctx_.session_id + ".db";
+        // 1. 构建 Memory 工作空间路径
+        // 格式: {base_workspace}/{agent_id}/memory
+        std::string memory_workspace = ctx_.workspace_dir + "/memory";
         
         // 确保目录存在
-        std::filesystem::create_directories(ctx_.workspace_dir + "/memory");
+        std::filesystem::create_directories(memory_workspace);
         
-        spdlog::get("default")->info("[AgentInstance] Initializing memory: path={}", memory_db_path);
+        log()->info("[AgentInstance] Initializing memory: workspace={}", memory_workspace);
         
-        // 2. 创建 SQLite Vector Storage
-        auto storage = memory::SQLiteVectorStorage::create(memory_db_path, 1536);
-        if (!storage) {
-            spdlog::get("default")->error("[AgentInstance] Failed to create SQLite storage");
-            return;
-        }
+        // 2. 配置 MemoryManager (对齐 OpenClaw BuiltinMemoryManager)
+        memory::MemoryManager::Config memory_config;
         
-        // 3. 创建 Embedding Provider (从配置)
-        std::shared_ptr<memory::EmbeddingProvider> embedding;
+        // 2.1 Workspace 配置
+        memory_config.workspace_dir = memory_workspace;
         
-        // ✅ 从 Agent 配置或全局配置读取 embedding 设置
-        std::string embedding_provider = "ollama";  // 默认 ollama
-        std::string embedding_model = "nomic-embed-text";
+        // 2.2 Compaction 配置 (对齐 OpenClaw CompactionManager)
+        memory_config.compaction.context_window = 200000;
+        memory_config.compaction.reserve_tokens = 16384;
+        memory_config.compaction.keep_recent_tokens = 20000;
+        memory_config.compaction.auto_compress = true;
+        memory_config.compaction.soft_threshold_tokens = 4000;
         
-        // TODO: 从配置读取
-        // 尝试从全局配置读取
-        // if (config_->memory.embedding_provider.has_value()) {
-        //     embedding_provider = *config_->memory.embedding_provider;
+        // 2.3 Session Memory 配置 (对齐 OpenClaw SessionMemoryProvider)
+        memory_config.session_memory.enabled = true;
+        memory_config.session_memory.export_dir = memory_workspace + "/sessions";
+        memory_config.session_memory.retention_days = 30;
+        
+        // 2.4 Memory Provider 配置 (默认使用 in_memory)
+        memory_config.provider_type = "in_memory";  // TODO: 支持 qdrant, chroma
+        
+        // 2.5 Embedding Provider 配置 (对齐 OpenClaw EmbeddingProvider)
+        memory_config.embedding.provider = "ollama";  // 默认 ollama
+        memory_config.embedding.model = "nomic-embed-text";
+        memory_config.embedding.fallback = "none";
+        
+        // TODO: 从全局配置读取 embedding 设置
+        // if (config_->memory.embedding_provider) {
+        //     memory_config.embedding.provider = *config_->memory.embedding_provider;
         // }
-        // if (config_->memory.embedding_model.has_value()) {
-        //     embedding_model = *config_->memory.embedding_model;
-        // }
-        
-        if (embedding_provider == "openai") {
-            // std::string api_key = config_->llm.api_key;  // 复用 LLM API Key
-            // embedding = memory::EmbeddingProviderFactory::create_openai(api_key, "text-embedding-3-small");
-            spdlog::get("default")->warn("[AgentInstance] OpenAI embedding not configured");
-        } else if (embedding_provider == "ollama") {
-            embedding = memory::EmbeddingProviderFactory::create_ollama(embedding_model);
-        }
-        
-        if (!embedding) {
-            spdlog::get("default")->warn("[AgentInstance] Failed to create embedding provider, memory disabled");
-            return;
-        }
-        
-        // 4. 创建 MemoryManager
-        memory::SearchConfig search_config;
-        search_config.max_results = 6;
-        search_config.min_score = 0.35;
-        search_config.hybrid.enabled = true;
-        search_config.hybrid.vector_weight = 0.7;
-        search_config.hybrid.text_weight = 0.3;
-        search_config.hybrid.mmr.enabled = true;
-        search_config.hybrid.mmr.lambda = 0.7;
-        
-        // ✅ 保存 MemoryManager 引用
-        memory_mgr_ = memory::MemoryManager::create(storage, embedding, search_config);
-        
-        // TODO: 等待 ReactEngine 实现后启用
-        // ✅ 传递 CompactionManager 给 ReactEngine (对齐 OpenClaw)
-        // if (react_engine_ && memory_mgr_) {
-        //     ...
+        // if (config_->memory.embedding_model) {
+        //     memory_config.embedding.model = *config_->memory.embedding_model;
         // }
         
-        // 5. 将 MemoryManager 转换为 MemoryProvider (适配)
-        // ✅ 创建适配器 (P3 优先级完成)
+        // 3. 创建 MemoryManager (传入 LLMClient 用于 compaction)
+        // TODO: 等待 LLMClient 实现后传入
+        std::shared_ptr<llm::LLMClient> llm_client = nullptr;
+        memory_mgr_ = std::make_shared<memory::MemoryManager>(memory_config, llm_client);
+        
+        // 4. 将 MemoryManager 转换为 MemoryProvider (适配器模式)
+        // 对齐 OpenClaw: AgentInstanceContext.memory 是统一的 MemoryProvider 接口
         ctx_.memory = std::make_shared<memory::MemoryProviderAdapter>(memory_mgr_);
         
-        spdlog::get("default")->info("[AgentInstance] Memory initialized: session={}, db={}, adapter=enabled",
-            ctx_.session_id, memory_db_path);
+        log()->info(
+            "[AgentInstance] Memory initialized: session={}, workspace={}, provider={}, embedding={}",
+            ctx_.session_id, memory_workspace, 
+            memory_config.provider_type, memory_config.embedding.provider
+        );
         
     } catch (const std::exception& e) {
-        spdlog::get("default")->error("[AgentInstance] Memory initialization failed: {}", e.what());
+        log()->error("[AgentInstance] Memory initialization failed: {}", e.what());
         // 不抛出异常,允许 Agent 在没有 Memory 的情况下运行
+        // 对齐 OpenClaw: memory 是可选组件
     }
-    */
-    spdlog::get("default")->info("[AgentInstance] Memory module not implemented yet, skipping initialization");
 }
 
 void AgentInstance::initialize_tools() {

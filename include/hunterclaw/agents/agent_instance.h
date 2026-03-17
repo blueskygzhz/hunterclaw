@@ -18,7 +18,6 @@ namespace agents {
 // Forward declarations
 class ReactEngine;
 class ToolRegistry;
-class MemoryProvider;
 
 /**
  * Agent 实例隔离上下文
@@ -34,7 +33,7 @@ struct AgentInstanceContext {
     
     // 独立资源
     std::string workspace_dir;          // {workspace}/{agent_id}/sessions/{session_id}
-    std::shared_ptr<MemoryProvider> memory;  // Session 级别 Memory
+    std::shared_ptr<memory::MemoryProvider> memory;  // Session 级别 Memory (使用完整命名空间)
     std::vector<std::string> tools;     // Agent 配置过滤后的工具
     
     // 配置
@@ -160,6 +159,7 @@ private:
     std::shared_ptr<channels::ChannelManager> channel_mgr_;
     std::shared_ptr<ReactEngine> react_engine_;
     std::shared_ptr<ToolRegistry> tool_registry_;
+    std::shared_ptr<memory::MemoryManager> memory_mgr_;  // ✅ Memory 管理器
     
     // ✅ OpenClaw 对齐: Reasoning stream 状态跟踪
     std::string last_streamed_reasoning_;  // 用于去重和增量计算

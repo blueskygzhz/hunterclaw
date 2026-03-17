@@ -62,7 +62,7 @@ core::Result<std::vector<MemoryEntry>> MemoryProviderAdapter::search(
     }
 }
 
-core::Result<void> MemoryProviderAdapter::add_memory(const MemoryEntry& entry) {
+core::Result<void> MemoryProviderAdapter::add_memory_entry(const MemoryEntry& entry) {
     // ✅ P4 优先级完成: 使用 MemoryManager 的 add_entry() 方法
     // 
     // OpenClaw 实现 (src/memory/builtin-manager.ts):

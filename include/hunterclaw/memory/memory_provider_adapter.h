@@ -40,7 +40,7 @@ namespace memory {
  * 2. 解耦: MemoryManager 的复杂功能 (compaction, session) 隐藏在适配器后
  * 3. 兼容性: 未来可以切换不同的 Memory 实现 (如 QMD, remote memory)
  */
-class MemoryProviderAdapter {
+class MemoryProviderAdapter : public MemoryProvider {
 public:
     /**
      * 构造函数
@@ -48,14 +48,48 @@ public:
      */
     explicit MemoryProviderAdapter(std::shared_ptr<MemoryManager> memory_mgr);
     
-    ~MemoryProviderAdapter() = default;
+    ~MemoryProviderAdapter() override = default;
     
     // ========================================
-    // MemoryProvider 接口实现
+    // MemoryProvider 接口实现 (必需方法)
+    // ========================================
+    
+    // Provider identification
+    std::string provider_id() const override { return "adapter"; }
+    std::string provider_name() const override { return "MemoryManager Adapter"; }
+    std::string provider_version() const override { return "1.0.0"; }
+    
+    // Memory CRUD operations (实现 MemoryProvider 接口)
+    core::Result<std::string> add_memory(
+        const std::string& content,
+        const std::map<std::string, std::string>& metadata = {}
+    ) override;
+    
+    core::Result<std::vector<MemorySearchResult>> search_memories(
+        const std::string& query,
+        const SearchOptions& options = {}
+    ) override;
+    
+    core::Result<bool> remove_memory(const std::string& id) override;
+    
+    core::Result<bool> update_memory(
+        const std::string& id,
+        const std::string& content,
+        const std::map<std::string, std::string>& metadata = {}
+    ) override;
+    
+    core::Result<bool> clear_memories() override;
+    
+    core::Result<Memory> get_memory(const std::string& id) override;
+    
+    core::Result<MemoryStats> get_stats() override;
+    
+    // ========================================
+    // 原有的便捷方法 (保留用于简化调用)
     // ========================================
     
     /**
-     * 搜索 memory
+     * 搜索 memory (便捷方法)
      * 
      * 对齐 OpenClaw: MemoryProvider.search()
      * 
@@ -69,17 +103,17 @@ public:
     );
     
     /**
-     * 添加 memory
+     * 添加 memory (便捷方法)
      * 
      * 对齐 OpenClaw: MemoryProvider.store()
      * 
      * @param entry Memory 条目 (id, content, file_path, timestamp)
      * @return 成功/失败
      */
-    core::Result<void> add_memory(const MemoryEntry& entry);
+    core::Result<void> add_memory_entry(const MemoryEntry& entry);
     
     /**
-     * 重建索引
+     * 重建索引 (便捷方法)
      * 
      * 对齐 OpenClaw: MemoryProvider.reindex()
      * 
