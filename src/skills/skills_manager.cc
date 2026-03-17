@@ -1,12 +1,13 @@
 // 🎯 严格对齐 OpenClaw: src/agents/skills/workspace.ts
 // HunterClaw Skills Manager 实现
 
-#include "skills_manager.h"
+#include "hunterclaw/skills/skills_manager.h"
 
 #include <algorithm>
 #include <dirent.h>
 #include <fstream>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <sys/stat.h>
 #include <unistd.h>

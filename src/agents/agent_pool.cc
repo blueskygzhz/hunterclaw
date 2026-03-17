@@ -20,7 +20,7 @@ AgentPool::AgentPool(
     channel_mgr_(channel_mgr),
     pool_config_(pool_config) {
     
-    spdlog::info("[AgentPool] Initialized: max_agents={}, idle_ttl={}s, auto_cleanup={}",
+    spdlog::get("default")->info("[AgentPool] Initialized: max_agents={}, idle_ttl={}s, auto_cleanup={}",
         pool_config_.max_agents,
         pool_config_.idle_ttl.count(),
         pool_config_.auto_cleanup);
@@ -35,13 +35,13 @@ AgentPool::~AgentPool() {
     
     // 清理所有 Agent 实例
     std::lock_guard<std::mutex> lock(mutex_);
-    spdlog::info("[AgentPool] Cleaning up {} agent instances", agents_.size());
+    spdlog::get("default")->info("[AgentPool] Cleaning up {} agent instances", agents_.size());
     
     for (auto& [session_id, agent] : agents_) {
         try {
             agent->cleanup();
         } catch (const std::exception& e) {
-            spdlog::error("[AgentPool] Cleanup error for session {}: {}", session_id, e.what());
+            spdlog::get("default")->error("[AgentPool] Cleanup error for session {}: {}", session_id, e.what());
         }
     }
     agents_.clear();
@@ -75,11 +75,11 @@ std::shared_ptr<AgentInstance> AgentPool::get_or_create_agent(
         // 强制清理最老的 Agent
         size_t cleaned = cleanup_idle_agents(std::chrono::seconds(0));
         
-        spdlog::info("[AgentPool] Cleaned {} idle agents", cleaned);
+        spdlog::get("default")->info("[AgentPool] Cleaned {} idle agents", cleaned);
         
         // 还是超限 → 拒绝创建
         if (agents_.size() >= pool_config_.max_agents) {
-            spdlog::error("[AgentPool] Cannot create agent: pool full ({}/{})",
+            spdlog::get("default")->error("[AgentPool] Cannot create agent: pool full ({}/{})",
                 agents_.size(), pool_config_.max_agents);
             return nullptr;
         }
@@ -88,7 +88,7 @@ std::shared_ptr<AgentInstance> AgentPool::get_or_create_agent(
     // ========== Step 3: 解析 Agent ID ==========
     std::string agent_id = resolve_agent_id(session_id, agent_id_override);
     
-    spdlog::info("[AgentPool] Creating new agent: session={}, agent_id={}",
+    spdlog::get("default")->info("[AgentPool] Creating new agent: session={}, agent_id={}",
         session_id, agent_id);
     
     // ========== Step 4: 创建 Agent 实例 ==========
@@ -105,13 +105,13 @@ std::shared_ptr<AgentInstance> AgentPool::get_or_create_agent(
         agents_[session_id] = agent;
         last_active_[session_id] = core::utils::now();
         
-        spdlog::info("[AgentPool] Agent created: session={}, agent={}, workspace={}",
+        spdlog::get("default")->info("[AgentPool] Agent created: session={}, agent={}, workspace={}",
             session_id, agent_id, agent->context().workspace_dir);
         
         return agent;
         
     } catch (const std::exception& e) {
-        spdlog::error("[AgentPool] Failed to create agent: session={}, agent={}, error={}",
+        spdlog::get("default")->error("[AgentPool] Failed to create agent: session={}, agent={}, error={}",
             session_id, agent_id, e.what());
         return nullptr;
     }
@@ -136,14 +136,14 @@ void AgentPool::remove_agent(const std::string& session_id) {
     
     auto it = agents_.find(session_id);
     if (it != agents_.end()) {
-        spdlog::info("[AgentPool] Removing agent: session={}, agent={}",
+        spdlog::get("default")->info("[AgentPool] Removing agent: session={}, agent={}",
             session_id, it->second->context().agent_id);
         
         try {
             // 清理 Agent 资源
             it->second->cleanup();
         } catch (const std::exception& e) {
-            spdlog::error("[AgentPool] Cleanup error: {}", e.what());
+            spdlog::get("default")->error("[AgentPool] Cleanup error: {}", e.what());
         }
         
         agents_.erase(it);
@@ -219,7 +219,7 @@ size_t AgentPool::cleanup_idle_agents(std::optional<std::chrono::seconds> ttl_ov
     }
     
     if (!to_remove.empty()) {
-        spdlog::info("[AgentPool] Cleaning up {} idle agents (ttl={}s)",
+        spdlog::get("default")->info("[AgentPool] Cleaning up {} idle agents (ttl={}s)",
             to_remove.size(), ttl.count());
         
         for (const auto& session_id : to_remove) {
@@ -237,7 +237,7 @@ size_t AgentPool::cleanup_idle_agents(std::optional<std::chrono::seconds> ttl_ov
                 try {
                     it->second->cleanup();
                 } catch (const std::exception& e) {
-                    spdlog::error("[AgentPool] Cleanup error: {}", e.what());
+                    spdlog::get("default")->error("[AgentPool] Cleanup error: {}", e.what());
                 }
                 
                 agents_.erase(it);
@@ -257,7 +257,7 @@ void AgentPool::start_auto_cleanup() {
     cleanup_running_.store(true);
     
     cleanup_thread_ = std::thread([this]() {
-        spdlog::info("[AgentPool] Auto-cleanup thread started (interval={}s)",
+        spdlog::get("default")->info("[AgentPool] Auto-cleanup thread started (interval={}s)",
             pool_config_.cleanup_interval.count());
         
         while (cleanup_running_.load()) {
@@ -267,15 +267,15 @@ void AgentPool::start_auto_cleanup() {
                 try {
                     size_t cleaned = cleanup_idle_agents();
                     if (cleaned > 0) {
-                        spdlog::info("[AgentPool] Auto-cleanup: removed {} idle agents", cleaned);
+                        spdlog::get("default")->info("[AgentPool] Auto-cleanup: removed {} idle agents", cleaned);
                     }
                 } catch (const std::exception& e) {
-                    spdlog::error("[AgentPool] Auto-cleanup error: {}", e.what());
+                    spdlog::get("default")->error("[AgentPool] Auto-cleanup error: {}", e.what());
                 }
             }
         }
         
-        spdlog::info("[AgentPool] Auto-cleanup thread stopped");
+        spdlog::get("default")->info("[AgentPool] Auto-cleanup thread stopped");
     });
 }
 
@@ -284,7 +284,7 @@ void AgentPool::stop_auto_cleanup() {
         return;
     }
     
-    spdlog::info("[AgentPool] Stopping auto-cleanup thread");
+    spdlog::get("default")->info("[AgentPool] Stopping auto-cleanup thread");
     cleanup_running_.store(false);
     
     if (cleanup_thread_.joinable()) {
@@ -453,7 +453,7 @@ std::optional<core::SessionInfo> AgentPool::get_session_info(
                     info.metadata["workspace"] = entry["workspace"].get<std::string>();
                 }
                 
-                spdlog::info("[AgentPool] Loaded SessionInfo from disk: session={}, key={}, agent={}",
+                spdlog::get("default")->info("[AgentPool] Loaded SessionInfo from disk: session={}, key={}, agent={}",
                     session_id, session_key, info.metadata["agent_id"]);
                 
                 return info;
@@ -463,7 +463,7 @@ std::optional<core::SessionInfo> AgentPool::get_session_info(
         spdlog::debug("[AgentPool] Session not found in sessions.json: session={}", session_id);
         
     } catch (const std::exception& e) {
-        spdlog::error("[AgentPool] Error loading session from disk: session={}, error={}",
+        spdlog::get("default")->error("[AgentPool] Error loading session from disk: session={}, error={}",
             session_id, e.what());
     }
     

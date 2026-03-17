@@ -26,13 +26,13 @@ core::Result<SessionAcpMeta> SessionAcpMeta::from_json(const core::JsonValue& js
         if (json.contains("scope") && json["scope"].is_object()) {
             const auto& scope = json["scope"];
             
-            if (scope.contains("isolated_workspace") && scope["isolated_workspace"].is_boolean()) {
+            if (scope.contains("isolated_workspace") && scope["isolated_workspace"].is_bool()) {
                 meta.scope.isolated_workspace = scope["isolated_workspace"].get<bool>();
             }
-            if (scope.contains("isolated_memory") && scope["isolated_memory"].is_boolean()) {
+            if (scope.contains("isolated_memory") && scope["isolated_memory"].is_bool()) {
                 meta.scope.isolated_memory = scope["isolated_memory"].get<bool>();
             }
-            if (scope.contains("isolated_tools") && scope["isolated_tools"].is_boolean()) {
+            if (scope.contains("isolated_tools") && scope["isolated_tools"].is_bool()) {
                 meta.scope.isolated_tools = scope["isolated_tools"].get<bool>();
             }
             
@@ -85,25 +85,26 @@ core::Result<SessionAcpMeta> SessionAcpMeta::from_json(const core::JsonValue& js
             const auto& runtime = json["runtime"];
             
             if (runtime.contains("model") && runtime["model"].is_string()) {
-                meta.runtime.model = runtime["model"].get<std::string>();
+                meta.runtime.model = runtime["model"].as_string();
             }
             if (runtime.contains("max_turns") && runtime["max_turns"].is_number()) {
-                meta.runtime.max_turns = runtime["max_turns"].get<int>();
+                meta.runtime.max_turns = static_cast<int>(runtime["max_turns"].as_number());
             }
             if (runtime.contains("temperature") && runtime["temperature"].is_number()) {
-                meta.runtime.temperature = runtime["temperature"].get<double>();
+                meta.runtime.temperature = runtime["temperature"].as_number();
             }
             
             if (runtime.contains("env_vars") && runtime["env_vars"].is_object()) {
-                for (const auto& [key, value] : runtime["env_vars"].items()) {
-                    if (value.is_string()) {
-                        meta.runtime.env_vars[key] = value.get<std::string>();
+                for (const auto& [key, value_ptr] : runtime["env_vars"]) {
+                    if (value_ptr && value_ptr->is_string()) {
+                        meta.runtime.env_vars[key] = value_ptr->as_string();
                     }
                 }
             }
             
             if (runtime.contains("enabled_tools") && runtime["enabled_tools"].is_array()) {
-                for (const auto& tool : runtime["enabled_tools"]) {
+                auto tools_json = runtime["enabled_tools"].to_json();
+                for (const auto& tool : tools_json) {
                     if (tool.is_string()) {
                         meta.runtime.enabled_tools.push_back(tool.get<std::string>());
                     }
@@ -111,23 +112,27 @@ core::Result<SessionAcpMeta> SessionAcpMeta::from_json(const core::JsonValue& js
             }
             
             if (runtime.contains("context") && runtime["context"].is_object()) {
-                for (const auto& [key, value] : runtime["context"].items()) {
-                    meta.runtime.context[key] = value;  // Store as JsonValue
+                for (const auto& [key, value_ptr] : runtime["context"]) {
+                    if (value_ptr) {
+                        meta.runtime.context[key] = *value_ptr;  // Store as JsonValue
+                    }
                 }
             }
         }
         
         // 6. Metadata
         if (json.contains("metadata") && json["metadata"].is_object()) {
-            for (const auto& [key, value] : json["metadata"].items()) {
-                meta.metadata[key] = value;  // Store as JsonValue
+            for (const auto& [key, value_ptr] : json["metadata"]) {
+                if (value_ptr) {
+                    meta.metadata[key] = *value_ptr;  // Store as JsonValue
+                }
             }
         }
         
-        return core::Result<SessionAcpMeta>::ok(meta);
+        return core::Result<SessionAcpMeta>::Ok(meta);
         
     } catch (const std::exception& e) {
-        return core::Result<SessionAcpMeta>::err(std::string("JSON parse error: ") + e.what());
+        return core::Result<SessionAcpMeta>::Err(std::string("JSON parse error: ") + e.what());
     }
 }
 
@@ -163,17 +168,21 @@ core::JsonValue SessionAcpMeta::to_json() const {
     // Lifecycle
     {
         core::JsonValue lifecycle_json = core::JsonValue::object();
+        bool has_lifecycle = false;
         if (lifecycle.on_start) {
             lifecycle_json["on_start"] = *lifecycle.on_start;
+            has_lifecycle = true;
         }
         if (lifecycle.on_message) {
             lifecycle_json["on_message"] = *lifecycle.on_message;
+            has_lifecycle = true;
         }
         if (lifecycle.on_end) {
             lifecycle_json["on_end"] = *lifecycle.on_end;
+            has_lifecycle = true;
         }
         
-        if (!lifecycle_json.empty()) {
+        if (has_lifecycle) {
             json["lifecycle"] = lifecycle_json;
         }
     }
@@ -181,23 +190,29 @@ core::JsonValue SessionAcpMeta::to_json() const {
     // Limits
     {
         core::JsonValue limits_json = core::JsonValue::object();
+        bool has_limits = false;
         if (limits.max_memory_mb) {
-            limits_json["max_memory_mb"] = static_cast<int>(*limits.max_memory_mb);
+            limits_json["max_memory_mb"] = static_cast<int64_t>(*limits.max_memory_mb);
+            has_limits = true;
         }
         if (limits.max_disk_mb) {
-            limits_json["max_disk_mb"] = static_cast<int>(*limits.max_disk_mb);
+            limits_json["max_disk_mb"] = static_cast<int64_t>(*limits.max_disk_mb);
+            has_limits = true;
         }
         if (limits.max_concurrent_runs) {
-            limits_json["max_concurrent_runs"] = *limits.max_concurrent_runs;
+            limits_json["max_concurrent_runs"] = static_cast<int64_t>(*limits.max_concurrent_runs);
+            has_limits = true;
         }
         if (limits.max_turns_per_run) {
-            limits_json["max_turns_per_run"] = *limits.max_turns_per_run;
+            limits_json["max_turns_per_run"] = static_cast<int64_t>(*limits.max_turns_per_run);
+            has_limits = true;
         }
         if (limits.timeout_seconds) {
-            limits_json["timeout_seconds"] = *limits.timeout_seconds;
+            limits_json["timeout_seconds"] = static_cast<int64_t>(*limits.timeout_seconds);
+            has_limits = true;
         }
         
-        if (!limits_json.empty()) {
+        if (has_limits) {
             json["limits"] = limits_json;
         }
     }
@@ -209,10 +224,10 @@ core::JsonValue SessionAcpMeta::to_json() const {
             runtime_json["model"] = *runtime.model;
         }
         if (runtime.max_turns) {
-            runtime_json["max_turns"] = *runtime.max_turns;
+            runtime_json["max_turns"] = static_cast<int64_t>(*runtime.max_turns);
         }
         if (runtime.temperature) {
-            runtime_json["temperature"] = *runtime.temperature;
+            runtime_json["temperature"] = static_cast<double>(*runtime.temperature);
         }
         
         if (!runtime.env_vars.empty()) {
@@ -239,7 +254,11 @@ core::JsonValue SessionAcpMeta::to_json() const {
             runtime_json["context"] = context_json;
         }
         
-        if (!runtime_json.empty()) {
+        // Add runtime to json if it has any content
+        bool has_runtime = runtime.model || runtime.max_turns || runtime.temperature ||
+                          !runtime.env_vars.empty() || !runtime.enabled_tools.empty() ||
+                          !runtime.context.empty();
+        if (has_runtime) {
             json["runtime"] = runtime_json;
         }
     }
@@ -331,22 +350,22 @@ core::Result<AcpMessage> AcpMessage::from_json(const core::JsonValue& json) {
     try {
         // 1. 必填字段
         if (!json.contains("message_id") || !json["message_id"].is_string()) {
-            return core::Result<AcpMessage>::err("Missing or invalid 'message_id'");
+            return core::Result<AcpMessage>::Err("Missing or invalid 'message_id'");
         }
         msg.message_id = json["message_id"].get<std::string>();
         
         if (!json.contains("from_agent_id") || !json["from_agent_id"].is_string()) {
-            return core::Result<AcpMessage>::err("Missing or invalid 'from_agent_id'");
+            return core::Result<AcpMessage>::Err("Missing or invalid 'from_agent_id'");
         }
         msg.from_agent_id = json["from_agent_id"].get<std::string>();
         
         if (!json.contains("to_agent_id") || !json["to_agent_id"].is_string()) {
-            return core::Result<AcpMessage>::err("Missing or invalid 'to_agent_id'");
+            return core::Result<AcpMessage>::Err("Missing or invalid 'to_agent_id'");
         }
         msg.to_agent_id = json["to_agent_id"].get<std::string>();
         
         if (!json.contains("content") || !json["content"].is_string()) {
-            return core::Result<AcpMessage>::err("Missing or invalid 'content'");
+            return core::Result<AcpMessage>::Err("Missing or invalid 'content'");
         }
         msg.content = json["content"].get<std::string>();
         
@@ -362,15 +381,17 @@ core::Result<AcpMessage> AcpMessage::from_json(const core::JsonValue& json) {
         
         // 3. Metadata (可选)
         if (json.contains("meta") && json["meta"].is_object()) {
-            for (const auto& [key, value] : json["meta"].items()) {
-                msg.meta[key] = value;  // Store as JsonValue
+            for (const auto& [key, value_ptr] : json["meta"]) {
+                if (value_ptr) {
+                    msg.meta[key] = *value_ptr;  // Store as JsonValue
+                }
             }
         }
         
-        return core::Result<AcpMessage>::ok(msg);
+        return core::Result<AcpMessage>::Ok(msg);
         
     } catch (const std::exception& e) {
-        return core::Result<AcpMessage>::err(std::string("JSON parse error: ") + e.what());
+        return core::Result<AcpMessage>::Err(std::string("JSON parse error: ") + e.what());
     }
 }
 
@@ -416,7 +437,7 @@ SessionAcpMeta AcpProtocol::create_default_meta() {
 core::Result<void> AcpProtocol::validate_meta(const SessionAcpMeta& meta) {
     // 验证资源限制
     if (meta.limits.max_memory_mb && *meta.limits.max_memory_mb == 0) {
-        return core::Result<void>::err("max_memory_mb must be > 0");
+        return core::Result<void>::Err("max_memory_mb must be > 0");
     }
     
     if (meta.limits.max_disk_mb && *meta.limits.max_disk_mb == 0) {

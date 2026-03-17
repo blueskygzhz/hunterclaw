@@ -312,6 +312,37 @@ cc_library(
 )
 
 # ============================================================================
+# Agents Library - Agent Pool, Instance, Scope, Subagent Management
+# ============================================================================
+cc_library(
+    name = "hunterclaw_agents",
+    srcs = glob(["agents/*.cc"]),
+    deps = [
+        "//:hunterclaw_headers",
+        ":hunterclaw_memory",
+        ":hunterclaw_llm",
+        ":hunterclaw_skills",
+        "@nlohmann_json//:json",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+    copts = [
+        "-std=c++17",
+        "-Wall",
+        "-Wextra",
+        "-I/usr/include/jsoncpp",
+        "-I/usr/include/spdlog",
+    ],
+    linkopts = [
+        "-lpthread",
+        "-ljsoncpp",
+        "-luuid",
+    ],
+    linkstatic = False,
+    visibility = ["//visibility:public"],
+)
+
+# ============================================================================
 # Core Aggregate Library - All HunterClaw modules
 # ============================================================================
 cc_library(
@@ -321,7 +352,6 @@ cc_library(
         "utils/*.cc",
         "config/*.cc",
         "channels/*.cc",
-        "agents/*.cc",
         "context/*.cc",
         "plugins/*.cc",
         "process/*.cc",
@@ -343,6 +373,7 @@ cc_library(
         "cli/*.cc",
     ], exclude = ["main.cc"]),
     deps = [
+        ":hunterclaw_agents",    # ✅ 添加 agents 依赖
         ":hunterclaw_cron",      # ✅ 添加 cron 依赖
         ":hunterclaw_memory",
         ":hunterclaw_llm",

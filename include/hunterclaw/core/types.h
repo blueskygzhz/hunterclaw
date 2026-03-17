@@ -367,6 +367,7 @@ struct Config {
     SkillConfig skills;
     std::map<std::string, PluginConfig> plugins;
     std::vector<AgentConfigData> agents;  // Agent configurations
+    JsonValue agents_json;  // JSON representation of agents config for flexible access
     
     std::string workspace_dir;
     std::string config_dir;  // ~/.hunterclaw

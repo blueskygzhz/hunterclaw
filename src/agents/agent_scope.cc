@@ -12,6 +12,35 @@ namespace agents {
 
 namespace fs = std::filesystem;
 
+// Helper function to trim whitespace
+static void trim(std::string& s) {
+    // Trim left
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](unsigned char ch) {
+        return !std::isspace(ch);
+    }));
+    // Trim right
+    s.erase(std::find_if(s.rbegin(), s.rend(), [](unsigned char ch) {
+        return !std::isspace(ch);
+    }).base(), s.end());
+}
+
+// Helper to iterate JsonValue array through nlohmann::json
+static std::vector<nlohmann::json> json_array_items(const core::JsonValue& jv) {
+    std::vector<nlohmann::json> items;
+    if (jv.is_array()) {
+        auto j = jv.to_json();
+        for (const auto& item : j) {
+            items.push_back(item);
+        }
+    }
+    return items;
+}
+
+// Helper to convert JsonValue to int
+static int json_as_int(const core::JsonValue& jv) {
+    return static_cast<int>(jv.as_number());
+}
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -37,7 +66,8 @@ std::vector<AgentEntry> AgentScopeManager::list_agent_entries() const {
     if (config_.agents_json.is_object() && config_.agents_json.contains("list") &&
         config_.agents_json["list"].is_array()) {
         
-        for (const auto& entry_json : config_.agents_json["list"].as_array()) {
+        for (const auto& entry_json_item : json_array_items(config_.agents_json["list"])) {
+            core::JsonValue entry_json(entry_json_item);
             if (!entry_json.is_object()) continue;
             
             AgentEntry entry = load_agent_entry_from_json(entry_json);
@@ -86,13 +116,13 @@ std::string AgentScopeManager::resolve_default_agent_id() const {
     // Warn if multiple defaults
     if (defaults.size() > 1 && !default_agent_warned_) {
         default_agent_warned_ = true;
-        spdlog::warn("[AgentScope] Multiple agents marked default=true; using the first entry as default.");
+        spdlog::get("default")->warn("[AgentScope] Multiple agents marked default=true; using the first entry as default.");
     }
     
     // Return first default or first entry
     const auto& chosen = !defaults.empty() ? defaults[0] : entries[0];
     std::string id = chosen.id;
-    core::utils::trim(id);
+    trim(id);
     
     return id.empty() ? DEFAULT_AGENT_ID : normalize_agent_id(id);
 }
@@ -158,7 +188,7 @@ SessionAgentIds AgentScopeManager::resolve_session_agent_ids(
     // Handle explicit agent ID
     if (explicit_agent_id && !explicit_agent_id->empty()) {
         std::string id = *explicit_agent_id;
-        core::utils::trim(id);
+        trim(id);
         std::transform(id.begin(), id.end(), id.begin(), ::tolower);
         
         if (!id.empty()) {
@@ -168,7 +198,7 @@ SessionAgentIds AgentScopeManager::resolve_session_agent_ids(
     
     // Parse session key
     std::string normalized_session_key = session_key;
-    core::utils::trim(normalized_session_key);
+    trim(normalized_session_key);
     std::transform(normalized_session_key.begin(), normalized_session_key.end(),
                    normalized_session_key.begin(), ::tolower);
     
@@ -268,7 +298,8 @@ std::optional<std::vector<std::string>> AgentScopeManager::resolve_effective_mod
                 const auto& model = defaults["model"];
                 if (model.is_object() && model.contains("fallbacks") && model["fallbacks"].is_array()) {
                     std::vector<std::string> fallbacks;
-                    for (const auto& fb : model["fallbacks"].as_array()) {
+                    for (const auto& fb_item : json_array_items(model["fallbacks"])) {
+                        core::JsonValue fb(fb_item);
                         if (fb.is_string()) {
                             fallbacks.push_back(fb.as_string());
                         }
@@ -297,7 +328,7 @@ bool AgentScopeManager::has_configured_model_fallbacks(
         if (defaults.is_object() && defaults.contains("model")) {
             const auto& model = defaults["model"];
             if (model.is_object() && model.contains("fallbacks") && model["fallbacks"].is_array()) {
-                return !model["fallbacks"].as_array().empty();
+                return !json_array_items(model["fallbacks"]).empty();
             }
         }
     }
@@ -367,7 +398,7 @@ std::string AgentScopeManager::resolve_agent_workspace_dir(
     // Use configured workspace if available
     if (config && !config->workspace.empty()) {
         std::string ws = config->workspace;
-        core::utils::trim(ws);
+        trim(ws);
         return strip_null_bytes(expand_user_path(ws));
     }
     
@@ -380,7 +411,7 @@ std::string AgentScopeManager::resolve_agent_workspace_dir(
             if (defaults.is_object() && defaults.contains("workspace")) {
                 if (defaults["workspace"].is_string()) {
                     std::string fallback = defaults["workspace"].as_string();
-                    core::utils::trim(fallback);
+                    trim(fallback);
                     if (!fallback.empty()) {
                         return strip_null_bytes(expand_user_path(fallback));
                     }
@@ -406,7 +437,7 @@ std::string AgentScopeManager::resolve_agent_dir(const std::string& agent_id) co
     // Use configured agent_dir if available
     if (config && !config->agent_dir.empty()) {
         std::string dir = config->agent_dir;
-        core::utils::trim(dir);
+        trim(dir);
         return expand_user_path(dir);
     }
     
@@ -475,7 +506,7 @@ std::optional<std::string> AgentScopeManager::resolve_agent_id_by_workspace_path
 
 std::string AgentScopeManager::normalize_agent_id(const std::string& agent_id) {
     std::string id = agent_id;
-    core::utils::trim(id);
+    trim(id);
     std::transform(id.begin(), id.end(), id.begin(), ::tolower);
     return id.empty() ? DEFAULT_AGENT_ID : id;
 }
@@ -484,7 +515,7 @@ std::optional<AgentScopeManager::ParsedSessionKey> AgentScopeManager::parse_agen
     const std::string& session_key
 ) {
     std::string key = session_key;
-    core::utils::trim(key);
+    trim(key);
     
     if (key.empty()) {
         return std::nullopt;
@@ -499,8 +530,8 @@ std::optional<AgentScopeManager::ParsedSessionKey> AgentScopeManager::parse_agen
     
     std::string agent_id = key.substr(0, colon_pos);
     std::string session_name = key.substr(colon_pos + 1);
-    core::utils::trim(agent_id);
-    core::utils::trim(session_name);
+    trim(agent_id);
+    trim(session_name);
     
     return ParsedSessionKey{agent_id, session_name};
 }
@@ -518,7 +549,20 @@ std::string AgentScopeManager::strip_null_bytes(const std::string& path) {
 
 std::string AgentScopeManager::normalize_path_for_comparison(const std::string& path) {
     try {
-        fs::path p = expand_user_path(strip_null_bytes(path));
+        // Inline expand_user_path logic
+        std::string clean_path = strip_null_bytes(path);
+        if (!clean_path.empty() && clean_path[0] == '~') {
+            const char* home = std::getenv("HOME");
+            if (!home) {
+                struct passwd* pw = getpwuid(getuid());
+                home = pw ? pw->pw_dir : nullptr;
+            }
+            if (home) {
+                clean_path = std::string(home) + clean_path.substr(1);
+            }
+        }
+        
+        fs::path p = clean_path;
         fs::path resolved = fs::absolute(p);
         
         // Try to get canonical path (resolves symlinks)
@@ -535,7 +579,7 @@ std::string AgentScopeManager::normalize_path_for_comparison(const std::string& 
         
         return result;
     } catch (const std::exception& e) {
-        spdlog::warn("[AgentScope] Failed to normalize path '{}': {}", path, e.what());
+        spdlog::get("default")->warn("[AgentScope] Failed to normalize path '{}': {}", path, e.what());
         return path;
     }
 }
@@ -555,7 +599,10 @@ bool AgentScopeManager::is_path_within_root(
         return relative_str.empty() || 
                (relative_str.find("..") != 0 && !fs::path(relative_str).is_absolute());
     } catch (const std::exception& e) {
-        spdlog::warn("[AgentScope] Failed to check path containment: {}", e.what());
+        auto logger = spdlog::get("default");
+        if (logger) {
+            logger->warn("[AgentScope] Failed to check path containment: {}", e.what());
+        }
         return false;
     }
 }
@@ -608,7 +655,8 @@ AgentEntry AgentScopeManager::load_agent_entry_from_json(
                 entry.model_primary = model["primary"].as_string();
             }
             if (model.contains("fallbacks") && model["fallbacks"].is_array()) {
-                for (const auto& fb : model["fallbacks"].as_array()) {
+                for (const auto& fb_item : json_array_items(model["fallbacks"])) {
+                    core::JsonValue fb(fb_item);
                     if (fb.is_string()) {
                         entry.model_fallbacks.push_back(fb.as_string());
                     }
@@ -619,7 +667,8 @@ AgentEntry AgentScopeManager::load_agent_entry_from_json(
     
     // Skills
     if (json.contains("skills") && json["skills"].is_array()) {
-        for (const auto& skill : json["skills"].as_array()) {
+        for (const auto& skill_item : json_array_items(json["skills"])) {
+            core::JsonValue skill(skill_item);
             if (skill.is_string()) {
                 entry.skills.push_back(skill.as_string());
             }
@@ -631,7 +680,7 @@ AgentEntry AgentScopeManager::load_agent_entry_from_json(
         entry.features.memory_search = json["memorySearch"].as_bool();
     }
     if (json.contains("humanDelay") && json["humanDelay"].is_number()) {
-        entry.features.human_delay_ms = json["humanDelay"].as_int();
+        entry.features.human_delay_ms = json_as_int(json["humanDelay"]);
     }
     if (json.contains("heartbeat")) {
         const auto& hb = json["heartbeat"];
@@ -682,7 +731,7 @@ std::string resolve_fallback_agent_id(
 ) {
     if (agent_id && !agent_id->empty()) {
         std::string id = *agent_id;
-        core::utils::trim(id);
+        trim(id);
         return id.empty() ? DEFAULT_AGENT_ID : AgentScopeManager::normalize_agent_id(id);
     }
     
