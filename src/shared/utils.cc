@@ -283,7 +283,7 @@ std::string strip_ansi(const std::string& input) {
   std::regex ansi_sgr(R"(\x1b\[[0-9;]*m)");
   std::string result = std::regex_replace(input, ansi_sgr, "");
   
-  // Remove OSC-8 hyperlinks: ESC]8;;...ESC\
+  // Remove OSC-8 hyperlinks: ESC]8;;...ESC (backslash)
   std::regex osc8_regex(R"(\x1b\]8;;.*?\x1b\\|\x1b\]8;;\x1b\\)");
   result = std::regex_replace(result, osc8_regex, "");
   

@@ -63,6 +63,29 @@ new_local_repository(
 )
 
 # ============================================================================
+# Rules License (required by BoringSSL)
+# ============================================================================
+http_archive(
+    name = "rules_license",
+    urls = [
+        "https://github.com/bazelbuild/rules_license/releases/download/0.0.7/rules_license-0.0.7.tar.gz",
+    ],
+    sha256 = "4531deccb913639c30e5c7512a054d5d875698daeb75d8cf90f284375fe7c360",
+)
+
+# ============================================================================
+# BoringSSL (Google's OpenSSL fork with Ed25519 support)
+# Using an older commit compatible with Bazel 3.7.2
+# ============================================================================
+http_archive(
+    name = "boringssl",
+    # Use commit from 2021 that works with older Bazel
+    urls = ["https://github.com/google/boringssl/archive/afc30d43eef92979b05776ec0963c9cede5fb80f.tar.gz"],
+    strip_prefix = "boringssl-afc30d43eef92979b05776ec0963c9cede5fb80f",
+    sha256 = "2b18e1c1ad15cc180529ababde8a62885ac35005131e9a797cdaf0e07d76a767",
+)
+
+# ============================================================================
 # System Libraries (OpenSSL, libcurl, etc.)
 # ============================================================================
 # These will be referenced via linkopts in BUILD files

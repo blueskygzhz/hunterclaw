@@ -1,188 +1,208 @@
 #include "hunterclaw/infra/path_safety.h"
 
 #include <filesystem>
+#include <cstdlib>
 #include <algorithm>
-#include <cctype>
+
+#include "absl/strings/str_cat.h"
 
 namespace fs = std::filesystem;
 
-namespace hunterclaw {
-namespace infra {
+namespace hunterclaw::infra {
 
-PathSafetyChecker::PathSafetyChecker(const Config& config)
-    : workspace_root_(config.workspace_root),
-      allow_home_access_(config.allow_home_access),
-      block_patterns_(config.block_patterns) {
-  // Normalize workspace root to absolute path with trailing separator
-  workspace_root_ = fs::absolute(workspace_root_).string();
-  if (!workspace_root_.empty() &&
-      workspace_root_.back() != fs::path::preferred_separator) {
-    workspace_root_ += fs::path::preferred_separator;
-  }
-}
-
-PathSafetyChecker::CheckResult PathSafetyChecker::CheckPath(
-    const std::string& path,
-    const std::unordered_map<std::string, std::string>& env) const {
-  CheckResult result;
-  result.is_safe = true;
-
-  // Expand ~ to home directory
-  std::string expanded_path = ExpandHomePath(path, env);
-
-  // Convert to absolute path
-  fs::path abs_path;
+PathSafetyChecker::PathSafetyChecker(absl::string_view workspace_root)
+    : workspace_root_(workspace_root) {
+  // Normalize workspace root to absolute path
   try {
-    abs_path = fs::absolute(expanded_path);
-  } catch (const std::exception& e) {
-    result.is_safe = false;
-    result.violations.push_back(PathViolation{
-        .type = ViolationType::kInvalidPath,
-        .description = "Invalid path: " + std::string(e.what()),
-        .path = path});
-    return result;
+    workspace_root_ = fs::absolute(workspace_root_).string();
+  } catch (const std::exception&) {
+    // Keep original if conversion fails
   }
-
-  std::string abs_path_str = abs_path.string();
-  result.resolved_path = abs_path_str;
-
-  // Check for path traversal attempts (../)
-  if (path.find("..") != std::string::npos) {
-    result.is_safe = false;
-    result.violations.push_back(PathViolation{
-        .type = ViolationType::kPathTraversal,
-        .description =
-            "Path contains \"..\" (potential path traversal attack)",
-        .path = path,
-        .resolved_path = abs_path_str});
-  }
-
-  // Check if path is within workspace root
-  if (!IsPathInside(workspace_root_, abs_path_str)) {
-    result.is_safe = false;
-    result.violations.push_back(PathViolation{
-        .type = ViolationType::kOutsideWorkspace,
-        .description = "Path is outside workspace root",
-        .path = path,
-        .resolved_path = abs_path_str,
-        .workspace_root = workspace_root_});
-    return result;
-  }
-
-  // Check against block patterns (e.g., *.ssh/*, /etc/passwd)
-  for (const auto& pattern : block_patterns_) {
-    if (MatchesPattern(abs_path_str, pattern)) {
-      result.is_safe = false;
-      result.violations.push_back(PathViolation{
-          .type = ViolationType::kBlockedPattern,
-          .description = "Path matches blocked pattern: " + pattern,
-          .path = path,
-          .resolved_path = abs_path_str,
-          .blocked_pattern = pattern});
-    }
-  }
-
-  return result;
 }
 
-std::string PathSafetyChecker::ExpandHomePath(
-    const std::string& path,
-    const std::unordered_map<std::string, std::string>& env) const {
-  if (path.empty() || path[0] != '~') {
-    return path;
+absl::Status PathSafetyChecker::CheckTraversal(absl::string_view path) const {
+  if (ContainsTraversalSequence(path)) {
+    return absl::InvalidArgumentError(
+        "Path contains traversal sequence (../)");
   }
+  return absl::OkStatus();
+}
 
-  std::string home_dir;
-  auto home_it = env.find("HOME");
-  if (home_it != env.end()) {
-    home_dir = home_it->second;
-  } else {
-#ifdef _WIN32
-    auto userprofile_it = env.find("USERPROFILE");
-    if (userprofile_it != env.end()) {
-      home_dir = userprofile_it->second;
+absl::Status PathSafetyChecker::CheckWorkspaceBoundary(
+    absl::string_view path) const {
+  auto normalized = NormalizePath(path);
+  if (!normalized.ok()) {
+    return normalized.status();
+  }
+  
+  if (!IsPathInside(workspace_root_, *normalized)) {
+    return absl::PermissionDeniedError(
+        "Path is outside workspace boundary");
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<std::string> PathSafetyChecker::NormalizePath(
+    absl::string_view path) const {
+  // Expand home path first
+  auto expanded = ExpandHomePath(path);
+  if (!expanded.ok()) {
+    return expanded;
+  }
+  
+  // Then resolve canonical path
+  return ResolveCanonicalPath(*expanded);
+}
+
+absl::StatusOr<bool> PathSafetyChecker::IsSymlink(
+    absl::string_view path) const {
+  try {
+    fs::path p(path);
+    return fs::is_symlink(p);
+  } catch (const std::exception& e) {
+    return absl::InternalError(
+        absl::StrCat("Failed to check symlink: ", e.what()));
+  }
+}
+
+absl::StatusOr<bool> PathSafetyChecker::IsHardlink(
+    absl::string_view path) const {
+  try {
+    fs::path p(path);
+    if (!fs::exists(p)) {
+      return false;
     }
-#else
-    home_dir = std::getenv("HOME");
+    return fs::hard_link_count(p) > 1;
+  } catch (const std::exception& e) {
+    return absl::InternalError(
+        absl::StrCat("Failed to check hardlink: ", e.what()));
+  }
+}
+
+absl::Status PathSafetyChecker::ValidatePath(absl::string_view path) const {
+  // Check traversal
+  auto traversal_check = CheckTraversal(path);
+  if (!traversal_check.ok()) {
+    return traversal_check;
+  }
+  
+  // Check workspace boundary
+  return CheckWorkspaceBoundary(path);
+}
+
+void PathSafetyChecker::SetWorkspaceRoot(absl::string_view new_root) {
+  workspace_root_ = std::string(new_root);
+  try {
+    workspace_root_ = fs::absolute(workspace_root_).string();
+  } catch (const std::exception&) {
+    // Keep original if conversion fails
+  }
+}
+
+// Private helper methods
+
+bool PathSafetyChecker::ContainsTraversalSequence(
+    absl::string_view path) const {
+  return path.find("..") != absl::string_view::npos;
+}
+
+absl::StatusOr<std::string> PathSafetyChecker::ExpandHomePath(
+    absl::string_view path) const {
+  if (path.empty() || path[0] != '~') {
+    return std::string(path);
+  }
+  
+  const char* home = std::getenv("HOME");
+  if (!home) {
+#ifdef _WIN32
+    home = std::getenv("USERPROFILE");
 #endif
   }
-
-  if (home_dir.empty()) {
-    return path;  // Cannot expand, return as-is
+  
+  if (!home) {
+    return absl::NotFoundError("HOME directory not found");
   }
-
+  
   if (path.length() == 1) {
-    return home_dir;
+    return std::string(home);
   }
-
+  
   if (path[1] == '/' || path[1] == '\\') {
-    return home_dir + path.substr(1);
+    return absl::StrCat(home, path.substr(1));
   }
+  
+  return std::string(path);
+}
 
-  return path;  // ~user not supported, return as-is
+absl::StatusOr<std::string> PathSafetyChecker::ResolveCanonicalPath(
+    absl::string_view path) const {
+  try {
+    fs::path p(path);
+    
+    // Try to get canonical path (resolves symlinks)
+    if (fs::exists(p)) {
+      return fs::canonical(p).string();
+    } else {
+      // If path doesn't exist, just return absolute form
+      return fs::absolute(p).string();
+    }
+  } catch (const std::exception& e) {
+    return absl::InternalError(
+        absl::StrCat("Failed to resolve path: ", e.what()));
+  }
 }
 
 bool PathSafetyChecker::IsPathInside(const std::string& root,
-                                     const std::string& target) const {
-  // Both paths must be absolute
-  if (root.empty() || target.empty()) {
+                                      const std::string& path) const {
+  if (root.empty() || path.empty()) {
     return false;
   }
-
-  // Normalize paths for comparison
-  std::string root_normalized = fs::path(root).string();
-  std::string target_normalized = fs::path(target).string();
-
+  
+  // Normalize both paths
+  std::string root_normalized = root;
+  std::string path_normalized = path;
+  
   // Ensure root has trailing separator
   if (!root_normalized.empty() &&
       root_normalized.back() != fs::path::preferred_separator) {
     root_normalized += fs::path::preferred_separator;
   }
-
-  // Check if target starts with root
-  if (target_normalized.size() < root_normalized.size()) {
+  
+  // Check if path starts with root
+  if (path_normalized.size() < root_normalized.size()) {
     return false;
   }
-
-  return target_normalized.compare(0, root_normalized.size(),
-                                    root_normalized) == 0;
+  
+  return path_normalized.compare(0, root_normalized.size(),
+                                  root_normalized) == 0;
 }
 
-bool PathSafetyChecker::MatchesPattern(const std::string& path,
-                                       const std::string& pattern) const {
-  // Simple wildcard matching (* and ?)
-  // For production, use std::regex or glob library
+// Global utility functions
 
-  size_t path_idx = 0;
-  size_t pattern_idx = 0;
-  size_t star_idx = std::string::npos;
-  size_t match_idx = 0;
+absl::Status QuickPathSafetyCheck(absl::string_view path) {
+  if (path.find("..") != absl::string_view::npos) {
+    return absl::InvalidArgumentError("Path contains traversal sequence");
+  }
+  if (ContainsDangerousChars(path)) {
+    return absl::InvalidArgumentError("Path contains dangerous characters");
+  }
+  return absl::OkStatus();
+}
 
-  while (path_idx < path.length()) {
-    if (pattern_idx < pattern.length() && pattern[pattern_idx] == '*') {
-      star_idx = pattern_idx;
-      match_idx = path_idx;
-      pattern_idx++;
-    } else if (pattern_idx < pattern.length() &&
-               (pattern[pattern_idx] == '?' ||
-                pattern[pattern_idx] == path[path_idx])) {
-      path_idx++;
-      pattern_idx++;
-    } else if (star_idx != std::string::npos) {
-      pattern_idx = star_idx + 1;
-      match_idx++;
-      path_idx = match_idx;
-    } else {
-      return false;
+bool ContainsDangerousChars(absl::string_view path) {
+  // Check for null bytes and other dangerous characters
+  for (char c : path) {
+    if (c == '\0' || c < 0x20) {
+      return true;
     }
   }
-
-  while (pattern_idx < pattern.length() && pattern[pattern_idx] == '*') {
-    pattern_idx++;
-  }
-
-  return pattern_idx == pattern.length();
+  return false;
 }
 
-}  // namespace infra
-}  // namespace hunterclaw
+std::string NormalizePathSeparators(absl::string_view path) {
+  std::string result(path);
+  std::replace(result.begin(), result.end(), '\\', '/');
+  return result;
+}
+
+}  // namespace hunterclaw::infra

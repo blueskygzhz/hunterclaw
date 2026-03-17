@@ -18,7 +18,7 @@ std::unique_ptr<ProcessHealthChecker::HeartbeatWorker> ProcessHealthChecker::wor
 
 // ==================== 公共接口 ====================
 
-Result<HealthStatus> ProcessHealthChecker::Check(uint32_t pid) {
+core::Result<HealthStatus> ProcessHealthChecker::Check(uint32_t pid) {
 #ifdef __linux__
     return CheckLinux(pid);
 #elif defined(__APPLE__)
@@ -26,17 +26,17 @@ Result<HealthStatus> ProcessHealthChecker::Check(uint32_t pid) {
 #elif defined(_WIN32)
     return CheckWindows(pid);
 #else
-    return Result<HealthStatus>::Err("Unsupported platform");
+    return core::Result<HealthStatus>::Err("Unsupported platform");
 #endif
 }
 
-Result<HealthStatus> ProcessHealthChecker::CheckByService(const std::string& service_name) {
+core::Result<HealthStatus> ProcessHealthChecker::CheckByService(const std::string& service_name) {
     // 这里需要与 daemon 服务集成,读取 PID
     // 简化实现:从 /var/run/hunterclaw.pid 读取
     std::string pid_file = "/var/run/" + service_name + ".pid";
     std::ifstream file(pid_file);
     if (!file.is_open()) {
-        return Result<HealthStatus>::Err("Service not running or PID file not found");
+        return core::Result<HealthStatus>::Err("Service not running or PID file not found");
     }
     
     uint32_t pid;
@@ -46,15 +46,15 @@ Result<HealthStatus> ProcessHealthChecker::CheckByService(const std::string& ser
     return Check(pid);
 }
 
-Result<void> ProcessHealthChecker::StartHeartbeat(const HeartbeatConfig& config) {
+core::Result<void> ProcessHealthChecker::StartHeartbeat(const HeartbeatConfig& config) {
     if (IsHeartbeatRunning()) {
-        return Result<void>::Err("Heartbeat already running");
+        return core::Result<void>::Err("Heartbeat already running");
     }
     
     worker_ = std::make_unique<HeartbeatWorker>(config);
     worker_->Start();
     
-    return Result<void>::Ok();
+    return core::Result<void>::Ok();
 }
 
 void ProcessHealthChecker::StopHeartbeat() {
@@ -71,16 +71,16 @@ bool ProcessHealthChecker::IsHeartbeatRunning() {
 // ==================== Linux 实现 ====================
 
 #ifdef __linux__
-Result<HealthStatus> ProcessHealthChecker::CheckLinux(uint32_t pid) {
+core::Result<HealthStatus> ProcessHealthChecker::CheckLinux(uint32_t pid) {
     return ParseProcStat(pid);
 }
 
-Result<HealthStatus> ProcessHealthChecker::ParseProcStat(uint32_t pid) {
+core::Result<HealthStatus> ProcessHealthChecker::ParseProcStat(uint32_t pid) {
     std::string stat_path = "/proc/" + std::to_string(pid) + "/stat";
     std::ifstream stat_file(stat_path);
     
     if (!stat_file.is_open()) {
-        return Result<HealthStatus>::Err("Process not found or no access");
+        return core::Result<HealthStatus>::Err("Process not found or no access");
     }
     
     HealthStatus status;
@@ -138,23 +138,23 @@ Result<HealthStatus> ProcessHealthChecker::ParseProcStat(uint32_t pid) {
     status.fd_count = 0;  // 需要遍历目录计数
     
     status.status_message = "healthy";
-    return Result<HealthStatus>::Ok(status);
+    return core::Result<HealthStatus>::Ok(status);
 }
 #endif
 
 // ==================== macOS 实现 ====================
 
 #ifdef __APPLE__
-Result<HealthStatus> ProcessHealthChecker::CheckMacOS(uint32_t pid) {
+core::Result<HealthStatus> ProcessHealthChecker::CheckMacOS(uint32_t pid) {
     return ParsePsOutput(pid);
 }
 
-Result<HealthStatus> ProcessHealthChecker::ParsePsOutput(uint32_t pid) {
+core::Result<HealthStatus> ProcessHealthChecker::ParsePsOutput(uint32_t pid) {
     // 使用 ps 命令
     std::string cmd = "ps -p " + std::to_string(pid) + " -o pid,vsz,rss,%cpu,etime";
     FILE* pipe = popen(cmd.c_str(), "r");
     if (!pipe) {
-        return Result<HealthStatus>::Err("Failed to execute ps command");
+        return core::Result<HealthStatus>::Err("Failed to execute ps command");
     }
     
     HealthStatus status;
@@ -185,19 +185,19 @@ Result<HealthStatus> ProcessHealthChecker::ParsePsOutput(uint32_t pid) {
     pclose(pipe);
     
     if (!found) {
-        return Result<HealthStatus>::Err("Process not found");
+        return core::Result<HealthStatus>::Err("Process not found");
     }
     
-    return Result<HealthStatus>::Ok(status);
+    return core::Result<HealthStatus>::Ok(status);
 }
 #endif
 
 // ==================== Windows 实现 (Stub) ====================
 
 #ifdef _WIN32
-Result<HealthStatus> ProcessHealthChecker::CheckWindows(uint32_t pid) {
+core::Result<HealthStatus> ProcessHealthChecker::CheckWindows(uint32_t pid) {
     // TODO: Windows implementation using Performance Counters or WMI
-    return Result<HealthStatus>::Err("Windows health check not implemented yet");
+    return core::Result<HealthStatus>::Err("Windows health check not implemented yet");
 }
 #endif
 

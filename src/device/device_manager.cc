@@ -27,14 +27,14 @@ core::Result<std::string> DeviceManager::request_pairing(
     
     // Validate inputs
     if (device_id.empty() || public_key.empty()) {
-        return core::Error("Device ID and public key are required");
+        return core::Result<std::string>::Err("Device ID and public key are required");
     }
     
     // Check if already paired
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (paired_devices_.count(device_id) > 0) {
-            return core::Error("Device already paired: " + device_id);
+            return core::Result<std::string>::Err("Device already paired: " + device_id);
         }
     }
     
@@ -51,7 +51,7 @@ core::Result<std::string> DeviceManager::request_pairing(
     
     auto validation = validate_pairing_request(request);
     if (!validation.is_ok()) {
-        return core::Error(validation.error_message());
+        return core::Result<std::string>::Err(validation.error);
     }
     
     // Store request
@@ -65,7 +65,7 @@ core::Result<std::string> DeviceManager::request_pairing(
         event_callback_(device_id, "pairing.requested", "{}");
     }
     
-    return request.request_id;
+    return core::Result<std::string>::Ok(request.request_id);
 }
 
 core::Result<PairedDevice> DeviceManager::approve_pairing(const std::string& request_id) {
@@ -76,12 +76,12 @@ core::Result<PairedDevice> DeviceManager::approve_pairing(const std::string& req
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = pending_requests_.find(request_id);
         if (it == pending_requests_.end()) {
-            return core::Error("Pairing request not found: " + request_id);
+            return core::Result<PairedDevice>::Err("Pairing request not found: " + request_id);
         }
         request = it->second;
         
         if (request.approved) {
-            return core::Error("Pairing request already approved");
+            return core::Result<PairedDevice>::Err("Pairing request already approved");
         }
     }
     
@@ -111,7 +111,7 @@ core::Result<PairedDevice> DeviceManager::approve_pairing(const std::string& req
     if (device.role == DeviceRole::NODE) {
         auto node_result = create_node_resources(device);
         if (!node_result.is_ok()) {
-            return core::Error("Failed to create node resources: " + node_result.error_message());
+            return core::Result<PairedDevice>::Err("Failed to create node resources: " + node_result.error);
         }
     }
     
@@ -133,7 +133,7 @@ core::Result<PairedDevice> DeviceManager::approve_pairing(const std::string& req
         event_callback_(device.device_id, "pairing.approved", "{}");
     }
     
-    return device;
+    return core::Result<PairedDevice>::Ok(device);
 }
 
 core::Result<void> DeviceManager::reject_pairing(const std::string& request_id,
@@ -142,7 +142,7 @@ core::Result<void> DeviceManager::reject_pairing(const std::string& request_id,
     
     auto it = pending_requests_.find(request_id);
     if (it == pending_requests_.end()) {
-        return core::Error("Pairing request not found: " + request_id);
+        return core::Result<void>::Err("Pairing request not found: " + request_id);
     }
     
     std::string device_id = it->second.device_id;
@@ -155,7 +155,7 @@ core::Result<void> DeviceManager::reject_pairing(const std::string& request_id,
         event_callback_(device_id, "pairing.rejected", "{\"reason\":\"" + reason + "\"}");
     }
     
-    return core::Ok();
+    return core::Result<void>::Ok();
 }
 
 std::vector<PairingRequest> DeviceManager::list_pending_requests() const {
@@ -191,31 +191,31 @@ core::Result<bool> DeviceManager::verify_token(
     
     auto it = paired_devices_.find(device_id);
     if (it == paired_devices_.end()) {
-        return core::Error("Device not paired: " + device_id);
+        return core::Result<bool>::Err("Device not paired: " + device_id);
     }
     
     auto& device = it->second;
     auto token_it = device.tokens.find(role);
     if (token_it == device.tokens.end()) {
-        return core::Error("Token not found for role: " + role);
+        return core::Result<bool>::Err("Token not found for role: " + role);
     }
     
     auto& device_token = token_it->second;
     
     // Check expiration
     if (device_token.is_expired()) {
-        return core::Error("Token expired");
+        return core::Result<bool>::Err("Token expired");
     }
     
     // Check token match
     if (device_token.token != token) {
-        return core::Error("Token mismatch");
+        return core::Result<bool>::Err("Token mismatch");
     }
     
     // Update last seen
     device.last_seen_ms = current_time_ms();
     
-    return true;
+    return core::Result<bool>::Ok(true);
 }
 
 core::Result<DeviceAuthToken> DeviceManager::rotate_token(
@@ -226,7 +226,7 @@ core::Result<DeviceAuthToken> DeviceManager::rotate_token(
     
     auto it = paired_devices_.find(device_id);
     if (it == paired_devices_.end()) {
-        return core::Error("Device not paired: " + device_id);
+        return core::Result<DeviceAuthToken>::Err("Device not paired: " + device_id);
     }
     
     auto& device = it->second;
@@ -240,7 +240,7 @@ core::Result<DeviceAuthToken> DeviceManager::rotate_token(
         event_callback_(device_id, "token.rotated", "{\"role\":\"" + role + "\"}");
     }
     
-    return new_token;
+    return core::Result<DeviceAuthToken>::Ok(new_token);
 }
 
 core::Result<void> DeviceManager::revoke_token(
@@ -251,7 +251,7 @@ core::Result<void> DeviceManager::revoke_token(
     
     auto it = paired_devices_.find(device_id);
     if (it == paired_devices_.end()) {
-        return core::Error("Device not paired: " + device_id);
+        return core::Result<void>::Err("Device not paired: " + device_id);
     }
     
     auto& device = it->second;
@@ -262,7 +262,7 @@ core::Result<void> DeviceManager::revoke_token(
         event_callback_(device_id, "token.revoked", "{\"role\":\"" + role + "\"}");
     }
     
-    return core::Ok();
+    return core::Result<void>::Ok();
 }
 
 std::vector<PairedDevice> DeviceManager::list_paired_devices() const {
@@ -325,7 +325,7 @@ core::Result<void> DeviceManager::unpair_device(const std::string& device_id) {
         
         auto it = paired_devices_.find(device_id);
         if (it == paired_devices_.end()) {
-            return core::Error("Device not paired: " + device_id);
+            return core::Result<void>::Err("Device not paired: " + device_id);
         }
         
         device = it->second;
@@ -345,7 +345,7 @@ core::Result<void> DeviceManager::unpair_device(const std::string& device_id) {
         event_callback_(device_id, "device.unpaired", "{}");
     }
     
-    return core::Ok();
+    return core::Result<void>::Ok();
 }
 
 void DeviceManager::update_heartbeat(const std::string& device_id) {
@@ -405,18 +405,18 @@ std::string DeviceManager::get_statistics() const {
 
 core::Result<void> DeviceManager::validate_pairing_request(const PairingRequest& request) const {
     if (request.device_id.empty()) {
-        return core::Error("Device ID cannot be empty");
+        return core::Result<void>::Err("Device ID cannot be empty");
     }
     if (request.public_key.empty()) {
-        return core::Error("Public key cannot be empty");
+        return core::Result<void>::Err("Public key cannot be empty");
     }
     if (request.platform.empty()) {
-        return core::Error("Platform cannot be empty");
+        return core::Result<void>::Err("Platform cannot be empty");
     }
     if (request.role != "node" && request.role != "operator") {
-        return core::Error("Invalid role: " + request.role);
+        return core::Result<void>::Err("Invalid role: " + request.role);
     }
-    return core::Ok();
+    return core::Result<void>::Ok();
 }
 
 DeviceAuthToken DeviceManager::generate_token(
@@ -454,9 +454,7 @@ core::Result<void> DeviceManager::create_node_resources(PairedDevice& device) {
         config.metadata["display_name"] = device.display_name;
         
         auto sandbox_info = sandbox_manager_->create_sandbox(config);
-        if (sandbox_info.is_ok()) {
-            device.sandbox_id = sandbox_info.unwrap().id;
-        }
+        device.sandbox_id = sandbox_info.id;
     }
     
     // Register node if registry available
@@ -480,7 +478,7 @@ core::Result<void> DeviceManager::create_node_resources(PairedDevice& device) {
         }
     }
     
-    return core::Ok();
+    return core::Result<void>::Ok();
 }
 
 core::Result<void> DeviceManager::cleanup_node_resources(const PairedDevice& device) {
@@ -494,7 +492,7 @@ core::Result<void> DeviceManager::cleanup_node_resources(const PairedDevice& dev
         sandbox_manager_->delete_sandbox(device.sandbox_id);
     }
     
-    return core::Ok();
+    return core::Result<void>::Ok();
 }
 
 int64_t DeviceManager::current_time_ms() const {

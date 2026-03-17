@@ -44,13 +44,13 @@ struct HeartbeatConfig {
 class ProcessHealthChecker {
 public:
     // 健康检查 (单次)
-    static Result<HealthStatus> Check(uint32_t pid);
+    static core::Result<HealthStatus> Check(uint32_t pid);
     
     // 健康检查 (按服务名)
-    static Result<HealthStatus> CheckByService(const std::string& service_name);
+    static core::Result<HealthStatus> CheckByService(const std::string& service_name);
     
     // 启动心跳监控 (后台线程)
-    static Result<void> StartHeartbeat(const HeartbeatConfig& config);
+    static core::Result<void> StartHeartbeat(const HeartbeatConfig& config);
     
     // 停止心跳监控
     static void StopHeartbeat();
@@ -63,15 +63,15 @@ private:
     static std::unique_ptr<HeartbeatWorker> worker_;
     
     // 平台相关实现
-    static Result<HealthStatus> CheckLinux(uint32_t pid);
-    static Result<HealthStatus> CheckMacOS(uint32_t pid);
-    static Result<HealthStatus> CheckWindows(uint32_t pid);
+    static core::Result<HealthStatus> CheckLinux(uint32_t pid);
+    static core::Result<HealthStatus> CheckMacOS(uint32_t pid);
+    static core::Result<HealthStatus> CheckWindows(uint32_t pid);
     
     // 解析 /proc/[pid]/stat (Linux)
-    static Result<HealthStatus> ParseProcStat(uint32_t pid);
+    static core::Result<HealthStatus> ParseProcStat(uint32_t pid);
     
     // 使用 ps (macOS)
-    static Result<HealthStatus> ParsePsOutput(uint32_t pid);
+    static core::Result<HealthStatus> ParsePsOutput(uint32_t pid);
 };
 
 // 心跳工作线程

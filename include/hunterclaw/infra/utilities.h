@@ -65,8 +65,8 @@ struct JsonValue {
     std::string string_value;
     double number_value;
     bool bool_value;
-    std::vector<JsonValue> array_value;
-    std::unordered_map<std::string, JsonValue> object_value;
+    std::vector<std::shared_ptr<JsonValue>> array_value;
+    std::unordered_map<std::string, std::shared_ptr<JsonValue>> object_value;
     
     JsonValue() : type(Type::Null), number_value(0.0), bool_value(false) {}
 };

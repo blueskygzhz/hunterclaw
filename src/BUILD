@@ -5,6 +5,36 @@
 package(default_visibility = ["//visibility:public"])
 
 # ============================================================================
+# Device Library - Device Authentication and Management (使用系统 OpenSSL + RSA)
+# ============================================================================
+cc_library(
+    name = "hunterclaw_device",
+    srcs = glob(["device/*.cc"]),
+    deps = [
+        "//:hunterclaw_headers",
+        "@nlohmann_json//:json",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+    copts = [
+        "-std=c++17",
+        "-Wall",
+        "-Wextra",
+        "-Wno-unused-parameter",
+        "-I/usr/include/jsoncpp",
+        "-I/usr/include/spdlog",
+    ],
+    linkopts = [
+        "-lpthread",
+        "-lssl",       # System OpenSSL (使用 RSA，兼容 OpenSSL 1.0.2)
+        "-lcrypto",
+        "-ljsoncpp",
+    ],
+    linkstatic = False,
+    visibility = ["//visibility:public"],
+)
+
+# ============================================================================
 # Cron Library - Cron Job Scheduling and Management
 # ============================================================================
 cc_library(
@@ -431,6 +461,33 @@ cc_binary(
         "-lstdc++",
         "-lstdc++fs",  # C++17 filesystem
         "-lboost_system",  # Boost.System
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# ============================================================================
+# CLI Executable - Command Line Interface
+# ============================================================================
+cc_binary(
+    name = "hunterclaw_cli",
+    srcs = ["cli_main.cc"],
+    deps = [
+        "//:hunterclaw_headers",
+        "@nlohmann_json//:json",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+    copts = [
+        "-std=c++17",
+        "-Wall",
+        "-Wextra",
+        "-I/usr/include/jsoncpp",
+        "-I/usr/include/spdlog",
+    ],
+    linkopts = [
+        "-lpthread",
+        "-lstdc++",
+        "-lstdc++fs",  # C++17 filesystem
     ],
     visibility = ["//visibility:public"],
 )

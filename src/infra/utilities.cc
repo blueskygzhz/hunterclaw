@@ -93,7 +93,11 @@ std::optional<std::string> safe_json_stringify(const JsonValue& value) {
                 oss << "[";
                 for (size_t i = 0; i < value.array_value.size(); ++i) {
                     if (i > 0) oss << ",";
-                    auto elem_str = safe_json_stringify(value.array_value[i]);
+                    if (!value.array_value[i]) {
+                        oss << "null";
+                        continue;
+                    }
+                    auto elem_str = safe_json_stringify(*value.array_value[i]);
                     if (!elem_str) return std::nullopt;
                     oss << *elem_str;
                 }
@@ -107,7 +111,11 @@ std::optional<std::string> safe_json_stringify(const JsonValue& value) {
                     if (!first) oss << ",";
                     first = false;
                     oss << "\"" << key << "\":";
-                    auto val_str = safe_json_stringify(val);
+                    if (!val) {
+                        oss << "null";
+                        continue;
+                    }
+                    auto val_str = safe_json_stringify(*val);
                     if (!val_str) return std::nullopt;
                     oss << *val_str;
                 }

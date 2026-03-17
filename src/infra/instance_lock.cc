@@ -53,7 +53,7 @@ InstanceLock::~InstanceLock() {
 
 // ==================== 公共接口 ====================
 
-Result<InstanceLock> InstanceLock::Acquire(const std::string& name) {
+core::Result<InstanceLock> InstanceLock::Acquire(const std::string& name) {
     std::string lock_path = GetLockPath(name);
     
     // 确保目录存在
@@ -89,7 +89,7 @@ Result<InstanceLock> InstanceLock::Acquire(const std::string& name) {
     return Result<InstanceLock>::Ok(InstanceLock(fd, lock_path));
 }
 
-Result<InstanceLock> InstanceLock::TryAcquire(const std::string& name) {
+core::Result<InstanceLock> InstanceLock::TryAcquire(const std::string& name) {
     std::string lock_path = GetLockPath(name);
     
     // 确保目录存在
@@ -159,7 +159,7 @@ std::string InstanceLock::GetLockPath(const std::string& name) {
 #endif
 }
 
-Result<uint32_t> InstanceLock::GetLockOwner(const std::string& name) {
+core::Result<uint32_t> InstanceLock::GetLockOwner(const std::string& name) {
     std::string lock_path = GetLockPath(name);
     
     std::ifstream file(lock_path);
@@ -183,7 +183,7 @@ Result<uint32_t> InstanceLock::GetLockOwner(const std::string& name) {
     return Result<uint32_t>::Ok(pid);
 }
 
-Result<void> InstanceLock::ForceRelease(const std::string& name) {
+core::Result<void> InstanceLock::ForceRelease(const std::string& name) {
     std::string lock_path = GetLockPath(name);
     
     // 检查锁是否被持有

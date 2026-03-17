@@ -26,6 +26,16 @@ namespace fs = std::filesystem;  // ✅ 添加命名空间别名
 // C++11 兼容的路径操作函数
 namespace path_utils {
 
+inline bool ends_with(const std::string& str, const std::string& suffix) {
+    if (suffix.length() > str.length()) return false;
+    return str.compare(str.length() - suffix.length(), suffix.length(), suffix) == 0;
+}
+
+inline bool starts_with(const std::string& str, const std::string& prefix) {
+    if (prefix.length() > str.length()) return false;
+    return str.compare(0, prefix.length(), prefix) == 0;
+}
+
 inline bool is_absolute(const std::string& p) {
     return !p.empty() && p[0] == '/';
 }
@@ -53,16 +63,6 @@ inline std::string parent_path(const std::string& path) {
         return ".";
     }
     return path.substr(0, pos);
-}
-
-inline bool ends_with(const std::string& str, const std::string& suffix) {
-    if (suffix.length() > str.length()) return false;
-    return str.compare(str.length() - suffix.length(), suffix.length(), suffix) == 0;
-}
-
-inline bool starts_with(const std::string& str, const std::string& prefix) {
-    if (prefix.length() > str.length()) return false;
-    return str.compare(0, prefix.length(), prefix) == 0;
 }
 
 inline bool file_exists(const std::string& path) {
@@ -230,13 +230,13 @@ std::string resolve_archive_type(
     std::transform(lower_filename.begin(), lower_filename.end(), 
                    lower_filename.begin(), ::tolower);
     
-    if (lower_filename.ends_with(".tar.gz") || lower_filename.ends_with(".tgz")) {
+    if (path_utils::ends_with(lower_filename, ".tar.gz") || path_utils::ends_with(lower_filename, ".tgz")) {
         return "tar.gz";
     }
-    if (lower_filename.ends_with(".tar.bz2") || lower_filename.ends_with(".tbz2")) {
+    if (path_utils::ends_with(lower_filename, ".tar.bz2") || path_utils::ends_with(lower_filename, ".tbz2")) {
         return "tar.bz2";
     }
-    if (lower_filename.ends_with(".zip")) {
+    if (path_utils::ends_with(lower_filename, ".zip")) {
         return "zip";
     }
     
@@ -496,7 +496,8 @@ DownloadResult install_download_spec(
         fs::path canonical_root = fs::canonical(safe_root);
         
         auto rel = fs::relative(canonical_target, canonical_root);
-        if (rel.empty() || rel.string().starts_with("..")) {
+        std::string rel_str = rel.string();
+        if (rel.empty() || path_utils::starts_with(rel_str, "..")) {
             throw std::runtime_error("target directory outside allowed root");
         }
         
@@ -510,9 +511,10 @@ DownloadResult install_download_spec(
     fs::path archive_path = fs::path(target_dir) / filename;
     fs::path archive_relative = fs::relative(archive_path, safe_root);
     
+    std::string rel_str = archive_relative.string();
     if (archive_relative.empty() || 
-        archive_relative.string() == ".." ||
-        archive_relative.string().starts_with("..") ||
+        rel_str == ".." ||
+        path_utils::starts_with(rel_str, "..") ||
         archive_relative.is_absolute()) {
         return {false, "invalid download archive path", -1, "", 
                 "invalid download archive path", {}};

@@ -4,6 +4,8 @@
 #include <sstream>
 #include <iomanip>
 #include <chrono>
+#include <set>
+#include <optional>
 
 namespace hunterclaw {
 namespace logging {
@@ -238,7 +240,7 @@ private:
         const std::string& message,
         const std::map<std::string, std::string>& meta
     ) {
-        if (!is_enabled(level)) {
+        if (!is_enabled(level, LogTarget::Any)) {
             return;
         }
         

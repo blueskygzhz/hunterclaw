@@ -14,7 +14,7 @@
 #include <pwd.h>
 #include <nlohmann/json.hpp>
 
-#include "gateway/methods/skills_install_download.h"  // ✅ 通过 -Isrc 可访问
+#include "hunterclaw/gateway/methods/skills_install_download.h"
 #include "hunterclaw/skills/skills_manager.h"
 
 using json = nlohmann::json;

@@ -14,6 +14,9 @@
 namespace hunterclaw {
 namespace core {
 
+// Forward declarations
+template<typename T> struct Result;
+
 // ============================================================================
 // Basic Types
 // ============================================================================
@@ -125,6 +128,61 @@ public:
         return contains(key);
     }
     
+    // Alternative name for contains
+    bool has(const std::string& key) const {
+        return contains(key);
+    }
+    
+    // Get array size
+    size_t size() const {
+        if (type_ == Type::Array) {
+            return arr_val_.size();
+        } else if (type_ == Type::Object) {
+            return obj_val_.size();
+        }
+        return 0;
+    }
+    
+    // Array operator[]
+    JsonValue& operator[](size_t index) {
+        if (type_ != Type::Array) {
+            throw std::runtime_error("JsonValue is not an array");
+        }
+        if (index >= arr_val_.size()) {
+            throw std::runtime_error("Array index out of bounds");
+        }
+        return *arr_val_[index];
+    }
+    
+    const JsonValue& operator[](size_t index) const {
+        if (type_ != Type::Array) {
+            throw std::runtime_error("JsonValue is not an array");
+        }
+        if (index >= arr_val_.size()) {
+            throw std::runtime_error("Array index out of bounds");
+        }
+        return *arr_val_[index];
+    }
+    
+    // Get value with default fallback
+    template<typename T>
+    T get(const std::string& key, const T& default_value) const {
+        if (type_ != Type::Object) return default_value;
+        auto it = obj_val_.find(key);
+        if (it == obj_val_.end()) return default_value;
+        
+        if constexpr (std::is_same_v<T, std::string>) {
+            return it->second->is_string() ? it->second->as_string() : default_value;
+        } else if constexpr (std::is_same_v<T, bool>) {
+            return it->second->is_bool() ? it->second->as_bool() : default_value;
+        } else if constexpr (std::is_same_v<T, double>) {
+            return it->second->is_number() ? it->second->as_number() : default_value;
+        } else if constexpr (std::is_same_v<T, int>) {
+            return it->second->is_number() ? static_cast<int>(it->second->as_number()) : default_value;
+        }
+        return default_value;
+    }
+    
     void push_back(const JsonValue& val) {
         if (type_ != Type::Array) {
             type_ = Type::Array;
@@ -160,6 +218,14 @@ public:
         }
         return nullptr;
     }
+    
+    // Convert to JSON string
+    std::string to_string() const {
+        return to_json().dump();
+    }
+    
+    // Parse JSON from string (implemented after Result definition)
+    static Result<JsonValue> parse(const std::string& json_str);
     
     // Check if object contains key
     bool contains(const std::string& key) const {
@@ -267,6 +333,16 @@ struct Result<void> {
         }
     }
 };
+
+// JsonValue::parse implementation (must be after Result definition)
+inline Result<JsonValue> JsonValue::parse(const std::string& json_str) {
+    try {
+        auto j = nlohmann::json::parse(json_str);
+        return Result<JsonValue>::Ok(JsonValue(j));
+    } catch (const std::exception& e) {
+        return Result<JsonValue>::Err(std::string("JSON parse error: ") + e.what());
+    }
+}
 
 // ============================================================================
 // Configuration Types

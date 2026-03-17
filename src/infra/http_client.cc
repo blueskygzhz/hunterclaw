@@ -121,9 +121,9 @@ core::Result<HttpResponse> HttpClient::request(
     // 1. Parse URL
     auto parsed = parse_url(url);
     if (parsed.is_err()) {
-        return core::Result<HttpResponse>::Err(parsed.error());
+        return core::Result<HttpResponse>::Err(parsed.error);
     }
-    auto& u = parsed.value();
+    auto& u = parsed.value;
     
     int socket_fd = -1;
     void* ssl_ctx = nullptr;
@@ -134,27 +134,27 @@ core::Result<HttpResponse> HttpClient::request(
 #ifdef HUNTERCLAW_ENABLE_SSL
         auto ssl_result = connect_ssl(u.host, u.port, options.timeout_ms);
         if (ssl_result.is_err()) {
-            return core::Result<HttpResponse>::Err(ssl_result.error());
+            return core::Result<HttpResponse>::Err(ssl_result.error);
         }
-        socket_fd = ssl_result.value().socket_fd;
-        ssl_ctx = ssl_result.value().ssl_ctx;
-        ssl = ssl_result.value().ssl;
+        socket_fd = ssl_result.value.socket_fd;
+        ssl_ctx = ssl_result.value.ssl_ctx;
+        ssl = ssl_result.value.ssl;
 #else
         return core::Result<HttpResponse>::Err("HTTPS not supported (compile with HUNTERCLAW_ENABLE_SSL)");
 #endif
     } else {
         auto socket_result = connect_socket(u.host, u.port, options.timeout_ms);
         if (socket_result.is_err()) {
-            return core::Result<HttpResponse>::Err(socket_result.error());
+            return core::Result<HttpResponse>::Err(socket_result.error);
         }
-        socket_fd = socket_result.value();
+        socket_fd = socket_result.value;
     }
     
     // 3. Send request
     auto send_result = send_request(socket_fd, ssl, method, u.path, u.host, u.port, options);
     if (send_result.is_err()) {
         close_connection(socket_fd, ssl_ctx, ssl);
-        return core::Result<HttpResponse>::Err(send_result.error());
+        return core::Result<HttpResponse>::Err(send_result.error);
     }
     
     // 4. Receive response
@@ -335,9 +335,9 @@ core::Result<HttpClient::SslConnection> HttpClient::connect_ssl(
     // Create TCP connection first
     auto socket_result = connect_socket(host, port, timeout_ms);
     if (socket_result.is_err()) {
-        return core::Result<SslConnection>::Err(socket_result.error());
+        return core::Result<SslConnection>::Err(socket_result.error);
     }
-    int socket_fd = socket_result.value();
+    int socket_fd = socket_result.value;
     
     // Create SSL context
     const SSL_METHOD* method = TLS_client_method();

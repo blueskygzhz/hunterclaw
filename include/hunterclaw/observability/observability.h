@@ -318,6 +318,8 @@ public:
     const SpanContext& context() const { return context_; }
     
 private:
+    friend class Tracer;  // Allow Tracer to access private members
+    
     std::string name_;
     SpanKind kind_;
     SpanContext context_;

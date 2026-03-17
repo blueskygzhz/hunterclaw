@@ -5,6 +5,7 @@
 #include <memory>
 #include <functional>
 #include <map>
+#include <optional>
 #include <spdlog/spdlog.h>
 
 namespace hunterclaw {

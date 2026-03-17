@@ -19,9 +19,6 @@ struct MessageDirectives {
     /// Reasoning 级别 (来自 /reasoning <level> 指令)
     std::optional<react::ReasoningLevel> reasoning_level;
     
-    /// Thinking 级别 (来自 /think <level> 指令)
-    std::optional<react::ThinkingLevel> thinking_level;
-    
     /// 是否为纯指令消息 (没有其他内容)
     bool is_directive_only = false;
     

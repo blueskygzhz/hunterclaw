@@ -29,15 +29,26 @@ static std::string bytes_to_hex(const uint8_t* data, size_t len) {
 DeviceIdentity DeviceIdentity::generate() {
     DeviceIdentity identity;
     
-    // Generate ED25519 key pair using OpenSSL
-    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, nullptr);
+    // ✅ 使用 RSA 替代 ED25519（OpenSSL 1.0.2 兼容）
+    // Generate RSA key pair using OpenSSL
+    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr);
     if (!ctx) {
         return identity;
     }
     
+    if (EVP_PKEY_keygen_init(ctx) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        return identity;
+    }
+    
+    // Set RSA key size to 2048 bits
+    if (EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, 2048) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        return identity;
+    }
+    
     EVP_PKEY* pkey = nullptr;
-    if (EVP_PKEY_keygen_init(ctx) <= 0 ||
-        EVP_PKEY_keygen(ctx, &pkey) <= 0) {
+    if (EVP_PKEY_keygen(ctx, &pkey) <= 0) {
         EVP_PKEY_CTX_free(ctx);
         return identity;
     }
@@ -90,17 +101,18 @@ bool DeviceIdentity::verify_signature(const std::string& message,
         return false;
     }
     
-    // Verify signature
+    // Verify signature (OpenSSL 1.0.2 compatible API)
     EVP_MD_CTX* ctx = EVP_MD_CTX_new();
     bool result = false;
     
-    if (EVP_DigestVerifyInit(ctx, nullptr, nullptr, nullptr, pkey) == 1) {
-        if (EVP_DigestVerify(ctx,
-                            signature.data(),
-                            signature.size(),
-                            reinterpret_cast<const unsigned char*>(message.data()),
-                            message.size()) == 1) {
-            result = true;
+    if (EVP_DigestVerifyInit(ctx, nullptr, EVP_sha256(), nullptr, pkey) == 1) {
+        // OpenSSL 1.0.2 doesn't have EVP_DigestVerify, use EVP_DigestVerifyFinal
+        if (EVP_DigestVerifyUpdate(ctx,
+                                   reinterpret_cast<const unsigned char*>(message.data()),
+                                   message.size()) == 1) {
+            if (EVP_DigestVerifyFinal(ctx, signature.data(), signature.size()) == 1) {
+                result = true;
+            }
         }
     }
     
@@ -122,26 +134,23 @@ std::vector<uint8_t> DeviceIdentity::sign_message(const std::string& message) co
         return signature;
     }
     
-    // Sign message
+    // Sign message (OpenSSL 1.0.2 compatible API)
     EVP_MD_CTX* ctx = EVP_MD_CTX_new();
     size_t sig_len = 0;
     
-    if (EVP_DigestSignInit(ctx, nullptr, nullptr, nullptr, pkey) == 1) {
-        // Get signature length
-        EVP_DigestSign(ctx,
-                      nullptr,
-                      &sig_len,
-                      reinterpret_cast<const unsigned char*>(message.data()),
-                      message.size());
-        
-        // Allocate and sign
-        signature.resize(sig_len);
-        EVP_DigestSign(ctx,
-                      signature.data(),
-                      &sig_len,
-                      reinterpret_cast<const unsigned char*>(message.data()),
-                      message.size());
-        signature.resize(sig_len);
+    if (EVP_DigestSignInit(ctx, nullptr, EVP_sha256(), nullptr, pkey) == 1) {
+        // Update with message data
+        if (EVP_DigestSignUpdate(ctx,
+                                reinterpret_cast<const unsigned char*>(message.data()),
+                                message.size()) == 1) {
+            // Get signature length
+            EVP_DigestSignFinal(ctx, nullptr, &sig_len);
+            
+            // Allocate and sign
+            signature.resize(sig_len);
+            EVP_DigestSignFinal(ctx, signature.data(), &sig_len);
+            signature.resize(sig_len);
+        }
     }
     
     EVP_MD_CTX_free(ctx);
