@@ -1,6 +1,7 @@
 #include "hunterclaw/gateway/http_gateway.h"
 #include "hunterclaw/gateway/http/openai_compat.h"
 #include "hunterclaw/gateway/session_device_id.h"  // ✅ Device ID 工具
+#include "hunterclaw/security/timing_safe.h"       // 🎯 OpenClaw 对齐: 常量时间比较
 #include "hunterclaw/core/utils.h"
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -118,7 +119,8 @@ void AuthMiddleware::execute(
     if (req.has_header("Authorization")) {
         std::string auth_header = req.get_header_value("Authorization");
         std::string expected = "Bearer " + bearer_token_;
-        if (auth_header == expected) {
+        // 🎯 OpenClaw 对齐: 使用常量时间比较防止时序攻击
+        if (hunterclaw::security::timing_safe_equal(auth_header, expected)) {
             authenticated = true;
         }
     }
@@ -126,12 +128,16 @@ void AuthMiddleware::execute(
     // 2. API Key Header (x-api-key: <token>)
     if (!authenticated && req.has_header("x-api-key")) {
         std::string api_key = req.get_header_value("x-api-key");
-        if (api_key == bearer_token_) {
+        // 🎯 OpenClaw 对齐: 使用常量时间比较防止时序攻击
+        if (hunterclaw::security::timing_safe_equal(api_key, bearer_token_)) {
             authenticated = true;
         }
     }
     
     if (!authenticated) {
+        // 🎯 OpenClaw 对齐: 认证失败时关闭连接 (shouldKeepAlive = false)
+        res.set_header("Connection", "close");
+        
         // 返回标准 OpenAI 错误格式
         json error_response = {
             {"error", {
@@ -714,6 +720,24 @@ void HttpGateway::send_json(httplib::Response& res, int status, const json& data
 void HttpGateway::send_error(httplib::Response& res, int status, const std::string& error) {
     json response = {{"error", error}};
     send_json(res, status, response);
+}
+
+void HttpGateway::send_openai_error(
+    httplib::Response& res,
+    int status,
+    const std::string& message,
+    const std::string& type,
+    const std::string& code
+) {
+    // 🎯 OpenClaw 对齐: 标准 OpenAI 错误响应格式
+    json error_response = {
+        {"error", {
+            {"message", message},
+            {"type", type.empty() ? "invalid_request_error" : type},
+            {"code", code.empty() ? "invalid_request" : code}
+        }}
+    };
+    send_json(res, status, error_response);
 }
 
 void HttpGateway::send_sse_chunk(httplib::Response& res, const std::string& data) {
