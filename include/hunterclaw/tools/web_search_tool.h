@@ -39,7 +39,7 @@ using json = nlohmann::json;
 
 class WebSearchTool : public Tool {
 public:
-    explicit WebSearchTool(std::shared_ptr<core::HttpClient> http_client);
+    explicit WebSearchTool(std::shared_ptr<infra::HttpClient> http_client);
     
     std::string name() const override { return "web_search"; }
     
@@ -49,14 +49,14 @@ public:
                "Supports filtering by country, language, and time range.";
     }
     
-    json parameters_schema() const override;
+    Schema parameters() const override;
     
     // 执行搜索
     // Returns: { results: SearchResult[], provider: string, cached?: bool, raw?: json }
-    core::Result<json> execute(const json& params) override;
+    ToolResult execute(const core::JsonValue& params) override;
     
 private:
-    std::shared_ptr<core::HttpClient> http_client_;
+    std::shared_ptr<infra::HttpClient> http_client_;
     
     // ===== Provider 配置 =====
     
@@ -177,7 +177,7 @@ private:
 
 class WebSearchToolFactory {
 public:
-    static std::shared_ptr<Tool> create(std::shared_ptr<core::HttpClient> http_client);
+    static std::shared_ptr<Tool> create(std::shared_ptr<infra::HttpClient> http_client);
 };
 
 } // namespace tools
