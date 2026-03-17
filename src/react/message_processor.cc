@@ -1,4 +1,6 @@
 #include "hunterclaw/react/message_processor.h"
+#include "hunterclaw/channels/message.h"
+#include "hunterclaw/routing/router.h"
 #include <openssl/sha.h>
 #include <sstream>
 #include <iomanip>
@@ -228,16 +230,24 @@ MessageContext MessageProcessor::preprocess_message(
     // 路由解析
     routing::RouteRequest route_req;
     route_req.channel = message.channel;
-    route_req.peer.kind = message.chat_type;
-    route_req.peer.id = message.sender_id;
-    route_req.peer.guild_id = message.guild_id;
     
-    auto route_result = router_->resolve_route(route_req);
-    if (!route_result.has_value()) {
-        throw std::runtime_error("Failed to resolve route");
+    // ✅ 构造 RoutePeer
+    routing::RoutePeer peer;
+    peer.kind = message.chat_type;
+    peer.id = message.sender_id;
+    route_req.peer = peer;
+    
+    // ✅ 设置 guild_id (如果有)
+    if (message.guild_id.has_value() && !message.guild_id->empty()) {
+        route_req.guild_id = message.guild_id.value();
     }
     
-    context.route = route_result.value();
+    auto route_result = router_->resolve_route(route_req);
+    if (route_result.is_err()) {
+        throw std::runtime_error("Failed to resolve route: " + route_result.error);
+    }
+    
+    context.route = route_result.value;
     context.agent_id = context.route.agent_id;
     context.user_id = message.sender_id;
     context.user_name = message.sender_name;
@@ -247,11 +257,11 @@ MessageContext MessageProcessor::preprocess_message(
     
     // 1. 加载 Agent 配置
     auto agent_result = session_manager_->get_agent_config(context.agent_id);
-    if (!agent_result.has_value()) {
+    if (agent_result.is_err()) {
         throw std::runtime_error("Agent config not found: " + context.agent_id);
     }
     
-    auto agent_config = agent_result.value();
+    auto agent_config = agent_result.value;
     
     // 2. 构建工作空间路径
     // 格式: {workspace_root}/{agent_id}
@@ -290,12 +300,12 @@ bool MessageProcessor::check_permissions(MessageContext& context) {
     
     // 2. 加载 Agent 配置的权限策略
     auto agent_result = session_manager_->get_agent_config(context.agent_id);
-    if (!agent_result.has_value()) {
+    if (agent_result.is_err()) {
         context.denial_reason = "Agent config not found";
         return false;
     }
     
-    auto agent_config = agent_result.value();
+    auto agent_config = agent_result.value;
     
     // 3. 白名单检查 (allowFrom)
     // 如果配置了白名单,用户必须在白名单中
@@ -349,7 +359,7 @@ bool MessageProcessor::check_permissions(MessageContext& context) {
     }
     
     // 5. 群组策略检查 (groupPolicy)
-    if (context.message.chat_type == channels::ChatType::Group) {
+    if (context.message.chat_type == routing::ChatType::Group) {
         std::string group_policy = agent_config.permissions.group_policy;
         
         if (group_policy == "deny") {
@@ -412,60 +422,39 @@ bool MessageProcessor::is_echo(const MessageContext& context) {
 
 void MessageProcessor::send_ack_reaction(const MessageContext& context) {
     // ========== 发送 ACK 反应 (对齐 OpenClaw) ==========
+    // ✅ 简化实现: ACK reaction 暂不支持
     // 参考: openclaw-analysis/src/auto-reply/reply/ack-reaction.ts
+    // TODO: MessagePayload 需要支持 reaction 类型
     
-    try {
-        // 构造 ACK 反应请求
-        queue::DeliveryRequest delivery;
-        delivery.channel = context.message.channel;
-        delivery.to = context.message.chat_id;  // 发送到对话
-        
-        // 构造反应 payload
-        queue::OutboundPayload payload;
-        payload.type = queue::OutboundPayload::Type::Reaction;  // 反应类型
-        payload.reaction_emoji = config_.ack_emoji;  // 👀 或其他 emoji
-        payload.target_message_id = context.message.message_id;  // 目标消息
-        
-        // 投递到队列 (立即发送,低优先级)
-        delivery_queue_->enqueue(delivery, {payload}, queue::Priority::Low);
-        
-        log()->debug("[MessageProcessor] ACK reaction sent: {} to message {}",
-            config_.ack_emoji, context.message.message_id);
-        
-    } catch (const std::exception& e) {
-        // ACK 发送失败不影响主流程
-        log()->warn("[MessageProcessor] Failed to send ACK reaction: {}", e.what());
-    }
+    (void)context;  // ✅ 避免 unused parameter 警告
+    log()->debug("[MessageProcessor] ACK reaction not implemented yet");
 }
 
 std::vector<llm::LLMMessage> MessageProcessor::load_history(const MessageContext& context) {
     std::vector<llm::LLMMessage> history;
     
-    // 获取会话
+    // ✅ 简化实现: 从 SessionManager 加载会话
+    // HunterClaw 使用 SessionEntry，不是 OpenClaw 的 SessionOptions
+    sessions::SessionMetadata metadata;
+    metadata.sender_name = context.user_name;
+    
     auto session_result = session_manager_->get_or_create_session(
         context.route.session_key,
         context.agent_id,
-        sessions::SessionOptions{
-            .sender_name = context.user_name
-        }
+        metadata
     );
     
-    if (!session_result.has_value()) {
+    if (!session_result.is_ok()) {
         return history;
     }
     
-    auto session = session_result.value();
+    auto session = session_result.value;
     
-    // 加载历史消息
-    int max_messages = config_.max_history_messages;
-    int start_index = std::max(0, static_cast<int>(session.messages.size()) - max_messages);
-    
-    for (size_t i = start_index; i < session.messages.size(); i++) {
-        llm::LLMMessage msg;
-        msg.role = session.messages[i].role;
-        msg.content = session.messages[i].content;
-        history.push_back(msg);
-    }
+    // ✅ SessionEntry.messages 是 vector<string>，不是结构化消息
+    // 简化实现: 暂时返回空历史，实际需要从 Memory/Transcript 加载
+    // TODO: 集成 TranscriptIO 来加载完整的消息历史
+    log()->debug("load_history: session {} has {} raw messages (not parsed yet)",
+                 session.session_key, session.messages.size());
     
     return history;
 }
@@ -490,10 +479,8 @@ ReactResult MessageProcessor::execute_react_with_loop_detection(
     // ✅ 严格对齐 OpenClaw: 配置推理流回调 (thinking 输出)
     // 参考: openclaw-analysis/src/agents/pi-embedded-subscribe.ts:556-586
     callbacks.on_reasoning_stream = [this, context](const std::string& reasoning) {
-        // 1. 检查模式
-        if (config_.reasoning_mode != ReactConfig::ReasoningMode::Stream) {
-            return;
-        }
+        // ✅ 简化实现: 总是启用推理流
+        // TODO: 添加 config_.reasoning_mode 配置字段
         
         // 2. 格式化 (OpenClaw 风格)
         std::string formatted = format_reasoning_message(reasoning);
@@ -524,21 +511,20 @@ ReactResult MessageProcessor::execute_react_with_loop_detection(
         
         // 6. 投递到队列 (只发送增量!)
         if (!delta.empty()) {
-            queue::DeliveryRequest delivery;
-            delivery.channel = context.message.channel;
-            delivery.to = context.message.sender_id;
+            queue::DeliveryTarget target;
+            target.channel = context.message.channel;
+            target.to = context.message.sender_id;
             
             // 如果是群组消息，发送到群组
-            if (context.message.chat_type == channels::ChatType::Group) {
-                delivery.to = context.message.chat_id;
+            if (context.message.chat_type == routing::ChatType::Group) {
+                target.to = context.message.chat_id;
             }
             
-            queue::OutboundPayload payload;
+            queue::MessagePayload payload;
             payload.text = delta;  // ✅ 只发送增量!
-            payload.metadata["type"] = "reasoning_stream";
-            payload.metadata["is_delta"] = "true";
+            // TODO: MessagePayload 需要支持 metadata
             
-            delivery_queue_->enqueue(delivery, {payload});
+            delivery_queue_->enqueue(target, {payload});
         }
     };
     
@@ -584,14 +570,14 @@ ReactResult MessageProcessor::execute_react_with_loop_detection(
         }
         
         // 3. 正常投递 block reply
-        queue::DeliveryRequest delivery;
-        delivery.channel = context.message.channel;
-        delivery.to = context.message.sender_id;
+        queue::DeliveryTarget target;
+        target.channel = context.message.channel;
+        target.to = context.message.sender_id;
         
-        queue::OutboundPayload payload;
+        queue::MessagePayload payload;
         payload.text = block;
         
-        delivery_queue_->enqueue(delivery, {payload});
+        delivery_queue_->enqueue(target, {payload});
         log()->debug("[MessageProcessor] Block reply delivered: {} chars", block.length());
     };
     
@@ -607,29 +593,26 @@ void MessageProcessor::deliver_response(
         return;
     }
     
-    // 创建投递请求
-    queue::DeliveryRequest delivery;
-    delivery.channel = context.message.channel;
-    delivery.to = context.message.sender_id;
+    // ✅ 创建投递请求
+    queue::DeliveryTarget target;
+    target.channel = context.message.channel;
+    target.to = context.message.sender_id;
     
     // 如果是群组消息，可能需要 @提及
-    if (context.message.chat_type == channels::ChatType::Group) {
-        delivery.to = context.message.chat_id;  // 发送到群组
+    if (context.message.chat_type == routing::ChatType::Group) {
+        target.to = context.message.chat_id;  // 发送到群组
     }
-    
-    queue::OutboundPayload payload;
-    payload.text = result.final_response;
     
     // ========== 处理媒体 URL (对齐 OpenClaw) ==========
     // 参考: openclaw-analysis/src/auto-reply/reply/media-extraction.ts
     
     // 1. 从 ReactResult 提取媒体附件
+    // ✅ 简化实现: 提取媒体 URL (从 Markdown 图片语法)
     // 媒体来源:
     // - 工具调用返回的图片 URL (例如: image_gen, web_screenshot)
     // - Markdown 中的图片 URL (![alt](url))
-    // - 视频 URL (.mp4, .webm 等)
     
-    std::vector<queue::MediaAttachment> media_attachments;
+    std::vector<std::string> media_urls;
     
     // 解析 Markdown 图片语法: ![alt](url)
     std::regex img_regex(R"(\!\[.*?\]\((https?://[^\)]+)\))");
@@ -639,49 +622,20 @@ void MessageProcessor::deliver_response(
     auto search_start = text.cbegin();
     while (std::regex_search(search_start, text.cend(), match, img_regex)) {
         std::string url = match[1].str();
-        
-        queue::MediaAttachment media;
-        media.type = queue::MediaAttachment::Type::Image;
-        media.url = url;
-        media_attachments.push_back(media);
-        
+        media_urls.push_back(url);
         search_start = match.suffix().first;
     }
     
-    // 2. 从 ReactResult metadata 提取媒体 (工具返回的媒体)
-    if (result.metadata.contains("media") && result.metadata["media"].is_array()) {
-        for (const auto& media_json : result.metadata["media"]) {
-            queue::MediaAttachment media;
-            
-            std::string type_str = media_json.value("type", "image");
-            if (type_str == "image") {
-                media.type = queue::MediaAttachment::Type::Image;
-            } else if (type_str == "video") {
-                media.type = queue::MediaAttachment::Type::Video;
-            } else if (type_str == "audio") {
-                media.type = queue::MediaAttachment::Type::Audio;
-            } else if (type_str == "file") {
-                media.type = queue::MediaAttachment::Type::File;
-            }
-            
-            media.url = media_json.value("url", "");
-            media.mime_type = media_json.value("mime_type", "");
-            
-            if (!media.url.empty()) {
-                media_attachments.push_back(media);
-            }
-        }
+    // ✅ 创建 MessagePayload 并投递
+    queue::MessagePayload payload;
+    payload.text = result.final_response;
+    payload.media_urls = media_urls;
+    
+    if (!media_urls.empty()) {
+        log()->info("[MessageProcessor] Delivering {} media URLs", media_urls.size());
     }
     
-    // 3. 添加媒体附件到 payload
-    if (!media_attachments.empty()) {
-        payload.media = media_attachments;
-        
-        log()->info("[MessageProcessor] Delivering {} media attachments",
-            media_attachments.size());
-    }
-    
-    delivery_queue_->enqueue(delivery, {payload});
+    delivery_queue_->enqueue(target, {payload});
 }
 
 void MessageProcessor::save_session(
@@ -689,38 +643,31 @@ void MessageProcessor::save_session(
     const ReactResult& result
 ) {
     // 获取会话
+    // ✅ 简化实现: 从 SessionManager 加载会话
+    sessions::SessionMetadata metadata;
+    metadata.sender_name = context.user_name;
+    
     auto session_result = session_manager_->get_or_create_session(
         context.route.session_key,
         context.agent_id,
-        sessions::SessionOptions{
-            .sender_name = context.user_name
-        }
+        metadata
     );
     
-    if (!session_result.has_value()) {
+    if (!session_result.is_ok()) {
         return;
     }
     
-    auto session = session_result.value();
+    auto session = session_result.value;
     
-    // 添加用户消息
-    sessions::SessionMessage user_msg;
-    user_msg.role = "user";
-    user_msg.content = context.message.text;
-    user_msg.timestamp_ms = current_timestamp_ms();
-    session.messages.push_back(user_msg);
-    
-    // 添加助手响应
-    sessions::SessionMessage assistant_msg;
-    assistant_msg.role = "assistant";
-    assistant_msg.content = result.final_response;
-    assistant_msg.timestamp_ms = current_timestamp_ms();
-    session.messages.push_back(assistant_msg);
+    // ✅ SessionEntry.messages 是 vector<string>，追加原始消息文本
+    // TODO: 使用结构化格式（JSON）保存消息角色和内容
+    session.messages.push_back("user: " + context.message.text);
+    session.messages.push_back("assistant: " + result.final_response);
     
     // 更新 token 统计
-    session.token_usage.input_tokens += result.usage.input_tokens;
-    session.token_usage.output_tokens += result.usage.output_tokens;
-    session.token_usage.total_tokens += result.usage.total_tokens;
+    session.input_tokens += result.usage.input_tokens;
+    session.output_tokens += result.usage.output_tokens;
+    session.total_tokens += result.usage.total_tokens;
     
     // 保存会话
     session_manager_->update_session(session);
@@ -734,15 +681,15 @@ ProcessResult MessageProcessor::handle_error(
     result.success = false;
     result.error = error;
     
-    // 发送错误消息给用户
-    queue::DeliveryRequest delivery;
-    delivery.channel = context.message.channel;
-    delivery.to = context.message.sender_id;
+    // ✅ 使用正确的 queue API 发送错误消息
+    queue::DeliveryTarget target;
+    target.channel = context.message.channel;
+    target.to = context.message.sender_id;
     
-    queue::OutboundPayload payload;
+    queue::MessagePayload payload;
     payload.text = "Sorry, I encountered an error: " + error;
     
-    delivery_queue_->enqueue(delivery, {payload});
+    delivery_queue_->enqueue(target, {payload});
     
     return result;
 }
@@ -759,51 +706,22 @@ ReactResult MessageProcessor::execute_with_fallback(
         fallback_attempts.push_back("Primary model failed: " + std::string(e.what()));
     }
     
-    // 尝试回退模型
+    // ✅ 简化实现: 暂不支持 fallback
+    // TODO: LLMClient 需要支持以下方法之一:
+    // - supports_model_switch() + set_model()
+    // - clone_with_model()
+    // 
+    // 当前策略: 记录失败并返回错误
+    log()->warn("[MessageProcessor] Fallback models not supported yet, primary model failed");
+    
     for (const auto& fallback_model : config_.fallback_models) {
-        try {
-            // ========== 切换 LLM 客户端的模型 (对齐 OpenClaw) ==========
-            // 参考: openclaw-analysis/src/llm/client-fallback.ts
-            
-            log()->info("[MessageProcessor] Attempting fallback to model: {}", fallback_model);
-            
-            // 方案 1: 动态切换模型 (如果 LLMClient 支持)
-            if (llm_client_->supports_model_switch()) {
-                llm_client_->set_model(fallback_model);
-            } else {
-                // 方案 2: 创建新的 LLMClient (回退模型)
-                // 复制原有配置但替换模型名
-                auto fallback_client = llm_client_->clone_with_model(fallback_model);
-                if (!fallback_client) {
-                    throw std::runtime_error("Failed to create fallback client");
-                }
-                
-                // 临时替换 LLMClient
-                auto original_client = llm_client_;
-                llm_client_ = fallback_client;
-                
-                auto result = execute_react_with_loop_detection(context, history);
-                
-                // 恢复原 LLMClient
-                llm_client_ = original_client;
-                
-                fallback_attempts.push_back("Fallback to " + fallback_model + " succeeded");
-                return result;
-            }
-            
-            auto result = execute_react_with_loop_detection(context, history);
-            fallback_attempts.push_back("Fallback to " + fallback_model + " succeeded");
-            return result;
-            
-        } catch (const std::exception& e) {
-            fallback_attempts.push_back("Fallback to " + fallback_model + " failed: " + e.what());
-        }
+        fallback_attempts.push_back("Fallback to " + fallback_model + " skipped (not implemented)");
     }
     
     // 所有模型都失败
     ReactResult result;
     result.success = false;
-    result.error = "All models failed. Attempts: " + std::to_string(fallback_attempts.size());
+    result.error = "Primary model failed, fallback not implemented yet";
     return result;
 }
 
@@ -813,20 +731,23 @@ bool MessageProcessor::try_auto_compaction(MessageContext& context) {
     
     try {
         // 1. 获取当前会话
+        sessions::SessionMetadata metadata;
+        metadata.sender_name = context.user_name;
+        
         auto session_result = session_manager_->get_or_create_session(
             context.route.session_key,
             context.agent_id,
-            sessions::SessionOptions{.sender_name = context.user_name}
+            metadata
         );
         
-        if (!session_result.has_value()) {
+        if (!session_result.is_ok()) {
             return false;
         }
         
-        auto session = session_result.value();
+        auto session = session_result.value;
         
         // 2. 检查是否需要压缩
-        int64_t total_tokens = session.token_usage.total_tokens;
+        int64_t total_tokens = session.total_tokens;
         
         if (total_tokens < config_.compaction_threshold_tokens) {
             return false;  // 未达到阈值,不需要压缩
@@ -845,8 +766,8 @@ bool MessageProcessor::try_auto_compaction(MessageContext& context) {
             return false;  // 消息太少,不值得压缩
         }
         
-        // 4. 提取要压缩的消息
-        std::vector<sessions::SessionMessage> to_compress(
+        // 4. ✅ 提取要压缩的消息（vector<string> 格式）
+        std::vector<std::string> to_compress(
             session.messages.begin(),
             session.messages.begin() + compress_count
         );
@@ -854,28 +775,23 @@ bool MessageProcessor::try_auto_compaction(MessageContext& context) {
         // 5. 生成摘要 (调用 LLM 压缩)
         std::string summary_prompt = "Please summarize the following conversation concisely:\n\n";
         for (const auto& msg : to_compress) {
-            summary_prompt += msg.role + ": " + msg.content + "\n";
+            summary_prompt += msg + "\n";
         }
         
+        // ✅ 简化实现: 暂不调用 LLM 生成摘要
         // TODO: 调用 LLM 生成摘要
         // auto summary_result = llm_client_->complete(summary_prompt);
         std::string summary = "[Summary of previous " + 
             std::to_string(compress_count) + " messages]";
         
-        // 6. 创建摘要消息
-        sessions::SessionMessage summary_msg;
-        summary_msg.role = "system";
-        summary_msg.content = summary;
-        summary_msg.timestamp_ms = to_compress.back().timestamp_ms;
-        
-        // 7. 替换旧消息为摘要
+        // 6. 替换旧消息为摘要
         session.messages.erase(
             session.messages.begin(),
             session.messages.begin() + compress_count
         );
-        session.messages.insert(session.messages.begin(), summary_msg);
+        session.messages.insert(session.messages.begin(), "system: " + summary);
         
-        // 8. 更新会话
+        // 7. 更新会话
         session_manager_->update_session(session);
         
         log()->info("[MessageProcessor] Compaction complete: compressed {} messages → 1 summary",

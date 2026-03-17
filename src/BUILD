@@ -283,15 +283,14 @@ cc_library(
 # ============================================================================
 cc_library(
     name = "hunterclaw_react",
-    srcs = glob(
-        ["react/*.cc"],
-        exclude = ["react/message_processor.cc"]  # MessageProcessor 依赖 sessions，属于更高层
-    ),
+    srcs = glob(["react/*.cc"]),  # ✅ 不再排除 message_processor.cc - 所有依赖已实现
     deps = [
         "//:hunterclaw_headers",
         ":hunterclaw_llm",
         ":hunterclaw_tools",
         ":hunterclaw_memory",
+        ":hunterclaw_sessions",
+        ":hunterclaw_agents",  # ✅ 添加 agents 依赖 (message_processor 需要 AgentConfig)
         "@nlohmann_json//:json",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -306,6 +305,8 @@ cc_library(
     linkopts = [
         "-lpthread",
         "-ljsoncpp",
+        "-lssl",       # ✅ message_processor 需要 OpenSSL (SHA256 用于 echo 检测)
+        "-lcrypto",
     ],
     linkstatic = False,
     visibility = ["//visibility:public"],

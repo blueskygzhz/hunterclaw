@@ -60,7 +60,7 @@ struct MessageContext {
     channels::InboundMessage message;
     
     // 路由信息
-    routing::RouteResult route;
+    routing::ResolvedRoute route;  // ✅ 修正类型名称
     
     // 会话信息
     sessions::SessionEntry session;

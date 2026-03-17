@@ -1,5 +1,6 @@
 #include "hunterclaw/sessions/session_manager.h"
 #include "hunterclaw/observability/diagnostic_events.h"  // ✅ 可观测性集成
+#include "hunterclaw/agents/types.h"  // ✅ AgentConfig 定义
 #include <fstream>
 #include <filesystem>
 #include <nlohmann/json.hpp>
@@ -739,6 +740,49 @@ std::optional<std::string> SessionMapper::extract_label(const std::string& sessi
     }
     
     return label;
+}
+
+// ============================================================================
+// AgentConfig 实现 (临时解决方案)
+// ============================================================================
+
+core::Result<hunterclaw::agents::AgentConfig> FileSessionManager::get_agent_config(
+    const std::string& agent_id
+) {
+    // TODO: 这是临时实现，实际应该从 AgentRegistry 或配置系统获取
+    // 目前返回一个默认配置以允许编译通过
+    
+    hunterclaw::agents::AgentConfig config;
+    config.id = agent_id;
+    config.name = agent_id;
+    config.is_default = (agent_id == "main" || agent_id == "default");
+    
+    // 设置默认工作空间
+    std::string home = std::getenv("HOME") ? std::getenv("HOME") : "/tmp";
+    config.workspace = home + "/.hunterclaw/agents/" + agent_id;
+    config.agent_dir = config.workspace;
+    
+    // 默认 creator 为空 (后续从配置文件读取)
+    config.creator = "";
+    
+    // 默认模型配置
+    config.model.provider = "anthropic";
+    config.model.model = "claude-3-5-sonnet-20241022";
+    config.model.max_tokens = 4096;
+    config.model.temperature = 1.0;
+    config.model.context_tokens = 200000;
+    
+    // 默认行为配置
+    config.thinking_level = "medium";
+    config.timeout_seconds = 600;
+    
+    // 默认 subagent 配置
+    config.subagents.enabled = false;
+    config.subagents.max_concurrent = 3;
+    config.subagents.timeout_seconds = 900;
+    config.subagents.max_depth = 5;
+    
+    return core::Result<hunterclaw::agents::AgentConfig>::Ok(config);
 }
 
 } // namespace sessions

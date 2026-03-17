@@ -34,6 +34,9 @@ struct RouteInput {
     std::vector<std::string> member_role_ids;     // Discord角色ID
 };
 
+// ✅ 别名: RouteRequest 等同于 RouteInput (对齐 message_processor.cc)
+using RouteRequest = RouteInput;
+
 // 路由结果 (对齐 OpenClaw ResolvedAgentRoute)
 struct ResolvedRoute {
     std::string agent_id;           // Agent ID

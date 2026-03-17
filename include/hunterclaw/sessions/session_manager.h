@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include "hunterclaw/core/result.h"
 #include "hunterclaw/routing/router.h"
+#include "hunterclaw/agents/types.h"  // ✅ 包含完整定义
 
 namespace hunterclaw {
 namespace sessions {
@@ -173,6 +174,12 @@ public:
     // 检查会话是否需要重置
     virtual bool should_reset(const SessionEntry& session) const = 0;
     
+    // ✅ 获取 Agent 配置 (对齐 message_processor.cc 需求)
+    // 注意: 这是临时 API，实际应该从独立的 AgentRegistry 获取
+    virtual core::Result<hunterclaw::agents::AgentConfig> get_agent_config(
+        const std::string& agent_id
+    ) = 0;
+    
     // 工厂方法
     static Ptr create(const std::string& storage_dir, const SessionConfig& config);
 };
@@ -201,6 +208,11 @@ public:
     core::Result<int> prune_sessions() override;
     
     bool should_reset(const SessionEntry& session) const override;
+    
+    // ✅ 获取 Agent 配置
+    core::Result<hunterclaw::agents::AgentConfig> get_agent_config(
+        const std::string& agent_id
+    ) override;
     
 private:
     std::string storage_dir_;

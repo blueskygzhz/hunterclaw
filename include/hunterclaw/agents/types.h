@@ -39,12 +39,20 @@ struct SubagentConfig {
     int max_depth = 5;                          // Max nesting depth
 };
 
+/// Permission configuration (对齐 OpenClaw)
+struct PermissionConfig {
+    std::vector<std::string> allow_from;        // 白名单: 允许的用户ID列表
+    std::vector<std::string> deny_from;         // 黑名单: 拒绝的用户ID列表
+    std::string group_policy = "allow";         // 群组策略: allow/deny/mention_only
+};
+
 /// Complete agent configuration
 struct AgentConfig {
     // Identity
     std::string id;                             // Unique agent ID
     bool is_default = false;                    // Is default agent
     std::string name;                           // Display name
+    std::string creator;                        // ✅ Creator user ID (for owner判断)
     
     // Workspace
     std::string workspace;                      // Workspace directory
@@ -65,6 +73,9 @@ struct AgentConfig {
     
     // Subagents
     SubagentConfig subagents;
+    
+    // Permissions (对齐 OpenClaw)
+    PermissionConfig permissions;
     
     // Extra configuration
     std::map<std::string, core::JsonValue> extra;
