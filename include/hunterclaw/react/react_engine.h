@@ -2,7 +2,7 @@
 
 #include "hunterclaw/core/json.h"
 #include "hunterclaw/core/thread_pool.h"
-#include "hunterclaw/tools/tool.h"  // ToolManager is defined in tool.h
+#include "hunterclaw/tools/tool_manager.h"  // Full definition of ToolManager
 #include "hunterclaw/llm/llm_client.h"
 #include "hunterclaw/llm/provider.h"  // For Response, ToolCall, Usage
 #include "hunterclaw/memory/compaction_manager.h"  // ✅ 新增: Compaction 支持

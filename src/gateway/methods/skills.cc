@@ -153,6 +153,8 @@ core::Result<json> method_skill_status(
         missing["bins"] = json::array();  // 缺失的二进制文件
         missing["env"] = json::array();   // 缺失的环境变量
         missing["os"] = json::array();    // 不兼容的操作系统
+
+        
         
         // TODO: 实际检测缺失的依赖
         // hasBinary() 检查二进制文件是否存在

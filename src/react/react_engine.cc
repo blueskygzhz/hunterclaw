@@ -678,7 +678,7 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                         span->set_status(result.success, result.error);
                     }
                     
-                    return {tool_call.id, result};
+                    return std::make_pair(tool_call.id, result);
                     
                 } catch (const std::exception& e) {
                     // ✅ Span 失败标记
@@ -1045,8 +1045,8 @@ ReactEngine::CompactionResult ReactEngine::trigger_compaction(
         return result;
     }
     
-    auto& compact_data = compact_result.value.value();
-    
+    auto& compact_data = compact_result.get();
+
     if (!compact_data.compacted) {
         log()->info("[ReactEngine] Compaction skipped: {}", compact_data.reason);
         result.reason = compact_data.reason;

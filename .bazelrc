@@ -7,3 +7,8 @@ build --action_env=CXX=/opt/rh/devtoolset-11/root/usr/bin/g++
 # Disable warnings-as-errors for external dependencies like BoringSSL
 build --host_copt=-Wno-error
 build --copt=-Wno-error
+
+# System include paths for third-party headers
+build --copt=-I/usr/include/spdlog
+build --copt=-I/usr/include/jsoncpp
+build --copt=-I/usr/include
