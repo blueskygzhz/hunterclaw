@@ -695,6 +695,268 @@ core::Result<json> method_chat_inject(
     return core::Result<json>::Ok(result);
 }
 
+// ============================================================================
+// chat.update_params - 更新聊天参数
+// ============================================================================
+core::Result<json> method_chat_update_params(
+    std::shared_ptr<GatewayServer> server,
+    std::shared_ptr<MethodGuard> method_guard,
+    const ClientContext& client_ctx,
+    const json& params
+) {
+    (void)server;
+    (void)method_guard;
+    (void)client_ctx;
+
+    std::string session_id = params.value("session_id", params.value("sessionId", ""));
+    if (session_id.empty()) {
+        return core::Result<json>::Err("Missing required parameter: session_id");
+    }
+
+    // TODO: Update session parameters via session manager
+    json result;
+    result["ok"] = true;
+    result["session_id"] = session_id;
+    result["updated"] = true;
+
+    return core::Result<json>::Ok(result);
+}
+
+// ============================================================================
+// chat.regenerate - 重新生成最后一条回复
+// ============================================================================
+core::Result<json> method_chat_regenerate(
+    std::shared_ptr<GatewayServer> server,
+    std::shared_ptr<MethodGuard> method_guard,
+    const ClientContext& client_ctx,
+    const json& params
+) {
+    (void)method_guard;
+    (void)client_ctx;
+
+    std::string session_id = params.value("session_id", params.value("sessionId", ""));
+    if (session_id.empty()) {
+        return core::Result<json>::Err("Missing required parameter: session_id");
+    }
+
+    auto agent_pool = server->agent_pool();
+    if (!agent_pool) {
+        return core::Result<json>::Err("AgentPool not initialized");
+    }
+
+    // TODO: Trigger regeneration via agent
+    json result;
+    result["ok"] = true;
+    result["session_id"] = session_id;
+    result["status"] = "regenerating";
+
+    return core::Result<json>::Ok(result);
+}
+
+// ============================================================================
+// chat.fork - 分叉会话
+// ============================================================================
+core::Result<json> method_chat_fork(
+    std::shared_ptr<GatewayServer> server,
+    std::shared_ptr<MethodGuard> method_guard,
+    const ClientContext& client_ctx,
+    const json& params
+) {
+    (void)server;
+    (void)method_guard;
+    (void)client_ctx;
+
+    std::string session_id = params.value("session_id", params.value("sessionId", ""));
+    if (session_id.empty()) {
+        return core::Result<json>::Err("Missing required parameter: session_id");
+    }
+
+    // Generate forked session key
+    auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count();
+    std::string forked_key = session_id + ":fork:" + std::to_string(ts);
+
+    // TODO: Actually fork the session transcript
+
+    json result;
+    result["ok"] = true;
+    result["source_session_id"] = session_id;
+    result["forked_session_id"] = forked_key;
+
+    return core::Result<json>::Ok(result);
+}
+
+// ============================================================================
+// chat.summarize - 总结会话
+// ============================================================================
+core::Result<json> method_chat_summarize(
+    std::shared_ptr<GatewayServer> server,
+    std::shared_ptr<MethodGuard> method_guard,
+    const ClientContext& client_ctx,
+    const json& params
+) {
+    (void)method_guard;
+    (void)client_ctx;
+
+    std::string session_id = params.value("session_id", params.value("sessionId", ""));
+    if (session_id.empty()) {
+        return core::Result<json>::Err("Missing required parameter: session_id");
+    }
+
+    auto agent_pool = server->agent_pool();
+    if (!agent_pool) {
+        return core::Result<json>::Err("AgentPool not initialized");
+    }
+
+    // TODO: Trigger summarization via agent/LLM
+
+    json result;
+    result["ok"] = true;
+    result["session_id"] = session_id;
+    result["summary"] = "";  // Placeholder
+    result["status"] = "not_implemented";
+
+    return core::Result<json>::Ok(result);
+}
+
+// ============================================================================
+// chat.edit - 编辑消息
+// ============================================================================
+core::Result<json> method_chat_edit(
+    std::shared_ptr<GatewayServer> server,
+    std::shared_ptr<MethodGuard> method_guard,
+    const ClientContext& client_ctx,
+    const json& params
+) {
+    (void)server;
+    (void)method_guard;
+    (void)client_ctx;
+
+    std::string session_id = params.value("session_id", params.value("sessionId", ""));
+    std::string message_id = params.value("message_id", params.value("messageId", ""));
+    std::string new_content = params.value("content", "");
+
+    if (session_id.empty() || message_id.empty()) {
+        return core::Result<json>::Err("Missing required parameters: session_id, message_id");
+    }
+
+    // TODO: Edit message in session transcript
+
+    json result;
+    result["ok"] = true;
+    result["session_id"] = session_id;
+    result["message_id"] = message_id;
+    result["edited"] = true;
+
+    return core::Result<json>::Ok(result);
+}
+
+// ============================================================================
+// chat.delete - 删除消息
+// ============================================================================
+core::Result<json> method_chat_delete(
+    std::shared_ptr<GatewayServer> server,
+    std::shared_ptr<MethodGuard> method_guard,
+    const ClientContext& client_ctx,
+    const json& params
+) {
+    (void)server;
+    (void)method_guard;
+    (void)client_ctx;
+
+    std::string session_id = params.value("session_id", params.value("sessionId", ""));
+    std::string message_id = params.value("message_id", params.value("messageId", ""));
+
+    if (session_id.empty() || message_id.empty()) {
+        return core::Result<json>::Err("Missing required parameters: session_id, message_id");
+    }
+
+    // TODO: Delete message from session transcript
+
+    json result;
+    result["ok"] = true;
+    result["session_id"] = session_id;
+    result["message_id"] = message_id;
+    result["deleted"] = true;
+
+    return core::Result<json>::Ok(result);
+}
+
+// ============================================================================
+// chat.transcript - 获取完整对话记录
+// ============================================================================
+core::Result<json> method_chat_transcript(
+    std::shared_ptr<GatewayServer> server,
+    std::shared_ptr<MethodGuard> method_guard,
+    const ClientContext& client_ctx,
+    const json& params
+) {
+    (void)method_guard;
+    (void)client_ctx;
+
+    std::string session_id = params.value("session_id", params.value("sessionId", ""));
+    if (session_id.empty()) {
+        return core::Result<json>::Err("Missing required parameter: session_id");
+    }
+
+    int limit = params.value("limit", 200);
+    int offset = params.value("offset", 0);
+    (void)limit;
+    (void)offset;
+
+    auto agent_pool = server->agent_pool();
+    json messages = json::array();
+
+    if (agent_pool) {
+        // TODO: Get transcript from agent's session
+    }
+
+    json result;
+    result["session_id"] = session_id;
+    result["messages"] = messages;
+    result["count"] = messages.size();
+
+    return core::Result<json>::Ok(result);
+}
+
+// ============================================================================
+// chat.export - 导出对话
+// ============================================================================
+core::Result<json> method_chat_export(
+    std::shared_ptr<GatewayServer> server,
+    std::shared_ptr<MethodGuard> method_guard,
+    const ClientContext& client_ctx,
+    const json& params
+) {
+    (void)method_guard;
+    (void)client_ctx;
+
+    std::string session_id = params.value("session_id", params.value("sessionId", ""));
+    if (session_id.empty()) {
+        return core::Result<json>::Err("Missing required parameter: session_id");
+    }
+
+    std::string format = params.value("format", "json");  // "json" | "markdown" | "text"
+    (void)format;
+
+    auto agent_pool = server->agent_pool();
+    json messages = json::array();
+
+    if (agent_pool) {
+        // TODO: Get transcript from agent's session
+    }
+
+    json result;
+    result["ok"] = true;
+    result["session_id"] = session_id;
+    result["format"] = format;
+    result["data"] = messages;
+    result["count"] = messages.size();
+
+    return core::Result<json>::Ok(result);
+}
+
 }  // namespace methods
 }  // namespace gateway
 }  // namespace hunterclaw

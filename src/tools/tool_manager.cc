@@ -504,60 +504,60 @@ ToolResult ToolManager::execute_tool(
 //                 config_path.empty() ? "default" : config_path);
 // }
 // 
-// // Tool结果辅助函数实现
-// namespace tool_result {
-// 
-// ToolResult text(const std::string& content) {
-//     ToolResult result;
-//     result.success = true;
-//     
-//     ToolResultContent text_content;
-//     text_content.type = ToolResultContent::Type::Text;
-//     text_content.text = content;
-//     result.content.push_back(text_content);
-//     
-//     return result;
-// }
-// 
-// ToolResult json(const core::JsonValue& data) {
-//     ToolResult result;
-//     result.success = true;
-//     result.details = data;
-//     
-//     // TODO: 将JsonValue序列化为字符串
-//     ToolResultContent json_content;
-//     json_content.type = ToolResultContent::Type::Json;
-//     json_content.text = "{}";  // TODO: 实际序列化
-//     result.content.push_back(json_content);
-//     
-//     return result;
-// }
-// 
-// ToolResult image(const std::string& base64_data, const std::string& mime_type) {
-//     ToolResult result;
-//     result.success = true;
-//     
-//     ToolResultContent img_content;
-//     img_content.type = ToolResultContent::Type::Image;
-//     img_content.data = base64_data;
-//     img_content.mime_type = mime_type;
-//     result.content.push_back(img_content);
-//     
-//     return result;
-// }
-// 
-// ToolResult error(const std::string& message) {
-//     ToolResult result;
-//     result.success = false;
-//     result.error = message;
-//     
-//     ToolResultContent text_content;
-//     text_content.type = ToolResultContent::Type::Text;
-//     text_content.text = "Error: " + message;
-//     result.content.push_back(text_content);
-//     
-//     return result;
-// }
+// Tool结果辅助函数实现
+namespace tool_result {
 
+ToolResult text(const std::string& content) {
+    ToolResult result;
+    result.success = true;
+
+    ToolResultContent text_content;
+    text_content.type = ToolResultContent::Type::Text;
+    text_content.text = content;
+    result.content.push_back(text_content);
+
+    return result;
+}
+
+ToolResult json(const core::JsonValue& data) {
+    ToolResult result;
+    result.success = true;
+    result.details = data;
+
+    ToolResultContent json_content;
+    json_content.type = ToolResultContent::Type::Json;
+    json_content.text = data.to_string();
+    result.content.push_back(json_content);
+
+    return result;
+}
+
+ToolResult image(const std::string& base64_data, const std::string& mime_type) {
+    ToolResult result;
+    result.success = true;
+
+    ToolResultContent img_content;
+    img_content.type = ToolResultContent::Type::Image;
+    img_content.data = base64_data;
+    img_content.mime_type = mime_type;
+    result.content.push_back(img_content);
+
+    return result;
+}
+
+ToolResult error(const std::string& message) {
+    ToolResult result;
+    result.success = false;
+    result.error = message;
+
+    ToolResultContent text_content;
+    text_content.type = ToolResultContent::Type::Text;
+    text_content.text = "Error: " + message;
+    result.content.push_back(text_content);
+
+    return result;
+}
+
+} // namespace tool_result
 } // namespace tools
 } // namespace hunterclaw

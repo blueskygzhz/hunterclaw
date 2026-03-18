@@ -9,6 +9,7 @@
 #include <variant>
 #include <functional>
 #include <stdexcept>
+#include <sstream>
 #include <nlohmann/json.hpp>
 
 namespace hunterclaw {
@@ -488,8 +489,17 @@ struct SessionKey {
     std::string to_string() const {
         return channel + ":" + account_id + ":" + target_id;
     }
-    
-    static SessionKey from_string(const std::string& str);
+
+    static SessionKey from_string(const std::string& str) {
+        std::istringstream iss(str);
+        std::string ch, acc, tgt;
+        if (!std::getline(iss, ch, ':') ||
+            !std::getline(iss, acc, ':') ||
+            !std::getline(iss, tgt)) {
+            throw std::invalid_argument("Invalid SessionKey format: " + str);
+        }
+        return SessionKey{ch, acc, tgt};
+    }
 };
 
 struct SessionInfo {

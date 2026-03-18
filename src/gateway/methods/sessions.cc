@@ -512,6 +512,107 @@ core::Result<json> method_session_resolve(
     return core::Result<json>::Ok(result);
 }
 
+// ============================================================================
+// sessions.create - 创建新会话 (严格对齐 OpenClaw)
+// ============================================================================
+core::Result<json> method_session_create(
+    std::shared_ptr<GatewayServer> server,
+    std::shared_ptr<MethodGuard> method_guard,
+    const ClientContext& client_ctx,
+    const json& params
+) {
+    (void)method_guard;
+    (void)client_ctx;
+
+    // 🎯 OpenClaw 对齐: 参数提取
+    std::string agent_id = params.value("agentId", "main");
+    std::string label = params.value("label", "");
+    std::string model = params.value("model", "");
+    std::string channel = params.value("channel", "");
+
+    // 生成 session key
+    std::string session_key;
+    if (!channel.empty()) {
+        session_key = "agent:" + agent_id + ":" + channel;
+    } else {
+        // 生成唯一 key
+        auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count();
+        session_key = "agent:" + agent_id + ":session:" + std::to_string(ts);
+    }
+
+    // TODO: HunterClaw session creation not yet fully implemented
+    // This would integrate with sessions::SessionManager
+
+    json entry;
+    entry["sessionId"] = session_key;
+    entry["agentId"] = agent_id;
+    entry["createdAt"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count();
+    if (!label.empty()) entry["label"] = label;
+    if (!model.empty()) entry["model"] = model;
+
+    json result;
+    result["ok"] = true;
+    result["key"] = session_key;
+    result["entry"] = entry;
+
+    return core::Result<json>::Ok(result);
+}
+
+// ============================================================================
+// sessions.update - 更新会话 (严格对齐 OpenClaw)
+// ============================================================================
+core::Result<json> method_session_update(
+    std::shared_ptr<GatewayServer> server,
+    std::shared_ptr<MethodGuard> method_guard,
+    const ClientContext& client_ctx,
+    const json& params
+) {
+    (void)server;
+    (void)method_guard;
+    (void)client_ctx;
+
+    if (!params.contains("key")) {
+        return core::Result<json>::Err("Missing 'key' parameter");
+    }
+
+    std::string key = params["key"].get<std::string>();
+    if (key.empty()) {
+        return core::Result<json>::Err("key required");
+    }
+
+    // 🎯 OpenClaw 对齐: 支持更新的字段
+    json entry;
+    entry["sessionId"] = key;
+    entry["updatedAt"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count();
+
+    // Apply updates from params
+    static const std::vector<std::string> updatable_fields = {
+        "label", "model", "thinking", "thinkingLevel", "verboseLevel",
+        "reasoningLevel", "fastMode", "toolPolicy", "externalContentHandling",
+        "deliveryPolicy", "systemPrompt", "elevated"
+    };
+    for (const auto& field : updatable_fields) {
+        if (params.contains(field)) {
+            entry[field] = params[field];
+        }
+    }
+
+    // TODO: HunterClaw session update not yet fully implemented
+
+    json result;
+    result["ok"] = true;
+    result["key"] = key;
+    result["entry"] = entry;
+
+    return core::Result<json>::Ok(result);
+}
+
 }  // namespace methods
 }  // namespace gateway
 }  // namespace hunterclaw

@@ -773,12 +773,319 @@ core::Result<std::vector<std::vector<float>>> MistralEmbeddingProvider::embed_ba
 }
 
 // ============================================================================
-// Provider Factory - TODO: 实现与 types.h 中 EmbeddingProviderResult 兼容的工厂函数
+// EmbeddingProviderFactory - Factory implementation
 // ============================================================================
 
-// 暂时注释掉：这个实现与 types.h 中的 EmbeddingProviderResult 定义不匹配
-// EmbeddingProviderResult 应该只包含 provider_name、model 等元数据，
-// 而不是 unique_ptr<EmbeddingProvider>。需要重新设计工厂模式。
+const std::vector<EmbeddingProviderId> EmbeddingProviderFactory::REMOTE_PROVIDER_IDS = {
+    EmbeddingProviderId::OpenAI,
+    EmbeddingProviderId::Gemini,
+    EmbeddingProviderId::Voyage,
+    EmbeddingProviderId::Mistral,
+    EmbeddingProviderId::Ollama,
+};
+
+core::Result<EmbeddingProviderResult> EmbeddingProviderFactory::create(
+    const EmbeddingProviderOptions& options
+) {
+    EmbeddingProviderResult result;
+    result.requested_provider = options.provider;
+
+    // "none" or empty provider means FTS-only mode
+    if (options.provider == "none" || options.provider.empty()) {
+        result.provider = nullptr;
+        return core::Result<EmbeddingProviderResult>::Ok(result);
+    }
+
+    // "auto" mode: try providers in priority order
+    if (options.provider == "auto") {
+        for (auto provider_id : REMOTE_PROVIDER_IDS) {
+            auto provider_result = create_provider(provider_id, options);
+            if (provider_result.is_ok()) {
+                result.provider = provider_result.get().provider;
+                return core::Result<EmbeddingProviderResult>::Ok(result);
+            }
+        }
+        // All providers failed - return FTS-only mode
+        result.provider = nullptr;
+        result.provider_unavailable_reason = "No embedding provider available";
+        return core::Result<EmbeddingProviderResult>::Ok(result);
+    }
+
+    // Specific provider requested
+    auto parsed_id = parse_provider_id(options.provider);
+    if (!parsed_id.has_value()) {
+        return core::Result<EmbeddingProviderResult>::Err(
+            "Unknown embedding provider: " + options.provider
+        );
+    }
+
+    auto provider_result = create_provider(parsed_id.value(), options);
+    if (!provider_result.is_ok()) {
+        // Try fallback if configured
+        if (!options.fallback.empty() && options.fallback != "none") {
+            auto fallback_id = parse_provider_id(options.fallback);
+            if (fallback_id.has_value()) {
+                auto fallback_result = create_provider(fallback_id.value(), options);
+                if (fallback_result.is_ok()) {
+                    result.provider = fallback_result.get().provider;
+                    result.fallback_from = parsed_id;
+                    result.fallback_reason = provider_result.error;
+                    return core::Result<EmbeddingProviderResult>::Ok(result);
+                }
+            }
+        }
+        return core::Result<EmbeddingProviderResult>::Err(provider_result.error);
+    }
+
+    result.provider = provider_result.get().provider;
+    return core::Result<EmbeddingProviderResult>::Ok(result);
+}
+
+core::Result<EmbeddingProviderResult> EmbeddingProviderFactory::create_provider(
+    EmbeddingProviderId id,
+    const EmbeddingProviderOptions& options
+) {
+    EmbeddingProviderResult result;
+
+    switch (id) {
+        case EmbeddingProviderId::OpenAI: {
+            RemoteEmbeddingProvider::Config config;
+            config.provider_id = EmbeddingProviderId::OpenAI;
+            config.base_url = "https://api.openai.com/v1";
+            config.model = options.model.empty() ? "text-embedding-3-small" : options.model;
+            // API key from environment
+            const char* api_key = std::getenv("OPENAI_API_KEY");
+            if (!api_key || std::string(api_key).empty()) {
+                return core::Result<EmbeddingProviderResult>::Err("OPENAI_API_KEY not set");
+            }
+            config.api_key = api_key;
+            auto provider = RemoteEmbeddingProvider::create(config);
+            if (!provider.is_ok()) {
+                return core::Result<EmbeddingProviderResult>::Err(provider.error);
+            }
+            result.provider = provider.get();
+            return core::Result<EmbeddingProviderResult>::Ok(result);
+        }
+        case EmbeddingProviderId::Ollama: {
+            RemoteEmbeddingProvider::Config config;
+            config.provider_id = EmbeddingProviderId::Ollama;
+            config.base_url = "http://localhost:11434";
+            config.model = options.model.empty() ? "nomic-embed-text" : options.model;
+            auto provider = RemoteEmbeddingProvider::create(config);
+            if (!provider.is_ok()) {
+                return core::Result<EmbeddingProviderResult>::Err(provider.error);
+            }
+            result.provider = provider.get();
+            return core::Result<EmbeddingProviderResult>::Ok(result);
+        }
+        case EmbeddingProviderId::Gemini: {
+            RemoteEmbeddingProvider::Config config;
+            config.provider_id = EmbeddingProviderId::Gemini;
+            config.base_url = "https://generativelanguage.googleapis.com/v1beta";
+            config.model = options.model.empty() ? "text-embedding-004" : options.model;
+            const char* api_key = std::getenv("GEMINI_API_KEY");
+            if (!api_key || std::string(api_key).empty()) {
+                return core::Result<EmbeddingProviderResult>::Err("GEMINI_API_KEY not set");
+            }
+            config.api_key = api_key;
+            auto provider = RemoteEmbeddingProvider::create(config);
+            if (!provider.is_ok()) {
+                return core::Result<EmbeddingProviderResult>::Err(provider.error);
+            }
+            result.provider = provider.get();
+            return core::Result<EmbeddingProviderResult>::Ok(result);
+        }
+        case EmbeddingProviderId::Voyage: {
+            RemoteEmbeddingProvider::Config config;
+            config.provider_id = EmbeddingProviderId::Voyage;
+            config.base_url = "https://api.voyageai.com/v1";
+            config.model = options.model.empty() ? "voyage-3" : options.model;
+            const char* api_key = std::getenv("VOYAGE_API_KEY");
+            if (!api_key || std::string(api_key).empty()) {
+                return core::Result<EmbeddingProviderResult>::Err("VOYAGE_API_KEY not set");
+            }
+            config.api_key = api_key;
+            auto provider = RemoteEmbeddingProvider::create(config);
+            if (!provider.is_ok()) {
+                return core::Result<EmbeddingProviderResult>::Err(provider.error);
+            }
+            result.provider = provider.get();
+            return core::Result<EmbeddingProviderResult>::Ok(result);
+        }
+        case EmbeddingProviderId::Mistral: {
+            RemoteEmbeddingProvider::Config config;
+            config.provider_id = EmbeddingProviderId::Mistral;
+            config.base_url = "https://api.mistral.ai/v1";
+            config.model = options.model.empty() ? "mistral-embed" : options.model;
+            const char* api_key = std::getenv("MISTRAL_API_KEY");
+            if (!api_key || std::string(api_key).empty()) {
+                return core::Result<EmbeddingProviderResult>::Err("MISTRAL_API_KEY not set");
+            }
+            config.api_key = api_key;
+            auto provider = RemoteEmbeddingProvider::create(config);
+            if (!provider.is_ok()) {
+                return core::Result<EmbeddingProviderResult>::Err(provider.error);
+            }
+            result.provider = provider.get();
+            return core::Result<EmbeddingProviderResult>::Ok(result);
+        }
+        default:
+            return core::Result<EmbeddingProviderResult>::Err(
+                "Unsupported embedding provider: " + to_string(id)
+            );
+    }
+}
+
+core::Result<std::shared_ptr<EmbeddingProvider>> EmbeddingProviderFactory::create_local_provider(
+    const EmbeddingProviderOptions& /*options*/
+) {
+    // Local provider not yet implemented
+    return core::Result<std::shared_ptr<EmbeddingProvider>>::Err(
+        "Local embedding provider not yet implemented"
+    );
+}
+
+bool EmbeddingProviderFactory::can_auto_select_local(
+    const EmbeddingProviderOptions& /*options*/
+) {
+    return false;
+}
+
+bool EmbeddingProviderFactory::is_missing_api_key_error(const std::string& error_msg) {
+    return error_msg.find("API_KEY") != std::string::npos ||
+           error_msg.find("api_key") != std::string::npos ||
+           error_msg.find("not set") != std::string::npos;
+}
+
+// ============================================================================
+// RemoteEmbeddingProvider Implementation
+// ============================================================================
+
+namespace {
+
+// Internal implementation class
+class RemoteEmbeddingProviderImpl : public RemoteEmbeddingProvider {
+public:
+    explicit RemoteEmbeddingProviderImpl(const RemoteEmbeddingProvider::Config& config)
+        : config_(config) {}
+
+    std::string get_id() const override {
+        return to_string(config_.provider_id);
+    }
+
+    std::string get_model() const override {
+        return config_.model;
+    }
+
+    std::optional<int> get_max_input_tokens() const override {
+        return config_.max_input_tokens;
+    }
+
+    core::Result<std::vector<float>> embed_query(const std::string& text) override {
+        auto batch_result = embed_batch({text});
+        if (!batch_result.is_ok()) {
+            return core::Result<std::vector<float>>::Err(batch_result.error);
+        }
+        const auto& batch = batch_result.get();
+        if (batch.empty()) {
+            return core::Result<std::vector<float>>::Err("Empty embedding result");
+        }
+        return core::Result<std::vector<float>>::Ok(batch[0]);
+    }
+
+    core::Result<std::vector<std::vector<float>>> embed_batch(
+        const std::vector<std::string>& texts
+    ) override {
+        if (texts.empty()) {
+            return core::Result<std::vector<std::vector<float>>>::Ok({});
+        }
+
+        // Build request body
+        json request_body;
+        request_body["model"] = config_.model;
+        if (texts.size() == 1) {
+            request_body["input"] = texts[0];
+        } else {
+            request_body["input"] = texts;
+        }
+        if (config_.output_dimensionality.has_value()) {
+            request_body["dimensions"] = config_.output_dimensionality.value();
+        }
+
+        // Build headers
+        std::map<std::string, std::string> headers = config_.headers;
+        if (!config_.api_key.empty()) {
+            headers["Authorization"] = "Bearer " + config_.api_key;
+        }
+
+        // Make HTTP request using post_json
+        std::string url = config_.base_url + "/embeddings";
+        auto http_result = HttpClient::post_json(url, request_body, headers);
+        if (!http_result.is_ok()) {
+            return core::Result<std::vector<std::vector<float>>>::Err(
+                "HTTP request failed: " + http_result.error
+            );
+        }
+
+        // Parse response
+        try {
+            const json& response = http_result.get();
+            if (!response.contains("data") || !response["data"].is_array()) {
+                std::string err_msg = "Invalid response format";
+                if (response.contains("error")) {
+                    err_msg = response["error"].value("message", err_msg);
+                }
+                return core::Result<std::vector<std::vector<float>>>::Err(err_msg);
+            }
+
+            std::vector<std::vector<float>> embeddings;
+            embeddings.reserve(response["data"].size());
+
+            for (const auto& item : response["data"]) {
+                if (!item.contains("embedding") || !item["embedding"].is_array()) {
+                    return core::Result<std::vector<std::vector<float>>>::Err(
+                        "Missing embedding in response item"
+                    );
+                }
+                std::vector<float> embedding;
+                embedding.reserve(item["embedding"].size());
+                for (const auto& val : item["embedding"]) {
+                    embedding.push_back(val.get<float>());
+                }
+                embeddings.push_back(std::move(embedding));
+            }
+
+            return core::Result<std::vector<std::vector<float>>>::Ok(embeddings);
+        } catch (const std::exception& e) {
+            return core::Result<std::vector<std::vector<float>>>::Err(
+                std::string("Failed to parse embedding response: ") + e.what()
+            );
+        }
+    }
+
+private:
+    RemoteEmbeddingProvider::Config config_;
+};
+
+} // anonymous namespace
+
+// static
+core::Result<std::shared_ptr<RemoteEmbeddingProvider>> RemoteEmbeddingProvider::create(
+    const Config& config
+) {
+    if (config.base_url.empty()) {
+        return core::Result<std::shared_ptr<RemoteEmbeddingProvider>>::Err(
+            "RemoteEmbeddingProvider: base_url is required"
+        );
+    }
+    if (config.model.empty()) {
+        return core::Result<std::shared_ptr<RemoteEmbeddingProvider>>::Err(
+            "RemoteEmbeddingProvider: model is required"
+        );
+    }
+    auto provider = std::make_shared<RemoteEmbeddingProviderImpl>(config);
+    return core::Result<std::shared_ptr<RemoteEmbeddingProvider>>::Ok(provider);
+}
 
 } // namespace memory
 } // namespace hunterclaw

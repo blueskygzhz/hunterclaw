@@ -426,6 +426,66 @@ core::Result<json> method_channel_send(
     return core::Result<json>::Err("channel.send not implemented yet");
 }
 
+// ============================================================================
+// channel.health - 检查 channel 健康状态
+// ============================================================================
+core::Result<json> method_channel_health(
+    std::shared_ptr<GatewayServer> server,
+    std::shared_ptr<MethodGuard> method_guard,
+    const ClientContext& client_ctx,
+    const json& params
+) {
+    (void)method_guard;
+    (void)client_ctx;
+
+    std::string channel_id = params.value("channel_id", "");
+
+    auto channel_mgr = server->channel_manager();
+    if (!channel_mgr) {
+        json result;
+        result["healthy"] = false;
+        result["reason"] = "Channel manager not initialized";
+        return core::Result<json>::Ok(result);
+    }
+
+    if (!channel_id.empty()) {
+        // Check specific channel health
+        auto channel = channel_mgr->get_channel(channel_id);
+        json result;
+        if (!channel) {
+            result["healthy"] = false;
+            result["channel_id"] = channel_id;
+            result["reason"] = "Channel not found";
+        } else {
+            result["healthy"] = channel->is_connected();
+            result["channel_id"] = channel_id;
+            result["status"] = channel->is_connected() ? "connected" : "disconnected";
+        }
+        return core::Result<json>::Ok(result);
+    }
+
+    // Check all channels health
+    auto channels = channel_mgr->list_channels();
+    json channels_health = json::array();
+    bool all_healthy = true;
+
+    for (const auto& ch : channels) {
+        json ch_health;
+        ch_health["channel_id"] = ch->id();
+        ch_health["healthy"] = ch->is_connected();
+        ch_health["status"] = ch->is_connected() ? "connected" : "disconnected";
+        if (!ch->is_connected()) all_healthy = false;
+        channels_health.push_back(ch_health);
+    }
+
+    json result;
+    result["healthy"] = all_healthy;
+    result["channels"] = channels_health;
+    result["count"] = channels_health.size();
+
+    return core::Result<json>::Ok(result);
+}
+
 }  // namespace methods
 }  // namespace gateway
 }  // namespace hunterclaw

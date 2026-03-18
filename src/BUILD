@@ -65,6 +65,33 @@ cc_library(
 )
 
 # ============================================================================
+# Observability Library - Tracing, Metrics, Diagnostic Events
+# ============================================================================
+cc_library(
+    name = "hunterclaw_observability",
+    srcs = glob(["observability/*.cc"]),
+    deps = [
+        "//:hunterclaw_headers",
+        "@nlohmann_json//:json",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+    copts = [
+        "-std=c++17",
+        "-Wall",
+        "-Wextra",
+        "-I/usr/include/jsoncpp",
+        "-I/usr/include/spdlog",
+    ],
+    linkopts = [
+        "-lpthread",
+        "-ljsoncpp",
+    ],
+    linkstatic = False,
+    visibility = ["//visibility:public"],
+)
+
+# ============================================================================
 # Memory Library - 严格对齐 OpenClaw Memory 实现
 # ============================================================================
 cc_library(
@@ -136,6 +163,15 @@ cc_library(
     deps = [
         "//:hunterclaw_headers",
         "//third_party:httplib",
+        ":hunterclaw_agents",        # ✅ 添加 agents 依赖
+        ":hunterclaw_memory",        # ✅ 添加 memory 依赖
+        ":hunterclaw_llm",           # ✅ 添加 llm 依赖
+        ":hunterclaw_sessions",      # ✅ 添加 sessions 依赖
+        ":hunterclaw_skills",        # ✅ 添加 skills 依赖
+        ":hunterclaw_tools",         # ✅ 添加 tools 依赖
+        ":hunterclaw_react",         # ✅ 添加 react 依赖
+        ":hunterclaw_cron",          # ✅ 添加 cron 依赖
+        ":hunterclaw_observability", # ✅ 添加 observability 依赖 (WebhookReceivedEvent vtable)
         "@nlohmann_json//:json",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -260,6 +296,7 @@ cc_library(
         ":hunterclaw_llm",
         ":hunterclaw_memory",
         ":hunterclaw_sessions",
+        ":hunterclaw_observability",  # ✅ 添加 observability 依赖
         "@nlohmann_json//:json",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -313,6 +350,33 @@ cc_library(
 )
 
 # ============================================================================
+# Core Base Library - Core utilities (ThreadPool, etc.) with no heavy deps
+# ============================================================================
+cc_library(
+    name = "hunterclaw_core_base",
+    srcs = glob(["core/*.cc"]),
+    deps = [
+        "//:hunterclaw_headers",
+        "@nlohmann_json//:json",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+    copts = [
+        "-std=c++17",
+        "-Wall",
+        "-Wextra",
+        "-I/usr/include/jsoncpp",
+        "-I/usr/include/spdlog",
+    ],
+    linkopts = [
+        "-lpthread",
+        "-ljsoncpp",
+    ],
+    linkstatic = False,
+    visibility = ["//visibility:public"],
+)
+
+# ============================================================================
 # ReAct Library - ReAct Engine, Reasoning, Tool Orchestration (对齐 OpenClaw)
 # ============================================================================
 cc_library(
@@ -320,11 +384,14 @@ cc_library(
     srcs = glob(["react/*.cc"]),  # ✅ 不再排除 message_processor.cc - 所有依赖已实现
     deps = [
         "//:hunterclaw_headers",
+        ":hunterclaw_core_base",     # ✅ 添加 core_base 依赖 (ThreadPool)
         ":hunterclaw_llm",
         ":hunterclaw_tools",
         ":hunterclaw_memory",
         ":hunterclaw_sessions",
-        ":hunterclaw_agents",  # ✅ 添加 agents 依赖 (message_processor 需要 AgentConfig)
+        ":hunterclaw_observability",  # ✅ 添加 observability 依赖 (Tracer, Span, DiagnosticEventBus)
+        # ✅ 移除 hunterclaw_agents 依赖，打破循环依赖
+        # message_processor 只需要 AgentConfig 类型，该类型定义在头文件中
         "@nlohmann_json//:json",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -357,6 +424,8 @@ cc_library(
         ":hunterclaw_memory",
         ":hunterclaw_llm",
         ":hunterclaw_skills",
+        ":hunterclaw_tools",   # ✅ 添加 tools 依赖 (ToolManager::create)
+        ":hunterclaw_react",   # ✅ 添加 react 依赖 (ReactEngine::create)
         "@nlohmann_json//:json",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -383,7 +452,6 @@ cc_library(
 cc_library(
     name = "hunterclaw_core",
     srcs = glob([
-        "core/*.cc",
         "utils/*.cc",
         "config/*.cc",
         "channels/*.cc",
@@ -397,7 +465,7 @@ cc_library(
         "security/*.cc",
         "secrets/*.cc",
         "auto_reply/*.cc",
-        "observability/*.cc",
+        # ✅ 移除 observability/*.cc - 已移至独立的 hunterclaw_observability 库
         "infra/*.cc",
         "logging/*.cc",
         "markdown/*.cc",
@@ -408,6 +476,7 @@ cc_library(
         "infra/exec_approvals.cc",  # TODO: 需要更新以匹配新的 API
     ]),
     deps = [
+        ":hunterclaw_core_base",  # ✅ 依赖 core_base (core/*.cc)
         ":hunterclaw_agents",    # ✅ 添加 agents 依赖
         ":hunterclaw_cron",      # ✅ 添加 cron 依赖
         ":hunterclaw_gateway",   # ✅ 添加 gateway 依赖
@@ -419,6 +488,7 @@ cc_library(
         ":hunterclaw_tools",  # ✅ 添加 tools 依赖
         ":hunterclaw_sandbox",  # ✅ 添加 sandbox 依赖
         ":hunterclaw_react",  # ✅ 添加 react 依赖
+        ":hunterclaw_observability",  # ✅ 添加 observability 依赖
         "//:hunterclaw_headers",
         "//third_party:httplib",
         "//third_party:subprocess",  # ✅ 添加 subprocess 依赖
