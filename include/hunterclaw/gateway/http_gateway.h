@@ -24,6 +24,10 @@ namespace gateway {
 // Forward declarations
 class OpenAIAdapter;
 
+namespace http {
+    class OpenAICompat;
+}
+
 // ============================================================================
 // HTTP Gateway Options
 // ============================================================================

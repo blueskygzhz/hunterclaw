@@ -459,7 +459,7 @@ void HttpGateway::handle_rpc(const httplib::Request& req, httplib::Response& res
         auto result = invoke_rpc(method, params);
         
         if (result.is_ok()) {
-            send_json(res, 200, result.value);
+            send_json(res, 200, result.value.value_or(json::object()));
         } else {
             send_error(res, 500, result.error);
         }
@@ -475,7 +475,7 @@ void HttpGateway::handle_list_sessions(const httplib::Request& req, httplib::Res
     auto result = invoke_rpc("session.list", json::object());
     
     if (result.is_ok()) {
-        send_json(res, 200, result.value);
+        send_json(res, 200, result.value.value_or(json::object()));
     } else {
         send_error(res, 500, result.error);
     }
@@ -488,7 +488,7 @@ void HttpGateway::handle_get_session(const httplib::Request& req, httplib::Respo
     auto result = invoke_rpc("session.get", params);
     
     if (result.is_ok()) {
-        send_json(res, 200, result.value);
+        send_json(res, 200, result.value.value_or(json::object()));
     } else {
         send_error(res, 404, result.error);
     }
@@ -500,7 +500,7 @@ void HttpGateway::handle_create_session(const httplib::Request& req, httplib::Re
         auto result = invoke_rpc("session.create", body);
         
         if (result.is_ok()) {
-            send_json(res, 201, result.value);
+            send_json(res, 201, result.value.value_or(json::object()));
         } else {
             send_error(res, 400, result.error);
         }
@@ -516,7 +516,7 @@ void HttpGateway::handle_delete_session(const httplib::Request& req, httplib::Re
     auto result = invoke_rpc("session.delete", params);
     
     if (result.is_ok()) {
-        send_json(res, 200, result.value);
+        send_json(res, 200, result.value.value_or(json::object()));
     } else {
         send_error(res, 404, result.error);
     }
@@ -561,7 +561,7 @@ void HttpGateway::handle_update_session(const httplib::Request& req, httplib::Re
         auto result = invoke_rpc("session.patch", params);
         
         if (result.is_ok()) {
-            send_json(res, 200, result.value);
+            send_json(res, 200, result.value.value_or(json::object()));
         } else {
             send_error(res, 400, result.error);
         }
@@ -577,7 +577,7 @@ void HttpGateway::handle_list_channels(const httplib::Request& req, httplib::Res
     auto result = invoke_rpc("channel.list", json::object());
     
     if (result.is_ok()) {
-        send_json(res, 200, result.value);
+        send_json(res, 200, result.value.value_or(json::object()));
     } else {
         send_error(res, 500, result.error);
     }
@@ -590,7 +590,7 @@ void HttpGateway::handle_get_channel(const httplib::Request& req, httplib::Respo
     auto result = invoke_rpc("channel.get", params);
     
     if (result.is_ok()) {
-        send_json(res, 200, result.value);
+        send_json(res, 200, result.value.value_or(json::object()));
     } else {
         send_error(res, 404, result.error);
     }
@@ -613,7 +613,7 @@ void HttpGateway::handle_start_channel(const httplib::Request& req, httplib::Res
     auto result = invoke_rpc("channel.start", params);
     
     if (result.is_ok()) {
-        send_json(res, 200, result.value);
+        send_json(res, 200, result.value.value_or(json::object()));
     } else {
         send_error(res, 400, result.error);
     }
@@ -636,7 +636,7 @@ void HttpGateway::handle_stop_channel(const httplib::Request& req, httplib::Resp
     auto result = invoke_rpc("channel.stop", params);
     
     if (result.is_ok()) {
-        send_json(res, 200, result.value);
+        send_json(res, 200, result.value.value_or(json::object()));
     } else {
         send_error(res, 400, result.error);
     }
@@ -676,8 +676,10 @@ void HttpGateway::handle_create_agent(const httplib::Request& req, httplib::Resp
         
         auto result = invoke_rpc("agents.create", params);
         
-        if (result.is_ok()) {
-            send_json(res, 201, result.value);
+        if (result.is_ok() && result.value.has_value()) {
+            send_json(res, 201, result.value.value());
+        } else if (result.is_ok()) {
+            send_json(res, 201, json::object());
         } else {
             send_error(res, 400, result.error);
         }
@@ -717,7 +719,7 @@ void HttpGateway::handle_list_agents(const httplib::Request& req, httplib::Respo
     auto result = invoke_rpc("agents.list", params);
     
     if (result.is_ok()) {
-        send_json(res, 200, result.value);
+        send_json(res, 200, result.value.value_or(json::object()));
     } else {
         send_error(res, 500, result.error);
     }
@@ -733,7 +735,7 @@ void HttpGateway::handle_get_agent(const httplib::Request& req, httplib::Respons
     auto result = invoke_rpc("agents.get", params);
     
     if (result.is_ok()) {
-        send_json(res, 200, result.value);
+        send_json(res, 200, result.value.value_or(json::object()));
     } else {
         send_error(res, 404, result.error);
     }
@@ -765,7 +767,7 @@ void HttpGateway::handle_update_agent(const httplib::Request& req, httplib::Resp
         auto result = invoke_rpc("agents.patch", params);
         
         if (result.is_ok()) {
-            send_json(res, 200, result.value);
+            send_json(res, 200, result.value.value_or(json::object()));
         } else {
             send_error(res, 400, result.error);
         }
@@ -785,7 +787,7 @@ void HttpGateway::handle_delete_agent(const httplib::Request& req, httplib::Resp
     auto result = invoke_rpc("agents.delete", params);
     
     if (result.is_ok()) {
-        send_json(res, 200, result.value);
+        send_json(res, 200, result.value.value_or(json::object()));
     } else {
         send_error(res, 404, result.error);
     }
@@ -797,7 +799,7 @@ void HttpGateway::handle_list_skills(const httplib::Request& req, httplib::Respo
     auto result = invoke_rpc("skill.list", json::object());
     
     if (result.is_ok()) {
-        send_json(res, 200, result.value);
+        send_json(res, 200, result.value.value_or(json::object()));
     } else {
         send_error(res, 500, result.error);
     }
@@ -810,7 +812,7 @@ void HttpGateway::handle_get_skill(const httplib::Request& req, httplib::Respons
     auto result = invoke_rpc("skill.get", params);
     
     if (result.is_ok()) {
-        send_json(res, 200, result.value);
+        send_json(res, 200, result.value.value_or(json::object()));
     } else {
         send_error(res, 404, result.error);
     }
@@ -873,12 +875,17 @@ void HttpGateway::handle_chat_completions(const httplib::Request& req, httplib::
             res.set_header("X-Accel-Buffering", "no");  // Disable nginx buffering
             
             // Use chunked content provider for streaming
+            auto compat = openai_compat_;  // Capture by value to avoid lambda issues
             res.set_chunked_content_provider(
                 "text/event-stream",
-                [this, request](size_t offset, httplib::DataSink& sink) {
+                [this, request, compat](size_t offset, httplib::DataSink& sink) {
                     bool stream_complete = false;
                     
-                    auto result = openai_compat_->create_chat_completion_stream(
+                    if (!compat) {
+                        return false;  // End streaming if no compat layer
+                    }
+                    
+                    auto result = compat->create_chat_completion_stream(
                         request,
                         // On chunk callback
                         [&](const ChatCompletionChunk& chunk) {
@@ -907,10 +914,19 @@ void HttpGateway::handle_chat_completions(const httplib::Request& req, httplib::
             
         } else {
             // Non-streaming response
+            if (!openai_compat_) {
+                send_json(res, 500, {{"error", "OpenAI compatibility layer not initialized"}});
+                return;
+            }
+            
             auto result = openai_compat_->create_chat_completion(request);
             
             if (result.is_ok()) {
-                send_json(res, 200, result.value.to_json());
+                if (result.value.has_value()) {
+                    send_json(res, 200, result.value.value().to_json());
+                } else {
+                    send_error(res, 500, "Empty response from LLM");
+                }
             } else {
                 send_error(res, 500, result.error);
             }
@@ -992,7 +1008,7 @@ void HttpGateway::handle_webhook_hook(const httplib::Request& req, httplib::Resp
     // 方式 1: Bearer Token
     if (req.has_header("Authorization")) {
         std::string auth_header = req.get_header_value("Authorization");
-        if (auth_header.starts_with("Bearer ")) {
+        if (auth_header.size() >= 7 && auth_header.substr(0, 7) == "Bearer ") {
             provided_token = auth_header.substr(7);
         }
     }
@@ -1003,8 +1019,8 @@ void HttpGateway::handle_webhook_hook(const httplib::Request& req, httplib::Resp
     }
     
     // 🎯 常量时间比较 Token (防止时序攻击)
-    if (!provided_token.empty() && !bearer_token_.empty()) {
-        authenticated = hunterclaw::security::timing_safe_equal(provided_token, bearer_token_);
+    if (!provided_token.empty() && !options_.bearer_token.empty()) {
+        authenticated = hunterclaw::security::timing_safe_equal(provided_token, options_.bearer_token);
     }
     
     if (!authenticated) {

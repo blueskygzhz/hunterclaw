@@ -28,7 +28,8 @@ alias(
 )
 
 # Test targets
-alias(
-    name = "test_process_integration",
-    actual = "//tests:test_process_integration",
-)
+# Temporarily disabled until tests/BUILD is created
+# alias(
+#     name = "test_process_integration",
+#     actual = "//tests:test_process_integration",
+# )

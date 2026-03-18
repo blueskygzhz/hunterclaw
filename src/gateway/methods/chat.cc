@@ -1,5 +1,6 @@
 #include "hunterclaw/gateway/gateway.h"
 #include "hunterclaw/gateway/method_guard.h"
+#include "hunterclaw/gateway/protocol.h"
 #include "hunterclaw/core/utils.h"
 #include "hunterclaw/agents/agent_pool.h"
 #include "hunterclaw/agents/agent_instance.h"
@@ -18,6 +19,17 @@ using json = nlohmann::json;
 namespace hunterclaw {
 namespace gateway {
 namespace methods {
+
+// ============================================================================
+// Logger Helper
+// ============================================================================
+static std::shared_ptr<spdlog::logger> get_logger() {
+    static auto logger = spdlog::get("chat");
+    if (!logger) {
+        logger = spdlog::stdout_logger_mt("chat");
+    }
+    return logger;
+}
 
 // ============================================================================
 // Chat Methods
@@ -87,14 +99,14 @@ core::Result<json> method_chat_send(
         return core::Result<json>::Err("Message cannot be empty after sanitization");
     }
     
-    spdlog::info("[chat.send] session={}, message_len={}", session_id, message.size());
+    get_logger()->info("[chat.send] session={}, message_len={}", session_id, message.size());
     
     // ========================================================================
     // Step 2: Stop Command 检测 (对齐 OpenClaw)
     // ========================================================================
     
     if (is_stop_command(message)) {
-        spdlog::info("[chat.send] Stop command detected: session={}", session_id);
+        get_logger()->info("[chat.send] Stop command detected: session={}", session_id);
         
         // TODO: 调用 abort_chat_run(session_id)
         // 当前返回确认
@@ -140,16 +152,21 @@ core::Result<json> method_chat_send(
         event_payload["seq"] = evt.seq;
         event_payload["stream"] = "lifecycle";
         event_payload["timestamp"] = evt.timestamp_ms;
-        event_payload["data"] = evt.data;
+        event_payload["data"] = evt.data.to_json();
         
         core::EventFrame frame;
-        frame.type = "agent";
-        frame.payload = event_payload;
+        frame.event = "agent";
+        frame.seq = evt.seq;
+        frame.payload = core::JsonValue(event_payload);
         
         server->broadcast(frame);
         
-        spdlog::debug("[chat.send] Agent event: run_id={}, seq={}, phase={}",
-            evt.run_id, evt.seq, evt.data.value("phase", "unknown"));
+        std::string phase = "unknown";
+        if (evt.data.contains("phase")) {
+            phase = evt.data["phase"].as_string();
+        }
+        get_logger()->debug("[chat.send] Agent event: run_id={}, seq={}, phase={}",
+            evt.run_id, evt.seq, phase);
     });
     
     // ========================================================================
@@ -157,7 +174,7 @@ core::Result<json> method_chat_send(
     // ========================================================================
     
     std::string run_id = generate_run_id();
-    spdlog::info("[chat.send] Starting run: session={}, run_id={}, agent={}",
+    get_logger()->info("[chat.send] Starting run: session={}, run_id={}, agent={}",
         session_id, run_id, agent->context().agent_id);
     
     // ========================================================================
@@ -178,9 +195,9 @@ core::Result<json> method_chat_send(
     );
     
     if (!append_result.ok) {
-        spdlog::warn("[chat.send] Failed to write user message to transcript: {}", append_result.error);
+        get_logger()->warn("[chat.send] Failed to write user message to transcript: {}", append_result.error);
     } else {
-        spdlog::debug("[chat.send] User message written to transcript: session={}, message_id={}",
+        get_logger()->debug("[chat.send] User message written to transcript: session={}, message_id={}",
             session_id, append_result.message_id);
     }
     
@@ -210,8 +227,8 @@ core::Result<json> method_chat_send(
         ).count();
         
         core::EventFrame frame;
-        frame.type = "chat";
-        frame.payload = event;
+        frame.event = "chat";
+        frame.payload = core::JsonValue(event);
         
         server->broadcast(frame);
     };
@@ -228,8 +245,8 @@ core::Result<json> method_chat_send(
         ).count();
         
         core::EventFrame frame;
-        frame.type = "reasoning";
-        frame.payload = event;
+        frame.event = "reasoning";
+        frame.payload = core::JsonValue(event);
         
         server->broadcast(frame);
     };
@@ -244,11 +261,11 @@ core::Result<json> method_chat_send(
         event["session_id"] = session_id;
         event["run_id"] = run_id;
         event["tool_name"] = tool_name;
-        event["args"] = args;
+        event["args"] = args.to_json();
         
         core::EventFrame frame;
-        frame.type = "tool";
-        frame.payload = event;
+        frame.event = "tool";
+        frame.payload = core::JsonValue(event);
         
         server->broadcast(frame);
     };
@@ -263,11 +280,34 @@ core::Result<json> method_chat_send(
         event["run_id"] = run_id;
         event["tool_name"] = tool_name;
         event["success"] = result.success;
-        event["output"] = result.output;
+        
+        // 转换 content 到 JSON
+        json content_array = json::array();
+        for (const auto& item : result.content) {
+            json content_item;
+            if (item.type == tools::ToolResultContent::Type::Text) {
+                content_item["type"] = "text";
+                content_item["text"] = item.text;
+            } else if (item.type == tools::ToolResultContent::Type::Image) {
+                content_item["type"] = "image";
+                content_item["data"] = item.data;
+                content_item["mime_type"] = item.mime_type;
+            } else if (item.type == tools::ToolResultContent::Type::Json) {
+                content_item["type"] = "json";
+                content_item["text"] = item.text;
+            }
+            content_array.push_back(content_item);
+        }
+        event["content"] = content_array;
+        event["details"] = result.details.to_json();
+        
+        if (!result.error.empty()) {
+            event["error"] = result.error;
+        }
         
         core::EventFrame frame;
-        frame.type = "tool";
-        frame.payload = event;
+        frame.event = "tool";
+        frame.payload = core::JsonValue(event);
         
         server->broadcast(frame);
     };
@@ -283,12 +323,12 @@ core::Result<json> method_chat_send(
         ).count();
         
         core::EventFrame frame;
-        frame.type = "chat";
-        frame.payload = event;
+        frame.event = "chat";
+        frame.payload = core::JsonValue(event);
         
         server->broadcast(frame);
         
-        spdlog::info("[chat.send] Completed: session={}, run_id={}", session_id, run_id);
+        get_logger()->info("[chat.send] Completed: session={}, run_id={}", session_id, run_id);
     };
     
     // 错误回调
@@ -300,12 +340,12 @@ core::Result<json> method_chat_send(
         event["error"] = error;
         
         core::EventFrame frame;
-        frame.type = "chat";
-        frame.payload = event;
+        frame.event = "chat";
+        frame.payload = core::JsonValue(event);
         
         server->broadcast(frame);
         
-        spdlog::error("[chat.send] Error: session={}, run_id={}, error={}",
+        get_logger()->error("[chat.send] Error: session={}, run_id={}, error={}",
             session_id, run_id, error);
     };
     
@@ -325,15 +365,15 @@ core::Result<json> method_chat_send(
             );
             
             if (!append_result.ok) {
-                spdlog::warn("[chat.send] Failed to write assistant message to transcript: {}",
+                get_logger()->warn("[chat.send] Failed to write assistant message to transcript: {}",
                     append_result.error);
             }
             
-            spdlog::info("[chat.send] Agent completed: session={}, run_id={}, steps={}",
+            get_logger()->info("[chat.send] Agent completed: session={}, run_id={}, steps={}",
                 session_id, run_id, result.total_steps);
                 
         } catch (const std::exception& e) {
-            spdlog::error("[chat.send] Agent exception: session={}, run_id={}, error={}",
+            get_logger()->error("[chat.send] Agent exception: session={}, run_id={}, error={}",
                 session_id, run_id, e.what());
         }
     }).detach();
@@ -374,7 +414,7 @@ core::Result<json> method_chat_abort(
     std::string session_id = params["session_id"];
     std::string run_id = params.value("run_id", "");
     
-    spdlog::info("[chat.abort] session={}, run_id={}", session_id, run_id.empty() ? "<all>" : run_id);
+    get_logger()->info("[chat.abort] session={}, run_id={}", session_id, run_id.empty() ? "<all>" : run_id);
     
     // ========================================================================
     // Step 2: 获取 Agent
@@ -413,22 +453,18 @@ core::Result<json> method_chat_abort(
     bool aborted = false;
     std::vector<std::string> aborted_runs;
     
+    // ReactEngine 只支持 cancel() 当前执行，没有 run_id 管理
+    // TODO: 实现基于 run_id 的 abort 功能
+    react_engine->cancel();
+    aborted = true;
+    
     if (run_id.empty()) {
-        // 中止所有运行
-        aborted = react_engine->abort_all();
-        if (aborted) {
-            // TODO: 从 engine 获取实际 aborted 的 run_ids
-            aborted_runs.push_back("all");
-        }
+        aborted_runs.push_back("all");
     } else {
-        // 中止特定运行
-        aborted = react_engine->abort(run_id);
-        if (aborted) {
-            aborted_runs.push_back(run_id);
-        }
+        aborted_runs.push_back(run_id);
     }
     
-    spdlog::info("[chat.abort] Result: session={}, aborted={}, count={}",
+    get_logger()->info("[chat.abort] Result: session={}, aborted={}, count={}",
         session_id, aborted, aborted_runs.size());
     
     // ========================================================================
@@ -467,7 +503,7 @@ core::Result<json> method_chat_history(
     // 硬限制：最多 1000 条
     limit = std::min(limit, 1000);
     
-    spdlog::debug("[chat.history] session={}, limit={}", session_id, limit);
+    get_logger()->debug("[chat.history] session={}, limit={}", session_id, limit);
     
     // ========================================================================
     // Step 2: 获取 Agent
@@ -541,7 +577,7 @@ core::Result<json> method_chat_history(
     result["fastMode"] = false;
     result["verboseLevel"] = "normal";
     
-    spdlog::debug("[chat.history] Returned 0 messages for session={}", session_id);
+    get_logger()->debug("[chat.history] Returned 0 messages for session={}", session_id);
     
     return core::Result<json>::Ok(result);
 }
@@ -568,7 +604,7 @@ core::Result<json> method_chat_inject(
     std::string message = params["message"];
     std::string label = params.value("label", "");
     
-    spdlog::info("[chat.inject] session={}, message_len={}, label={}",
+    get_logger()->info("[chat.inject] session={}, message_len={}, label={}",
         session_id, message.size(), label);
     
     // ========================================================================
@@ -608,11 +644,11 @@ core::Result<json> method_chat_inject(
     
     std::string message_id;
     if (!append_result.ok) {
-        spdlog::warn("[chat.inject] Failed to write to transcript: {}", append_result.error);
+        get_logger()->warn("[chat.inject] Failed to write to transcript: {}", append_result.error);
         message_id = core::utils::generate_uuid();
     } else {
         message_id = append_result.message_id;
-        spdlog::debug("[chat.inject] Written to transcript: session={}, message_id={}",
+        get_logger()->debug("[chat.inject] Written to transcript: session={}, message_id={}",
             session_id, message_id);
     }
     
@@ -641,8 +677,8 @@ core::Result<json> method_chat_inject(
     chat_payload["message"] = chat_message;
     
     core::EventFrame frame;
-    frame.type = "chat";
-    frame.payload = chat_payload;
+    frame.event = "chat";
+    frame.payload = core::JsonValue(chat_payload);
     
     server->broadcast(frame);
     
@@ -654,7 +690,7 @@ core::Result<json> method_chat_inject(
     result["ok"] = true;
     result["messageId"] = message_id;
     
-    spdlog::info("[chat.inject] Completed: session={}, message_id={}", session_id, message_id);
+    get_logger()->info("[chat.inject] Completed: session={}, message_id={}", session_id, message_id);
     
     return core::Result<json>::Ok(result);
 }

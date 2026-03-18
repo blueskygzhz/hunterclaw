@@ -1,4 +1,5 @@
 #include "hunterclaw/react/react_engine.h"
+#include "hunterclaw/tools/tool_manager.h"
 #include "hunterclaw/observability/observability.h"  // ✅ Span, Tracer, SpanKind
 #include "hunterclaw/observability/diagnostic_events.h"  // ✅ 可观测性集成
 #include <regex>
@@ -1044,7 +1045,7 @@ ReactEngine::CompactionResult ReactEngine::trigger_compaction(
         return result;
     }
     
-    auto& compact_data = compact_result.value;
+    auto& compact_data = compact_result.value.value();
     
     if (!compact_data.compacted) {
         log()->info("[ReactEngine] Compaction skipped: {}", compact_data.reason);

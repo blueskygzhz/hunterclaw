@@ -247,7 +247,7 @@ MessageContext MessageProcessor::preprocess_message(
         throw std::runtime_error("Failed to resolve route: " + route_result.error);
     }
     
-    context.route = route_result.value;
+    context.route = route_result.get();  // Use get() instead of .value
     context.agent_id = context.route.agent_id;
     context.user_id = message.sender_id;
     context.user_name = message.sender_name;
@@ -261,7 +261,7 @@ MessageContext MessageProcessor::preprocess_message(
         throw std::runtime_error("Agent config not found: " + context.agent_id);
     }
     
-    auto agent_config = agent_result.value;
+    auto& agent_config = agent_result.get();  // Use get() instead of .value
     
     // 2. 构建工作空间路径
     // 格式: {workspace_root}/{agent_id}
@@ -305,7 +305,7 @@ bool MessageProcessor::check_permissions(MessageContext& context) {
         return false;
     }
     
-    auto agent_config = agent_result.value;
+    auto& agent_config = agent_result.get();  // Use get() to get AgentConfig
     
     // 3. 白名单检查 (allowFrom)
     // 如果配置了白名单,用户必须在白名单中
@@ -448,7 +448,7 @@ std::vector<llm::LLMMessage> MessageProcessor::load_history(const MessageContext
         return history;
     }
     
-    auto session = session_result.value;
+    auto& session = session_result.get();  // Use get() to get SessionEntry
     
     // ✅ SessionEntry.messages 是 vector<string>，不是结构化消息
     // 简化实现: 暂时返回空历史，实际需要从 Memory/Transcript 加载
@@ -657,7 +657,7 @@ void MessageProcessor::save_session(
         return;
     }
     
-    auto session = session_result.value;
+    auto& session = session_result.get();  // Use get() to get SessionEntry
     
     // ✅ SessionEntry.messages 是 vector<string>，追加原始消息文本
     // TODO: 使用结构化格式（JSON）保存消息角色和内容
@@ -744,7 +744,7 @@ bool MessageProcessor::try_auto_compaction(MessageContext& context) {
             return false;
         }
         
-        auto session = session_result.value;
+        auto& session = session_result.get();  // Use get() to get SessionEntry
         
         // 2. 检查是否需要压缩
         int64_t total_tokens = session.total_tokens;

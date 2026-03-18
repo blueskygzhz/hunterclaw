@@ -6,6 +6,7 @@
 #include "hunterclaw/react/react_engine.h"  // ✅ ReactEngine
 #include "hunterclaw/llm/llm_client.h"       // ✅ LLMClient
 #include "hunterclaw/tools/tool.h"            // ✅ ToolManager
+#include "hunterclaw/tools/tool_manager.h"    // ✅ ToolManager::create
 #include <spdlog/spdlog.h>
 #include <filesystem>
 #include <sstream>

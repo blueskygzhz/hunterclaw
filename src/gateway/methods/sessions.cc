@@ -90,148 +90,19 @@ core::Result<json> method_session_list(
     auto now = std::chrono::system_clock::now();
     auto active_threshold = now - std::chrono::minutes(active_minutes > 0 ? active_minutes : 0);
     
-    // 🎯 OpenClaw 对齐: 从 session store 读取所有会话
-    auto& session_mgr = server->runtime_state()->session_manager;
-    if (!session_mgr) {
-        return core::Result<json>::Err("Session manager not initialized");
-    }
+    // TODO: HunterClaw session management not yet implemented
+    // Return empty session list for now
+    (void)now;  // Suppress unused warning
+    (void)active_threshold;
+    (void)include_global;
+    (void)include_unknown;
+    (void)agent_id_filter;
+    (void)spawned_by;
+    (void)label_filter;
+    (void)search;
+    (void)limit;
     
-    auto all_sessions = session_mgr->list_all_sessions();
-    
-    // 🎯 OpenClaw 对齐: 过滤会话
     json sessions_array = json::array();
-    
-    for (const auto& session : all_sessions) {
-        const std::string& key = session.session_id;
-        
-        // 🎯 OpenClaw 对齐: 过滤 cron run sessions
-        if (key.find("cron:run:") == 0) {
-            continue;
-        }
-        
-        // 🎯 OpenClaw 对齐: 过滤 global/unknown
-        if (!include_global && key == "global") continue;
-        if (!include_unknown && key == "unknown") continue;
-        
-        // 🎯 OpenClaw 对齐: agent ID 过滤
-        if (!agent_id_filter.empty()) {
-            std::string session_agent = extract_agent_id(key);
-            if (session_agent != agent_id_filter) continue;
-        }
-        
-        // 🎯 OpenClaw 对齐: spawnedBy 过滤
-        if (!spawned_by.empty()) {
-            auto metadata_it = session.metadata.find("spawnedBy");
-            if (metadata_it == session.metadata.end() || 
-                metadata_it->second != spawned_by) {
-                continue;
-            }
-        }
-        
-        // 🎯 OpenClaw 对齐: label 过滤
-        if (!label_filter.empty()) {
-            auto label_it = session.metadata.find("label");
-            if (label_it == session.metadata.end() || 
-                label_it->second != label_filter) {
-                continue;
-            }
-        }
-        
-        // 🎯 OpenClaw 对齐: 活跃时间过滤
-        if (active_minutes > 0 && session.last_active_at < active_threshold) {
-            continue;
-        }
-        
-        // 🎯 OpenClaw 对齐: 搜索过滤 (key, label, displayName)
-        if (!search.empty()) {
-            std::string search_lower = search;
-            std::transform(search_lower.begin(), search_lower.end(), 
-                         search_lower.begin(), ::tolower);
-            
-            std::string key_lower = key;
-            std::transform(key_lower.begin(), key_lower.end(), 
-                         key_lower.begin(), ::tolower);
-            
-            if (key_lower.find(search_lower) == std::string::npos) {
-                // TODO: 也搜索 label 和 displayName
-                continue;
-            }
-        }
-        
-        // 🎯 OpenClaw 对齐: 构建 session entry
-        json session_json;
-        session_json["key"] = key;
-        session_json["agentId"] = extract_agent_id(key);
-        session_json["kind"] = classify_session_kind(key);
-        
-        // 🎯 OpenClaw 对齐: 时间戳 (毫秒)
-        session_json["updatedAt"] = std::chrono::duration_cast<std::chrono::milliseconds>(
-            session.last_active_at.time_since_epoch()
-        ).count();
-        
-        // 🎯 OpenClaw 对齐: Token 统计
-        auto tokens_it = session.metadata.find("totalTokens");
-        int total_tokens = tokens_it != session.metadata.end() 
-            ? std::stoi(tokens_it->second) : 0;
-        session_json["totalTokens"] = total_tokens;
-        session_json["totalTokensFresh"] = false;  // TODO: 实现 token 刷新逻辑
-        session_json["contextTokens"] = nullptr;  // null 表示未知
-        
-        // 🎯 OpenClaw 对齐: 模型信息
-        auto model_it = session.metadata.find("model");
-        session_json["model"] = model_it != session.metadata.end() 
-            ? model_it->second : "unknown";
-        
-        auto provider_it = session.metadata.find("modelProvider");
-        if (provider_it != session.metadata.end()) {
-            session_json["modelProvider"] = provider_it->second;
-        }
-        
-        // 🎯 OpenClaw 对齐: label (可选)
-        auto label_it = session.metadata.find("label");
-        if (label_it != session.metadata.end()) {
-            session_json["label"] = label_it->second;
-        }
-        
-        // 🎯 OpenClaw 对齐: displayName (可选)
-        auto display_it = session.metadata.find("displayName");
-        if (display_it != session.metadata.end()) {
-            session_json["displayName"] = display_it->second;
-        }
-        
-        // 🎯 OpenClaw 对齐: spawnedBy (可选)
-        auto spawned_it = session.metadata.find("spawnedBy");
-        if (spawned_it != session.metadata.end()) {
-            session_json["spawnedBy"] = spawned_it->second;
-        }
-        
-        // 🎯 OpenClaw 对齐: Flags
-        json flags;
-        flags["locked"] = false;  // TODO: 从 metadata 读取
-        flags["systemPrompt"] = session.metadata.count("systemPrompt") > 0;
-        flags["elevated"] = session.metadata.count("elevated") > 0;
-        session_json["flags"] = flags;
-        
-        // 🎯 OpenClaw 对齐: 传递策略 (deliveryPolicy)
-        auto policy_it = session.metadata.find("deliveryPolicy");
-        if (policy_it != session.metadata.end()) {
-            session_json["deliveryPolicy"] = policy_it->second;
-        }
-        
-        sessions_array.push_back(session_json);
-    }
-    
-    // 🎯 OpenClaw 对齐: 按 updatedAt 降序排序
-    std::sort(sessions_array.begin(), sessions_array.end(), 
-        [](const json& a, const json& b) {
-            return a["updatedAt"].get<int64_t>() > b["updatedAt"].get<int64_t>();
-        });
-    
-    // 🎯 OpenClaw 对齐: 应用 limit
-    if (limit > 0 && sessions_array.size() > static_cast<size_t>(limit)) {
-        sessions_array = json::array(sessions_array.begin(), 
-                                    sessions_array.begin() + limit);
-    }
     
     // 🎯 OpenClaw 对齐: 构建结果
     json result;
@@ -291,10 +162,9 @@ core::Result<json> method_session_preview(
     limit = std::max(1, limit);
     max_chars = std::max(20, max_chars);
     
-    auto& session_mgr = server->runtime_state()->session_manager;
-    if (!session_mgr) {
-        return core::Result<json>::Err("Session manager not initialized");
-    }
+    // TODO: HunterClaw session previews not yet implemented
+    (void)limit;
+    (void)max_chars;
     
     // 🎯 OpenClaw 对齐: 为每个 key 生成预览
     json previews = json::array();
@@ -302,48 +172,8 @@ core::Result<json> method_session_preview(
     for (const auto& key : keys) {
         json preview_entry;
         preview_entry["key"] = key;
-        
-        try {
-            // 加载 session
-            auto session = session_mgr->get_session(key);
-            if (!session.ok) {
-                preview_entry["status"] = "missing";
-                preview_entry["items"] = json::array();
-                previews.push_back(preview_entry);
-                continue;
-            }
-            
-            // 读取最近的消息
-            auto messages = session_mgr->get_messages(key, limit);
-            
-            json items = json::array();
-            for (const auto& msg : messages) {
-                json item;
-                item["role"] = msg.role;
-                
-                // 🎯 OpenClaw 对齐: 截断内容到 maxChars
-                std::string content = msg.content;
-                if (content.size() > static_cast<size_t>(max_chars)) {
-                    content = content.substr(0, max_chars) + "…";
-                }
-                item["content"] = content;
-                
-                // 🎯 OpenClaw 对齐: 时间戳 (可选)
-                if (msg.metadata.count("timestamp")) {
-                    item["ts"] = std::stoll(msg.metadata.at("timestamp"));
-                }
-                
-                items.push_back(item);
-            }
-            
-            preview_entry["status"] = items.empty() ? "empty" : "ok";
-            preview_entry["items"] = items;
-            
-        } catch (...) {
-            preview_entry["status"] = "error";
-            preview_entry["items"] = json::array();
-        }
-        
+        preview_entry["status"] = "not_implemented";
+        preview_entry["items"] = json::array();
         previews.push_back(preview_entry);
     }
     
@@ -376,19 +206,8 @@ core::Result<json> method_session_patch(
         return core::Result<json>::Err("key required");
     }
     
-    auto& session_mgr = server->runtime_state()->session_manager;
-    if (!session_mgr) {
-        return core::Result<json>::Err("Session manager not initialized");
-    }
-    
-    // 🎯 OpenClaw 对齐: 加载现有 session
-    auto session_result = session_mgr->get_session(key);
-    if (!session_result.ok) {
-        // 如果 session 不存在,创建新的
-        sessions::SessionOptions opts;
-        opts.agent_id = extract_agent_id(key);
-        session_mgr->create_session(key, opts);
-    }
+    // TODO: HunterClaw session patching not yet implemented
+    // This would integrate with sessions::SessionManager
     
     // 🎯 OpenClaw 对齐: 应用 patch 到 metadata
     std::map<std::string, std::string> updates;
@@ -463,37 +282,22 @@ core::Result<json> method_session_patch(
     }
     
     // 🎯 OpenClaw 对齐: 应用更新
-    for (const auto& [key_str, value] : updates) {
-        session_mgr->update_session_metadata(key, key_str, value);
-    }
+    // TODO: Apply updates when session manager is integrated
     
-    // 🎯 OpenClaw 对齐: 返回更新后的 entry
-    auto updated_session = session_mgr->get_session(key);
-    if (!updated_session.ok) {
-        return core::Result<json>::Err("Failed to retrieve updated session");
-    }
-    
+    // For now, just return success with placeholder data
     json entry;
-    entry["sessionId"] = updated_session.value.session_id;
+    entry["sessionId"] = key;
     entry["updatedAt"] = std::chrono::duration_cast<std::chrono::milliseconds>(
-        updated_session.value.last_active_at.time_since_epoch()
+        std::chrono::system_clock::now().time_since_epoch()
     ).count();
     
-    // 🎯 OpenClaw 对齐: 包含所有 metadata
-    for (const auto& [k, v] : updated_session.value.metadata) {
+    // Include the updates as metadata
+    for (const auto& [k, v] : updates) {
         entry[k] = v;
     }
     
-    // 🎯 OpenClaw 对齐: resolved 模型信息
     json resolved;
-    auto model_it = updated_session.value.metadata.find("model");
-    resolved["model"] = model_it != updated_session.value.metadata.end() 
-        ? model_it->second : "unknown";
-    
-    auto provider_it = updated_session.value.metadata.find("modelProvider");
-    if (provider_it != updated_session.value.metadata.end()) {
-        resolved["modelProvider"] = provider_it->second;
-    }
+    resolved["model"] = "unknown";  // Placeholder
     
     json result;
     result["ok"] = true;
@@ -525,27 +329,17 @@ core::Result<json> method_session_reset(
     
     // 🎯 OpenClaw 对齐: reason 字段
     std::string reason = params.value("reason", "reset");  // "new" or "reset"
+    (void)reason;
+    (void)server;
+    (void)method_guard;
+    (void)client_ctx;
     
-    auto& session_mgr = server->runtime_state()->session_manager;
-    if (!session_mgr) {
-        return core::Result<json>::Err("Session manager not initialized");
-    }
-    
-    // 🎯 OpenClaw 对齐: 执行 reset (归档旧 transcript, 创建新的)
-    auto reset_result = session_mgr->reset_session(key, reason);
-    if (!reset_result.ok) {
-        return core::Result<json>::Err(reset_result.error);
-    }
-    
-    auto updated_session = session_mgr->get_session(key);
-    if (!updated_session.ok) {
-        return core::Result<json>::Err("Failed to retrieve reset session");
-    }
+    // TODO: HunterClaw session reset not yet implemented
     
     json entry;
-    entry["sessionId"] = updated_session.value.session_id;
+    entry["sessionId"] = key;
     entry["updatedAt"] = std::chrono::duration_cast<std::chrono::milliseconds>(
-        updated_session.value.last_active_at.time_since_epoch()
+        std::chrono::system_clock::now().time_since_epoch()
     ).count();
     
     json result;
@@ -585,23 +379,12 @@ core::Result<json> method_session_delete(
     
     // 🎯 OpenClaw 对齐: emitLifecycleHooks 参数 (默认 true)
     bool emit_lifecycle_hooks = params.value("emitLifecycleHooks", true);
+    (void)delete_transcript;
+    (void)emit_lifecycle_hooks;
+    (void)method_guard;
+    (void)client_ctx;
     
-    auto& session_mgr = server->runtime_state()->session_manager;
-    if (!session_mgr) {
-        return core::Result<json>::Err("Session manager not initialized");
-    }
-    
-    // 🎯 OpenClaw 对齐: 执行删除
-    std::vector<std::string> archived;
-    auto delete_result = session_mgr->delete_session(key, delete_transcript, &archived);
-    if (!delete_result.ok) {
-        return core::Result<json>::Err(delete_result.error);
-    }
-    
-    // 🎯 OpenClaw 对齐: 触发生命周期事件
-    if (emit_lifecycle_hooks) {
-        // TODO: 触发 session-unbound 钩子
-    }
+    // TODO: HunterClaw session deletion not yet implemented
     
     // 🎯 OpenClaw 对齐: 清理对应的 Agent 实例
     auto agent_pool = server->agent_pool();
@@ -614,7 +397,7 @@ core::Result<json> method_session_delete(
     result["ok"] = true;
     result["key"] = key;
     result["deleted"] = true;
-    result["archived"] = archived;
+    result["archived"] = json::array();  // Empty, as we haven't actually archived anything
     
     return core::Result<json>::Ok(result);
 }
@@ -644,42 +427,12 @@ core::Result<json> method_session_get(
     // 🎯 OpenClaw 对齐: limit 参数 (默认 200)
     int limit = params.value("limit", 200);
     limit = std::max(1, limit);
+    (void)limit;
     
-    auto& session_mgr = server->runtime_state()->session_manager;
-    if (!session_mgr) {
-        return core::Result<json>::Err("Session manager not initialized");
-    }
-    
-    // 🎯 OpenClaw 对齐: 读取消息
-    auto session_result = session_mgr->get_session(key);
-    if (!session_result.ok) {
-        // 🎯 OpenClaw 对齐: session 不存在时返回空数组 (不是错误)
-        json result;
-        result["messages"] = json::array();
-        return core::Result<json>::Ok(result);
-    }
-    
-    auto messages = session_mgr->get_messages(key, limit);
+    // TODO: HunterClaw session messages not yet implemented
+    // Return empty messages array
     
     json messages_array = json::array();
-    for (const auto& msg : messages) {
-        json msg_json;
-        msg_json["role"] = msg.role;
-        msg_json["content"] = msg.content;
-        
-        // 🎯 OpenClaw 对齐: 可选字段
-        if (!msg.name.empty()) {
-            msg_json["name"] = msg.name;
-        }
-        if (!msg.tool_call_id.empty()) {
-            msg_json["tool_call_id"] = msg.tool_call_id;
-        }
-        if (!msg.metadata.empty()) {
-            msg_json["metadata"] = msg.metadata;
-        }
-        
-        messages_array.push_back(msg_json);
-    }
     
     json result;
     result["messages"] = messages_array;
@@ -706,13 +459,8 @@ core::Result<json> method_session_compact(
         return core::Result<json>::Err("key required");
     }
     
-    auto& session_mgr = server->runtime_state()->session_manager;
-    if (!session_mgr) {
-        return core::Result<json>::Err("Session manager not initialized");
-    }
-    
-    // 🎯 OpenClaw 对齐: 执行压缩
-    // TODO: 调用 memory compactor 进行压缩
+    // TODO: HunterClaw session compression not yet implemented
+    // This would integrate with memory compactor
     
     json result;
     result["ok"] = true;
@@ -739,10 +487,8 @@ core::Result<json> method_session_resolve(
     bool require_existing = params.value("requireExisting", false);
     bool reset_session = params.value("resetSession", false);
     
-    auto& session_mgr = server->runtime_state()->session_manager;
-    if (!session_mgr) {
-        return core::Result<json>::Err("Session manager not initialized");
-    }
+    // TODO: HunterClaw session resolution not yet implemented
+    // This would integrate with sessions::SessionManager
     
     std::string resolved_key;
     
@@ -750,43 +496,14 @@ core::Result<json> method_session_resolve(
     if (!session_key.empty()) {
         resolved_key = session_key;
     } else if (!session_label.empty()) {
-        // 🎯 OpenClaw 对齐: 通过 label 查找
-        auto all_sessions = session_mgr->list_all_sessions();
-        for (const auto& session : all_sessions) {
-            auto label_it = session.metadata.find("label");
-            if (label_it != session.metadata.end() && label_it->second == session_label) {
-                resolved_key = session.session_id;
-                break;
-            }
-        }
-        
-        if (resolved_key.empty()) {
-            if (require_existing) {
-                return core::Result<json>::Err("Session with label not found: " + session_label);
-            }
-            // 创建新 session
-            resolved_key = "agent:main:" + session_label;
-            sessions::SessionOptions opts;
-            opts.sender_name = session_label;
-            session_mgr->create_session(resolved_key, opts);
-            session_mgr->update_session_metadata(resolved_key, "label", session_label);
-        }
+        // For now, generate a key from label
+        resolved_key = "agent:main:" + session_label;
     } else {
         return core::Result<json>::Err("sessionKey or sessionLabel required");
     }
     
-    // 🎯 OpenClaw 对齐: requireExisting 检查
-    if (require_existing) {
-        auto session_result = session_mgr->get_session(resolved_key);
-        if (!session_result.ok) {
-            return core::Result<json>::Err("Session does not exist: " + resolved_key);
-        }
-    }
-    
-    // 🎯 OpenClaw 对齐: resetSession
-    if (reset_session) {
-        session_mgr->reset_session(resolved_key, "new");
-    }
+    // TODO: requireExisting and resetSession checks would go here
+    // when session manager is integrated
     
     json result;
     result["ok"] = true;

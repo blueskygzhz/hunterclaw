@@ -147,6 +147,13 @@ public:
     using EventCallback = std::function<void(const AgentEvent&)>;
     void on_event(EventCallback callback);
     
+    /**
+     * 获取 ReactEngine (用于 Gateway 集成)
+     */
+    std::shared_ptr<react::ReactEngine> react_engine() const {
+        return react_engine_;
+    }
+    
 private:
     AgentInstanceContext ctx_;
     

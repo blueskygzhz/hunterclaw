@@ -59,57 +59,7 @@ core::Result<json> method_channel_list(
             channel_info["accounts"][default_account.account_id] = account_info;
         }
         
-        channels.push_back(channel_info);
-    }
-
-    result["channels"] = channels;
-    return core::Result<json>::Ok(result);
-}
-
-// list - 列出所有渠道
-core::Result<json> method_channel_list(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    auto channel_mgr = server->get_channel_manager();
-    if (!channel_mgr) {
-        return core::Result<json>::Err("ChannelManager not available");
-    }
-    
-    auto runtime_snapshot = channel_mgr->get_runtime_snapshot();
-
-    json result;
-    result["channels"] = json::array();
-
-    // 遍历所有渠道账户
-    for (const auto& [channel_id, default_account] : runtime_snapshot.channels) {
-        // 如果有多账户
-        auto multi_accounts_it = runtime_snapshot.channel_accounts.find(channel_id);
-        if (multi_accounts_it != runtime_snapshot.channel_accounts.end()) {
-            for (const auto& [account_id, account_state] : multi_accounts_it->second) {
-            
-            // Token source 信息
-            if (!account_state.token_source.empty()) {
-                account_info["tokenSource"] = account_state.token_source;
-            }
-            
-            // 认证年龄（毫秒）
-            if (account_state.auth_age_ms > 0) {
-                account_info["authAgeMs"] = account_state.auth_age_ms;
-            }
-
-            channel_info["accounts"][account_id] = account_info;
-        }
-
         result["chat"][channel_id] = channel_info;
-    }
-
-    // 可选: 使用统计 (如果请求了)
-    if (params.contains("usage") && params["usage"].get<bool>()) {
-        result["usage"] = json::object();
-        // TODO: 实现 provider 使用统计
     }
 
     return core::Result<json>::Ok(result);
@@ -127,13 +77,12 @@ core::Result<json> method_channel_status(
     
     // 是否进行探测 (probe)
     bool do_probe = params.value("probe", false);
-    int timeout_ms = params.value("timeout", 5000);
 
     json result = json::object();
 
-    // 遍历所有渠道账户
-    for (const auto& [channel_id, channel_state] : runtime_snapshot.channels) {
-        for (const auto& [account_id, account_state] : channel_state.accounts) {
+    // 遍历所有渠道账户（使用多账户映射）
+    for (const auto& [channel_id, accounts_map] : runtime_snapshot.channel_accounts) {
+        for (const auto& [account_id, account_state] : accounts_map) {
             std::string key = channel_id + ":" + account_id;
             
             json status;
@@ -141,7 +90,8 @@ core::Result<json> method_channel_status(
             status["accountId"] = account_id;
             status["enabled"] = account_state.enabled;
             status["configured"] = account_state.configured;
-            status["linked"] = account_state.linked;
+            status["running"] = account_state.running;
+            status["connected"] = account_state.connected;
 
             // Probe 探测
             if (do_probe) {
@@ -149,26 +99,25 @@ core::Result<json> method_channel_status(
                 probe_result["ok"] = account_state.running;
                 probe_result["connected"] = account_state.connected;
                 
-                // 最后入站/出站消息时间
-                if (account_state.last_inbound_at > 0) {
-                    probe_result["lastInboundAt"] = account_state.last_inbound_at;
-                }
-                if (account_state.last_outbound_at > 0) {
-                    probe_result["lastOutboundAt"] = account_state.last_outbound_at;
+                // 最后消息时间
+                if (account_state.last_message_at.has_value()) {
+                    probe_result["lastMessageAt"] = account_state.last_message_at.value();
                 }
                 
-                // Bot 信息
-                if (!account_state.bot_username.empty()) {
-                    json bot_info;
-                    bot_info["username"] = account_state.bot_username;
-                    bot_info["id"] = account_state.bot_id;
-                    probe_result["bot"] = bot_info;
+                // 最后启动/停止时间
+                if (account_state.last_start_at.has_value()) {
+                    probe_result["lastStartAt"] = account_state.last_start_at.value();
+                }
+                if (account_state.last_stop_at.has_value()) {
+                    probe_result["lastStopAt"] = account_state.last_stop_at.value();
                 }
                 
                 // 错误信息
-                if (!account_state.error.empty()) {
-                    probe_result["error"] = account_state.error;
+                if (account_state.last_error.has_value()) {
+                    probe_result["error"] = account_state.last_error.value();
                 }
+                
+                probe_result["reconnectAttempts"] = account_state.reconnect_attempts;
                 
                 status["probe"] = probe_result;
             }
@@ -199,8 +148,8 @@ core::Result<json> method_channel_capabilities(
     auto runtime_snapshot = channel_mgr->get_runtime_snapshot();
 
     // 查找渠道
-    auto channel_it = runtime_snapshot.channels.find(channel_id);
-    if (channel_it == runtime_snapshot.channels.end()) {
+    auto channel_it = runtime_snapshot.channel_accounts.find(channel_id);
+    if (channel_it == runtime_snapshot.channel_accounts.end()) {
         return core::Result<json>::Err("Channel not found: " + channel_id);
     }
 
@@ -210,10 +159,12 @@ core::Result<json> method_channel_capabilities(
 
     // 基础状态
     if (!account_id.empty()) {
-        auto account_it = channel_it->second.accounts.find(account_id);
-        if (account_it != channel_it->second.accounts.end()) {
+        auto account_it = channel_it->second.find(account_id);
+        if (account_it != channel_it->second.end()) {
             result["configured"] = account_it->second.configured;
             result["enabled"] = account_it->second.enabled;
+            result["running"] = account_it->second.running;
+            result["connected"] = account_it->second.connected;
         }
     }
 
@@ -266,22 +217,19 @@ core::Result<json> method_channel_capabilities(
     if (params.contains("probe") && params["probe"].get<bool>()) {
         json probe;
         if (!account_id.empty()) {
-            auto account_it = channel_it->second.accounts.find(account_id);
-            if (account_it != channel_it->second.accounts.end()) {
+            auto account_it = channel_it->second.find(account_id);
+            if (account_it != channel_it->second.end()) {
                 probe["ok"] = account_it->second.running && account_it->second.connected;
+                probe["running"] = account_it->second.running;
+                probe["connected"] = account_it->second.connected;
                 
-                // Bot 信息
-                if (!account_it->second.bot_username.empty()) {
-                    json bot;
-                    bot["username"] = account_it->second.bot_username;
-                    bot["id"] = account_it->second.bot_id;
-                    probe["bot"] = bot;
+                // 最后错误
+                if (account_it->second.last_error.has_value()) {
+                    probe["error"] = account_it->second.last_error.value();
                 }
                 
-                // 错误信息
-                if (!account_it->second.error.empty()) {
-                    probe["error"] = account_it->second.error;
-                }
+                // 重连次数
+                probe["reconnectAttempts"] = account_it->second.reconnect_attempts;
             }
         }
         result["probe"] = probe;
@@ -384,8 +332,8 @@ core::Result<json> method_channel_get(
     auto channel_mgr = server->channel_manager();
     auto runtime_snapshot = channel_mgr->get_runtime_snapshot();
 
-    auto it = runtime_snapshot.channels.find(channel_id);
-    if (it == runtime_snapshot.channels.end()) {
+    auto it = runtime_snapshot.channel_accounts.find(channel_id);
+    if (it == runtime_snapshot.channel_accounts.end()) {
         return core::Result<json>::Err("Channel not found");
     }
 
@@ -393,13 +341,13 @@ core::Result<json> method_channel_get(
     result["id"] = channel_id;
     result["accounts"] = json::object();
 
-    for (const auto& [account_id, account_state] : it->second.accounts) {
+    for (const auto& [account_id, account_state] : it->second) {
         json account_info;
         account_info["accountId"] = account_id;
         account_info["enabled"] = account_state.enabled;
         account_info["configured"] = account_state.configured;
-        account_info["linked"] = account_state.linked;
         account_info["running"] = account_state.running;
+        account_info["connected"] = account_state.connected;
         result["accounts"][account_id] = account_info;
     }
 

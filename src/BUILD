@@ -410,6 +410,7 @@ cc_library(
     deps = [
         ":hunterclaw_agents",    # ✅ 添加 agents 依赖
         ":hunterclaw_cron",      # ✅ 添加 cron 依赖
+        ":hunterclaw_gateway",   # ✅ 添加 gateway 依赖
         ":hunterclaw_memory",
         ":hunterclaw_llm",
         ":hunterclaw_mcp",

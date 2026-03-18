@@ -90,37 +90,47 @@ core::Result<json> method_health(
         json channel_info;
         json accounts = json::object();
         
-        for (const auto& [account_id, account_state] : channel_state.accounts) {
+        // 检查是否有多账户
+        auto multi_accounts_it = runtime_snapshot.channel_accounts.find(channel_id);
+        if (multi_accounts_it != runtime_snapshot.channel_accounts.end()) {
+            // 有多账户，遍历所有账户
+            for (const auto& [account_id, account_state] : multi_accounts_it->second) {
+                json account_info;
+                account_info["accountId"] = account_id;
+                account_info["configured"] = account_state.configured;
+                account_info["linked"] = account_state.running && account_state.connected;
+                
+                // Probe 探测
+                json probe;
+                probe["ok"] = account_state.running && account_state.connected;
+                probe["elapsedMs"] = 0;  // TODO: 实际探测延迟
+                
+                // 错误信息
+                if (account_state.last_error && !account_state.last_error->empty()) {
+                    probe["error"] = *account_state.last_error;
+                }
+                
+                account_info["probe"] = probe;
+                accounts[account_id] = account_info;
+            }
+        } else {
+            // 只有默认账户
             json account_info;
-            account_info["accountId"] = account_id;
-            account_info["configured"] = account_state.configured;
-            account_info["linked"] = account_state.linked;
+            account_info["accountId"] = channel_state.account_id;
+            account_info["configured"] = channel_state.configured;
+            account_info["linked"] = channel_state.running && channel_state.connected;
             
-            // 认证年龄
-            if (account_state.auth_age_ms > 0) {
-                account_info["authAgeMs"] = account_state.auth_age_ms;
-            }
-            
-            // Probe 探测 (并发执行)
+            // Probe 探测
             json probe;
-            probe["ok"] = account_state.running && account_state.connected;
-            probe["elapsedMs"] = 0;  // TODO: 实际探测延迟
+            probe["ok"] = channel_state.running && channel_state.connected;
+            probe["elapsedMs"] = 0;
             
-            // Bot 信息
-            if (!account_state.bot_username.empty()) {
-                json bot;
-                bot["username"] = account_state.bot_username;
-                bot["id"] = account_state.bot_id;
-                probe["bot"] = bot;
-            }
-            
-            // 错误信息
-            if (!account_state.error.empty()) {
-                probe["error"] = account_state.error;
+            if (channel_state.last_error && !channel_state.last_error->empty()) {
+                probe["error"] = *channel_state.last_error;
             }
             
             account_info["probe"] = probe;
-            accounts[account_id] = account_info;
+            accounts[channel_state.account_id] = account_info;
         }
         
         channel_info["accounts"] = accounts;

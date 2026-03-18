@@ -145,7 +145,7 @@ int main(int argc, char** argv) {
             std::cout << "Using default configuration" << std::endl;
             config = core::create_default_config();
         } else {
-            config = config_result.value;
+            config = config_result.get();
         }
     } else {
         std::cout << "Configuration file not found, using defaults" << std::endl;

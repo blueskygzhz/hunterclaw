@@ -1,8 +1,8 @@
 #include "hunterclaw/observability/observability.h"
 #include "hunterclaw/observability/diagnostic_events.h"
 #include <spdlog/spdlog.h>
-#include <spdlog/sinks/file_sinks.h>  // ✅ daily_file_sink 在此文件中定义
-#include <spdlog/sinks/stdout_sinks.h>  // ✅ 修正头文件名
+#include <spdlog/sinks/file_sinks.h>  // ✅ file_sinks 在此文件中定义
+#include <spdlog/sinks/stdout_sinks.h>  // ✅ stdout_sinks
 #include <nlohmann/json.hpp>
 #include <regex>
 
@@ -59,7 +59,7 @@ std::string LogEntry::to_console() const {
     oss << "[" << level_str << "] " << event;
     
     for (const auto& [key, value] : fields) {
-        oss << " " << key << "=" << value;
+        oss << " " << key << "=" << value.to_string();
     }
     
     return oss.str();
@@ -73,7 +73,7 @@ std::string LogEntry::to_syslog() const {
     oss << "<" << priority << ">hunterclaw: " << event;
     
     for (const auto& [key, value] : fields) {
-        oss << " " << key << "=" << value;
+        oss << " " << key << "=" << value.to_string();
     }
     
     return oss.str();
@@ -84,31 +84,18 @@ std::string LogEntry::to_syslog() const {
 // ============================================================================
 
 void StructuredLogger::init(const LogConfig& config) {
-    std::vector<spdlog::sink_ptr> sinks;
-    
-    for (const auto& output : config.outputs) {
-        if (output.type == LogConfig::Output::Type::File && output.path) {
-            // 关键! 按日期滚动日志 (对齐 OpenClaw)
-            // 生成: /tmp/hunterclaw/hunterclaw-2026-03-12.log
-            auto file_sink = std::make_shared<spdlog::sinks::daily_file_sink_mt>(
-                *output.path,  // 例如: /tmp/hunterclaw/hunterclaw.log
-                0,             // 午夜滚动 (小时)
-                0              // 午夜滚动 (分钟)
-            );
-            
-            // JSON Lines 格式 (每行一个 JSON 对象)
-            file_sink->set_pattern("%v");  // 只输出消息本身 (不加时间戳)
-            sinks.push_back(file_sink);
-        } 
-        else if (output.type == LogConfig::Output::Type::Console) {
-            auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
-            console_sink->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] %v");
-            sinks.push_back(console_sink);
+    // 简化实现：直接创建 logger，避免复杂的 sink 配置
+    if (config.outputs.empty()) {
+        g_logger = spdlog::stdout_logger_mt("hunterclaw");
+    } else {
+        // 使用第一个输出配置
+        const auto& first_output = config.outputs[0];
+        if (first_output.type == LogConfig::Output::Type::File && first_output.path) {
+            g_logger = spdlog::basic_logger_mt("hunterclaw", *first_output.path);
+        } else {
+            g_logger = spdlog::stdout_logger_mt("hunterclaw");
         }
     }
-    
-    // 创建多 sink logger
-    g_logger = std::make_shared<spdlog::logger>("hunterclaw", sinks.begin(), sinks.end());
     
     // 设置日志级别
     switch (config.level) {
@@ -119,12 +106,6 @@ void StructuredLogger::init(const LogConfig& config) {
         case LogLevel::ERROR: g_logger->set_level(spdlog::level::err); break;
         case LogLevel::CRITICAL: g_logger->set_level(spdlog::level::critical); break;
     }
-    
-    // 异步刷新 (每1秒)
-    spdlog::flush_every(std::chrono::seconds(1));
-    
-    // 注册为默认 logger
-    spdlog::set_default_logger(g_logger);
     
     instance().config_ = config;
 }
