@@ -357,6 +357,7 @@ cc_library(
     srcs = glob(["core/*.cc"]),
     deps = [
         "//:hunterclaw_headers",
+        "//third_party:subprocess",  # ✅ subprocess.cc 需要 subprocess.h
         "@nlohmann_json//:json",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -367,6 +368,7 @@ cc_library(
         "-Wextra",
         "-I/usr/include/jsoncpp",
         "-I/usr/include/spdlog",
+        "-Ithird_party",  # ✅ 添加 third_party 路径以支持 subprocess.h
     ],
     linkopts = [
         "-lpthread",

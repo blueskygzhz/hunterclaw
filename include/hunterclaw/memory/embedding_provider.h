@@ -275,15 +275,17 @@ public:
     };
     
     static core::Result<std::shared_ptr<RemoteEmbeddingProvider>> create(const Config& config);
-    
-    // EmbeddingProvider interface
-    std::string get_id() const override;
-    std::string get_model() const override;
-    std::optional<int> get_max_input_tokens() const override;
-    core::Result<std::vector<float>> embed_query(const std::string& text) override;
+
+    virtual ~RemoteEmbeddingProvider() = default;
+
+    // EmbeddingProvider interface - pure virtual, implemented by internal Impl class
+    std::string get_id() const override = 0;
+    std::string get_model() const override = 0;
+    std::optional<int> get_max_input_tokens() const override = 0;
+    core::Result<std::vector<float>> embed_query(const std::string& text) override = 0;
     core::Result<std::vector<std::vector<float>>> embed_batch(
         const std::vector<std::string>& texts
-    ) override;
+    ) override = 0;
 
 protected:
     RemoteEmbeddingProvider() = default;

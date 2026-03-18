@@ -438,7 +438,7 @@ core::Result<json> method_channel_health(
     (void)method_guard;
     (void)client_ctx;
 
-    std::string channel_id = params.value("channel_id", "");
+    std::string channel_id_str = params.value("channel_id", "");
 
     auto channel_mgr = server->channel_manager();
     if (!channel_mgr) {
@@ -448,33 +448,43 @@ core::Result<json> method_channel_health(
         return core::Result<json>::Ok(result);
     }
 
-    if (!channel_id.empty()) {
+    // Get runtime snapshot for health info
+    auto snapshot = channel_mgr->get_runtime_snapshot();
+
+    if (!channel_id_str.empty()) {
         // Check specific channel health
-        auto channel = channel_mgr->get_channel(channel_id);
         json result;
-        if (!channel) {
+        result["channel_id"] = channel_id_str;
+
+        auto it = snapshot.channels.find(channel_id_str);
+        if (it == snapshot.channels.end()) {
             result["healthy"] = false;
-            result["channel_id"] = channel_id;
             result["reason"] = "Channel not found";
         } else {
-            result["healthy"] = channel->is_connected();
-            result["channel_id"] = channel_id;
-            result["status"] = channel->is_connected() ? "connected" : "disconnected";
+            const auto& ch_snapshot = it->second;
+            result["healthy"] = ch_snapshot.connected;
+            result["running"] = ch_snapshot.running;
+            result["connected"] = ch_snapshot.connected;
+            result["status"] = static_cast<int>(ch_snapshot.status);
+            if (ch_snapshot.last_error.has_value()) {
+                result["last_error"] = ch_snapshot.last_error.value();
+            }
         }
         return core::Result<json>::Ok(result);
     }
 
     // Check all channels health
-    auto channels = channel_mgr->list_channels();
     json channels_health = json::array();
     bool all_healthy = true;
 
-    for (const auto& ch : channels) {
+    for (const auto& [ch_id, ch_snapshot] : snapshot.channels) {
         json ch_health;
-        ch_health["channel_id"] = ch->id();
-        ch_health["healthy"] = ch->is_connected();
-        ch_health["status"] = ch->is_connected() ? "connected" : "disconnected";
-        if (!ch->is_connected()) all_healthy = false;
+        ch_health["channel_id"] = ch_id;
+        ch_health["healthy"] = ch_snapshot.connected;
+        ch_health["running"] = ch_snapshot.running;
+        ch_health["connected"] = ch_snapshot.connected;
+        ch_health["status"] = static_cast<int>(ch_snapshot.status);
+        if (!ch_snapshot.connected) all_healthy = false;
         channels_health.push_back(ch_health);
     }
 
