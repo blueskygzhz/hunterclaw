@@ -23,7 +23,7 @@ core::Result<void> NodeRegistry::register_node(const Node& node) {
     
     // Check if already registered
     if (nodes_.count(node.node_id) > 0) {
-        return core::Error("Node already registered: " + node.node_id);
+        return core::Result<void>::Err("Node already registered: " + node.node_id);
     }
     
     // Register node
@@ -34,7 +34,7 @@ core::Result<void> NodeRegistry::register_node(const Node& node) {
         event_callback_(node.node_id, "node.registered", "{}");
     }
     
-    return core::Ok();
+    return core::Result<void>::Ok();
 }
 
 core::Result<void> NodeRegistry::unregister_node(const std::string& node_id) {
@@ -147,7 +147,7 @@ core::Result<NodeInvokeResult> NodeRegistry::invoke(
         auto it = nodes_.find(node_id);
         if (it == nodes_.end()) {
             ++failed_invocations_;
-            return core::Error("Node not found: " + node_id);
+            return core::Result<NodeInvokeResult>::Err("Node not found: " + node_id);
         }
         node = it->second;
     }
@@ -155,30 +155,29 @@ core::Result<NodeInvokeResult> NodeRegistry::invoke(
     // Check connection status
     if (!node.is_connected()) {
         ++failed_invocations_;
-        return core::Error("Node not connected: " + node_id);
+        return core::Result<NodeInvokeResult>::Err("Node not connected: " + node_id);
     }
     
     // Check command support
     if (!node.supports_command(command)) {
         ++failed_invocations_;
-        return core::Error("Command not supported by node: " + command);
+        return core::Result<NodeInvokeResult>::Err("Command not supported by node: " + command);
     }
     
     // Check permission
     if (!check_permission(node, command)) {
         ++failed_invocations_;
-        return core::Error("Permission denied for command: " + command);
+        return core::Result<NodeInvokeResult>::Err("Permission denied for command: " + command);
     }
     
     // Route to ToolManager with node context
     // Parse params_json to JsonValue
-    core::JsonValue params;
-    try {
-        params = core::parse_json(params_json);
-    } catch (...) {
+    auto params_result = core::JsonValue::parse(params_json);
+    if (!params_result.is_ok()) {
         ++failed_invocations_;
-        return core::Error("Invalid JSON parameters");
+        return core::Result<NodeInvokeResult>::Err("Invalid JSON parameters");
     }
+    core::JsonValue params = params_result.get();
     
     // Execute tool (metadata in ToolContext will be available to the tool)
     auto tool_result = tool_manager_->execute_tool(command, params);
@@ -189,18 +188,19 @@ core::Result<NodeInvokeResult> NodeRegistry::invoke(
     result.command = command;
     result.duration_ms = current_time_ms() - start_time;
     
-    if (tool_result.is_ok()) {
-        auto tr = tool_result.unwrap();
-        result.success = tr.success;
-        result.result_json = tr.content;
-        result.error_message = tr.error;
-    } else {
-        result.success = false;
-        result.error_message = tool_result.error_message();
+    // ToolResult 已经包含 success 和 error 字段
+    result.success = tool_result.success;
+    if (!tool_result.content.empty()) {
+        // 使用第一个content item的text
+        result.result_json = tool_result.content[0].text;
+    }
+    result.error_message = tool_result.error;
+    
+    if (!result.success) {
         ++failed_invocations_;
     }
     
-    return result;
+    return core::Result<NodeInvokeResult>::Ok(result);
 }
 
 core::Result<std::string> NodeRegistry::describe(const std::string& node_id) const {

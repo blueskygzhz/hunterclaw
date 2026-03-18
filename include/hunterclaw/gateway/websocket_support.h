@@ -179,7 +179,9 @@ public:
         int max_connections = 1000;                         // 最大连接数
     };
     
-    explicit WebSocketSessionManager(const Config& config = {})
+    WebSocketSessionManager() : config_() {}
+    
+    explicit WebSocketSessionManager(const Config& config)
         : config_(config) {}
     
     std::shared_ptr<WebSocketSession> create_session(
@@ -474,7 +476,11 @@ public:
         WebSocketSessionManager::Config session_config;
     };
     
-    explicit WebSocketServer(const ServerConfig& config = {})
+    WebSocketServer() 
+        : config_(),
+          session_manager_(config_.session_config) {}
+    
+    explicit WebSocketServer(const ServerConfig& config)
         : config_(config),
           session_manager_(config.session_config) {}
     
@@ -493,7 +499,8 @@ public:
     }
     
     std::shared_ptr<WebSocketSessionManager> session_manager() {
-        return std::make_shared<WebSocketSessionManager>(session_manager_);
+        // 返回指向成员对象的shared_ptr (使用空删除器,因为对象生命周期由WebSocketServer管理)
+        return std::shared_ptr<WebSocketSessionManager>(&session_manager_, [](WebSocketSessionManager*){});
     }
 
 private:

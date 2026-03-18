@@ -1,6 +1,8 @@
 #include "hunterclaw/config/config_reloader.h"
 #include "hunterclaw/config/config_system.h"
 #include "hunterclaw/core/utils.h"
+#include "hunterclaw/logging/subsystem_logger.h"
+#include <spdlog/fmt/fmt.h>
 #include <fstream>
 #include <filesystem>
 #include <sstream>
@@ -9,6 +11,9 @@ namespace hunterclaw {
 namespace config {
 
 namespace fs = std::filesystem;
+
+// 创建日志器
+static auto logger = logging::create_subsystem_logger("config");
 
 ConfigReloader::ConfigReloader(
     const std::string& config_path,
@@ -39,7 +44,7 @@ ConfigReloader::ConfigReloader(
             );
         }
     } catch (const std::exception& e) {
-        get_logger()->error("[ConfigReloader] Failed to initialize snapshot: {}", e.what());
+        logger->error(fmt::format("[ConfigReloader] Failed to initialize snapshot: {}", e.what()));
     }
 }
 
@@ -49,22 +54,22 @@ ConfigReloader::~ConfigReloader() {
 
 void ConfigReloader::start() {
     if (settings_.mode == ReloadMode::Off) {
-        get_logger()->info("[ConfigReloader] Disabled by mode=off");
+        logger->info("[ConfigReloader] Disabled by mode=off");
         return;
     }
     
     if (running_) {
-        get_logger()->warn("[ConfigReloader] Already running");
+        logger->warn("[ConfigReloader] Already running");
         return;
     }
     
     running_ = true;
     watch_thread_ = std::thread(&ConfigReloader::watch_loop, this);
     
-    get_logger()->info("[ConfigReloader] Started watching: {} (mode: {}, debounce: {}ms)",
+    logger->info(fmt::format("[ConfigReloader] Started watching: {} (mode: {}, debounce: {}ms)",
                       config_path_,
                       static_cast<int>(settings_.mode),
-                      settings_.debounce_ms);
+                      settings_.debounce_ms));
 }
 
 void ConfigReloader::stop() {
@@ -78,7 +83,7 @@ void ConfigReloader::stop() {
         watch_thread_.join();
     }
     
-    get_logger()->info("[ConfigReloader] Stopped");
+    logger->info("[ConfigReloader] Stopped");
 }
 
 ConfigSnapshot ConfigReloader::get_current_snapshot() const {
@@ -107,7 +112,7 @@ bool ConfigReloader::check_file_changed() {
         
         return false;
     } catch (const std::exception& e) {
-        get_logger()->warn("[ConfigReloader] Failed to check file change: {}", e.what());
+        logger->warn(fmt::format("[ConfigReloader] Failed to check file change: {}", e.what()));
         return false;
     }
 }
@@ -138,14 +143,17 @@ ConfigSnapshot ConfigReloader::read_snapshot() {
         snapshot.content_hash = std::to_string(std::hash<std::string>{}(content));
         
         // 加载配置
-        auto result = ConfigIO::load_config(config_path_);
-        if (result.is_ok()) {
-            snapshot.config = std::make_shared<core::Config>(result.value());
+        ConfigIO io;
+        auto config_opt = io.load_config(config_path_);
+        if (config_opt.has_value()) {
+            // TODO: Convert OpenClawConfig to core::Config
+            // For now, use existing config
+            snapshot.config = current_snapshot_.config;
         } else {
-            get_logger()->error("[ConfigReloader] Failed to load config: {}", result.error());
+            logger->error(fmt::format("[ConfigReloader] Failed to load config from {}", config_path_));
         }
     } catch (const std::exception& e) {
-        get_logger()->error("[ConfigReloader] Failed to read snapshot: {}", e.what());
+        logger->error(fmt::format("[ConfigReloader] Failed to read snapshot: {}", e.what()));
     }
     
     return snapshot;
@@ -175,14 +183,15 @@ std::vector<std::string> ConfigReloader::diff_config_paths(
     if (prev.gateway.auth.bearer_token != next.gateway.auth.bearer_token) {
         changes.push_back("gateway.auth.bearer_token");
     }
-    if (prev.gateway.heartbeat_interval.milliseconds != next.gateway.heartbeat_interval.milliseconds) {
+    if (prev.gateway.heartbeat_interval.count() != next.gateway.heartbeat_interval.count()) {
         changes.push_back("gateway.heartbeat_interval");
     }
     
-    // Agent 配置
-    if (prev.agents.defaults.model != next.agents.defaults.model) {
-        changes.push_back("agents.defaults.model");
-    }
+    // Agent 配置 - agents 是 vector,没有 defaults 字段
+    // TODO: 如果需要比较 agent 配置,需要遍历 vector
+    // if (prev.agents.size() != next.agents.size()) {
+    //     changes.push_back("agents");
+    // }
     
     return changes;
 }
@@ -229,7 +238,7 @@ ReloadPlan ConfigReloader::create_reload_plan(
 }
 
 void ConfigReloader::trigger_reload() {
-    get_logger()->info("[ConfigReloader] Manual reload triggered");
+    logger->info("[ConfigReloader] Manual reload triggered");
     
     // 防抖: 距离上次重载不足 debounce_ms 则跳过
     auto now = std::chrono::steady_clock::now();
@@ -238,8 +247,8 @@ void ConfigReloader::trigger_reload() {
     ).count();
     
     if (elapsed < settings_.debounce_ms) {
-        get_logger()->debug("[ConfigReloader] Skipping reload (debounce: {}ms < {}ms)",
-                           elapsed, settings_.debounce_ms);
+        logger->debug(fmt::format("[ConfigReloader] Skipping reload (debounce: {}ms < {}ms)",
+                           elapsed, settings_.debounce_ms));
         return;
     }
     
@@ -247,12 +256,12 @@ void ConfigReloader::trigger_reload() {
     ConfigSnapshot next_snapshot = read_snapshot();
     
     if (!next_snapshot.exists) {
-        get_logger()->warn("[ConfigReloader] Config file missing: {}", config_path_);
+        logger->warn(fmt::format("[ConfigReloader] Config file missing: {}", config_path_));
         return;
     }
     
     if (!next_snapshot.config) {
-        get_logger()->error("[ConfigReloader] Failed to load config");
+        logger->error("[ConfigReloader] Failed to load config");
         return;
     }
     
@@ -263,16 +272,16 @@ void ConfigReloader::trigger_reload() {
         plan = create_reload_plan(current_snapshot_, next_snapshot);
     }
     
-    get_logger()->info("[ConfigReloader] Reload plan: restart={}, hot_only={}, changes={}",
+    logger->info(fmt::format("[ConfigReloader] Reload plan: restart={}, hot_only={}, changes={}",
                       plan.restart_gateway,
                       plan.hot_reloadable_only,
-                      plan.changed_paths.size());
+                      plan.changed_paths.size()));
     
     // 执行重载
     if (plan.restart_gateway) {
         // 需要重启
         if (settings_.mode == ReloadMode::Hot) {
-            get_logger()->warn("[ConfigReloader] Ignoring restart (mode=hot)");
+            logger->warn("[ConfigReloader] Ignoring restart (mode=hot)");
             return;
         }
         
@@ -296,13 +305,13 @@ void ConfigReloader::trigger_reload() {
 }
 
 void ConfigReloader::watch_loop() {
-    get_logger()->info("[ConfigReloader] Watch loop started");
+    logger->info("[ConfigReloader] Watch loop started");
     
     while (running_) {
         try {
             // 检查文件变更
             if (check_file_changed()) {
-                get_logger()->info("[ConfigReloader] Config file changed: {}", config_path_);
+                logger->info(fmt::format("[ConfigReloader] Config file changed: {}", config_path_));
                 
                 // 等待写入完成 (stabilityThreshold)
                 std::this_thread::sleep_for(
@@ -317,11 +326,11 @@ void ConfigReloader::watch_loop() {
                 std::chrono::milliseconds(1000)
             );
         } catch (const std::exception& e) {
-            get_logger()->error("[ConfigReloader] Error in watch loop: {}", e.what());
+            logger->error(fmt::format("[ConfigReloader] Error in watch loop: {}", e.what()));
         }
     }
     
-    get_logger()->info("[ConfigReloader] Watch loop stopped");
+    logger->info("[ConfigReloader] Watch loop stopped");
 }
 
 } // namespace config

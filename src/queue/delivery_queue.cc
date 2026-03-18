@@ -275,8 +275,9 @@ core::Result<bool> FileDeliveryQueue::ack(const std::string& delivery_id) {
             uint64_t enqueued_at = 0;
             int retry_count = 0;
             if (delivery_result.is_ok()) {
-                enqueued_at = delivery_result.value.enqueued_at;
-                retry_count = delivery_result.value.retry_count;
+                auto& delivery = delivery_result.get();
+                enqueued_at = delivery.enqueued_at;
+                retry_count = delivery.retry_count;
             }
             
             fs::remove(file_path);
@@ -287,8 +288,8 @@ core::Result<bool> FileDeliveryQueue::ack(const std::string& delivery_id) {
                 uint64_t duration_ms = current_timestamp_ms() - enqueued_at;
                 DeliverySuccessEvent event;
                 event.delivery_id = delivery_id;
-                event.channel = delivery_result.is_ok() ? delivery_result.value.target.channel : "";
-                event.to = delivery_result.is_ok() ? delivery_result.value.target.to : "";
+                event.channel = delivery_result.is_ok() ? delivery_result.get().target.channel : "";
+                event.to = delivery_result.is_ok() ? delivery_result.get().target.to : "";
                 event.retry_count = retry_count;
                 event.duration_ms = duration_ms;
                 DiagnosticEventBus::instance().emit(std::make_shared<DeliverySuccessEvent>(event));
@@ -313,7 +314,7 @@ core::Result<bool> FileDeliveryQueue::fail(
         return core::Result<bool>::Err(result.error);
     }
     
-    QueuedDelivery delivery = result.value;
+    QueuedDelivery delivery = result.get();
     delivery.retry_count++;
     delivery.last_attempt_at = current_timestamp_ms();
     delivery.last_error = error;
@@ -436,7 +437,7 @@ core::Result<std::vector<QueuedDelivery>> FileDeliveryQueue::load_pending() {
             if (entry.is_regular_file() && entry.path().extension() == ".json") {
                 auto result = read_delivery(entry.path().string());
                 if (result.is_ok()) {
-                    deliveries.push_back(result.value);
+                    deliveries.push_back(result.get());
                 }
             }
         }
@@ -456,7 +457,7 @@ core::Result<RecoverySummary> FileDeliveryQueue::recover(DeliveryCallback callba
         return core::Result<RecoverySummary>::Err(result.error);
     }
     
-    for (const auto& delivery : result.value) {
+    for (const auto& delivery : result.get()) {
         // Check if should retry
         if (!should_retry(delivery)) {
             if (delivery.retry_count >= MAX_RETRIES) {

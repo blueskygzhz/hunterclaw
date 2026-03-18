@@ -269,7 +269,7 @@ ManagerEmbeddingOps::embed_chunks_in_batches(const std::vector<MemoryChunk>& chu
         if (!batch_result.is_ok()) {
             return batch_result;
         }
-        auto batch_embeddings = batch_result.value;
+        auto batch_embeddings = batch_result.get();
 
         // 填充结果 (对齐:214-222)
         for (size_t i = 0; i < batch.size(); ++i) {
@@ -648,7 +648,7 @@ core::Result<void> ManagerEmbeddingOps::index_file(
     if (!embeddings_result.is_ok()) {
         return core::Result<void>::Err(embeddings_result.error);
     }
-    auto embeddings = embeddings_result.value;
+    auto embeddings = embeddings_result.get();
 
     // Ensure vector ready (对齐:865-866)
     std::optional<std::vector<float>> sample;
@@ -661,7 +661,7 @@ core::Result<void> ManagerEmbeddingOps::index_file(
     bool vector_ready = false;
     if (sample.has_value()) {
         auto result = ensure_vector_ready(sample->size());
-        vector_ready = result.is_ok() && result.value;
+        vector_ready = result.is_ok() && result.get();
     }
 
     // 清理旧数据 (对齐:868)

@@ -79,7 +79,7 @@ struct PluginDiscovery::Impl {
         ss << ifs.rdbuf();
         ifs.close();
         
-        auto parse_result = JsonValue::parse(ss.str());
+        auto parse_result = core::JsonValue::parse(ss.str());
         if (parse_result.is_err()) {
             return core::Result<PluginManifest>::Err("Failed to parse manifest: " + parse_result.error);
         }

@@ -23,33 +23,25 @@ auto get_logger() {
 core::Result<bool> ChannelPlugin::init(const plugins::PluginContext&) {
     get_logger()->info("ChannelPlugin::init called");
     
-    core::Result<bool> result;
-    result.value = true;
-    return result;
+    return core::Result<bool>::Ok(true);
 }
 
 core::Result<bool> ChannelPlugin::shutdown() {
     get_logger()->info("ChannelPlugin::shutdown called");
     
-    core::Result<bool> result;
-    result.value = true;
-    return result;
+    return core::Result<bool>::Ok(true);
 }
 
 core::Result<bool> ChannelPlugin::on_load() {
     get_logger()->info("ChannelPlugin::on_load called");
     
-    core::Result<bool> result;
-    result.value = true;
-    return result;
+    return core::Result<bool>::Ok(true);
 }
 
 core::Result<bool> ChannelPlugin::on_unload() {
     get_logger()->info("ChannelPlugin::on_unload called");
     
-    core::Result<bool> result;
-    result.value = true;
-    return result;
+    return core::Result<bool>::Ok(true);
 }
 
 } // namespace hunterclaw::channels

@@ -16,8 +16,21 @@ namespace auto_reply {
 namespace llm { class LLMClient; }
 namespace tools { class ToolManager; }
 namespace sessions { class SessionManager; }
-namespace queue { class DeliveryQueue; }
+} // namespace auto_reply
+} // namespace hunterclaw
+
+// 前置声明全局 queue 命名空间
+namespace hunterclaw {
+namespace queue { 
+    class DeliveryQueue;
+    struct MessagePayload;
+    struct DeliveryTarget;
+}
 namespace routing { class MessageRouter; }
+}
+
+namespace hunterclaw {
+namespace auto_reply {
 
 // ═══════════════════════════════════════════════════════════════
 // ✅ 严格对齐 OpenClaw: src/auto-reply/dispatch.ts
@@ -49,9 +62,9 @@ public:
     
     // ✅ 构造函数
     static std::shared_ptr<MessageDispatcher> create(
-        std::shared_ptr<routing::MessageRouter> router,
+        std::shared_ptr<::hunterclaw::routing::MessageRouter> router,
         std::shared_ptr<sessions::SessionManager> session_manager,
-        std::shared_ptr<queue::DeliveryQueue> delivery_queue,
+        std::shared_ptr<::hunterclaw::queue::DeliveryQueue> delivery_queue,
         std::shared_ptr<tools::ToolManager> tool_manager,
         std::shared_ptr<llm::LLMClient> llm_client,
         const DispatchConfig& config
@@ -72,9 +85,9 @@ public:
     
 private:
     MessageDispatcher(
-        std::shared_ptr<routing::MessageRouter> router,
+        std::shared_ptr<::hunterclaw::routing::MessageRouter> router,
         std::shared_ptr<sessions::SessionManager> session_manager,
-        std::shared_ptr<queue::DeliveryQueue> delivery_queue,
+        std::shared_ptr<::hunterclaw::queue::DeliveryQueue> delivery_queue,
         std::shared_ptr<tools::ToolManager> tool_manager,
         std::shared_ptr<llm::LLMClient> llm_client,
         const DispatchConfig& config
@@ -120,7 +133,7 @@ private:
     // ✅ 对齐 OpenClaw: maybeApplyTtsToPayload (line 550-580)
     // TTS (文本转语音) 处理
     void maybe_apply_tts_to_payload(
-        std::vector<queue::OutboundPayload>& payloads,
+        std::vector<::hunterclaw::queue::MessagePayload>& payloads,
         const AutoReplyConfig& config
     );
     
@@ -139,9 +152,9 @@ private:
     std::vector<DedupRecord> dedup_cache_;
     
     // 组件依赖
-    std::shared_ptr<routing::MessageRouter> router_;
+    std::shared_ptr<::hunterclaw::routing::MessageRouter> router_;
     std::shared_ptr<sessions::SessionManager> session_manager_;
-    std::shared_ptr<queue::DeliveryQueue> delivery_queue_;
+    std::shared_ptr<::hunterclaw::queue::DeliveryQueue> delivery_queue_;
     std::shared_ptr<tools::ToolManager> tool_manager_;
     std::shared_ptr<llm::LLMClient> llm_client_;
     

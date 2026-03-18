@@ -85,7 +85,7 @@ public:
             return core::Result<GenerateResponse>::Err(http_result.error);
         }
         
-        return parse_response(http_result.value);
+        return parse_response(http_result.get());
     }
     
     core::Result<GenerateResponse> generate_stream(

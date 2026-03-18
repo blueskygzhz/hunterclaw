@@ -130,6 +130,9 @@ cc_library(
         "gateway/methods/*.cc",
         "gateway/http/*.cc",  # ✅ OpenAI 兼容层
     ]),
+    hdrs = glob([
+        "gateway/**/*.h",
+    ]),
     deps = [
         "//:hunterclaw_headers",
         "//third_party:httplib",

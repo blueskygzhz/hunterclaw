@@ -36,13 +36,13 @@ MessageDirectives CommandDetection::parse_directives(const std::string& text) {
         
         if (level == "off") {
             directives.verbose_level = react::VerboseLevel::Off;
-            spdlog::debug("[CommandDetection] Parsed /verbose off");
+            //spdlog::debug("[CommandDetection] Parsed /verbose off");
         } else if (level == "on") {
             directives.verbose_level = react::VerboseLevel::On;
-            spdlog::debug("[CommandDetection] Parsed /verbose on");
+            //spdlog::debug("[CommandDetection] Parsed /verbose on");
         } else if (level == "full") {
             directives.verbose_level = react::VerboseLevel::Full;
-            spdlog::debug("[CommandDetection] Parsed /verbose full");
+            //spdlog::debug("[CommandDetection] Parsed /verbose full");
         }
     }
     
@@ -54,13 +54,13 @@ MessageDirectives CommandDetection::parse_directives(const std::string& text) {
         
         if (level == "off") {
             directives.reasoning_level = react::ReasoningLevel::Off;
-            spdlog::debug("[CommandDetection] Parsed /reasoning off");
+            //spdlog::debug("[CommandDetection] Parsed /reasoning off");
         } else if (level == "on") {
             directives.reasoning_level = react::ReasoningLevel::On;
-            spdlog::debug("[CommandDetection] Parsed /reasoning on");
+            //spdlog::debug("[CommandDetection] Parsed /reasoning on");
         } else if (level == "stream") {
             directives.reasoning_level = react::ReasoningLevel::Stream;
-            spdlog::debug("[CommandDetection] Parsed /reasoning stream");
+            //spdlog::debug("[CommandDetection] Parsed /reasoning stream");
         }
     }
     
@@ -70,16 +70,20 @@ MessageDirectives CommandDetection::parse_directives(const std::string& text) {
         std::string level = match[1].str();
         std::transform(level.begin(), level.end(), level.begin(), ::tolower);
         
+        // Note: thinking_level is not in current MessageDirectives struct
+        // If needed, add it to the struct definition
+        /*
         if (level == "off") {
             directives.thinking_level = react::ThinkingLevel::Off;
-            spdlog::debug("[CommandDetection] Parsed /thinking off");
+            //spdlog::debug("[CommandDetection] Parsed /thinking off");
         } else if (level == "on") {
             directives.thinking_level = react::ThinkingLevel::On;
-            spdlog::debug("[CommandDetection] Parsed /thinking on");
+            //spdlog::debug("[CommandDetection] Parsed /thinking on");
         } else if (level == "verbose") {
             directives.thinking_level = react::ThinkingLevel::Verbose;
-            spdlog::debug("[CommandDetection] Parsed /thinking verbose");
+            //spdlog::debug("[CommandDetection] Parsed /thinking verbose");
         }
+        */
     }
     
     // ========== 4. 判断是否为纯指令消息 ==========

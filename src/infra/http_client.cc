@@ -123,7 +123,7 @@ core::Result<HttpResponse> HttpClient::request(
     if (parsed.is_err()) {
         return core::Result<HttpResponse>::Err(parsed.error);
     }
-    auto& u = parsed.value;
+    auto& u = parsed.get();
     
     int socket_fd = -1;
     void* ssl_ctx = nullptr;
@@ -136,9 +136,9 @@ core::Result<HttpResponse> HttpClient::request(
         if (ssl_result.is_err()) {
             return core::Result<HttpResponse>::Err(ssl_result.error);
         }
-        socket_fd = ssl_result.value.socket_fd;
-        ssl_ctx = ssl_result.value.ssl_ctx;
-        ssl = ssl_result.value.ssl;
+        socket_fd = ssl_result.get().socket_fd;
+        ssl_ctx = ssl_result.get().ssl_ctx;
+        ssl = ssl_result.get().ssl;
 #else
         return core::Result<HttpResponse>::Err("HTTPS not supported (compile with HUNTERCLAW_ENABLE_SSL)");
 #endif
@@ -147,7 +147,7 @@ core::Result<HttpResponse> HttpClient::request(
         if (socket_result.is_err()) {
             return core::Result<HttpResponse>::Err(socket_result.error);
         }
-        socket_fd = socket_result.value;
+        socket_fd = socket_result.get();
     }
     
     // 3. Send request

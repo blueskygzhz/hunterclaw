@@ -210,6 +210,16 @@ public:
     
     // ========== Statistics ==========
     
+    // 可复制的统计快照(用于返回)
+    struct StatisticsSnapshot {
+        size_t total_clients{0};
+        size_t events_sent{0};
+        size_t events_dropped{0};  // Slow consumers
+        size_t slow_consumers_disconnected{0};
+        std::map<std::string, size_t> events_by_type;
+    };
+    
+    // 内部使用的原子统计结构
     struct Statistics {
         std::atomic<size_t> total_clients{0};
         std::atomic<size_t> events_sent{0};
@@ -218,7 +228,7 @@ public:
         std::map<std::string, size_t> events_by_type;
     };
     
-    Statistics get_statistics() const;
+    StatisticsSnapshot get_statistics() const;
     void reset_statistics();
     
 private:

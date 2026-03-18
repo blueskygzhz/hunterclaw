@@ -1,4 +1,5 @@
 #include "hunterclaw/tools/tool.h"
+#include "hunterclaw/tools/tool_manager.h"
 #include "hunterclaw/tools/screen_record_tool.h"
 #include "hunterclaw/tools/location_tool.h"
 #include "hunterclaw/tools/video_understanding_tool.h"

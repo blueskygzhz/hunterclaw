@@ -230,7 +230,7 @@ core::Result<std::string> MemoryCompactor::summarize_chunk(
     }
     
     // 提取摘要内容
-    std::string summary = result.value;
+    std::string summary = result.get();
     
     // 后处理: 移除多余空白 (假设 core::utils::trim 存在)
     // 如果不存在，使用简单的实现
@@ -269,7 +269,7 @@ core::Result<CompactionResult> MemoryCompactor::summarize_in_stages(
             return core::Result<CompactionResult>::Err(summary_result.error);
         }
         
-        result.summary = summary_result.value;
+        result.summary = summary_result.get();
         result.compressed_messages.push_back(create_summary_message(result.summary, messages));
     } else {
         // 计算自适应分块比率
@@ -291,8 +291,8 @@ core::Result<CompactionResult> MemoryCompactor::summarize_in_stages(
                 return core::Result<CompactionResult>::Err(summary_result.error);
             }
             
-            chunk_summaries.push_back(summary_result.value);
-            previous_summary = summary_result.value;
+            chunk_summaries.push_back(summary_result.get());
+            previous_summary = summary_result.get();
         }
         
         // 合并所有块的摘要

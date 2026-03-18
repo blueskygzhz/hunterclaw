@@ -255,7 +255,7 @@ core::Result<ChatCompletionResponse> OpenAICompat::create_chat_completion(
         }
         
         // Convert response
-        auto response = convert_response(llm_result.value, request);
+        auto response = convert_response(llm_result.get(), request);
         
         return core::Result<ChatCompletionResponse>::Ok(response);
         

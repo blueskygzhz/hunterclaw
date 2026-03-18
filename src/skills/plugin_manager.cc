@@ -57,7 +57,7 @@ std::vector<SkillPluginManifest> SkillPluginLoader::discover_plugins(
                 continue;
             }
             
-            auto manifest = result.value;
+            auto manifest = result.get();
             manifest.root_dir = entry.path();
             
             // 设置来源
@@ -438,7 +438,7 @@ struct SkillPluginManager::Impl {
         // 注册到 Registry
         SkillPluginRecord record;
         record.manifest = manifest;
-        record.instance = result.value;
+        record.instance = result.get();
         record.loaded = true;
         
         registry_.register_plugin(record);

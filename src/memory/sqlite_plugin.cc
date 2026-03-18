@@ -325,7 +325,7 @@ core::Result<std::vector<MemorySearchResult>> SQLiteMemoryProvider::search_memor
         
         // 转换 Memory -> MemorySearchResult
         std::vector<MemorySearchResult> converted_results;
-        for (const auto& mem : hybrid_result.value) {
+        for (const auto& mem : hybrid_result.get()) {
             MemorySearchResult result;
             result.path = mem.id;
             result.start_line = 0;
@@ -437,7 +437,7 @@ core::Result<std::vector<Memory>> SQLiteMemoryProvider::hybrid_search(
     if (fts_result.is_err()) {
         return core::Result<std::vector<Memory>>::Err(fts_result.error);
     }
-    auto keyword_results = fts_result.value;
+    auto keyword_results = fts_result.get();
     
     // 3. 合并结果 (加权融合)
     std::map<std::string, double> merged_scores;

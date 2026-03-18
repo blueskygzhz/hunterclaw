@@ -94,7 +94,7 @@ core::Result<std::vector<std::string>> MemoryPluginManager::discover_plugins() {
                 continue;
             }
             
-            auto manifest = manifest_result.value;
+            auto manifest = manifest_result.get();
             
             // 验证 manifest
             auto validate_result = validate_manifest(manifest);
@@ -139,7 +139,7 @@ core::Result<std::shared_ptr<MemoryPlugin>> MemoryPluginManager::load_plugin(
         return core::Result<std::shared_ptr<MemoryPlugin>>::Err(manifest_result.error);
     }
     
-    auto manifest = manifest_result.value;
+    auto manifest = manifest_result.get();
     
     // 2. 验证 manifest
     auto validate_result = validate_manifest(manifest);
@@ -246,7 +246,7 @@ core::Result<std::shared_ptr<MemoryPlugin>> MemoryPluginManager::load_plugin_by_
             auto manifest_result = parse_manifest(entry.path().string());
             if (manifest_result.is_err()) continue;
             
-            if (manifest_result.value.id == plugin_id) {
+            if (manifest_result.get().id == plugin_id) {
                 return load_plugin(entry.path().string());
             }
         }
@@ -326,7 +326,7 @@ core::Result<int> MemoryPluginManager::discover_and_load_all() {
         return core::Result<int>::Err(discover_result.error);
     }
     
-    auto plugin_ids = discover_result.value;
+    auto plugin_ids = discover_result.get();
     
     // 2. 加载所有插件
     int loaded_count = 0;

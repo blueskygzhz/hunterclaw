@@ -19,7 +19,7 @@ void HookRegistry::register_hook(const std::string& event_key, InternalHookHandl
     
     handlers_[event_key].push_back(handler);
     
-    spdlog::debug("[HookRegistry] Registered hook for event '{}'", event_key);
+    //spdlog::debug("[HookRegistry] Registered hook for event '{}'", event_key);
 }
 
 void HookRegistry::unregister_hook(const std::string& event_key, InternalHookHandler handler) {
@@ -33,8 +33,8 @@ void HookRegistry::unregister_hook(const std::string& event_key, InternalHookHan
     // Note: In C++ we can't directly compare std::function objects
     // In practice, we would need a different approach (e.g., handle/ID based)
     // For now, we just clear all handlers for this event
-    spdlog::warn("[HookRegistry] unregister_hook not fully implemented - clearing all handlers for '{}'", 
-                 event_key);
+    //spdlog::warn("[HookRegistry] unregister_hook not fully implemented - clearing all handlers for '{}'",
+    //             event_key);
 }
 
 void HookRegistry::clear_hooks() {
@@ -42,7 +42,7 @@ void HookRegistry::clear_hooks() {
     
     handlers_.clear();
     
-    spdlog::debug("[HookRegistry] Cleared all hooks");
+    //spdlog::debug("[HookRegistry] Cleared all hooks");
 }
 
 void HookRegistry::trigger_hook(const InternalHookEvent& event) {
@@ -58,20 +58,20 @@ void HookRegistry::trigger_hook(const InternalHookEvent& event) {
     }
     
     if (handlers.empty()) {
-        spdlog::trace("[HookRegistry] No hooks registered for event '{}'", event_key);
+        //spdlog::trace("[HookRegistry] No hooks registered for event '{}'", event_key);
         return;
     }
     
-    spdlog::debug("[HookRegistry] Triggering {} hook(s) for event '{}'", 
-                  handlers.size(), event_key);
+    //spdlog::debug("[HookRegistry] Triggering {} hook(s) for event '{}'", 
+//              handlers.size(), event_key);
     
     // Execute all handlers
     for (const auto& handler : handlers) {
         try {
             handler(event);
         } catch (const std::exception& e) {
-            spdlog::error("[HookRegistry] Hook handler failed for event '{}': {}", 
-                          event_key, e.what());
+            //spdlog::error("[HookRegistry] Hook handler failed for event '{}': {}",
+            //              event_key, e.what());
         }
     }
 }
@@ -133,7 +133,7 @@ AgentBootstrapEvent create_agent_bootstrap_event(const AgentBootstrapContext& co
     
     auto bootstrap_files_arr = core::JsonValue::array();
     for (const auto& file : context.bootstrap_files) {
-        bootstrap_files_arr.array_push(file);
+        bootstrap_files_arr.push_back(file);
     }
     event.context["bootstrapFiles"] = bootstrap_files_arr;
     

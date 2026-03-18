@@ -175,7 +175,7 @@ core::Result<CompactionResult> CompactionManager::compact_session(
     }
     
     // 5. 填充结果 (对齐 OpenClaw compact.ts:1009-1019)
-    const auto& compaction_output = compact_result.value;
+    const CompactionResult& compaction_output = compact_result.get();
     
     result.compacted = true;
     result.summary = compaction_output.summary;

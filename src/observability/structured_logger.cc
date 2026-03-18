@@ -32,7 +32,7 @@ std::string LogEntry::to_json() const {
     
     // 添加自定义字段
     for (const auto& [key, value] : fields) {
-        j[key] = value;
+        j[key] = value.to_json();
     }
     
     // 添加 trace context

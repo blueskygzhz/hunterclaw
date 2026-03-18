@@ -2,12 +2,14 @@
 
 #include "hunterclaw/config/config_system.h"
 #include "hunterclaw/core/json.h"
+#include "hunterclaw/core/types.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
 #include <functional>
 #include <memory>
 #include <optional>
+#include <mutex>
 
 namespace hunterclaw {
 namespace hooks {

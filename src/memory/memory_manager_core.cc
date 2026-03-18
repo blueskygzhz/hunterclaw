@@ -102,7 +102,7 @@ void MemoryManager::init_embedding_provider() {
             throw std::runtime_error("Failed to create embedding provider: " + result.error);
         }
         
-        EmbeddingProviderResult provider_result = result.value;
+        EmbeddingProviderResult provider_result = result.get();
         
         // 设置 Provider (可能为 nullptr 表示 FTS-only 模式)
         embedding_provider_ = provider_result.provider;
@@ -218,7 +218,7 @@ core::Result<void> MemoryManager::add_entry(const MemoryEntry& entry) {
         if (embedding_provider_) {
             auto embed_result = embedding_provider_->embed_query(entry.content);
             if (embed_result.is_ok()) {
-                embedding = embed_result.value;
+                embedding = embed_result.get();
             } else {
                 // spdlog::..."[MemoryManager] Failed to generate embedding: {}", embed_result.error;
             }
@@ -402,7 +402,7 @@ core::Result<std::vector<Memory>> MemoryManager::search_memories(
     // 转换 MemorySearchResult -> Memory
     // 注意: MemorySearchResult 包含的是 path/snippet,需要从中提取内容
     std::vector<Memory> memories;
-    for (const auto& result : search_result.value) {
+    for (const auto& result : search_result.get()) {
         Memory mem;
         mem.id = result.path;  // 使用 path 作为 ID
         mem.content = result.snippet;  // 使用 snippet 作为内容

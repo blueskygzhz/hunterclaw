@@ -66,7 +66,7 @@ core::Result<bool> MemoryManagerSyncOps::ensure_vector_ready(std::optional<int> 
             return core::Result<bool>::Ok(false);
         }
         
-        vector_ready_->set_value(load_result.value);
+        vector_ready_->set_value(load_result.get());
     }
     
     bool ready = false;
@@ -256,7 +256,7 @@ core::Result<void> MemoryManagerSyncOps::sync_memory_files(
         std::string sql = "SELECT hash FROM files WHERE path = ? AND source = ?";
         auto prep_result = db_->prepare_statement(sql);
         if (prep_result.is_ok()) {
-            stmt = prep_result.value;
+            stmt = prep_result.get();
             sqlite3_bind_text(stmt, 1, entry.path.c_str(), -1, SQLITE_TRANSIENT);
             sqlite3_bind_text(stmt, 2, "memory", -1, SQLITE_TRANSIENT);
             
@@ -301,7 +301,7 @@ core::Result<void> MemoryManagerSyncOps::sync_memory_files(
     std::string query = "SELECT path FROM files WHERE source = ?";
     auto prep_result = db_->prepare_statement(query);
     if (prep_result.is_ok()) {
-        sqlite3_stmt* stmt = prep_result.value;
+        sqlite3_stmt* stmt = prep_result.get();
         sqlite3_bind_text(stmt, 1, "memory", -1, SQLITE_TRANSIENT);
         
         std::vector<std::string> stale_paths;
@@ -319,7 +319,7 @@ core::Result<void> MemoryManagerSyncOps::sync_memory_files(
             std::string del_sql = "DELETE FROM files WHERE path = ? AND source = ?";
             auto del_result = db_->prepare_statement(del_sql);
             if (del_result.is_ok()) {
-                sqlite3_stmt* del_stmt = del_result.value;
+                sqlite3_stmt* del_stmt = del_result.get();
                 sqlite3_bind_text(del_stmt, 1, stale_path.c_str(), -1, SQLITE_TRANSIENT);
                 sqlite3_bind_text(del_stmt, 2, "memory", -1, SQLITE_TRANSIENT);
                 sqlite3_step(del_stmt);
@@ -332,7 +332,7 @@ core::Result<void> MemoryManagerSyncOps::sync_memory_files(
                                      " WHERE id IN (SELECT id FROM chunks WHERE path = ? AND source = ?)";
                 auto vec_result = db_->prepare_statement(vec_sql);
                 if (vec_result.is_ok()) {
-                    sqlite3_stmt* vec_stmt = vec_result.value;
+                    sqlite3_stmt* vec_stmt = vec_result.get();
                     sqlite3_bind_text(vec_stmt, 1, stale_path.c_str(), -1, SQLITE_TRANSIENT);
                     sqlite3_bind_text(vec_stmt, 2, "memory", -1, SQLITE_TRANSIENT);
                     sqlite3_step(vec_stmt);
@@ -346,7 +346,7 @@ core::Result<void> MemoryManagerSyncOps::sync_memory_files(
             std::string chunks_sql = "DELETE FROM chunks WHERE path = ? AND source = ?";
             auto chunks_result = db_->prepare_statement(chunks_sql);
             if (chunks_result.is_ok()) {
-                sqlite3_stmt* chunks_stmt = chunks_result.value;
+                sqlite3_stmt* chunks_stmt = chunks_result.get();
                 sqlite3_bind_text(chunks_stmt, 1, stale_path.c_str(), -1, SQLITE_TRANSIENT);
                 sqlite3_bind_text(chunks_stmt, 2, "memory", -1, SQLITE_TRANSIENT);
                 sqlite3_step(chunks_stmt);
@@ -360,7 +360,7 @@ core::Result<void> MemoryManagerSyncOps::sync_memory_files(
                                          " WHERE path = ? AND source = ? AND model = ?";
                     auto fts_result = db_->prepare_statement(fts_sql);
                     if (fts_result.is_ok()) {
-                        sqlite3_stmt* fts_stmt = fts_result.value;
+                        sqlite3_stmt* fts_stmt = fts_result.get();
                         sqlite3_bind_text(fts_stmt, 1, stale_path.c_str(), -1, SQLITE_TRANSIENT);
                         sqlite3_bind_text(fts_stmt, 2, "memory", -1, SQLITE_TRANSIENT);
                         // Assuming provider_ has a model field
@@ -453,7 +453,7 @@ core::Result<void> MemoryManagerSyncOps::sync_session_files(
         std::string sql = "SELECT hash FROM files WHERE path = ? AND source = ?";
         auto prep_result = db_->prepare_statement(sql);
         if (prep_result.is_ok()) {
-            stmt = prep_result.value;
+            stmt = prep_result.get();
             sqlite3_bind_text(stmt, 1, session_path.c_str(), -1, SQLITE_TRANSIENT);
             sqlite3_bind_text(stmt, 2, "sessions", -1, SQLITE_TRANSIENT);
             
@@ -501,7 +501,7 @@ core::Result<void> MemoryManagerSyncOps::sync_session_files(
         std::string query = "SELECT path FROM files WHERE source = ?";
         auto prep_result = db_->prepare_statement(query);
         if (prep_result.is_ok()) {
-            sqlite3_stmt* stmt = prep_result.value;
+            sqlite3_stmt* stmt = prep_result.get();
             sqlite3_bind_text(stmt, 1, "sessions", -1, SQLITE_TRANSIENT);
             
             std::vector<std::string> stale_paths;
@@ -643,7 +643,7 @@ std::optional<MemoryIndexMeta> MemoryManagerSyncOps::load_index_meta() {
             return std::nullopt;
         }
         
-        sqlite3_stmt* stmt = prep_result.value;
+        sqlite3_stmt* stmt = prep_result.get();
         sqlite3_bind_text(stmt, 1, META_KEY, -1, SQLITE_TRANSIENT);
         
         std::optional<MemoryIndexMeta> result;

@@ -87,7 +87,7 @@ std::string MemoryManager::add_memory(
     }
     
     // 存储到数据库
-    return storage_->add(content, embedding_result.value, metadata);
+    return storage_->add(content, embedding_result.get(), metadata);
 }
 
 std::vector<SearchResult> MemoryManager::search(const std::string& query) {
@@ -101,7 +101,7 @@ std::vector<SearchResult> MemoryManager::search(const std::string& query) {
     // 2. 向量搜索
     int vector_limit = config_.max_results * config_.hybrid.candidate_multiplier;
     auto vector_results = storage_->vector_search(
-        query_embedding_result.value,
+        query_embedding_result.get(),
         vector_limit,
         config_.min_score
     );
@@ -122,7 +122,7 @@ std::vector<SearchResult> MemoryManager::search(const std::string& query) {
     
     // 6. MMR重排 (增加多样性)
     if (config_.hybrid.mmr.enabled) {
-        combined = maximal_marginal_relevance(combined, query_embedding_result.value);
+        combined = maximal_marginal_relevance(combined, query_embedding_result.get());
     }
     
     // 7. 时间衰减

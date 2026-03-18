@@ -51,7 +51,7 @@ core::Result<std::string> MockLLMClient::generate_stream(
     auto result = generate(prompt);
     if (result.is_ok() && callback) {
         // 模拟流式输出
-        const auto& text = result.value;
+        const auto& text = result.get();
         for (size_t i = 0; i < text.size(); i += 10) {
             std::string chunk = text.substr(i, std::min(size_t(10), text.size() - i));
             callback(chunk);

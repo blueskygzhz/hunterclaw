@@ -137,7 +137,7 @@ public:
         // 默认实现: 回退到非流式接口
         auto result = generate_from_messages(messages);
         if (result.ok && callback) {
-            callback(result.value);
+            callback(result.get());
         }
         return result;
     }

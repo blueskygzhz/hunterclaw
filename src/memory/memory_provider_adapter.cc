@@ -40,9 +40,9 @@ core::Result<std::vector<MemoryEntry>> MemoryProviderAdapter::search(
         
         // 转换 Memory -> MemoryEntry
         std::vector<MemoryEntry> entries;
-        entries.reserve(result.value.size());
+        entries.reserve(result.get().size());
         
-        for (const auto& memory : result.value) {
+        for (const auto& memory : result.get()) {
             MemoryEntry entry;
             entry.id = memory.id;
             entry.content = memory.content;

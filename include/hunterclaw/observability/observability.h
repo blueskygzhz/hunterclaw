@@ -212,6 +212,20 @@ private:
     struct Bucket {
         double upper_bound;
         std::atomic<uint64_t> count{0};
+        
+        // 移动构造函数(atomic不能复制,但可以移动)
+        Bucket() = default;
+        Bucket(Bucket&& other) noexcept 
+            : upper_bound(other.upper_bound), count(other.count.load()) {}
+        Bucket& operator=(Bucket&& other) noexcept {
+            upper_bound = other.upper_bound;
+            count.store(other.count.load());
+            return *this;
+        }
+        
+        // 删除复制构造函数
+        Bucket(const Bucket&) = delete;
+        Bucket& operator=(const Bucket&) = delete;
     };
     
     std::string name_;

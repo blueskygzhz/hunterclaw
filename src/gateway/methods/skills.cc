@@ -14,59 +14,58 @@ namespace hunterclaw {
 namespace gateway {
 namespace methods {
 
+// Helper: Convert SkillSource enum to string
+static std::string skill_source_to_string(skills::SkillSource source) {
+    switch (source) {
+        case skills::SkillSource::Bundled:    return "bundled";
+        case skills::SkillSource::Managed:    return "managed";
+        case skills::SkillSource::Personal:   return "personal";
+        case skills::SkillSource::Plugin:     return "plugin";
+        case skills::SkillSource::Project:    return "project";
+        case skills::SkillSource::Workspace:  return "workspace";
+        default:                               return "unknown";
+    }
+}
+
 // ============================================================================
 // Skills Methods - 🎯 严格对齐 OpenClaw (src/gateway/server-methods/skills.ts)
 // ============================================================================
 
 // 🎯 对齐 OpenClaw: collectSkillBins - 收集所有技能需要的二进制文件
-static std::vector<std::string> collect_skill_bins(const std::vector<skills::SkillMetadata>& skills) {
+static std::vector<std::string> collect_skill_bins(const std::vector<skills::SkillEntry>& skills) {
     std::set<std::string> bins_set;
     
-    for (const auto& skill_meta : skills) {
-        // 从 metadata.openclaw.requires.bins 收集
-        if (skill_meta.metadata.contains("openclaw")) {
-            auto openclaw = skill_meta.metadata["openclaw"];
-            
-            // requires.bins
-            if (openclaw.contains("requires") && openclaw["requires"].contains("bins")) {
-                for (const auto& bin : openclaw["requires"]["bins"]) {
-                    std::string bin_str = bin.get<std::string>();
-                    // trim
-                    bin_str.erase(0, bin_str.find_first_not_of(" \t\n\r"));
-                    bin_str.erase(bin_str.find_last_not_of(" \t\n\r") + 1);
-                    if (!bin_str.empty()) {
-                        bins_set.insert(bin_str);
-                    }
-                }
+    auto trim = [](std::string s) {
+        s.erase(0, s.find_first_not_of(" \t\n\r"));
+        s.erase(s.find_last_not_of(" \t\n\r") + 1);
+        return s;
+    };
+    
+    for (const auto& skill_entry : skills) {
+        const auto& metadata = skill_entry.metadata;
+        
+        // requires.bins
+        for (const auto& bin : metadata.requires.bins) {
+            std::string bin_str = trim(bin);
+            if (!bin_str.empty()) {
+                bins_set.insert(bin_str);
             }
-            
-            // requires.anyBins
-            if (openclaw.contains("requires") && openclaw["requires"].contains("anyBins")) {
-                for (const auto& bin : openclaw["requires"]["anyBins"]) {
-                    std::string bin_str = bin.get<std::string>();
-                    // trim
-                    bin_str.erase(0, bin_str.find_first_not_of(" \t\n\r"));
-                    bin_str.erase(bin_str.find_last_not_of(" \t\n\r") + 1);
-                    if (!bin_str.empty()) {
-                        bins_set.insert(bin_str);
-                    }
-                }
+        }
+        
+        // requires.any_bins
+        for (const auto& bin : metadata.requires.any_bins) {
+            std::string bin_str = trim(bin);
+            if (!bin_str.empty()) {
+                bins_set.insert(bin_str);
             }
-            
-            // install[].bins
-            if (openclaw.contains("install") && openclaw["install"].is_array()) {
-                for (const auto& install_spec : openclaw["install"]) {
-                    if (install_spec.contains("bins") && install_spec["bins"].is_array()) {
-                        for (const auto& bin : install_spec["bins"]) {
-                            std::string bin_str = bin.is_string() ? bin.get<std::string>() : bin.dump();
-                            // trim
-                            bin_str.erase(0, bin_str.find_first_not_of(" \t\n\r"));
-                            bin_str.erase(bin_str.find_last_not_of(" \t\n\r") + 1);
-                            if (!bin_str.empty()) {
-                                bins_set.insert(bin_str);
-                            }
-                        }
-                    }
+        }
+        
+        // install[].bins
+        for (const auto& install_spec : metadata.install) {
+            for (const auto& bin : install_spec.bins) {
+                std::string bin_str = trim(bin);
+                if (!bin_str.empty()) {
+                    bins_set.insert(bin_str);
                 }
             }
         }
@@ -108,36 +107,26 @@ core::Result<json> method_skill_status(
         std::string skill_key = skill_meta.skill.name;  // TODO: 支持 metadata.skillKey 覆盖
         skill_info["skillKey"] = skill_key;
         skill_info["description"] = skill_meta.skill.description;
-        skill_info["source"] = skill_meta.skill.source;
+        skill_info["source"] = skill_source_to_string(skill_meta.skill.source);
         skill_info["filePath"] = skill_meta.skill.file_path.string();
         skill_info["baseDir"] = skill_meta.skill.file_path.parent_path().string();
         
         // 🎯 对齐 OpenClaw: emoji (默认 🔧 或从 metadata 读取)
-        std::string emoji = "🔧";
-        if (skill_meta.metadata.contains("openclaw") && 
-            skill_meta.metadata["openclaw"].contains("emoji")) {
-            emoji = skill_meta.metadata["openclaw"]["emoji"].get<std::string>();
-        }
+        std::string emoji = skill_meta.metadata.emoji.empty() ? "🔧" : skill_meta.metadata.emoji;
         skill_info["emoji"] = emoji;
         
         // 🎯 对齐 OpenClaw: homepage
-        if (skill_meta.metadata.contains("openclaw") && 
-            skill_meta.metadata["openclaw"].contains("homepage")) {
-            skill_info["homepage"] = skill_meta.metadata["openclaw"]["homepage"];
+        if (!skill_meta.metadata.homepage.empty()) {
+            skill_info["homepage"] = skill_meta.metadata.homepage;
         }
         
         // 🎯 对齐 OpenClaw: always flag
-        bool always = false;
-        if (skill_meta.metadata.contains("openclaw") && 
-            skill_meta.metadata["openclaw"].contains("always")) {
-            always = skill_meta.metadata["openclaw"]["always"].get<bool>();
-        }
+        bool always = skill_meta.metadata.always;
         skill_info["always"] = always;
         
         // 🎯 对齐 OpenClaw: primaryEnv
-        if (skill_meta.metadata.contains("openclaw") && 
-            skill_meta.metadata["openclaw"].contains("primaryEnv")) {
-            skill_info["primaryEnv"] = skill_meta.metadata["openclaw"]["primaryEnv"];
+        if (!skill_meta.metadata.primary_env.empty()) {
+            skill_info["primaryEnv"] = skill_meta.metadata.primary_env;
         }
         
         // 🎯 对齐 OpenClaw: 启用状态 (从配置读取)
@@ -145,8 +134,7 @@ core::Result<json> method_skill_status(
         skill_info["disabled"] = disabled;
         
         // 🎯 对齐 OpenClaw: bundled 标志
-        bool bundled = (skill_meta.skill.source == "openclaw-bundled" || 
-                        skill_meta.skill.source == "hunterclaw-bundled");
+        bool bundled = (skill_meta.skill.source == skills::SkillSource::Bundled);
         skill_info["bundled"] = bundled;
         
         // 🎯 对齐 OpenClaw: blockedByAllowlist
@@ -193,26 +181,21 @@ core::Result<json> method_skill_status(
         // 🎯 对齐 OpenClaw: install options (normalizeInstallOptions)
         json install = json::array();
         
-        // 从 metadata.openclaw.install 解析
-        if (skill_meta.metadata.contains("openclaw") && 
-            skill_meta.metadata["openclaw"].contains("install")) {
-            // TODO: 实现完整的 normalizeInstallOptions 逻辑
-            // 1. 过滤平台不兼容的安装器
-            // 2. 选择首选安装器 (brew > node > go > download)
-            // 3. 生成 label
-            
-            // 示例:
-            // {
-            //   "id": "brew-python3",
-            //   "kind": "brew",
-            //   "label": "Install Python 3 via Homebrew",
-            //   "bins": ["python3"]
-            // }
+        // 从 metadata.install 解析
+        for (const auto& install_spec : skill_meta.metadata.install) {
+            json spec_json;
+            spec_json["id"] = install_spec.id;
+            // TODO: 将 Kind enum 转换为字符串
+            spec_json["label"] = install_spec.label;
+            spec_json["bins"] = install_spec.bins;
+            if (!install_spec.formula.empty()) {
+                spec_json["formula"] = install_spec.formula;
+            }
+            install.push_back(spec_json);
         }
         skill_info["install"] = install;
         
-        // Metadata (原始 metadata)
-        skill_info["metadata"] = skill_meta.metadata;
+        // Metadata - 结构化字段已经单独导出,不需要原始metadata
         
         skills_array.push_back(skill_info);
     }

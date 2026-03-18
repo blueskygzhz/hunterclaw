@@ -319,7 +319,7 @@ core::Result<SessionEntry> FileSessionManager::get_or_create_session(
     if (key_result.is_err()) {
         return core::Result<SessionEntry>::Err(key_result.error);
     }
-    std::string session_key = key_result.value;
+    std::string session_key = key_result.get();
     
     std::string file_path = get_session_file_path(session_key, agent_id);
     
@@ -327,7 +327,7 @@ core::Result<SessionEntry> FileSessionManager::get_or_create_session(
     if (fs::exists(file_path)) {
         auto result = read_session(file_path);
         if (result.is_ok()) {
-            auto session = result.value;
+            SessionEntry session = result.get();
             
             // Check if should reset
             if (should_reset(session)) {
@@ -411,7 +411,7 @@ core::Result<SessionEntry> FileSessionManager::get_session(const std::string& la
     if (key_result.is_err()) {
         return core::Result<SessionEntry>::Err(key_result.error);
     }
-    std::string session_key = key_result.value;
+    std::string session_key = key_result.get();
     
     // 需要遍历所有 agent 目录查找 (Per-Agent Storage)
     if (config_.per_agent_storage) {
@@ -446,7 +446,7 @@ core::Result<bool> FileSessionManager::delete_session(const std::string& label_o
         if (key_result.is_err()) {
             return core::Result<bool>::Err(key_result.error);
         }
-        std::string session_key = key_result.value;
+        std::string session_key = key_result.get();
         
         bool deleted = false;
         std::string deleted_session_id;
@@ -464,7 +464,7 @@ core::Result<bool> FileSessionManager::delete_session(const std::string& label_o
                             // 读取 session_id (用于可观测性)
                             auto session_result = read_session(file_path);
                             if (session_result.is_ok()) {
-                                deleted_session_id = session_result.value.session_id;
+                                deleted_session_id = session_result.get().session_id;
                             }
                             
                             fs::remove(file_path);
@@ -480,7 +480,7 @@ core::Result<bool> FileSessionManager::delete_session(const std::string& label_o
         if (fs::exists(file_path)) {
             auto session_result = read_session(file_path);
             if (session_result.is_ok()) {
-                deleted_session_id = session_result.value.session_id;
+                deleted_session_id = session_result.get().session_id;
             }
             
             fs::remove(file_path);
@@ -535,7 +535,7 @@ core::Result<std::vector<SessionEntry>> FileSessionManager::list_sessions(
                         if (entry.is_regular_file() && entry.path().extension() == ".json") {
                             auto result = read_session(entry.path().string());
                             if (result.is_ok()) {
-                                sessions.push_back(result.value);
+                                sessions.push_back(result.get());
                             }
                         }
                     }
@@ -547,7 +547,7 @@ core::Result<std::vector<SessionEntry>> FileSessionManager::list_sessions(
                 if (entry.is_regular_file() && entry.path().extension() == ".json") {
                     auto result = read_session(entry.path().string());
                     if (result.is_ok()) {
-                        auto session = result.value;
+                        SessionEntry session = result.get();
                         
                         // Filter by agent_id if provided
                         if (!agent_id || session.agent_id == *agent_id) {
@@ -618,7 +618,7 @@ core::Result<int> FileSessionManager::prune_sessions() {
         return core::Result<int>::Err(sessions_result.error);
     }
     
-    auto sessions = sessions_result.value;
+    std::vector<SessionEntry> sessions = sessions_result.get();
     int pruned = 0;
     uint64_t now = current_timestamp_ms();
     uint64_t prune_threshold_ms = config_.prune_after_days * 24 * 60 * 60 * 1000;

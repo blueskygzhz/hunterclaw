@@ -23,7 +23,7 @@ public:
             return core::Result<std::string>::Err(result.error);
         }
         
-        return core::Result<std::string>::Ok(result.value.content);
+        return core::Result<std::string>::Ok(result.get().content);
     }
     
     core::Result<std::string> generate_from_messages(
@@ -91,7 +91,7 @@ public:
             return core::Result<std::string>::Err(result.error);
         }
         
-        return core::Result<std::string>::Ok(result.value.content);
+        return core::Result<std::string>::Ok(result.get().content);
     }
     
     core::Result<std::string> generate_stream(
@@ -113,7 +113,7 @@ public:
             return core::Result<std::string>::Err(result.error);
         }
         
-        return core::Result<std::string>::Ok(result.value.content);
+        return core::Result<std::string>::Ok(result.get().content);
     }
     
     core::Result<std::string> generate_stream_from_messages(
@@ -186,7 +186,7 @@ public:
             return core::Result<std::string>::Err(result.error);
         }
         
-        return core::Result<std::string>::Ok(result.value.content);
+        return core::Result<std::string>::Ok(result.get().content);
     }
     
     const LLMConfig& get_config() const override { 
@@ -274,7 +274,7 @@ LLMClient::Ptr create_llm_client_impl(const LLMConfig& config) {
         return MockLLMClient::create(config);
     }
     
-    return create_from_provider_impl(provider_result.value, config);
+    return create_from_provider_impl(provider_result.get(), config);
 }
 
 } // namespace llm

@@ -121,7 +121,7 @@ core::Result<std::shared_ptr<MemorySearchManager>> FallbackMemoryManager::ensure
         );
     }
     
-    fallback_ = result.value;
+    fallback_ = result.get();
     return core::Result<std::shared_ptr<MemorySearchManager>>::Ok(fallback_);
 }
 
@@ -151,8 +151,8 @@ std::vector<MemorySearchResult> FallbackMemoryManager::search(
     
     // 使用fallback
     auto fallback_res = ensure_fallback();
-    if (fallback_res.is_ok() && fallback_res.value) {
-        return fallback_res.value->search(query, opts);
+    if (fallback_res.is_ok() && fallback_res.get()) {
+        return fallback_res.get()->search(query, opts);
     }
     
     std::string error_msg;
@@ -177,8 +177,8 @@ ReadFileResult FallbackMemoryManager::read_file(const ReadFileParams& params) {
     
     // 使用fallback
     auto fallback_res = ensure_fallback();
-    if (fallback_res.is_ok() && fallback_res.value) {
-        return fallback_res.value->read_file(params);
+    if (fallback_res.is_ok() && fallback_res.get()) {
+        return fallback_res.get()->read_file(params);
     }
     
     std::string error_msg;
@@ -226,8 +226,8 @@ void FallbackMemoryManager::sync(const SyncParams& params) {
     
     // 使用fallback
     auto fallback_res = ensure_fallback();
-    if (fallback_res.is_ok() && fallback_res.value) {
-        fallback_res.value->sync(params);
+    if (fallback_res.is_ok() && fallback_res.get()) {
+        fallback_res.get()->sync(params);
     }
 }
 
@@ -245,8 +245,8 @@ MemoryEmbeddingProbeResult FallbackMemoryManager::probe_embedding_availability()
     
     // 使用fallback
     auto fallback_res = ensure_fallback();
-    if (fallback_res.is_ok() && fallback_res.value) {
-        return fallback_res.value->probe_embedding_availability();
+    if (fallback_res.is_ok() && fallback_res.get()) {
+        return fallback_res.get()->probe_embedding_availability();
     }
     
     std::string error_msg;
@@ -275,8 +275,8 @@ bool FallbackMemoryManager::probe_vector_availability() {
     
     // 使用fallback
     auto fallback_res = ensure_fallback();
-    if (fallback_res.is_ok() && fallback_res.value) {
-        return fallback_res.value->probe_vector_availability();
+    if (fallback_res.is_ok() && fallback_res.get()) {
+        return fallback_res.get()->probe_vector_availability();
     }
     
     return false;
@@ -369,7 +369,9 @@ MemorySearchManagerResult get_memory_search_manager(const GetManagerParams& para
                         if (result.is_err()) {
                             return core::Result<std::shared_ptr<MemorySearchManager>>::Err(result.error);
                         }
-                        return core::Result<std::shared_ptr<MemorySearchManager>>::Ok(result.value);
+                        // 向上转换: MemoryIndexManager -> MemorySearchManager
+                        std::shared_ptr<MemorySearchManager> mgr = result.get();
+                        return core::Result<std::shared_ptr<MemorySearchManager>>::Ok(mgr);
                     },
                     // onClose: 驱逐缓存
                     [cache_key]() {
@@ -405,7 +407,9 @@ MemorySearchManagerResult get_memory_search_manager(const GetManagerParams& para
         if (result.is_err()) {
             return MemorySearchManagerResult::Err(result.error);
         }
-        return MemorySearchManagerResult::Ok(result.value);
+        // 向上转换: MemoryIndexManager -> MemorySearchManager
+        std::shared_ptr<MemorySearchManager> mgr = result.get();
+        return MemorySearchManagerResult::Ok(mgr);
     } catch (const std::exception& e) {
         return MemorySearchManagerResult::Err(e.what());
     }

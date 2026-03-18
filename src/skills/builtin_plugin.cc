@@ -171,7 +171,7 @@ std::vector<Skill> BuiltinSkillsPlugin::load_skills_from_dir(
                 continue;
             }
             
-            Skill skill = result.value;
+            Skill skill = result.get();
             skill.source = source;
             skill.base_dir = entry.path();
             

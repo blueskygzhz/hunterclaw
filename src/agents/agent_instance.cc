@@ -126,7 +126,7 @@ AgentInstance::AgentInstance(
     if (config_result.is_err()) {
         throw std::runtime_error("Failed to resolve agent config: " + config_result.error);
     }
-    ctx_.config = config_result.value;
+    ctx_.config = config_result.get();
     
     // 初始化资源
     initialize_workspace();
@@ -704,7 +704,7 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
                 auto search_result = memory_adapter->search("", 20);  // 空查询 + limit=20
                 
                 if (search_result.is_ok()) {
-                    const auto& entries = search_result.value;
+                    const auto& entries = search_result.get();
                     
                     spdlog::get("default")->debug("[AgentInstance] Loaded {} history messages from memory", 
                                  entries.size());

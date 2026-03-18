@@ -24,17 +24,12 @@ struct NpmPluginLoader::Impl {
     
     core::Result<std::string> ensure_npm_available() {
         // 检查 npm 是否可用
-        auto npm_check = core::Process::execute("npm --version");
-        if (npm_check.is_err()) {
+        auto npm_result = core::subprocess::run({"npm", "--version"});
+        if (npm_result.exit_code != 0) {
             return core::Result<std::string>::Err("npm is not installed or not in PATH");
         }
         
-        auto [stdout_content, stderr_content, exit_code] = npm_check.unwrap();
-        if (exit_code != 0) {
-            return core::Result<std::string>::Err("npm is not available");
-        }
-        
-        return core::Result<std::string>::Ok(stdout_content);
+        return core::Result<std::string>::Ok(npm_result.stdout_output);
     }
     
     core::Result<std::string> install_npm_package(
@@ -59,15 +54,11 @@ struct NpmPluginLoader::Impl {
         }
         
         // 执行 npm install
-        std::string cmd = "cd " + target_dir + " && npm install --no-save " + package_spec;
-        auto result = core::Process::execute(cmd);
-        if (result.is_err()) {
-            return core::Result<std::string>::Err("Failed to execute npm install: " + result.error);
-        }
-        
-        auto [stdout_content, stderr_content, exit_code] = result.unwrap();
-        if (exit_code != 0) {
-            return core::Result<std::string>::Err("npm install failed: " + stderr_content);
+        core::subprocess::RunOptions opts;
+        opts.cwd = target_dir;
+        auto result = core::subprocess::run({"npm", "install", "--no-save", package_spec}, opts);
+        if (result.exit_code != 0) {
+            return core::Result<std::string>::Err("npm install failed: " + result.stderr_output);
         }
         
         // 查找安装的包路径
@@ -117,12 +108,12 @@ struct NpmPluginLoader::Impl {
         ss << ifs.rdbuf();
         ifs.close();
         
-        auto parse_result = core::Json::parse(ss.str());
+        auto parse_result = core::JsonValue::parse(ss.str());
         if (parse_result.is_err()) {
             return core::Result<core::JsonValue>::Err("Failed to parse package.json: " + parse_result.error);
         }
         
-        return core::Result<core::JsonValue>::Ok(parse_result.unwrap());
+        return core::Result<core::JsonValue>::Ok(parse_result.get());
     }
     
     core::Result<std::string> resolve_entry_point(
@@ -167,7 +158,8 @@ NpmPluginLoader::NpmPluginLoader(std::shared_ptr<core::Config> config)
     : impl_(std::make_unique<Impl>())
 {
     impl_->config = config;
-    impl_->cache_dir = config->get_string("plugins.npm_cache_dir", "~/.hunterclaw/npm_cache");
+    // TODO: Read from config when Config API is available
+    impl_->cache_dir = "~/.hunterclaw/npm_cache";
     
     // 展开 ~ 符号
     if (impl_->cache_dir[0] == '~') {

@@ -126,7 +126,7 @@ core::Result<nlohmann::json> HttpClient::post_json(
         return core::Result<nlohmann::json>::Err(result.error);
     }
     
-    const auto& resp = result.value;
+    const auto& resp = result.get();
     if (!resp.is_success()) {
         std::stringstream ss;
         ss << "HTTP error " << resp.status_code << ": " << resp.body;

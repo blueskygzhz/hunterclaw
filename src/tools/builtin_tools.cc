@@ -1,4 +1,5 @@
 #include "hunterclaw/tools/tool.h"
+#include "hunterclaw/tools/tool_manager.h"
 #include "hunterclaw/sandbox/sandbox.h"
 #include "hunterclaw/core/utils.h"
 #include <fstream>

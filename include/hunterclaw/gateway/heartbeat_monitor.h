@@ -4,6 +4,9 @@
 #include <memory>
 #include <chrono>
 #include <functional>
+#include <mutex>
+#include <thread>
+#include <map>
 
 namespace hunterclaw {
 namespace gateway {

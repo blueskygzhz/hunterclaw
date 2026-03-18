@@ -207,7 +207,7 @@ core::Result<std::vector<float>> OpenAIEmbeddingProvider::embed_query(const std:
     
     // 解析响应 (对齐 OpenClaw格式)
     try {
-        const auto& resp_json = result.value;
+        const nlohmann::json& resp_json = result.get();
         
         
         if (!resp_json.contains("data") || !resp_json["data"].is_array()) {
@@ -266,7 +266,7 @@ core::Result<std::vector<std::vector<float>>> OpenAIEmbeddingProvider::embed_bat
     
     // 解析响应
     try {
-        const auto& resp_json = result.value;
+        const auto& resp_json = result.get();
         
         if (!resp_json.contains("data") || !resp_json["data"].is_array()) {
             return core::Result<std::vector<std::vector<float>>>::Err(
@@ -338,7 +338,7 @@ core::Result<std::vector<float>> OllamaEmbeddingProvider::embed_query(const std:
     
     // 解析响应: {"embedding": [0.1, 0.2, ...]}
     try {
-        const auto& resp_json = result.value;
+        const auto& resp_json = result.get();
         
         if (!resp_json.contains("embedding")) {
             return core::Result<std::vector<float>>::Err("No embedding field in Ollama response");
@@ -371,7 +371,7 @@ core::Result<std::vector<std::vector<float>>> OllamaEmbeddingProvider::embed_bat
         if (!res.is_ok()) {
             return core::Result<std::vector<std::vector<float>>>::Err(res.error);
         }
-        results.push_back(res.value);
+        results.push_back(res.get());
     }
     
     return core::Result<std::vector<std::vector<float>>>::Ok(results);
@@ -452,7 +452,7 @@ core::Result<std::vector<float>> GeminiEmbeddingProvider::embed_query(const std:
     
     // 解析响应: {"embedding": {"values": [0.1, 0.2, ...]}}
     try {
-        const auto& resp_json = result.value;
+        const auto& resp_json = result.get();
         
         if (!resp_json.contains("embedding") || !resp_json["embedding"].contains("values")) {
             return core::Result<std::vector<float>>::Err(
@@ -540,7 +540,7 @@ core::Result<std::vector<std::vector<float>>> GeminiEmbeddingProvider::embed_bat
     
     // 解析响应: {"embeddings": [{"values": [...]}, ...]}
     try {
-        const auto& resp_json = result.value;
+        const auto& resp_json = result.get();
         
         if (!resp_json.contains("embeddings") || !resp_json["embeddings"].is_array()) {
             return core::Result<std::vector<std::vector<float>>>::Err(
@@ -616,7 +616,7 @@ core::Result<std::vector<float>> VoyageEmbeddingProvider::embed_query(const std:
     
     // 解析响应: {data: [{embedding: [0.1, 0.2, ...]}]}
     try {
-        const auto& resp_json = result.value;
+        const auto& resp_json = result.get();
         
         if (!resp_json.contains("data") || !resp_json["data"].is_array()) {
             return core::Result<std::vector<float>>::Err("Invalid Voyage response format");
@@ -689,7 +689,7 @@ core::Result<std::vector<float>> MistralEmbeddingProvider::embed_query(const std
     
     // 解析响应 (OpenAI格式兼容): {data: [{embedding: [...]}]}
     try {
-        const auto& resp_json = result.value;
+        const auto& resp_json = result.get();
         
         if (!resp_json.contains("data") || !resp_json["data"].is_array()) {
             return core::Result<std::vector<float>>::Err("Invalid Mistral response format");
@@ -740,7 +740,7 @@ core::Result<std::vector<std::vector<float>>> MistralEmbeddingProvider::embed_ba
     
     // 解析响应
     try {
-        const auto& resp_json = result.value;
+        const auto& resp_json = result.get();
         
         if (!resp_json.contains("data") || !resp_json["data"].is_array()) {
             return core::Result<std::vector<std::vector<float>>>::Err(

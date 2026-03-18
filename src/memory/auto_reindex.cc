@@ -55,7 +55,7 @@ core::Result<ReindexReason> AutoReindexDetector::check_reindex_needed(
         return core::Result<ReindexReason>::Ok(ReindexReason{ReindexReason::None, "", ""});
     }
     
-    const auto& old_info = load_result.value;
+    const MemoryProviderInfo& old_info = load_result.get();
     ReindexReason reason = compare_provider_info(old_info, current_info);
     
     return core::Result<ReindexReason>::Ok(reason);
@@ -185,7 +185,7 @@ core::Result<bool> MemoryManagerWithAutoReindex::initialize(
         return core::Result<bool>::Err(reindex_result.error);
     }
     
-    const auto& reason = reindex_result.value;
+    const ReindexReason& reason = reindex_result.get();
     
     if (reason.type != ReindexReason::None) {
         // Log reindex reason
@@ -247,7 +247,8 @@ bool MemoryManagerWithAutoReindex::needs_reindex(const MemoryProviderInfo& new_p
     if (!result.is_ok()) {
         return false;
     }
-    return result.value.type != ReindexReason::None;
+    const ReindexReason& reason = result.get();
+    return reason.type != ReindexReason::None;
 }
 
 // ============================================================================
@@ -318,7 +319,7 @@ core::Result<bool> MemoryManagerWithAutoReindex::run_safe_reindex() {
             "Failed to create temp database: " + temp_storage_result.error
         );
     }
-    auto temp_storage = temp_storage_result.value;
+    auto temp_storage = temp_storage_result.get();
     
     // 3. 保存原始状态 (对齐:1159-1170)
     struct OriginalState {
@@ -411,7 +412,7 @@ core::Result<bool> MemoryManagerWithAutoReindex::run_safe_reindex() {
                 .enable_vector = true
             });
             if (reopen_result.is_ok()) {
-                storage_ = reopen_result.value;
+                storage_ = reopen_result.get();
             }
             return core::Result<bool>::Err("Failed to swap index files: " + swap_result.error);
         }
@@ -430,7 +431,7 @@ core::Result<bool> MemoryManagerWithAutoReindex::run_safe_reindex() {
             );
         }
         
-        storage_ = reopen_result.value;
+        storage_ = reopen_result.get();
         current_status_.vector_dims = next_meta.vector_dims.value_or(-1);
         current_status_.vector_available = next_meta.vector_dims.has_value();
         

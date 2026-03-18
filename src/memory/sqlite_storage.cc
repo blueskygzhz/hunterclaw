@@ -75,7 +75,7 @@ core::Result<std::shared_ptr<SQLiteVectorStorage>> SQLiteVectorStorage::create(c
             storage->fts_error_ = fts_res.error;
             storage->fts_available_ = false;
         } else {
-            storage->fts_available_ = fts_res.value;
+            storage->fts_available_ = fts_res.get();
         }
     }
     
@@ -86,7 +86,7 @@ core::Result<std::shared_ptr<SQLiteVectorStorage>> SQLiteVectorStorage::create(c
             storage->vec_error_ = vec_res.error;
             storage->vec_available_ = false;
         } else {
-            storage->vec_available_ = vec_res.value;
+            storage->vec_available_ = vec_res.get();
         }
     }
     
@@ -358,7 +358,7 @@ core::Result<std::vector<std::string>> SQLiteVectorStorage::add_chunks_batch(
             rollback_transaction();
             return core::Result<std::vector<std::string>>::Err(res.error);
         }
-        ids.push_back(res.value);
+        ids.push_back(res.get());
     }
     
     auto tx_commit = commit_transaction();

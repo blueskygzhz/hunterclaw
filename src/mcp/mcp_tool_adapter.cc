@@ -1,5 +1,6 @@
 #include "hunterclaw/mcp/mcp_tool_adapter.h"
 #include "hunterclaw/mcp/json_converter.h"
+#include "hunterclaw/tools/tool_manager.h"
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
 #include <algorithm>
@@ -60,7 +61,7 @@ tools::ToolResult McpToolAdapter::execute(const core::JsonValue& params) {
         );
     }
     
-    auto mcp_result = result.value;
+    auto mcp_result = result.get();
     
     if (!mcp_result.success) {
         return tools::tool_result::error(
@@ -210,7 +211,7 @@ core::Result<int> McpToolRegistry::discover_and_register(
         for (const auto& [server_name, tools] : cache_.tools_by_server) {
             auto result = register_server_tools(tool_manager, server_name);
             if (result.is_ok()) {
-                registered_count += result.value;
+                registered_count += result.get();
             } else {
                 log()->warn("Failed to register tools from {}: {}", 
                            server_name, result.error);
@@ -221,7 +222,7 @@ core::Result<int> McpToolRegistry::discover_and_register(
         for (const auto& server_name : server_names) {
             auto result = register_server_tools(tool_manager, server_name);
             if (result.is_ok()) {
-                registered_count += result.value;
+                registered_count += result.get();
             } else {
                 log()->warn("Failed to register tools from {}: {}", 
                            server_name, result.error);
@@ -247,7 +248,7 @@ core::Result<int> McpToolRegistry::register_server_tools(
         }
         
         // 更新缓存
-        cache_.tools_by_server[server_name] = tools_result.value;
+        cache_.tools_by_server[server_name] = tools_result.get();
         it = cache_.tools_by_server.find(server_name);
     }
     
@@ -292,14 +293,15 @@ core::Result<void> McpToolRegistry::refresh_cache() {
     // 按 server 分组
     cache_.tools_by_server.clear();
     
-    for (const auto& tool : tools_result.value) {
+    const auto& tools = tools_result.get();
+    for (const auto& tool : tools) {
         cache_.tools_by_server[tool.server_name].push_back(tool);
     }
     
     cache_.last_refresh = std::chrono::steady_clock::now();
     
     log()->info("Cached {} tools from {} servers",
-               tools_result.value.size(),
+               tools.size(),
                cache_.tools_by_server.size());
     
     return core::Result<void>::Ok();

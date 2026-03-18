@@ -276,7 +276,7 @@ public:
         
         std::vector<McpToolDefinition> all_tools;
         
-        for (const auto& server : servers_result.value) {
+        for (const auto& server : servers_result.get()) {
             // 检查白名单
             if (!config_.allowed_servers.empty()) {
                 auto it = std::find(
@@ -293,10 +293,11 @@ public:
             // 获取该 server 的所有 tools
             auto tools_result = list_tools(server.name, true);
             if (tools_result.is_ok()) {
+                auto& tools = tools_result.get();
                 all_tools.insert(
                     all_tools.end(),
-                    tools_result.value.begin(),
-                    tools_result.value.end()
+                    tools.begin(),
+                    tools.end()
                 );
             } else {
                 log()->warn("Failed to list tools for {}: {}", 
@@ -305,7 +306,7 @@ public:
         }
         
         log()->info("Discovered {} MCP tools from {} servers",
-                   all_tools.size(), servers_result.value.size());
+                   all_tools.size(), servers_result.get().size());
         
         return core::Result<std::vector<McpToolDefinition>>::Ok(all_tools);
     }
@@ -404,7 +405,7 @@ public:
             config_.timeout_ms = old_timeout;
             
             if (result.is_ok()) {
-                results.push_back(result.value);
+                results.push_back(result.get());
             } else {
                 McporterResult error_result;
                 error_result.success = false;

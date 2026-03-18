@@ -265,7 +265,7 @@ public:
     
     static std::optional<FetchResponse> fetch_with_timeout(
         const std::string& url,
-        const FetchOptions& options = {});
+        const FetchOptions& options = {30000, {}, std::nullopt, std::nullopt});
 };
 
 // ============================================================================

@@ -52,9 +52,9 @@ int64_t current_timestamp_ms() {
 // ═══════════════════════════════════════════════════════════════
 
 std::shared_ptr<MessageDispatcher> MessageDispatcher::create(
-    std::shared_ptr<routing::MessageRouter> router,
+    std::shared_ptr<::hunterclaw::routing::MessageRouter> router,
     std::shared_ptr<sessions::SessionManager> session_manager,
-    std::shared_ptr<queue::DeliveryQueue> delivery_queue,
+    std::shared_ptr<::hunterclaw::queue::DeliveryQueue> delivery_queue,
     std::shared_ptr<tools::ToolManager> tool_manager,
     std::shared_ptr<llm::LLMClient> llm_client,
     const DispatchConfig& config
@@ -66,9 +66,9 @@ std::shared_ptr<MessageDispatcher> MessageDispatcher::create(
 }
 
 MessageDispatcher::MessageDispatcher(
-    std::shared_ptr<routing::MessageRouter> router,
+    std::shared_ptr<::hunterclaw::routing::MessageRouter> router,
     std::shared_ptr<sessions::SessionManager> session_manager,
-    std::shared_ptr<queue::DeliveryQueue> delivery_queue,
+    std::shared_ptr<::hunterclaw::queue::DeliveryQueue> delivery_queue,
     std::shared_ptr<tools::ToolManager> tool_manager,
     std::shared_ptr<llm::LLMClient> llm_client,
     const DispatchConfig& config
@@ -155,18 +155,19 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
     
     // ✅ 步骤 5: 命令授权检查 (对齐 OpenClaw: line 250-280)
     if (config.dispatch.enable_command_auth) {
-        auto cmd_detection = CommandDetector::detect_command(message.text);
-        if (cmd_detection.needs_authorization) {
-            // TODO: 检查用户是否为 owner
-            bool is_owner = false;  // TODO: 从配置读取
-            
-            if (!is_owner) {
-                result.denied = true;
-                result.error = "Command requires owner authorization: " + cmd_detection.command;
-                log()->warn("Command authorization failed: {}", cmd_detection.command);
-                return result;
-            }
-        }
+        auto directives = CommandDetection::parse_directives(message.text);
+        // TODO: 实现命令授权检查
+        // if (directives.needs_authorization) {
+        //     // TODO: 检查用户是否为 owner
+        //     bool is_owner = false;  // TODO: 从配置读取
+        //     
+        //     if (!is_owner) {
+        //         result.denied = true;
+        //         result.error = "Command requires owner authorization";
+        //         log()->warn("Command authorization failed");
+        //         return result;
+        //     }
+        // }
     }
     
     // ✅ 步骤 6: 生成回复 (对齐 OpenClaw: line 300-450)
@@ -194,9 +195,9 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
     result.total_tokens = gen_result.react_result.usage.total_tokens;
     
     // ✅ 步骤 7: 构建投递负载 (对齐 OpenClaw: line 460-520)
-    std::vector<queue::OutboundPayload> payloads;
+    std::vector<::hunterclaw::queue::MessagePayload> payloads;
     
-    queue::OutboundPayload payload;
+    ::hunterclaw::queue::MessagePayload payload;
     payload.text = gen_result.response;
     
     // TODO: 处理媒体 URL
@@ -210,7 +211,7 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
     }
     
     // ✅ 步骤 9: 投递响应 (对齐 OpenClaw: line 590-610)
-    queue::DeliveryRequest delivery;
+    ::hunterclaw::queue::DeliveryTarget delivery;
     delivery.channel = message.channel;
     delivery.to = message.sender_id;
     
@@ -289,18 +290,20 @@ MessageDispatcher::FastAbortResult MessageDispatcher::try_fast_abort_from_messag
     }
     
     // 2. 系统消息
-    if (message.is_system) {
-        result.should_abort = true;
-        result.reason = "System message";
-        return result;
-    }
+    // TODO: InboundMessage 需要添加 is_system 字段
+    // if (message.is_system) {
+    //     result.should_abort = true;
+    //     result.reason = "System message";
+    //     return result;
+    // }
     
     // 3. Bot 消息 (避免循环)
-    if (message.is_bot) {
-        result.should_abort = true;
-        result.reason = "Bot message";
-        return result;
-    }
+    // TODO: InboundMessage 需要添加 is_bot 字段
+    // if (message.is_bot) {
+    //     result.should_abort = true;
+    //     result.reason = "Bot message";
+    //     return result;
+    // }
     
     return result;
 }
@@ -356,7 +359,7 @@ MessageDispatcher::PermissionCheckResult MessageDispatcher::check_permissions(
     }
     
     // 3. 群组策略检查
-    if (message.chat_type == channels::ChatType::Group) {
+    if (message.chat_type == routing::ChatType::Group) {
         switch (config.channel.group_policy) {
             case ChannelConfig::GroupPolicy::Block:
                 result.allowed = false;
@@ -382,13 +385,13 @@ MessageDispatcher::PermissionCheckResult MessageDispatcher::check_permissions(
 
 // 对齐 OpenClaw: maybeApplyTtsToPayload (line 550-580)
 void MessageDispatcher::maybe_apply_tts_to_payload(
-    std::vector<queue::OutboundPayload>& payloads,
+    std::vector<::hunterclaw::queue::MessagePayload>& payloads,
     const AutoReplyConfig& config
 ) {
     // TODO: 实现 TTS (文本转语音)
     // 1. 调用 TTS 服务 (OpenAI, ElevenLabs, Azure)
     // 2. 生成音频文件
-    // 3. 添加到 payload.mediaUrls
+    // 3. 添加到 payload.media_urls
 }
 
 // 对齐 OpenClaw: shouldRouteToOriginating (line 320-340)
@@ -396,7 +399,7 @@ bool MessageDispatcher::should_route_to_originating(
     const channels::InboundMessage& message
 ) {
     // 群组消息应该发送到群组,而非私聊发送者
-    return message.chat_type == channels::ChatType::Group;
+    return message.chat_type == ::hunterclaw::routing::ChatType::Group;
 }
 
 // ═══════════════════════════════════════════════════════════════

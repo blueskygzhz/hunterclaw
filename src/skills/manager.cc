@@ -217,8 +217,8 @@ struct SkillManager::Impl {
             
             auto result = load_from_directory(root.path, root.source);
             if (result.is_ok()) {
-                total_loaded += result.value;
-                log()->info("Loaded {} skills from: {}", result.value, root.path);
+                total_loaded += result.get();
+                log()->info("Loaded {} skills from: {}", result.get(), root.path);
             } else {
                 log()->error("Failed to load skills from {}: {}", root.path, result.error);
             }
@@ -278,9 +278,9 @@ struct SkillManager::Impl {
                 max_bytes = config_->skills.limits.max_skill_file_bytes;
             }
             
-            if (content_result.value.size() > max_bytes) {
+            if (content_result.get().size() > max_bytes) {
                 log()->warn("Skill file too large ({}): {}", 
-                           content_result.value.size(), file_path.string());
+                           content_result.get().size(), file_path.string());
                 return core::Result<bool>::Err("Skill file exceeds size limit");
             }
             
@@ -290,7 +290,7 @@ struct SkillManager::Impl {
                 return core::Result<bool>::Err(skill_result.error);
             }
             
-            Skill skill = skill_result.value;
+            Skill skill = skill_result.get();
             skill.source = source;
             skill.base_dir = file_path.parent_path();
             

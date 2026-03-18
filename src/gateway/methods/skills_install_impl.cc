@@ -14,7 +14,7 @@
 #include <pwd.h>
 #include <nlohmann/json.hpp>
 
-#include "hunterclaw/gateway/methods/skills_install_download.h"
+#include "skills_install_download.h"
 #include "hunterclaw/skills/skills_manager.h"
 
 using json = nlohmann::json;

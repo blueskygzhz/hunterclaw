@@ -174,14 +174,27 @@ void ConnectionPool::unsubscribe_by_owner(void* owner) {
 // Statistics
 // ============================================================================
 
-ConnectionPool::Statistics ConnectionPool::get_statistics() const {
+ConnectionPool::StatisticsSnapshot ConnectionPool::get_statistics() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return statistics_;
+    
+    // 创建可复制的快照
+    StatisticsSnapshot snapshot;
+    snapshot.total_clients = statistics_.total_clients.load();
+    snapshot.events_sent = statistics_.events_sent.load();
+    snapshot.events_dropped = statistics_.events_dropped.load();
+    snapshot.slow_consumers_disconnected = statistics_.slow_consumers_disconnected.load();
+    snapshot.events_by_type = statistics_.events_by_type;
+    
+    return snapshot;
 }
 
 void ConnectionPool::reset_statistics() {
     std::lock_guard<std::mutex> lock(mutex_);
-    statistics_ = Statistics{};
+    statistics_.total_clients.store(0);
+    statistics_.events_sent.store(0);
+    statistics_.events_dropped.store(0);
+    statistics_.slow_consumers_disconnected.store(0);
+    statistics_.events_by_type.clear();
 }
 
 // ============================================================================

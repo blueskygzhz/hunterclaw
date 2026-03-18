@@ -45,12 +45,12 @@ core::Result<Skill> SkillParser::parse_file(const fs::path& skill_path) {
         
         // Build Skill object
         Skill skill;
-        skill.name = fm_result.value.name;
-        skill.description = fm_result.value.description;
+        skill.name = fm_result.get().name;
+        skill.description = fm_result.get().description;
         skill.content = body;
         skill.file_path = skill_path;
         skill.base_dir = skill_path.parent_path();
-        skill.frontmatter = fm_result.value;
+        skill.frontmatter = fm_result.get();
         
         // Determine source (simplified)
         if (skill_path.string().find("/.hunterclaw/") != std::string::npos) {

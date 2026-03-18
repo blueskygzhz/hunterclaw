@@ -22,7 +22,8 @@ Counter::Counter(const std::string& name, const std::string& help,
 
 void Counter::inc(double value, const std::map<std::string, std::string>& labels) {
     std::lock_guard<std::mutex> lock(mutex_);
-    values_[labels] += value;
+    auto& atomic_val = values_[labels];
+    atomic_val.store(atomic_val.load() + value);
 }
 
 std::string Counter::export_prometheus() const {
@@ -71,12 +72,14 @@ void Gauge::set(double value, const std::map<std::string, std::string>& labels) 
 
 void Gauge::inc(double value, const std::map<std::string, std::string>& labels) {
     std::lock_guard<std::mutex> lock(mutex_);
-    values_[labels] += value;
+    auto& atomic_val = values_[labels];
+    atomic_val.store(atomic_val.load() + value);
 }
 
 void Gauge::dec(double value, const std::map<std::string, std::string>& labels) {
     std::lock_guard<std::mutex> lock(mutex_);
-    values_[labels] -= value;
+    auto& atomic_val = values_[labels];
+    atomic_val.store(atomic_val.load() - value);
 }
 
 std::string Gauge::export_prometheus() const {
@@ -121,12 +124,14 @@ void Histogram::observe(double value, const std::map<std::string, std::string>& 
     // 初始化 bucket (如果不存在)
     if (buckets_by_label_.find(labels) == buckets_by_label_.end()) {
         std::vector<Bucket> bs;
+        bs.reserve(buckets_.size());
         for (double bound : buckets_) {
             Bucket b;
             b.upper_bound = bound;
-            bs.push_back(b);
+            b.count.store(0);
+            bs.push_back(std::move(b));
         }
-        buckets_by_label_[labels] = bs;
+        buckets_by_label_[labels] = std::move(bs);
     }
     
     // 更新 bucket 计数
@@ -137,7 +142,8 @@ void Histogram::observe(double value, const std::map<std::string, std::string>& 
     }
     
     // 更新 sum 和 count
-    sum_[labels] += value;
+    auto& sum_val = sum_[labels];
+    sum_val.store(sum_val.load() + value);
     count_[labels]++;
 }
 

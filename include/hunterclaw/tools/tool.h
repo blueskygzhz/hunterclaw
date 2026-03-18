@@ -134,25 +134,6 @@ struct ToolUpdate;
 using ToolUpdateCallback = std::function<void(const ToolUpdate&)>;
 
 // Note: ToolManager 的完整定义在 tool_manager.h 中
-    
-    // Hook 支持
-    std::shared_ptr<ToolHookManager> hook_manager_;
-    
-    // 循环检测
-    std::shared_ptr<ToolLoopDetector> loop_detector_;
-    bool loop_detection_enabled_ = false;
-    
-    // 策略管道
-    std::shared_ptr<PolicyPipeline> policy_pipeline_;
-    bool policy_enabled_ = false;
-    
-    // 结果处理
-    std::shared_ptr<ResultProcessingPipeline> result_pipeline_;
-    bool result_normalization_enabled_ = false;
-    
-    // 审批系统
-    std::shared_ptr<class ApprovalManager> approval_manager_;
-};
 
 // 内置Tools工厂
 class BuiltinTools {

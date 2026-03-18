@@ -122,7 +122,7 @@ public:
             auto http_result = http_post(url, request_json, headers);
             
             if (http_result.is_ok()) {
-                return parse_response(http_result.value);
+                return parse_response(http_result.get());
             }
             
             // Request failed, will retry

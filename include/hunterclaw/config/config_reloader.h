@@ -5,6 +5,7 @@
 #include <thread>
 #include <atomic>
 #include <chrono>
+#include <mutex>
 
 namespace hunterclaw {
 namespace config {

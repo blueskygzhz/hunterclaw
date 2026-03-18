@@ -149,7 +149,7 @@ MemoryProviderRegistry::get_all_provider_info() const {
         // 尝试获取统计信息
         auto stats_result = provider->get_stats();
         if (stats_result.is_ok()) {
-            const auto& stats = stats_result.value;
+            const MemoryStats& stats = stats_result.get();
             info.memory_count = stats.total_memories;
             info.total_size = stats.total_size;
         }
@@ -188,7 +188,7 @@ core::Result<std::string> MemoryProviderRegistry::create_and_register_provider(
     }
     
     // 注册
-    providers_[provider_id] = result.value;
+    providers_[provider_id] = result.get();
     
     // 如果是第一个 provider,设置为默认
     if (default_provider_id_.empty()) {
