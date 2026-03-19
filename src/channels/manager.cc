@@ -1,6 +1,7 @@
 #include "hunterclaw/channels/manager.h"
 #include "hunterclaw/channels/registry.h"
 #include "hunterclaw/core/utils.h"
+#include "hunterclaw/auto_reply/message_dispatcher.h"
 #include <thread>
 #include <chrono>
 #include <random>
@@ -204,6 +205,27 @@ public:
                     }
                 };
 
+                // Aligned with openclaw: inject dispatchReplyFromConfig into gateway context.
+                // The channel gateway (e.g. telegram webhook handler) calls ctx.dispatch_inbound
+                // when an inbound message arrives. Wire to the real MessageDispatcher if available.
+                {
+                    auto dispatcher_weak = std::weak_ptr<auto_reply::MessageDispatcher>(dispatcher_);
+                    ctx.dispatch_inbound = [channel_id, effective_account_id, dispatcher_weak](
+                        const channels::InboundMessage& msg
+                    ) {
+                        auto dispatcher = dispatcher_weak.lock();
+                        if (dispatcher) {
+                            // Aligned with openclaw: dispatchReplyFromConfig(inboundMessage)
+                            dispatcher->dispatch_inbound_message(msg);
+                        } else {
+                            ::hunterclaw::channels::log()->warn(
+                                "[{}/{}] dispatch_inbound: MessageDispatcher not available, message dropped",
+                                channel_id, effective_account_id
+                            );
+                        }
+                    };
+                }
+
                 // ✅ 调用 ChannelGatewayAdapter::start_account (对齐 OpenClaw)
                 if (!plugin_copy.gateway.has_value() || !plugin_copy.gateway->start_account) {
                     log()->warn("Channel {} has no gateway.start_account", channel_id);
@@ -296,15 +318,25 @@ public:
         return core::Result<void>::Ok();
     }
     
-    core::Result<void> mark_channel_logged_out(ChannelId channel_id, const std::string& account_id) {
+    core::Result<void> mark_channel_logged_out(ChannelId channel_id, const std::string& account_id, bool cleared = true) {
         std::string effective_account_id = account_id.empty() ? "default" : account_id;
         
-        // ✅ 原子性更新状态
-        update_runtime_fields(channel_id, effective_account_id, [](auto& s) {
-            s.configured = false;
-            s.running    = false;
-            s.connected  = false;
-            s.last_error = std::string("Logged out");
+        // ✅ 对齐 OpenClaw markChannelLoggedOut:
+        //   next = { running: false, restartPending: false,
+        //            lastError: cleared ? "logged out" : current.lastError,
+        //            connected: false (if was boolean) }
+        //   注意: 不修改 configured 字段 (OpenClaw 不修改)
+        update_runtime_fields(channel_id, effective_account_id, [cleared](auto& s) {
+            s.running         = false;
+            s.restart_pending = false;
+            s.last_stop_at    = core::utils::now().time_since_epoch().count() / 1000000;
+            if (cleared) {
+                s.last_error = std::string("logged out");
+            }
+            // 如果之前有 connected 值，则设为 false (对齐 OpenClaw)
+            if (s.connected.has_value()) {
+                s.connected = false;
+            }
         });
         
         return core::Result<void>::Ok();
@@ -313,20 +345,95 @@ public:
     // ========== Status Query ==========
     
     ChannelRuntimeSnapshot get_runtime_snapshot() const {
+        // ✅ 对齐 OpenClaw getRuntimeSnapshot():
+        //   遍历 listChannelPlugins() (所有注册插件，不只是已启动的)
+        //   对每个 plugin，遍历 listAccountIds(cfg)
+        //   合并 store.runtimes 中的运行时状态
+        //   根据 enabled/configured 设置 lastError fallback
         std::lock_guard<std::mutex> lock(stores_mutex_);
         
         ChannelRuntimeSnapshot snapshot;
         
-        for (const auto& [channel_id_str, store] : channel_stores_) {
+        // 1. 遍历所有注册的 channel plugins (对齐 OpenClaw: listChannelPlugins())
+        const auto& all_plugins = ChannelPluginRegistry::instance().list_plugins();
+        for (const auto& plugin : all_plugins) {
+            const std::string& channel_id_str = plugin.id;
             ChannelId channel_id = channel_id_str.c_str();
             
-            // Default account
+            // 获取该 channel 的 store（可能不存在，即未启动）
+            auto store_it = channel_stores_.find(channel_id_str);
+            
+            // 2. 遍历该 plugin 的所有账户 (对齐 OpenClaw: plugin.config.listAccountIds(cfg))
+            // HunterClaw 简化版: 从 store 中获取已知账户，或使用 "default"
+            std::vector<std::string> account_ids;
+            if (store_it != channel_stores_.end()) {
+                for (const auto& [acc_id, _] : store_it->second.runtimes) {
+                    account_ids.push_back(acc_id);
+                }
+            }
+            if (account_ids.empty()) {
+                account_ids.push_back("default");
+            }
+            
+            // 3. 确定 defaultAccountId (对齐 OpenClaw: resolveChannelDefaultAccountId)
+            std::string default_account_id = "default";
+            
+            std::map<std::string, ChannelAccountSnapshot> accounts;
+            for (const auto& acc_id : account_ids) {
+                ChannelAccountSnapshot current;
+                current.account_id = acc_id;
+                
+                // 从 store 中获取运行时状态
+                if (store_it != channel_stores_.end()) {
+                    auto runtime_it = store_it->second.runtimes.find(acc_id);
+                    if (runtime_it != store_it->second.runtimes.end()) {
+                        current = runtime_it->second;
+                    }
+                }
+                current.account_id = acc_id;
+                
+                // 4. 对齐 OpenClaw: enabled/configured fallback
+                bool enabled = current.enabled.value_or(true);
+                bool configured = current.configured.value_or(true);
+                
+                // 5. 对齐 OpenClaw: 未运行时设置 lastError fallback
+                if (!current.running.value_or(false)) {
+                    if (!enabled) {
+                        if (!current.last_error.has_value() || current.last_error->empty()) {
+                            current.last_error = std::string("disabled");
+                        }
+                    } else if (!configured) {
+                        if (!current.last_error.has_value() || current.last_error->empty()) {
+                            current.last_error = std::string("not configured");
+                        }
+                    }
+                }
+                
+                accounts[acc_id] = current;
+            }
+            
+            // 6. 设置 default account (对齐 OpenClaw: channels[plugin.id] = defaultAccount)
+            auto default_it = accounts.find(default_account_id);
+            if (default_it != accounts.end()) {
+                snapshot.channels[channel_id] = default_it->second;
+            } else if (!accounts.empty()) {
+                snapshot.channels[channel_id] = accounts.begin()->second;
+            }
+            
+            snapshot.channel_accounts[channel_id] = accounts;
+        }
+        
+        // 7. 补充 channel_stores_ 中有但 plugin registry 中没有的 channel
+        //    (兼容动态注册的 channel)
+        for (const auto& [channel_id_str, store] : channel_stores_) {
+            if (snapshot.channel_accounts.find(channel_id_str) != snapshot.channel_accounts.end()) {
+                continue;  // 已处理
+            }
+            ChannelId channel_id = channel_id_str.c_str();
             auto default_it = store.runtimes.find("default");
             if (default_it != store.runtimes.end()) {
                 snapshot.channels[channel_id] = default_it->second;
             }
-            
-            // All accounts
             for (const auto& [account_id, runtime] : store.runtimes) {
                 snapshot.channel_accounts[channel_id][account_id] = runtime;
             }
@@ -382,8 +489,57 @@ public:
         log()->info("Channel health monitor stopped");
     }
     
+    void set_dispatcher(std::shared_ptr<auto_reply::MessageDispatcher> dispatcher) {
+        dispatcher_ = std::move(dispatcher);
+        log()->info("MessageDispatcher wired into ChannelManager");
+    }
+
+    // ========== Channel Activity (对齐 OpenClaw: channel-activity.ts) ==========
+
+    void record_channel_activity(
+        const ChannelId& channel_id,
+        const std::string& account_id,
+        ChannelDirection direction,
+        std::optional<int64_t> at = std::nullopt
+    ) {
+        std::string effective_account_id = account_id.empty() ? "default" : account_id;
+        // trim
+        while (!effective_account_id.empty() && (effective_account_id.front() == ' ' || effective_account_id.front() == '\t'))
+            effective_account_id.erase(effective_account_id.begin());
+        while (!effective_account_id.empty() && (effective_account_id.back() == ' ' || effective_account_id.back() == '\t'))
+            effective_account_id.pop_back();
+        if (effective_account_id.empty()) effective_account_id = "default";
+
+        int64_t ts = at.value_or(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()
+            ).count()
+        );
+        std::string key = channel_id + ":" + effective_account_id;
+        std::lock_guard<std::mutex> lock(activity_mutex_);
+        auto& entry = channel_activity_[key];
+        if (direction == ChannelDirection::Inbound) {
+            entry.inbound_at = ts;
+        } else {
+            entry.outbound_at = ts;
+        }
+    }
+
+    ChannelActivityEntry get_channel_activity(
+        const ChannelId& channel_id,
+        const std::string& account_id
+    ) const {
+        std::string effective_account_id = account_id.empty() ? "default" : account_id;
+        std::string key = channel_id + ":" + effective_account_id;
+        std::lock_guard<std::mutex> lock(activity_mutex_);
+        auto it = channel_activity_.find(key);
+        if (it != channel_activity_.end()) {
+            return it->second;
+        }
+        return ChannelActivityEntry{};
+    }
+
 private:
-    // ========== Internal Helpers ==========
     
     ChannelManager::ChannelRuntimeStore& get_store(ChannelId channel_id) {
         std::lock_guard<std::mutex> lock(stores_mutex_);
@@ -611,9 +767,15 @@ private:
     }
     
     ChannelManager::Options options_;
+    std::shared_ptr<auto_reply::MessageDispatcher> dispatcher_;  // Aligned with openclaw: runtime.dispatchReplyFromConfig
     
     mutable std::mutex stores_mutex_;
     std::map<std::string, ChannelManager::ChannelRuntimeStore> channel_stores_;
+
+    // ✅ Channel Activity 追踪 (对齐 OpenClaw: channel-activity.ts)
+    // key = "channelId:accountId"
+    mutable std::mutex activity_mutex_;
+    std::map<std::string, ChannelActivityEntry> channel_activity_;
     
     mutable std::mutex manually_stopped_mutex_;
     std::set<std::string> manually_stopped_;
@@ -698,6 +860,26 @@ void ChannelManager::start_health_monitor(const ChannelHealthMonitorConfig& conf
 
 void ChannelManager::stop_health_monitor() {
     impl_->stop_health_monitor();
+}
+
+void ChannelManager::set_dispatcher(std::shared_ptr<auto_reply::MessageDispatcher> dispatcher) {
+    impl_->set_dispatcher(std::move(dispatcher));
+}
+
+void ChannelManager::record_channel_activity(
+    const ChannelId& channel_id,
+    const std::string& account_id,
+    ChannelDirection direction,
+    std::optional<int64_t> at
+) {
+    impl_->record_channel_activity(channel_id, account_id, direction, at);
+}
+
+ChannelActivityEntry ChannelManager::get_channel_activity(
+    const ChannelId& channel_id,
+    const std::string& account_id
+) const {
+    return impl_->get_channel_activity(channel_id, account_id);
 }
 
 // ============================================================================

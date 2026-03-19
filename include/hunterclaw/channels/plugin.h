@@ -3,6 +3,7 @@
 #include "hunterclaw/core/types.h"
 #include "hunterclaw/core/json.h"
 #include "hunterclaw/plugins/plugin.h"
+#include "hunterclaw/channels/message.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -424,6 +425,12 @@ struct ChannelGatewayContext {
     std::function<void(const ChannelAccountSnapshot&)> set_status;
     // channelRuntime: optional plugin SDK runtime helpers
     std::optional<nlohmann::json> channel_runtime;
+
+    // Aligned with openclaw: dispatchReplyFromConfig injected into startAccount context.
+    // Called by channel gateway (e.g. telegram webhook handler) when an inbound message
+    // arrives. Manager injects the real MessageDispatcher::dispatch_inbound_message here.
+    // Signature: void(const InboundMessage&)
+    std::function<void(const InboundMessage&)> dispatch_inbound;
 };
 
 // ChannelLoginWithQrStartResult

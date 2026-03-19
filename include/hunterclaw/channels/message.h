@@ -1,7 +1,6 @@
 #pragma once
 
 #include "hunterclaw/core/types.h"
-#include "hunterclaw/channels/channel.h"
 #include "hunterclaw/routing/router.h"
 #include <string>
 #include <vector>
@@ -11,6 +10,11 @@
 
 namespace hunterclaw {
 namespace channels {
+
+// Message type enum (defined here to avoid circular dependency with channel.h)
+enum class MessageType {
+    Text, Image, File, Voice, Video, Sticker, Location, Contact, System
+};
 
 // 入站消息 (从外部平台接收)
 struct InboundMessage {
@@ -47,7 +51,6 @@ struct InboundMessage {
     std::chrono::system_clock::time_point timestamp = std::chrono::system_clock::now();
 
     // Cross-provider routing (aligned with openclaw: ctx.OriginatingChannel / ctx.OriginatingTo)
-    // Set when a message is relayed from a different provider/surface.
     std::string originating_channel;   // Original channel (e.g. "telegram" when relayed via slack)
     std::string originating_to;        // Original recipient ID in the originating channel
 

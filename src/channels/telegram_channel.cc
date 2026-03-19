@@ -1,6 +1,11 @@
 #include "hunterclaw/channels/plugin.h"
+#include "hunterclaw/security/timing_safe.h"   // constant-time compare for webhook secret
+#include <httplib.h>                            // dedicated HTTP server for webhook listener
+#include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_sinks.h>
+#include <thread>
+#include <chrono>
 
 namespace hunterclaw {
 namespace channels {
@@ -266,12 +271,61 @@ ChannelPlugin make_telegram_plugin() {
             }
 
             // Aligned with openclaw: dispatchReplyFromConfig(inboundMessage)
-            // Build InboundMessage and dispatch via MessageDispatcher
+            // Build InboundMessage and dispatch via ctx.dispatch_inbound
+            // (Manager injects the real MessageDispatcher::dispatch_inbound_message here)
             ctx.log->info("[telegram] webhook update: from=" + from_id + " chat=" + chat_id + " text_len=" + std::to_string(text.size()));
 
-            // TODO: call message_dispatcher->dispatch_reply_from_config(inbound_msg)
-            // For now, log and acknowledge
-            ctx.log->debug("[telegram] [dispatch] text=" + text.substr(0, 80));
+            channels::InboundMessage inbound_msg;
+            // Aligned with openclaw: ctx.Provider = "telegram"
+            inbound_msg.channel    = "telegram";
+            // Aligned with openclaw: ctx.AccountId
+            inbound_msg.account_id = ctx.account_id;
+            // Aligned with openclaw: ctx.MessageId
+            inbound_msg.message_id = message_id;
+            // Aligned with openclaw: ctx.PeerId / ctx.SenderId
+            inbound_msg.sender_id  = from_id;
+            inbound_msg.from_id    = from_id;
+            // Aligned with openclaw: ctx.ChatId
+            inbound_msg.chat_id    = chat_id;
+            // Aligned with openclaw: ctx.Text
+            inbound_msg.text       = text;
+            // Aligned with openclaw: ctx.ChatType — Telegram DM vs group
+            // chat.type: "private" → Direct, "group"/"supergroup"/"channel" → Group
+            {
+                const std::string chat_type_str = body.contains("message") && body["message"].contains("chat")
+                    ? body["message"]["chat"].value("type", std::string{"private"})
+                    : "private";
+                if (chat_type_str == "private") {
+                    inbound_msg.chat_type = routing::ChatType::Direct;
+                } else {
+                    inbound_msg.chat_type = routing::ChatType::Group;
+                }
+            }
+            // Aligned with openclaw: ctx.SenderName
+            if (body.contains("message") && body["message"].contains("from")) {
+                const auto& from = body["message"]["from"];
+                std::string first = from.value("first_name", std::string{});
+                std::string last  = from.value("last_name",  std::string{});
+                inbound_msg.sender_name = last.empty() ? first : first + " " + last;
+            }
+            // Aligned with openclaw: ctx.ThreadId (message_thread_id for supergroups)
+            if (body.contains("message") && body["message"].contains("message_thread_id")) {
+                inbound_msg.thread_id = std::to_string(body["message"]["message_thread_id"].get<int64_t>());
+            }
+            // Aligned with openclaw: ctx.ReplyToId
+            if (body.contains("message") && body["message"].contains("reply_to_message")) {
+                const auto& reply = body["message"]["reply_to_message"];
+                inbound_msg.reply_to_id = std::to_string(reply.value("message_id", 0));
+            }
+            // Aligned with openclaw: timestamp
+            inbound_msg.timestamp = std::chrono::system_clock::now();
+
+            // Dispatch — aligned with openclaw: dispatchReplyFromConfig(inboundMessage)
+            if (ctx.dispatch_inbound) {
+                ctx.dispatch_inbound(inbound_msg);
+            } else {
+                ctx.log->warn("[telegram] dispatch_inbound not wired — message dropped");
+            }
 
             res.status = 200;
             res.set_content("ok", "text/plain");

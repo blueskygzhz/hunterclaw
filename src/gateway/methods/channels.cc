@@ -3,6 +3,8 @@
 #include "hunterclaw/channels/manager.h"
 #include "hunterclaw/core/utils.h"
 #include <nlohmann/json.hpp>
+#include <chrono>
+#include <set>
 
 using json = nlohmann::json;
 
@@ -65,7 +67,65 @@ core::Result<json> method_channel_list(
     return core::Result<json>::Ok(result);
 }
 
-// channels.status - 获取渠道状态 (对齐 OpenClaw channelsStatusCommand)
+// ============================================================================
+// 🎯 OpenClaw 严格对齐: buildChannelAccountSnapshot
+// 对应 OpenClaw: channels/plugins/status.ts buildChannelAccountSnapshot()
+// ============================================================================
+static json build_channel_account_snapshot(
+    const channels::ChannelAccountSnapshot& runtime,
+    const std::string& channel_id,
+    const std::string& account_id
+) {
+    json snap;
+    snap["accountId"] = account_id;
+    snap["enabled"]   = runtime.enabled.value_or(true);
+    snap["configured"] = runtime.configured.value_or(false);
+    snap["running"]   = runtime.running.value_or(false);
+    snap["connected"] = runtime.connected.value_or(false);
+    snap["restartPending"] = runtime.restart_pending.value_or(false);
+    snap["reconnectAttempts"] = runtime.reconnect_attempts.value_or(0);
+
+    if (runtime.last_error.has_value() && !runtime.last_error.value().empty()) {
+        snap["lastError"] = runtime.last_error.value();
+    } else {
+        snap["lastError"] = nullptr;
+    }
+    if (runtime.last_start_at.has_value()) {
+        snap["lastStartAt"] = runtime.last_start_at.value();
+    }
+    if (runtime.last_stop_at.has_value()) {
+        snap["lastStopAt"] = runtime.last_stop_at.value();
+    }
+    if (runtime.last_message_at.has_value()) {
+        snap["lastInboundAt"] = runtime.last_message_at.value();
+    }
+    return snap;
+}
+
+// ============================================================================
+// 🎯 OpenClaw 严格对齐: buildChannelSummary
+// 对应 OpenClaw: plugin.status.buildChannelSummary()
+// ============================================================================
+static json build_channel_summary(
+    const channels::ChannelAccountSnapshot& default_account,
+    const std::string& channel_id
+) {
+    json summary;
+    summary["configured"] = default_account.configured.value_or(false);
+    summary["enabled"]    = default_account.enabled.value_or(true);
+    summary["running"]    = default_account.running.value_or(false);
+    summary["connected"]  = default_account.connected.value_or(false);
+    if (default_account.last_error.has_value() && !default_account.last_error.value().empty()) {
+        summary["lastError"] = default_account.last_error.value();
+    }
+    return summary;
+}
+
+// channels.status - 获取渠道状态
+// 🎯 OpenClaw 严格对齐: server-methods/channels.ts channelsHandlers["channels.status"]
+// 返回格式: { ts, channelOrder, channelLabels, channelDetailLabels,
+//             channelSystemImages, channelMeta, channels, channelAccounts,
+//             channelDefaultAccountId }
 core::Result<json> method_channel_status(
     std::shared_ptr<GatewayServer> server,
     std::shared_ptr<MethodGuard> method_guard,
@@ -74,57 +134,168 @@ core::Result<json> method_channel_status(
 ) {
     auto channel_mgr = server->channel_manager();
     auto runtime_snapshot = channel_mgr->get_runtime_snapshot();
-    
-    // 是否进行探测 (probe)
+
+    // 🎯 OpenClaw 对齐: probe 参数
     bool do_probe = params.value("probe", false);
+    // int64_t timeout_ms = params.value("timeoutMs", 10000);  // 保留供 probe 使用
 
-    json result = json::object();
+    int64_t ts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count();
 
-    // 遍历所有渠道账户（使用多账户映射）
-    for (const auto& [channel_id, accounts_map] : runtime_snapshot.channel_accounts) {
-        for (const auto& [account_id, account_state] : accounts_map) {
-            std::string key = channel_id + ":" + account_id;
-            
-            json status;
-            status["channel"] = channel_id;
-            status["accountId"] = account_id;
-            status["enabled"] = account_state.enabled.value_or(false);
-            status["configured"] = account_state.configured.value_or(false);
-            status["running"] = account_state.running.value_or(false);
-            status["connected"] = account_state.connected.value_or(false);
+    // 🎯 OpenClaw 对齐: buildChannelUiCatalog → channelOrder / channelLabels / channelMeta
+    // HunterClaw 简化版: 从 runtime_snapshot 中枚举已知 channel
+    json channel_order = json::array();
+    json channel_labels = json::object();
+    json channel_detail_labels = json::object();
+    json channel_system_images = json::object();
+    json channel_meta = json::object();
 
-            // Probe 探测
+    // 收集所有已知 channel id
+    std::set<std::string> known_channels;
+    for (const auto& [ch_id, _] : runtime_snapshot.channels) {
+        known_channels.insert(std::string(ch_id));
+    }
+    for (const auto& [ch_id, _] : runtime_snapshot.channel_accounts) {
+        known_channels.insert(std::string(ch_id));
+    }
+
+    for (const auto& ch_id : known_channels) {
+        channel_order.push_back(ch_id);
+        channel_labels[ch_id] = ch_id;  // TODO: 从 plugin.config.label 获取
+        channel_detail_labels[ch_id] = ch_id;
+        channel_meta[ch_id] = json{{"id", ch_id}};
+    }
+
+    // 🎯 OpenClaw 对齐: channels / channelAccounts / channelDefaultAccountId
+    json channels_map = json::object();
+    json accounts_map = json::object();
+    json default_account_id_map = json::object();
+
+    for (const auto& ch_id_str : known_channels) {
+        channels::ChannelId ch_id = ch_id_str.c_str();
+
+        // 🎯 OpenClaw 对齐: defaultAccountId
+        std::string default_account_id = "default";
+        auto default_it = runtime_snapshot.channels.find(ch_id);
+        if (default_it != runtime_snapshot.channels.end()) {
+            default_account_id = default_it->second.account_id;
+        }
+        default_account_id_map[ch_id_str] = default_account_id;
+
+        // 🎯 OpenClaw 对齐: channelAccounts[channelId] = accounts[]
+        json accounts_arr = json::array();
+        auto accounts_it = runtime_snapshot.channel_accounts.find(ch_id);
+        if (accounts_it != runtime_snapshot.channel_accounts.end()) {
+            for (const auto& [acc_id, acc_state] : accounts_it->second) {
+                json snap = build_channel_account_snapshot(acc_state, ch_id_str, acc_id);
+
+                // 🎯 OpenClaw 对齐: probe 结果注入
+                if (do_probe) {
+                    // HunterClaw 简化版: 直接使用 runtime 状态作为 probe 结果
+                    json probe_result;
+                    probe_result["ok"] = acc_state.connected.value_or(false);
+                    probe_result["connected"] = acc_state.connected.value_or(false);
+                    probe_result["running"] = acc_state.running.value_or(false);
+                    if (acc_state.last_error.has_value()) {
+                        probe_result["error"] = acc_state.last_error.value();
+                    }
+                    snap["probe"] = probe_result;
+                    snap["lastProbeAt"] = ts_ms;
+                }
+
+                accounts_arr.push_back(snap);
+            }
+        } else if (default_it != runtime_snapshot.channels.end()) {
+            // 只有 default account
+            json snap = build_channel_account_snapshot(
+                default_it->second, ch_id_str, default_account_id);
             if (do_probe) {
                 json probe_result;
-                probe_result["ok"] = account_state.running.value_or(false);
-                probe_result["connected"] = account_state.connected.value_or(false);
-                
-                // 最后消息时间
-                if (account_state.last_message_at.has_value()) {
-                    probe_result["lastMessageAt"] = account_state.last_message_at.value();
-                }
-                
-                // 最后启动/停止时间
-                if (account_state.last_start_at.has_value()) {
-                    probe_result["lastStartAt"] = account_state.last_start_at.value();
-                }
-                if (account_state.last_stop_at.has_value()) {
-                    probe_result["lastStopAt"] = account_state.last_stop_at.value();
-                }
-                
-                // 错误信息
-                if (account_state.last_error.has_value()) {
-                    probe_result["error"] = account_state.last_error.value();
-                }
-                
-                probe_result["reconnectAttempts"] = account_state.reconnect_attempts.value_or(0);
-                
-                status["probe"] = probe_result;
+                probe_result["ok"] = default_it->second.connected.value_or(false);
+                probe_result["connected"] = default_it->second.connected.value_or(false);
+                probe_result["running"] = default_it->second.running.value_or(false);
+                snap["probe"] = probe_result;
+                snap["lastProbeAt"] = ts_ms;
             }
-
-            result[key] = status;
+            accounts_arr.push_back(snap);
         }
+        accounts_map[ch_id_str] = accounts_arr;
+
+        // 🎯 OpenClaw 对齐: channels[channelId] = summary (buildChannelSummary)
+        channels::ChannelAccountSnapshot default_snap;
+        if (default_it != runtime_snapshot.channels.end()) {
+            default_snap = default_it->second;
+        }
+        channels_map[ch_id_str] = build_channel_summary(default_snap, ch_id_str);
     }
+
+    // 🎯 OpenClaw 对齐: 完整 payload 结构
+    json result;
+    result["ts"] = ts_ms;
+    result["channelOrder"] = channel_order;
+    result["channelLabels"] = channel_labels;
+    result["channelDetailLabels"] = channel_detail_labels;
+    result["channelSystemImages"] = channel_system_images;
+    result["channelMeta"] = channel_meta;
+    result["channels"] = channels_map;
+    result["channelAccounts"] = accounts_map;
+    result["channelDefaultAccountId"] = default_account_id_map;
+
+    return core::Result<json>::Ok(result);
+}
+
+// channels.logout - 登出渠道账户
+// 🎯 OpenClaw 严格对齐: server-methods/channels.ts channelsHandlers["channels.logout"]
+// 流程: validateParams → stopChannel → plugin.gateway.logoutAccount → markChannelLoggedOut
+core::Result<json> method_channel_logout(
+    std::shared_ptr<GatewayServer> server,
+    std::shared_ptr<MethodGuard> method_guard,
+    const ClientContext& client_ctx,
+    const json& params
+) {
+    // 🎯 OpenClaw 对齐: 验证 channel 参数
+    if (!params.contains("channel") || !params["channel"].is_string()) {
+        return core::Result<json>::Err("invalid channels.logout channel");
+    }
+    std::string channel_id = params["channel"].get<std::string>();
+    if (channel_id.empty()) {
+        return core::Result<json>::Err("invalid channels.logout channel");
+    }
+
+    // 🎯 OpenClaw 对齐: 可选 accountId
+    std::string account_id;
+    if (params.contains("accountId") && params["accountId"].is_string()) {
+        account_id = params["accountId"].get<std::string>();
+        // trim
+        account_id.erase(0, account_id.find_first_not_of(" \t\r\n"));
+        account_id.erase(account_id.find_last_not_of(" \t\r\n") + 1);
+    }
+    if (account_id.empty()) {
+        account_id = "default";
+    }
+
+    auto channel_mgr = server->channel_manager();
+
+    // 🎯 OpenClaw 对齐: stopChannel(channelId, accountId)
+    auto stop_result = channel_mgr->stop_channel(channel_id.c_str(), account_id);
+    if (stop_result.is_err()) {
+        return core::Result<json>::Err("Failed to stop channel: " + stop_result.error);
+    }
+
+    // 🎯 OpenClaw 对齐: plugin.gateway.logoutAccount(...)
+    // HunterClaw 简化版: 直接调用 mark_channel_logged_out
+    auto logout_result = channel_mgr->mark_channel_logged_out(channel_id.c_str(), account_id);
+    if (logout_result.is_err()) {
+        return core::Result<json>::Err("Failed to logout channel: " + logout_result.error);
+    }
+
+    // 🎯 OpenClaw 对齐: 返回 { channel, accountId, cleared, loggedOut }
+    json result;
+    result["channel"] = channel_id;
+    result["accountId"] = account_id;
+    result["cleared"] = true;   // 对齐 OpenClaw: result.cleared
+    result["loggedOut"] = true; // 对齐 OpenClaw: result.loggedOut
 
     return core::Result<json>::Ok(result);
 }

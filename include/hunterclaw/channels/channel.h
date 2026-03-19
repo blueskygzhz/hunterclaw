@@ -44,10 +44,6 @@ struct ChannelAccount {
     std::map<std::string, core::JsonValue> config;
 };
 
-enum class MessageType {
-    Text, Image, File, Voice, Video, Sticker, Location, Contact, System
-};
-
 struct ChannelMessage {
     std::string id;
     std::string channel_id;

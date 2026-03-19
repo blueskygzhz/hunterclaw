@@ -4,6 +4,9 @@
 #include "hunterclaw/core/types.h"
 #include "hunterclaw/core/json.h"
 #include <spdlog/spdlog.h>
+
+// Forward declaration — avoid circular include with message_dispatcher.h
+namespace hunterclaw { namespace auto_reply { class MessageDispatcher; } }
 #include <string>
 #include <memory>
 #include <map>
@@ -61,6 +64,15 @@ struct ChannelHealthMonitorConfig {
     int cooldown_cycles = 2;
     int max_restarts_per_hour = 10;
 };
+
+/// Channel Activity 追踪 (100% 对齐 OpenClaw: channel-activity.ts)
+/// 记录每个 channel:account 的最后收发消息时间
+struct ChannelActivityEntry {
+    std::optional<int64_t> inbound_at;   // lastInboundAt (ms)
+    std::optional<int64_t> outbound_at;  // lastOutboundAt (ms)
+};
+
+enum class ChannelDirection { Inbound, Outbound };
 
 /// Channel 账户状态枚举 (内部使用)
 enum class ChannelAccountStatus {
@@ -142,6 +154,26 @@ public:
     // 健康监控
     void start_health_monitor(const ChannelHealthMonitorConfig& config = {});
     void stop_health_monitor();
+
+    // Aligned with openclaw: inject dispatchReplyFromConfig runtime.
+    // Call this after MessageDispatcher is constructed so that all subsequent
+    // ctx.dispatch_inbound calls are routed to the real dispatcher.
+    void set_dispatcher(std::shared_ptr<auto_reply::MessageDispatcher> dispatcher);
+
+    // ========== Channel Activity (对齐 OpenClaw: channel-activity.ts) ==========
+    // recordChannelActivity: 记录 channel 收发消息时间
+    void record_channel_activity(
+        const ChannelId& channel_id,
+        const std::string& account_id,
+        ChannelDirection direction,
+        std::optional<int64_t> at = std::nullopt
+    );
+
+    // getChannelActivity: 获取 channel 收发消息时间
+    ChannelActivityEntry get_channel_activity(
+        const ChannelId& channel_id,
+        const std::string& account_id
+    ) const;
 
 private:
     std::unique_ptr<ChannelManagerImpl> impl_;

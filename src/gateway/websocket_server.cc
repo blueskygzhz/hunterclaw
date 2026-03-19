@@ -54,10 +54,13 @@ json WebSocketResponse::to_json() const {
 // ============================================================================
 
 json WebSocketEvent::to_json() const {
+    // 🎯 OpenClaw 严格对齐: {type:"event", event, payload}
     json j;
-    j["jsonrpc"] = "2.0";
-    j["method"] = event;
-    j["params"] = payload;
+    j["type"] = "event";
+    j["event"] = event;
+    if (!payload.is_null()) {
+        j["payload"] = payload;
+    }
     
     return j;
 }

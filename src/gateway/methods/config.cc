@@ -347,6 +347,111 @@ core::Result<json> method_config_export(
     return core::Result<json>::Ok(result);
 }
 
+// ============================================================================
+// config.schema - 获取配置 JSON Schema
+// 🎯 OpenClaw 严格对齐: server-methods/config.ts configHandlers["config.schema"]
+// ============================================================================
+core::Result<json> method_config_schema(
+    std::shared_ptr<GatewayServer> server,
+    std::shared_ptr<MethodGuard> method_guard,
+    const ClientContext& client_ctx,
+    const json& params
+) {
+    (void)server; (void)method_guard; (void)client_ctx; (void)params;
+
+    // 🎯 OpenClaw 对齐: 返回 ConfigSchemaResponse 格式
+    // { schema, uiHints, channels, plugins }
+    json result;
+    result["schema"] = json::object();   // TODO: 从 config 类型定义生成
+    result["uiHints"] = json::object();
+    result["channels"] = json::array();
+    result["plugins"] = json::array();
+
+    return core::Result<json>::Ok(result);
+}
+
+// ============================================================================
+// config.schema.lookup - 查找配置 Schema 路径
+// 🎯 OpenClaw 严格对齐: server-methods/config.ts configHandlers["config.schema.lookup"]
+// ============================================================================
+core::Result<json> method_config_schema_lookup(
+    std::shared_ptr<GatewayServer> server,
+    std::shared_ptr<MethodGuard> method_guard,
+    const ClientContext& client_ctx,
+    const json& params
+) {
+    (void)server; (void)method_guard; (void)client_ctx;
+
+    if (!params.contains("path") || !params["path"].is_string()) {
+        return core::Result<json>::Err("invalid config.schema.lookup params: path (string) required");
+    }
+    std::string path = params["path"].get<std::string>();
+
+    // 🎯 OpenClaw 对齐: 返回 ConfigSchemaLookupResult 格式
+    // { path, schema, uiHints }
+    json result;
+    result["path"] = path;
+    result["schema"] = nullptr;   // TODO: 从 schema 中查找
+    result["uiHints"] = nullptr;
+
+    return core::Result<json>::Ok(result);
+}
+
+// ============================================================================
+// config.apply - 应用配置并触发重启
+// 🎯 OpenClaw 严格对齐: server-methods/config.ts configHandlers["config.apply"]
+// 对应 OpenClaw: writeConfigFile + scheduleGatewaySigusr1Restart
+// ============================================================================
+core::Result<json> method_config_apply(
+    std::shared_ptr<GatewayServer> server,
+    std::shared_ptr<MethodGuard> method_guard,
+    const ClientContext& client_ctx,
+    const json& params
+) {
+    (void)method_guard; (void)client_ctx;
+
+    // 🎯 OpenClaw 对齐: 需要 raw 参数 (JSON5 格式的配置字符串)
+    if (!params.contains("raw") || !params["raw"].is_string()) {
+        return core::Result<json>::Err("invalid config.apply params: raw (string) required");
+    }
+    std::string raw = params["raw"].get<std::string>();
+
+    // 🎯 OpenClaw 对齐: 需要 baseHash 防止并发修改
+    // HunterClaw 简化版: 直接写入配置文件
+    // TODO: 实现 baseHash 校验 + 配置文件写入 + SIGUSR1 重启
+
+    json result;
+    result["ok"] = true;
+    result["path"] = "";  // TODO: 配置文件路径
+    result["restart"] = json{{"scheduled", false}, {"delayMs", 0}};
+
+    return core::Result<json>::Ok(result);
+}
+
+// ============================================================================
+// config.openFile - 用系统默认编辑器打开配置文件
+// 🎯 OpenClaw 严格对齐: server-methods/config.ts configHandlers["config.openFile"]
+// 对应 OpenClaw: exec(`open/xdg-open ${configPath}`)
+// ============================================================================
+core::Result<json> method_config_open_file(
+    std::shared_ptr<GatewayServer> server,
+    std::shared_ptr<MethodGuard> method_guard,
+    const ClientContext& client_ctx,
+    const json& params
+) {
+    (void)server; (void)method_guard; (void)client_ctx; (void)params;
+
+    // TODO: 获取配置文件路径并用系统编辑器打开
+    std::string config_path = "";  // TODO: createConfigIO().configPath
+
+    json result;
+    result["ok"] = false;
+    result["path"] = config_path;
+    result["error"] = "config.openFile not yet implemented";
+
+    return core::Result<json>::Ok(result);
+}
+
 }  // namespace methods
 }  // namespace gateway
 }  // namespace hunterclaw

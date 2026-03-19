@@ -268,10 +268,22 @@ std::string ConnectionPool::create_event_frame(
     const json& payload,
     const BroadcastOptions& opts
 ) const {
+    // 🎯 OpenClaw 严格对齐: {type:"event", event, payload, seq, stateVersion}
     json frame;
-    frame["jsonrpc"] = "2.0";
-    frame["method"] = event;
-    frame["params"] = payload;
+    frame["type"] = "event";
+    frame["event"] = event;
+    if (!payload.is_null()) {
+        frame["payload"] = payload;
+    }
+    if (opts.seq > 0) {
+        frame["seq"] = opts.seq;
+    }
+    if (opts.state_version.presence > 0 || opts.state_version.health > 0) {
+        frame["stateVersion"] = json{
+            {"presence", opts.state_version.presence},
+            {"health", opts.state_version.health}
+        };
+    }
     
     return frame.dump();
 }

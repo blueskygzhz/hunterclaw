@@ -998,43 +998,83 @@ void HttpGateway::send_sse_chunk(httplib::Response& res, const std::string& data
 
 void HttpGateway::handle_webhook_hook(const httplib::Request& req, httplib::Response& res) {
     std::string hook_path = req.matches[1];
-    
+
     log_info("Webhook hook: POST /hooks/{}", hook_path);
-    
-    // 🎯 安全机制 1: Token 认证 (Bearer / X-HunterClaw-Token)
+
+    // Aligned with openclaw: token must NOT be in query parameters
+    // (server-http.ts: if (url.searchParams.has("token")) → 400)
+    if (req.has_param("token")) {
+        res.status = 400;
+        res.set_header("Content-Type", "text/plain; charset=utf-8");
+        res.set_content(
+            "Hook token must be provided via Authorization: Bearer <token> or "
+            "X-HunterClaw-Token header (query parameters are not allowed).",
+            "text/plain"
+        );
+        return;
+    }
+
+    // Aligned with openclaw: only POST is allowed
+    // (already enforced by httplib route, but double-check for safety)
+
+    // Aligned with openclaw: extractHookToken(req)
+    // Priority: Authorization: Bearer <token> > X-HunterClaw-Token (≈ X-OpenClaw-Token)
     std::string provided_token;
-    bool authenticated = false;
-    
-    // 方式 1: Bearer Token
+
+    // Method 1: Authorization: Bearer <token>
     if (req.has_header("Authorization")) {
         std::string auth_header = req.get_header_value("Authorization");
         if (auth_header.size() >= 7 && auth_header.substr(0, 7) == "Bearer ") {
             provided_token = auth_header.substr(7);
         }
     }
-    
-    // 方式 2: X-HunterClaw-Token Header
+
+    // Method 2: X-HunterClaw-Token header
+    // (aligned with openclaw: X-OpenClaw-Token)
     if (provided_token.empty() && req.has_header("X-HunterClaw-Token")) {
         provided_token = req.get_header_value("X-HunterClaw-Token");
     }
-    
-    // 🎯 常量时间比较 Token (防止时序攻击)
+
+    // Aligned with openclaw: safeEqualSecret(token, hooksConfig.token)
+    // Constant-time comparison to prevent timing attacks.
+    // If no token is configured, reject all requests.
+    bool authenticated = false;
     if (!provided_token.empty() && !options_.bearer_token.empty()) {
         authenticated = hunterclaw::security::timing_safe_equal(provided_token, options_.bearer_token);
     }
-    
+
     if (!authenticated) {
-        // 🎯 认证失败时关闭连接
+        // Aligned with openclaw: hookAuthLimiter.recordFailure + 401
+        // (rate limiter integration is a future step)
         res.set_header("Connection", "close");
-        send_openai_error(res, 401, "Invalid or missing webhook token", 
-                          "invalid_request_error", "invalid_webhook_token");
+        res.status = 401;
+        res.set_header("Content-Type", "text/plain; charset=utf-8");
+        res.set_content("Unauthorized", "text/plain");
         return;
     }
-    
+    // Aligned with openclaw: hookAuthLimiter.reset(clientKey) on success
+
+    // Aligned with openclaw: subPath check — must be non-empty
+    if (hook_path.empty()) {
+        res.status = 404;
+        res.set_header("Content-Type", "text/plain; charset=utf-8");
+        res.set_content("Not Found", "text/plain");
+        return;
+    }
+
+    // Aligned with openclaw: readJsonBody(req, hooksConfig.maxBodyBytes)
+    if (req.body.size() > 10 * 1024 * 1024) {  // 10MB default
+        json error_body = {{"ok", false}, {"error", "payload too large"}};
+        res.status = 413;
+        res.set_header("Content-Type", "application/json; charset=utf-8");
+        res.set_content(error_body.dump(), "application/json");
+        return;
+    }
+
     // 解析请求体
     try {
         auto body = json::parse(req.body);
-        
+
         // 🎯 多种 Webhook 格式解析
         std::string text;
         std::string from;

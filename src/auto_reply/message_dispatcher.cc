@@ -580,7 +580,9 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
         }
         // Aligned with openclaw: maybeApplyTtsToPayload({ kind: "final", inboundAudio, ttsAuto })
         if (config.dispatch.enable_tts) {
-            maybe_apply_tts_to_payload({p}, config);
+            std::vector<::hunterclaw::queue::MessagePayload> tts_single = {p};
+            maybe_apply_tts_to_payload(tts_single, config);
+            p = tts_single[0];
         }
         final_payloads.push_back(p);
     }
@@ -1110,7 +1112,13 @@ ReplyGenerator::GenerateResult ReplyGenerator::run_prepared_reply(
         // Aligned with openclaw: onToolResult — forward to caller's on_tool_result callback
         log()->debug("run_prepared_reply: tool_end name={} ok={}", tool_name, tr.success);
         if (config.on_tool_result && tr.success) {
-            config.on_tool_result(tr.output);
+            // Extract text from ToolResult content
+            std::string tool_text;
+            for (const auto& c : tr.content) {
+                if (!tool_text.empty()) tool_text += "\n";
+                tool_text += c.text;
+            }
+            config.on_tool_result(tool_text);
         }
     };
     callbacks.on_error = [&](const std::string& error) {
