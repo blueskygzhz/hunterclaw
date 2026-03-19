@@ -8,7 +8,7 @@ namespace hunterclaw {
 namespace plugins {
 
 // Forward declaration
-core::Result<std::shared_ptr<Plugin>> load_plugin(const std::string& path);
+core::Result<std::shared_ptr<Plugin>> load_plugin_impl(const std::string& path);
 
 // ============================================================================
 // PluginManager::Impl
@@ -28,7 +28,7 @@ struct PluginManager::Impl {
         }
         
         // Load the plugin
-        auto plugin_result = load_plugin(path);
+        auto plugin_result = load_plugin_impl(path);
         if (plugin_result.is_err()) {
             return core::Result<bool>::Err(plugin_result.error);
         }
@@ -147,7 +147,7 @@ void PluginManager::stop_watch() {
 // Plugin Loading Implementation
 // ============================================================================
 
-core::Result<std::shared_ptr<Plugin>> load_plugin(const std::string& path) {
+core::Result<std::shared_ptr<Plugin>> load_plugin_impl(const std::string& path) {
     // Open shared library
     void* handle = dlopen(path.c_str(), RTLD_LAZY);
     if (!handle) {

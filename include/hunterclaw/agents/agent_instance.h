@@ -5,6 +5,7 @@
 #include "hunterclaw/agents/types.h"
 #include "hunterclaw/skills/skill.h"
 #include "hunterclaw/channels/channel.h"
+#include "hunterclaw/channels/manager.h"
 #include "hunterclaw/memory/memory_manager.h"  // ✅ 新增: MemoryManager 支持
 #include "hunterclaw/react/react_engine.h"     // ✅ 新增: ReactEngine (直接包含，不使用前向声明)
 #include <memory>

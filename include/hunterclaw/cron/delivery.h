@@ -2,6 +2,7 @@
 
 #include "hunterclaw/cron/types.h"
 #include "hunterclaw/channels/channel.h"
+#include "hunterclaw/channels/manager.h"
 #include "hunterclaw/core/types.h"
 #include <nlohmann/json.hpp>
 #include <memory>

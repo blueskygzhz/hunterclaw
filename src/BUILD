@@ -449,6 +449,36 @@ cc_library(
 )
 
 # ============================================================================
+# Outbound Library - deliver_outbound_payloads (对齐 openclaw deliver.ts)
+# ============================================================================
+cc_library(
+    name = "hunterclaw_outbound",
+    srcs = glob(["outbound/*.cc"]) + [
+        "channels/channel_plugin_registry.cc",  # ChannelPluginRegistry implementation
+    ],
+    deps = [
+        "//:hunterclaw_headers",
+        ":hunterclaw_observability",
+        "@nlohmann_json//:json",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+    copts = [
+        "-std=c++17",
+        "-Wall",
+        "-Wextra",
+        "-I/usr/include/jsoncpp",
+        "-I/usr/include/spdlog",
+    ],
+    linkopts = [
+        "-lpthread",
+        "-ljsoncpp",
+    ],
+    linkstatic = False,
+    visibility = ["//visibility:public"],
+)
+
+# ============================================================================
 # Core Aggregate Library - All HunterClaw modules
 # ============================================================================
 cc_library(
@@ -467,6 +497,7 @@ cc_library(
         "security/*.cc",
         "secrets/*.cc",
         "auto_reply/*.cc",
+        # ✅ command_detection_directives.cc is merged into command_detection.cc
         # ✅ 移除 observability/*.cc - 已移至独立的 hunterclaw_observability 库
         "infra/*.cc",
         "logging/*.cc",
@@ -476,6 +507,7 @@ cc_library(
     ], exclude = [
         "main.cc",
         "infra/exec_approvals.cc",  # TODO: 需要更新以匹配新的 API
+        "auto_reply/command_detection_directives.cc",  # 已并入 command_detection.cc
     ]),
     deps = [
         ":hunterclaw_core_base",  # ✅ 依赖 core_base (core/*.cc)
@@ -491,6 +523,7 @@ cc_library(
         ":hunterclaw_sandbox",  # ✅ 添加 sandbox 依赖
         ":hunterclaw_react",  # ✅ 添加 react 依赖
         ":hunterclaw_observability",  # ✅ 添加 observability 依赖
+        ":hunterclaw_outbound",  # ✅ 添加 outbound 依赖 (deliver_outbound_payloads)
         "//:hunterclaw_headers",
         "//third_party:httplib",
         "//third_party:subprocess",  # ✅ 添加 subprocess 依赖

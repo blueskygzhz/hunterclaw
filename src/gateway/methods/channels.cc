@@ -40,10 +40,10 @@ core::Result<json> method_channel_list(
             for (const auto& [account_id, account_state] : multi_accounts_it->second) {
                 json account_info;
                 account_info["accountId"] = account_id;
-                account_info["enabled"] = account_state.enabled;
-                account_info["configured"] = account_state.configured;
-                account_info["running"] = account_state.running;
-                account_info["connected"] = account_state.connected;
+                account_info["enabled"] = account_state.enabled.value_or(false);
+                account_info["configured"] = account_state.configured.value_or(false);
+                account_info["running"] = account_state.running.value_or(false);
+                account_info["connected"] = account_state.connected.value_or(false);
                 
                 channel_info["accounts"][account_id] = account_info;
             }
@@ -51,10 +51,10 @@ core::Result<json> method_channel_list(
             // 只有默认账户
             json account_info;
             account_info["accountId"] = default_account.account_id;
-            account_info["enabled"] = default_account.enabled;
-            account_info["configured"] = default_account.configured;
-            account_info["running"] = default_account.running;
-            account_info["connected"] = default_account.connected;
+            account_info["enabled"] = default_account.enabled.value_or(false);
+            account_info["configured"] = default_account.configured.value_or(false);
+            account_info["running"] = default_account.running.value_or(false);
+            account_info["connected"] = default_account.connected.value_or(false);
             
             channel_info["accounts"][default_account.account_id] = account_info;
         }
@@ -88,16 +88,16 @@ core::Result<json> method_channel_status(
             json status;
             status["channel"] = channel_id;
             status["accountId"] = account_id;
-            status["enabled"] = account_state.enabled;
-            status["configured"] = account_state.configured;
-            status["running"] = account_state.running;
-            status["connected"] = account_state.connected;
+            status["enabled"] = account_state.enabled.value_or(false);
+            status["configured"] = account_state.configured.value_or(false);
+            status["running"] = account_state.running.value_or(false);
+            status["connected"] = account_state.connected.value_or(false);
 
             // Probe 探测
             if (do_probe) {
                 json probe_result;
-                probe_result["ok"] = account_state.running;
-                probe_result["connected"] = account_state.connected;
+                probe_result["ok"] = account_state.running.value_or(false);
+                probe_result["connected"] = account_state.connected.value_or(false);
                 
                 // 最后消息时间
                 if (account_state.last_message_at.has_value()) {
@@ -117,7 +117,7 @@ core::Result<json> method_channel_status(
                     probe_result["error"] = account_state.last_error.value();
                 }
                 
-                probe_result["reconnectAttempts"] = account_state.reconnect_attempts;
+                probe_result["reconnectAttempts"] = account_state.reconnect_attempts.value_or(0);
                 
                 status["probe"] = probe_result;
             }
@@ -158,15 +158,15 @@ core::Result<json> method_channel_capabilities(
     result["accountId"] = account_id;
 
     // 基础状态
-    if (!account_id.empty()) {
-        auto account_it = channel_it->second.find(account_id);
-        if (account_it != channel_it->second.end()) {
-            result["configured"] = account_it->second.configured;
-            result["enabled"] = account_it->second.enabled;
-            result["running"] = account_it->second.running;
-            result["connected"] = account_it->second.connected;
+        if (!account_id.empty()) {
+            auto account_it = channel_it->second.find(account_id);
+            if (account_it != channel_it->second.end()) {
+                result["configured"] = account_it->second.configured.value_or(false);
+                result["enabled"] = account_it->second.enabled.value_or(false);
+                result["running"] = account_it->second.running.value_or(false);
+                result["connected"] = account_it->second.connected.value_or(false);
+            }
         }
-    }
 
     // 能力信息 (support)
     json support;
@@ -219,9 +219,9 @@ core::Result<json> method_channel_capabilities(
         if (!account_id.empty()) {
             auto account_it = channel_it->second.find(account_id);
             if (account_it != channel_it->second.end()) {
-                probe["ok"] = account_it->second.running && account_it->second.connected;
-                probe["running"] = account_it->second.running;
-                probe["connected"] = account_it->second.connected;
+                probe["ok"] = account_it->second.running.value_or(false) && account_it->second.connected.value_or(false);
+                probe["running"] = account_it->second.running.value_or(false);
+                probe["connected"] = account_it->second.connected.value_or(false);
                 
                 // 最后错误
                 if (account_it->second.last_error.has_value()) {
@@ -229,7 +229,7 @@ core::Result<json> method_channel_capabilities(
                 }
                 
                 // 重连次数
-                probe["reconnectAttempts"] = account_it->second.reconnect_attempts;
+                probe["reconnectAttempts"] = account_it->second.reconnect_attempts.value_or(0);
             }
         }
         result["probe"] = probe;
@@ -344,10 +344,10 @@ core::Result<json> method_channel_get(
     for (const auto& [account_id, account_state] : it->second) {
         json account_info;
         account_info["accountId"] = account_id;
-        account_info["enabled"] = account_state.enabled;
-        account_info["configured"] = account_state.configured;
-        account_info["running"] = account_state.running;
-        account_info["connected"] = account_state.connected;
+        account_info["enabled"] = account_state.enabled.value_or(false);
+        account_info["configured"] = account_state.configured.value_or(false);
+        account_info["running"] = account_state.running.value_or(false);
+        account_info["connected"] = account_state.connected.value_or(false);
         result["accounts"][account_id] = account_info;
     }
 
@@ -462,10 +462,18 @@ core::Result<json> method_channel_health(
             result["reason"] = "Channel not found";
         } else {
             const auto& ch_snapshot = it->second;
-            result["healthy"] = ch_snapshot.connected;
-            result["running"] = ch_snapshot.running;
-            result["connected"] = ch_snapshot.connected;
-            result["status"] = static_cast<int>(ch_snapshot.status);
+        result["healthy"] = ch_snapshot.connected.value_or(false);
+            result["running"] = ch_snapshot.running.value_or(false);
+            result["connected"] = ch_snapshot.connected.value_or(false);
+            // Derive status from optional fields
+            bool is_connected = ch_snapshot.connected.value_or(false);
+            bool is_running   = ch_snapshot.running.value_or(false);
+            std::string status_str;
+            if (is_connected) status_str = "connected";
+            else if (is_running) status_str = "starting";
+            else if (ch_snapshot.last_error.has_value()) status_str = "error";
+            else status_str = "stopped";
+            result["status"] = status_str;
             if (ch_snapshot.last_error.has_value()) {
                 result["last_error"] = ch_snapshot.last_error.value();
             }
@@ -480,11 +488,19 @@ core::Result<json> method_channel_health(
     for (const auto& [ch_id, ch_snapshot] : snapshot.channels) {
         json ch_health;
         ch_health["channel_id"] = ch_id;
-        ch_health["healthy"] = ch_snapshot.connected;
-        ch_health["running"] = ch_snapshot.running;
-        ch_health["connected"] = ch_snapshot.connected;
-        ch_health["status"] = static_cast<int>(ch_snapshot.status);
-        if (!ch_snapshot.connected) all_healthy = false;
+        ch_health["healthy"] = ch_snapshot.connected.value_or(false);
+        ch_health["running"] = ch_snapshot.running.value_or(false);
+        ch_health["connected"] = ch_snapshot.connected.value_or(false);
+        // Derive status
+        bool is_conn = ch_snapshot.connected.value_or(false);
+        bool is_run  = ch_snapshot.running.value_or(false);
+        std::string st;
+        if (is_conn) st = "connected";
+        else if (is_run) st = "starting";
+        else if (ch_snapshot.last_error.has_value()) st = "error";
+        else st = "stopped";
+        ch_health["status"] = st;
+        if (!is_conn) all_healthy = false;
         channels_health.push_back(ch_health);
     }
 

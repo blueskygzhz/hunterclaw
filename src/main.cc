@@ -6,6 +6,8 @@
 #include "hunterclaw/channels/channel.h"
 #include "hunterclaw/channels/manager.h"
 #include "hunterclaw/agents/types.h"
+#include "hunterclaw/queue/delivery_queue.h"
+#include "hunterclaw/outbound/deliver.h"
 // #include "hunterclaw/cli/command.h"  // Temporarily disabled
 // #include "hunterclaw/cli/daemon_commands.h"  // Temporarily disabled
 #include <iostream>
@@ -195,6 +197,53 @@ int main(int argc, char** argv) {
     // Initialize Channel Manager
     std::cout << "[3/4] Initializing Channel Manager..." << std::endl;
     auto channel_mgr = channels::ChannelManager::create();
+
+    // ── Delivery Queue + Crash Recovery ─────────────────────────────────────
+    // Aligned with openclaw: recoverPendingDeliveries called at startup.
+    // Scans the write-ahead queue for deliveries that were enqueued but not
+    // acked before the last crash, and retries them (skipQueue=true to avoid
+    // re-enqueueing).
+    std::string queue_dir = core::utils::expand_path("~/.hunterclaw/delivery-queue");
+    auto delivery_queue = queue::DeliveryQueue::create(queue_dir);
+
+    std::cout << "  Recovering pending deliveries from: " << queue_dir << std::endl;
+    auto recovery_result = delivery_queue->recover(
+        [&delivery_queue](const queue::QueuedDelivery& queued) -> core::Result<bool> {
+            // Aligned with openclaw: skipQueue=true to prevent re-enqueueing
+            outbound::DeliverOutboundPayloadsParams params;
+            params.channel = queued.target.channel;
+            params.to = queued.target.to;
+            params.account_id = queued.target.account_id;
+            params.thread_id = queued.target.thread_id;
+            params.reply_to_id = queued.target.reply_to_id;
+            params.payloads = queued.payloads;
+            // Aligned with openclaw: restore all delivery options from queued entry
+            params.best_effort = queued.best_effort;
+            params.silent = queued.silent;
+            params.gif_playback = queued.target.gif_playback;
+            params.skip_queue = true;  // Crash recovery: don't re-enqueue
+            params.delivery_queue = delivery_queue;
+
+            auto r = outbound::deliver_outbound_payloads(params);
+            if (r.is_ok()) {
+                return core::Result<bool>::Ok(true);
+            }
+            return core::Result<bool>::Err(r.error);
+        }
+    );
+    if (recovery_result.is_ok()) {
+        const auto& summary = recovery_result.get();
+        if (summary.recovered > 0 || summary.failed > 0) {
+            std::cout << "  Recovery: recovered=" << summary.recovered
+                      << " failed=" << summary.failed
+                      << " skipped_max_retries=" << summary.skipped_max_retries
+                      << " deferred_backoff=" << summary.deferred_backoff << std::endl;
+        } else {
+            std::cout << "  No pending deliveries to recover" << std::endl;
+        }
+    } else {
+        std::cout << "  Warning: Recovery scan failed: " << recovery_result.error << std::endl;
+    }
     
     // TODO: Set up message callback when available
     // channel_mgr->set_message_callback([](const channels::ChannelMessage& msg) {

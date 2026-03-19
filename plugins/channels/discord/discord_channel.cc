@@ -15,7 +15,7 @@ using namespace hunterclaw;
 
 class DiscordChannelAdapter : public channels::ChannelAdapter {
 public:
-    channels::ChannelMeta meta() const override {
+    channels::ChannelAdapterMeta meta() const override {
         return {
             .id = "discord",
             .name = "Discord",
@@ -33,7 +33,7 @@ public:
         };
     }
     
-    core::Result<bool> start_account(const channels::ChannelContext& ctx) override {
+    core::Result<bool> start_account(const channels::ChannelAdapterContext& ctx) override {
         ctx_ = ctx;
         token_ = ctx.account.token;
         
@@ -134,7 +134,7 @@ public:
     }
 
 private:
-    channels::ChannelContext ctx_;
+    channels::ChannelAdapterContext ctx_;
     std::string token_;
     std::string gateway_url_;
     std::atomic<bool> is_running_{false};
@@ -297,7 +297,7 @@ private:
 // Discord Channel Plugin
 // ============================================================================
 
-class DiscordChannelPlugin : public channels::ChannelPlugin {
+class DiscordChannelPlugin : public channels::ChannelPluginBase {
 public:
     std::string id() const override { return "discord-channel"; }
     std::string name() const override { return "Discord Channel Adapter"; }

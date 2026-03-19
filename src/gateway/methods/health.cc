@@ -97,12 +97,12 @@ core::Result<json> method_health(
             for (const auto& [account_id, account_state] : multi_accounts_it->second) {
                 json account_info;
                 account_info["accountId"] = account_id;
-                account_info["configured"] = account_state.configured;
-                account_info["linked"] = account_state.running && account_state.connected;
+                account_info["configured"] = account_state.configured.value_or(false);
+                account_info["linked"] = account_state.running.value_or(false) && account_state.connected.value_or(false);
                 
                 // Probe 探测
                 json probe;
-                probe["ok"] = account_state.running && account_state.connected;
+                probe["ok"] = account_state.running.value_or(false) && account_state.connected.value_or(false);
                 probe["elapsedMs"] = 0;  // TODO: 实际探测延迟
                 
                 // 错误信息
@@ -117,12 +117,12 @@ core::Result<json> method_health(
             // 只有默认账户
             json account_info;
             account_info["accountId"] = channel_state.account_id;
-            account_info["configured"] = channel_state.configured;
-            account_info["linked"] = channel_state.running && channel_state.connected;
+            account_info["configured"] = channel_state.configured.value_or(false);
+            account_info["linked"] = channel_state.running.value_or(false) && channel_state.connected.value_or(false);
             
             // Probe 探测
             json probe;
-            probe["ok"] = channel_state.running && channel_state.connected;
+            probe["ok"] = channel_state.running.value_or(false) && channel_state.connected.value_or(false);
             probe["elapsedMs"] = 0;
             
             if (channel_state.last_error && !channel_state.last_error->empty()) {

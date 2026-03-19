@@ -14,7 +14,7 @@ using namespace hunterclaw;
 
 class TelegramChannelAdapter : public channels::ChannelAdapter {
 public:
-    channels::ChannelMeta meta() const override {
+    channels::ChannelAdapterMeta meta() const override {
         return {
             .id = "telegram",
             .name = "Telegram",
@@ -31,7 +31,7 @@ public:
         };
     }
     
-    core::Result<bool> start_account(const channels::ChannelContext& ctx) override {
+    core::Result<bool> start_account(const channels::ChannelAdapterContext& ctx) override {
         ctx_ = ctx;
         token_ = ctx.account.token;
         
@@ -122,7 +122,7 @@ public:
     }
 
 private:
-    channels::ChannelContext ctx_;
+    channels::ChannelAdapterContext ctx_;
     std::string token_;
     std::atomic<bool> is_running_{false};
     std::thread polling_thread_;
@@ -254,7 +254,7 @@ private:
 // Telegram Channel Plugin
 // ============================================================================
 
-class TelegramChannelPlugin : public channels::ChannelPlugin {
+class TelegramChannelPlugin : public channels::ChannelPluginBase {
 public:
     std::string id() const override { return "telegram-channel"; }
     std::string name() const override { return "Telegram Channel Adapter"; }

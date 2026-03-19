@@ -2,6 +2,7 @@
 
 #include "hunterclaw/core/types.h"
 #include "hunterclaw/channels/channel.h"
+#include "hunterclaw/channels/manager.h"
 #include "hunterclaw/skills/skill.h"
 #include "hunterclaw/plugins/plugin.h"
 #include "hunterclaw/gateway/todo_types.h"

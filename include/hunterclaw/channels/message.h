@@ -17,7 +17,7 @@ struct InboundMessage {
     // 消息标识
     std::string message_id;           // 消息ID
     std::string channel;              // 渠道ID (feishu, telegram, discord, etc.)
-    std::string account_id;           // 账户ID (default 或具体账户)
+    std::optional<std::string> account_id;  // 账户ID (aligned with openclaw: ctx.AccountId)
     
     // 发送者信息
     std::string sender_id;            // 发送者ID
@@ -45,7 +45,15 @@ struct InboundMessage {
     
     // 时间戳
     std::chrono::system_clock::time_point timestamp = std::chrono::system_clock::now();
-    
+
+    // Cross-provider routing (aligned with openclaw: ctx.OriginatingChannel / ctx.OriginatingTo)
+    // Set when a message is relayed from a different provider/surface.
+    std::string originating_channel;   // Original channel (e.g. "telegram" when relayed via slack)
+    std::string originating_to;        // Original recipient ID in the originating channel
+
+    // Session key (aligned with openclaw: ctx.SessionKey)
+    std::string session_key;
+
     // 元数据
     std::map<std::string, core::JsonValue> metadata;
 };

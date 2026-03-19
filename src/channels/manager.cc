@@ -43,17 +43,19 @@ namespace {
         const ChannelHealthMonitorConfig& config
     ) {
         // 1. 未启用 → 健康 (跳过)
-        if (!runtime.enabled) {
+        if (runtime.enabled.has_value() && !runtime.enabled.value()) {
             return {true, "disabled"};
         }
         
         // 2. 未配置 → 健康 (跳过)
-        if (!runtime.configured) {
+        if (runtime.configured.has_value() && !runtime.configured.value()) {
             return {true, "not configured"};
         }
         
         // 3. 运行中但未连接 → 检查连接宽限期 (对齐 channelConnectGraceMs)
-        if (runtime.running && !runtime.connected) {
+        bool is_running   = runtime.running.value_or(false);
+        bool is_connected = runtime.connected.value_or(false);
+        if (is_running && !is_connected) {
             if (runtime.last_start_at.has_value()) {
                 int64_t elapsed = now_ms - runtime.last_start_at.value();
                 if (elapsed < config.timing.channel_connect_grace_ms) {
@@ -64,7 +66,7 @@ namespace {
         }
         
         // 4. 已连接但消息过期 → 不健康 (对齐 staleEventThresholdMs)
-        if (runtime.connected && runtime.last_message_at.has_value()) {
+        if (is_connected && runtime.last_message_at.has_value()) {
             int64_t idle = now_ms - runtime.last_message_at.value();
             if (idle > config.timing.stale_event_threshold_ms) {
                 return {false, "stale"};  // ❌ 消息过期,需要重启
@@ -114,20 +116,21 @@ public:
         // Get or create channel store
         auto& store = get_store(channel_id);
         
-        // ✅ 从 Registry 加载 Adapter (对齐 OpenClaw: getChannelPlugin())
-        if (!store.adapter) {
-            store.adapter = ChannelPluginRegistry::instance().create_adapter(std::string(channel_id));
-            if (!store.adapter) {
-                return core::Result<void>::Err("Channel adapter not found: " + std::string(channel_id));
+        // ✅ 从 Registry 加载 ChannelPlugin (对齐 OpenClaw: getChannelPlugin())
+        if (!store.plugin.has_value()) {
+            auto plugin_opt = ChannelPluginRegistry::instance().get_plugin(std::string(channel_id));
+            if (!plugin_opt.has_value()) {
+                return core::Result<void>::Err("Channel plugin not found: " + std::string(channel_id));
             }
-            log()->info("Loaded channel adapter: {}", channel_id);
+            store.plugin = plugin_opt;
+            log()->info("Loaded channel plugin: {}", channel_id);
         }
         
         // Check if already running
         {
             std::lock_guard<std::mutex> lock(stores_mutex_);
             auto runtime = get_runtime(channel_id, effective_account_id);
-            if (runtime.running && !options.force) {
+            if (runtime.running.value_or(false) && !options.force) {
                 return core::Result<void>::Err("Channel already running");
             }
         }
@@ -146,12 +149,11 @@ public:
         // Update status (Phase 1: Starting)
         ChannelAccountSnapshot snapshot;
         snapshot.account_id = effective_account_id;
-        snapshot.enabled = true;
+        snapshot.enabled    = true;
         snapshot.configured = true;
-        snapshot.running = true;
-        snapshot.connected = false;  // ← 启动中,尚未连接
-        snapshot.status = ChannelAccountStatus::Starting;
-        snapshot.last_start_at = core::utils::now().time_since_epoch().count();
+        snapshot.running    = true;
+        snapshot.connected  = false;  // ← 启动中,尚未连接
+        snapshot.last_start_at = core::utils::now().time_since_epoch().count() / 1000000;
         
         set_runtime(channel_id, effective_account_id, snapshot);
         
@@ -163,59 +165,72 @@ public:
         }
         
         // ✅ 启动 Channel 异步任务 (对齐 OpenClaw: await startAccount(...))
-        std::thread([this, channel_id, effective_account_id, adapter = store.adapter, abort]() {
+        auto plugin_copy = store.plugin.value();
+        std::thread([this, channel_id, effective_account_id, plugin_copy, abort]() {
             try {
-                // 构建 ChannelContext (对齐 OpenClaw startAccount params)
-                ChannelContext ctx;
-                ctx.account.account_id = effective_account_id;
-                ctx.account.channel_id = std::string(channel_id);
-                ctx.abort_signal = abort;
-                
+                // 构建 ChannelGatewayContext (对齐 OpenClaw ChannelGatewayContext)
+                ChannelGatewayContext ctx;
+                ctx.account_id    = effective_account_id;
+                ctx.account       = nlohmann::json::object();  // TODO: resolve from config
+                ctx.abort_signal  = abort;
+
                 // 设置日志回调
-                ctx.log_info = [channel_id, effective_account_id](const std::string& log) {
-                    ::hunterclaw::channels::log()->info("[{}/{}] {}", channel_id, effective_account_id, log);
+                auto log_sink = std::make_shared<ChannelLogSink>();
+                log_sink->info  = [channel_id, effective_account_id](const std::string& msg) {
+                    ::hunterclaw::channels::log()->info("[{}/{}] {}", channel_id, effective_account_id, msg);
                 };
-                ctx.log_error = [channel_id, effective_account_id](const std::string& log) {
-                    ::hunterclaw::channels::log()->error("[{}/{}] {}", channel_id, effective_account_id, log);
+                log_sink->warn  = [channel_id, effective_account_id](const std::string& msg) {
+                    ::hunterclaw::channels::log()->warn("[{}/{}] {}", channel_id, effective_account_id, msg);
                 };
-                
-                // 设置消息接收回调 (TODO: 连接到 ReactEngine)
-                ctx.on_message_received = [this, channel_id, effective_account_id](const ChannelMessage& msg) {
-                    ::hunterclaw::channels::log()->debug("Received message from {} in channel {}", msg.from, channel_id);
-                    // TODO: Forward to ReactEngine
-                    
-                    // 更新 last_message_at
-                    update_runtime_fields(channel_id, effective_account_id, [](auto& s) {
-                        s.last_message_at = core::utils::now().time_since_epoch().count();
-                    });
+                log_sink->error = [channel_id, effective_account_id](const std::string& msg) {
+                    ::hunterclaw::channels::log()->error("[{}/{}] {}", channel_id, effective_account_id, msg);
                 };
-                
-                // ✅ 调用 Adapter 的 start_account (对齐 OpenClaw: await startAccount({ ... }))
-                auto result = adapter->start_account(ctx);
-                
+                log_sink->debug = [channel_id, effective_account_id](const std::string& msg) {
+                    ::hunterclaw::channels::log()->debug("[{}/{}] {}", channel_id, effective_account_id, msg);
+                };
+                ctx.log = log_sink;
+
+                // get_status / set_status callbacks
+                ctx.get_status = [this, channel_id, effective_account_id]() -> ChannelAccountSnapshot {
+                    return get_runtime(channel_id, effective_account_id);
+                };
+                ctx.set_status = [this, channel_id, effective_account_id](const ChannelAccountSnapshot& s) {
+                    set_runtime(channel_id, effective_account_id, s);
+                    // 更新 last_message_at when connected
+                    if (s.connected.value_or(false)) {
+                        update_runtime_fields(channel_id, effective_account_id, [](auto& snap) {
+                            snap.last_connected_at = core::utils::now().time_since_epoch().count() / 1000000;
+                        });
+                    }
+                };
+
+                // ✅ 调用 ChannelGatewayAdapter::start_account (对齐 OpenClaw)
+                if (!plugin_copy.gateway.has_value() || !plugin_copy.gateway->start_account) {
+                    log()->warn("Channel {} has no gateway.start_account", channel_id);
+                    return;
+                }
+
+                auto result = plugin_copy.gateway->start_account(ctx);
+
                 if (result.is_err()) {
-                    log()->error("Channel {} account {} failed to start: {}", 
+                    log()->error("Channel {} account {} failed to start: {}",
                                  channel_id, effective_account_id, result.error);
-                    
                     update_runtime_fields(channel_id, effective_account_id, [&result](auto& s) {
-                        s.running = false;
+                        s.running   = false;
                         s.connected = false;
-                        s.status = ChannelAccountStatus::Error;
                         s.last_error = result.error;
                     });
                 } else {
-                    log()->info("Channel {} account {} started successfully", 
+                    log()->info("Channel {} account {} started successfully",
                                 channel_id, effective_account_id);
                 }
             } catch (const std::exception& e) {
-                log()->error("Channel {} account {} exception: {}", 
+                log()->error("Channel {} account {} exception: {}",
                              channel_id, effective_account_id, e.what());
-                
                 update_runtime_fields(channel_id, effective_account_id, [&e](auto& s) {
-                    s.running = false;
+                    s.running   = false;
                     s.connected = false;
-                    s.status = ChannelAccountStatus::Error;
-                    s.last_error = e.what();
+                    s.last_error = std::string(e.what());
                 });
             }
         }).detach();
@@ -256,12 +271,11 @@ public:
         
         // ✅ 原子性更新状态
         update_runtime_fields(channel_id, effective_account_id, [](auto& s) {
-            s.running = false;
+            s.running   = false;
             s.connected = false;
-            s.status = ChannelAccountStatus::Stopped;
-            s.last_stop_at = core::utils::now().time_since_epoch().count();
+            s.last_stop_at = core::utils::now().time_since_epoch().count() / 1000000;
         });
-        
+
         // Abort any running tasks
         auto& store = get_store(channel_id);
         auto it = store.aborts.find(effective_account_id);
@@ -280,10 +294,9 @@ public:
         // ✅ 原子性更新状态
         update_runtime_fields(channel_id, effective_account_id, [](auto& s) {
             s.configured = false;
-            s.running = false;
-            s.connected = false;
-            s.status = ChannelAccountStatus::Stopped;
-            s.last_error = "Logged out";
+            s.running    = false;
+            s.connected  = false;
+            s.last_error = std::string("Logged out");
         });
         
         return core::Result<void>::Ok();
@@ -462,36 +475,49 @@ private:
     }
     
     // ========== Health Check Loop ==========
-    
+
     void health_check_loop() {
         auto start_time = core::utils::now();
         int64_t start_time_ms = start_time.time_since_epoch().count() / 1000000;
-        
+
         while (health_monitor_running_.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(health_config_.check_interval_ms));
-            
+
             auto now = core::utils::now();
             int64_t now_ms = now.time_since_epoch().count() / 1000000;
-            
+
             // Skip if within startup grace period
             if (now_ms - start_time_ms < health_config_.timing.monitor_startup_grace_ms) {
                 continue;
             }
-            
-            // Check all channels
-            std::lock_guard<std::mutex> lock(stores_mutex_);
-            for (const auto& [channel_id_str, store] : channel_stores_) {
-                ChannelId channel_id = channel_id_str.c_str();
-                check_channel_health(channel_id);
+
+            // Check all channels (copy keys to avoid holding lock during restart)
+            std::vector<std::string> channel_ids;
+            {
+                std::lock_guard<std::mutex> lock(stores_mutex_);
+                for (const auto& [channel_id_str, store] : channel_stores_) {
+                    channel_ids.push_back(channel_id_str);
+                }
+            }
+            for (const auto& channel_id_str : channel_ids) {
+                check_channel_health(channel_id_str);
             }
         }
     }
     
     void check_channel_health(ChannelId channel_id) {
-        auto& store = channel_stores_[std::string(channel_id)];
         auto now_ms = core::utils::now().time_since_epoch().count() / 1000000;
-        
-        for (const auto& [account_id, runtime] : store.runtimes) {
+
+        // Copy runtimes to avoid holding lock during restart
+        std::map<std::string, ChannelAccountSnapshot> runtimes_copy;
+        {
+            std::lock_guard<std::mutex> lock(stores_mutex_);
+            auto it = channel_stores_.find(std::string(channel_id));
+            if (it == channel_stores_.end()) return;
+            runtimes_copy = it->second.runtimes;
+        }
+
+        for (const auto& [account_id, runtime] : runtimes_copy) {
             std::string key = std::string(channel_id) + ":" + account_id;
             
             // ✅ 1. 跳过手动停止的 Channel (对齐 OpenClaw: isManuallyStopped)
@@ -549,9 +575,9 @@ private:
             // ✅ 5. 执行重启 (对齐 OpenClaw)
             log()->info("Channel {} account {} restarting (reason: {})",
                         channel_id, account_id, health.reason);
-            
+
             // 如果正在运行,先停止
-            if (runtime.running) {
+            if (runtime.running.value_or(false)) {
                 stop_channel(channel_id, account_id);
             }
             
@@ -732,8 +758,19 @@ std::vector<ChannelHealth> ChannelHealthMonitor::get_all_health() const {
             ChannelHealth health;
             health.channel_id = channel_id;
             health.account_id = account_id;
-            health.status = runtime.status;
-            health.is_healthy = (runtime.status == ChannelAccountStatus::Connected);
+            // Derive status from optional fields
+            bool is_connected = runtime.connected.value_or(false);
+            bool is_running   = runtime.running.value_or(false);
+            if (is_connected) {
+                health.status = ChannelAccountStatus::Connected;
+            } else if (is_running) {
+                health.status = ChannelAccountStatus::Starting;
+            } else if (runtime.last_error.has_value()) {
+                health.status = ChannelAccountStatus::Error;
+            } else {
+                health.status = ChannelAccountStatus::Stopped;
+            }
+            health.is_healthy = is_connected;
             health.last_check_time = core::utils::now();
             result.push_back(health);
         }

@@ -34,7 +34,7 @@ int main() {
     std::cout << "  - Capabilities: " << meta.capabilities.size() << " 种" << std::endl;
     
     // 4. 设置上下文
-    ChannelContext ctx;
+    ChannelAdapterContext ctx;
     ctx.log_info = [](const std::string& log) {
         std::cout << "[INFO] " << log << std::endl;
     };

@@ -36,11 +36,13 @@ struct QueueSettings {
     DropPolicy drop_policy = DropPolicy::Old;
 };
 
-// 消息Payload (简化版，对齐 OpenClaw ReplyPayload)
+// 消息Payload (对齐 OpenClaw ReplyPayload)
 struct MessagePayload {
     std::string text;
     std::vector<std::string> media_urls;
     std::optional<std::string> markdown;
+    // Channel-specific rich payload data (对齐 OpenClaw ReplyPayload.channelData)
+    std::optional<nlohmann::json> channel_data;
 };
 
 // 投递目标
@@ -50,6 +52,9 @@ struct DeliveryTarget {
     std::optional<std::string> account_id;
     std::optional<std::string> thread_id;  // 线程ID
     std::optional<std::string> reply_to_id;
+    bool best_effort = false;         // 对齐 OpenClaw QueuedDelivery.bestEffort
+    bool gif_playback = false;        // 对齐 OpenClaw QueuedDelivery.gifPlayback
+    bool silent = false;              // 对齐 OpenClaw QueuedDelivery.silent
 };
 
 // 队列投递条目 (对齐 OpenClaw QueuedDelivery)
@@ -150,6 +155,8 @@ private:
     std::string get_failed_file_path(const std::string& delivery_id) const;
     core::Result<bool> write_delivery(const QueuedDelivery& delivery);
     core::Result<QueuedDelivery> read_delivery(const std::string& file_path);
+    // Aligned with openclaw moveToFailed: atomic rename to failed/ subdirectory.
+    core::Result<bool> move_to_failed(const std::string& delivery_id);
     bool should_retry(const QueuedDelivery& delivery) const;
     int get_backoff_ms(int retry_count) const;
     bool is_permanent_delivery_error(const std::string& error) const;

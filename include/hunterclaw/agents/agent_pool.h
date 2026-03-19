@@ -4,6 +4,7 @@
 #include "hunterclaw/agents/types.h"
 #include "hunterclaw/skills/skill.h"
 #include "hunterclaw/channels/channel.h"
+#include "hunterclaw/channels/manager.h"
 #include <memory>
 #include <map>
 #include <vector>

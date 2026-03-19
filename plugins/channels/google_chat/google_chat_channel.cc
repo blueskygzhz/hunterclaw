@@ -26,8 +26,8 @@ public:
     
     // ========== Metadata ==========
     
-    ChannelMeta meta() const override {
-        ChannelMeta meta;
+    ChannelAdapterMeta meta() const override {
+        ChannelAdapterMeta meta;
         meta.id = "google_chat";
         meta.name = "Google Chat";
         meta.description = "Google Chat workspace messaging platform";
@@ -47,7 +47,7 @@ public:
     
     // ========== Lifecycle ==========
     
-    core::Result<bool> start_account(const ChannelContext& ctx) override {
+    core::Result<bool> start_account(const ChannelAdapterContext& ctx) override {
         ctx_ = ctx;
         running_.store(true);
         
@@ -488,7 +488,7 @@ private:
     
     // ========== State ==========
     
-    ChannelContext ctx_;
+    ChannelAdapterContext ctx_;
     std::atomic<bool> running_{false};
     std::thread health_thread_;
     
@@ -508,7 +508,7 @@ private:
 // Plugin Registration
 // ============================================================================
 
-class GoogleChatChannelPlugin : public ChannelPlugin {
+class GoogleChatChannelPlugin : public ChannelPluginBase {
 public:
     std::string id() const override { return "google_chat_channel"; }
     std::string name() const override { return "Google Chat Channel"; }

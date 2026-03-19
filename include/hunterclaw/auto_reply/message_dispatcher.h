@@ -13,10 +13,14 @@ namespace hunterclaw {
 namespace auto_reply {
 
 // Forward declarations
+} // namespace auto_reply
+} // namespace hunterclaw
+
+// Forward declarations in their actual namespaces
+namespace hunterclaw {
 namespace llm { class LLMClient; }
 namespace tools { class ToolManager; }
 namespace sessions { class SessionManager; }
-} // namespace auto_reply
 } // namespace hunterclaw
 
 // 前置声明全局 queue 命名空间
@@ -31,6 +35,11 @@ namespace routing { class MessageRouter; }
 
 namespace hunterclaw {
 namespace auto_reply {
+
+// Bring real types into scope
+namespace llm = ::hunterclaw::llm;
+namespace tools = ::hunterclaw::tools;
+namespace sessions = ::hunterclaw::sessions;
 
 // ═══════════════════════════════════════════════════════════════
 // ✅ 严格对齐 OpenClaw: src/auto-reply/dispatch.ts
@@ -143,10 +152,10 @@ private:
         const channels::InboundMessage& message
     );
     
-    // ✅ 去重缓存 (对齐 OpenClaw: 使用内容哈希)
+    // ✅ 去重缓存 (aligned with openclaw: inbound-dedupe.ts)
+    // Key: provider|accountId|sessionScope|peerId|threadId|messageId
     struct DedupRecord {
-        std::string message_id;
-        std::string content_hash;
+        std::string dedupe_key;   // composite key (aligned with openclaw: buildInboundDedupeKey)
         int64_t timestamp_ms;
     };
     std::vector<DedupRecord> dedup_cache_;

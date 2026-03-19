@@ -85,9 +85,9 @@ public:
     ~FeishuChannelAdapter() override;
     
     // ChannelAdapter interface
-    ChannelMeta meta() const override;
+    ChannelAdapterMeta meta() const override;
     
-    core::Result<bool> start_account(const ChannelContext& ctx) override;
+    core::Result<bool> start_account(const ChannelAdapterContext& ctx) override;
     core::Result<bool> stop_account() override;
     
     core::Result<bool> send_text(
@@ -136,7 +136,7 @@ private:
     std::string get_api_base_url() const;
     
     FeishuConfig config_;
-    ChannelContext context_;
+    ChannelAdapterContext context_;
     
     // Connection state
     std::atomic<bool> connected_{false};

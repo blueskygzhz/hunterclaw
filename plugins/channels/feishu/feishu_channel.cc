@@ -72,8 +72,8 @@ FeishuChannelAdapter::~FeishuChannelAdapter() {
 // Metadata
 // ----------------------------------------------------------------------------
 
-ChannelMeta FeishuChannelAdapter::meta() const {
-    ChannelMeta m;
+ChannelAdapterMeta FeishuChannelAdapter::meta() const {
+    ChannelAdapterMeta m;
     m.id = "feishu";
     m.name = "Feishu";
     m.description = "Feishu (飞书) / Lark channel adapter with WebSocket/Webhook support";
@@ -172,7 +172,7 @@ core::Result<core::JsonValue> FeishuChannelAdapter::get_tenant_access_token() {
 // Account Management
 // ----------------------------------------------------------------------------
 
-core::Result<bool> FeishuChannelAdapter::start_account(const ChannelContext& ctx) {
+core::Result<bool> FeishuChannelAdapter::start_account(const ChannelAdapterContext& ctx) {
     if (running_) {
         return core::Result<bool>::Err("Already running");
     }

@@ -107,7 +107,7 @@ int main() {
     // ========================================================================
     print_section("4. 启动 Feishu Channel");
     
-    channels::ChannelContext ctx;
+    channels::ChannelAdapterContext ctx;
     ctx.config = std::make_shared<core::Config>(config);
     ctx.account.account_id = "default";
     ctx.account.channel_id = "feishu";
