@@ -30,6 +30,21 @@ struct NormalizedOutboundPayload {
 };
 
 // ============================================================================
+// DeliveryMirror
+// Aligned with openclaw: DeliveryMirror (mirror.ts)
+// Used to append assistant messages to session transcript after delivery.
+// ============================================================================
+struct DeliveryMirror {
+    std::string session_key;       // session key for transcript append
+    std::string agent_id;          // agent id for scoping
+    std::string text;              // text to mirror (may differ from sent text)
+    std::vector<std::string> media_urls;
+    std::optional<std::string> idempotency_key;
+    bool is_group = false;
+    std::optional<std::string> group_id;
+};
+
+// ============================================================================
 // DeliverOutboundPayloadsParams (对齐 openclaw DeliverOutboundPayloadsParams)
 // ============================================================================
 struct DeliverOutboundPayloadsParams {
@@ -56,6 +71,10 @@ struct DeliverOutboundPayloadsParams {
 
     // Delivery queue instance (required unless skip_queue=true)
     std::shared_ptr<queue::DeliveryQueue> delivery_queue;
+
+    // Aligned with openclaw: mirror — append assistant message to session transcript
+    // after all payloads are delivered successfully.
+    std::optional<DeliveryMirror> mirror;
 };
 
 // ============================================================================

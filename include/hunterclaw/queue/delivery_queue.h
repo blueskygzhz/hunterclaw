@@ -39,10 +39,17 @@ struct QueueSettings {
 // 消息Payload (对齐 OpenClaw ReplyPayload)
 struct MessagePayload {
     std::string text;
+    std::string media_url;                  // singular mediaUrl (aligned with openclaw)
     std::vector<std::string> media_urls;
     std::optional<std::string> markdown;
     // Channel-specific rich payload data (对齐 OpenClaw ReplyPayload.channelData)
     std::optional<nlohmann::json> channel_data;
+    // Aligned with openclaw: audioAsVoice (voice-bubble channels: telegram/feishu/whatsapp)
+    bool audio_as_voice = false;
+    // Aligned with openclaw: isSilent — skip delivery if no media
+    bool silent = false;
+    // Aligned with openclaw: replyToId
+    std::optional<std::string> reply_to_id;
 };
 
 // 投递目标

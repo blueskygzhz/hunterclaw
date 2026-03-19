@@ -497,7 +497,6 @@ cc_library(
         "security/*.cc",
         "secrets/*.cc",
         "auto_reply/*.cc",
-        # ✅ command_detection_directives.cc is merged into command_detection.cc
         # ✅ 移除 observability/*.cc - 已移至独立的 hunterclaw_observability 库
         "infra/*.cc",
         "logging/*.cc",
@@ -507,7 +506,6 @@ cc_library(
     ], exclude = [
         "main.cc",
         "infra/exec_approvals.cc",  # TODO: 需要更新以匹配新的 API
-        "auto_reply/command_detection_directives.cc",  # 已并入 command_detection.cc
     ]),
     deps = [
         ":hunterclaw_core_base",  # ✅ 依赖 core_base (core/*.cc)

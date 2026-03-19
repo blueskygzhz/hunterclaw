@@ -83,6 +83,62 @@ static std::string sanitize_for_plain_text(const std::string& text) {
 }
 
 // ============================================================================
+// normalize_reply_payloads_for_delivery
+// Aligned with openclaw: normalizeReplyPayloadsForDelivery (payloads.ts)
+//
+// First-pass normalization BEFORE channel-specific normalization:
+//   - shouldSuppressReasoningPayload: skip reasoning payloads
+//   - mediaUrl → mediaUrls merge (deduplicated)
+//   - parse [[silent]] directive: skip silent payloads with no media
+//   - isRenderablePayload: skip empty payloads
+// ============================================================================
+static std::vector<queue::MessagePayload> normalize_reply_payloads_for_delivery(
+    const std::vector<queue::MessagePayload>& payloads
+) {
+    std::vector<queue::MessagePayload> result;
+    for (const auto& payload : payloads) {
+        // Aligned with openclaw: shouldSuppressReasoningPayload(payload)
+        static const std::string REASONING_PREFIX = "<reasoning>";
+        if (!payload.text.empty() &&
+            payload.text.find(REASONING_PREFIX) != std::string::npos) {
+            continue;  // suppress reasoning payloads
+        }
+
+        // Aligned with openclaw: mergeMediaUrls(mediaUrls, mediaUrl)
+        // Merge mediaUrl into mediaUrls (deduplicated)
+        queue::MessagePayload normalized = payload;
+        if (!payload.media_url.empty()) {
+            bool already_present = false;
+            for (const auto& u : normalized.media_urls) {
+                if (u == payload.media_url) { already_present = true; break; }
+            }
+            if (!already_present) {
+                normalized.media_urls.insert(normalized.media_urls.begin(), payload.media_url);
+            }
+            normalized.media_url = "";  // clear singular after merge
+        }
+
+        // Aligned with openclaw: isSilent && mergedMedia.length === 0 → skip
+        if (payload.silent && normalized.media_urls.empty()) {
+            continue;
+        }
+
+        // Aligned with openclaw: isRenderablePayload(next) → skip empty
+        const bool has_text = !normalized.text.empty() &&
+            normalized.text.find_first_not_of(" \t\n\r") != std::string::npos;
+        const bool has_media = !normalized.media_urls.empty();
+        const bool has_channel_data = normalized.channel_data.has_value() &&
+                                      !normalized.channel_data->empty();
+        if (!has_text && !has_media && !has_channel_data) {
+            continue;  // not renderable
+        }
+
+        result.push_back(normalized);
+    }
+    return result;
+}
+
+// ============================================================================
 // normalizePayloadForChannelDelivery
 // Aligned with openclaw: normalizePayloadForChannelDelivery (deliver.ts)
 // ============================================================================
@@ -137,13 +193,22 @@ static std::optional<queue::MessagePayload> normalize_payload_for_channel(
 // ============================================================================
 // normalizePayloadsForChannelDelivery
 // Aligned with openclaw: normalizePayloadsForChannelDelivery (deliver.ts)
+//
+// Two-pass normalization:
+//   Pass 1: normalizeReplyPayloadsForDelivery (payloads.ts) — mediaUrl merge,
+//           reasoning suppression, silent/renderable filtering
+//   Pass 2: per-channel normalization (plain-text sanitize, whatsapp blank lines)
 // ============================================================================
 static std::vector<queue::MessagePayload> normalize_payloads_for_channel(
     const std::vector<queue::MessagePayload>& payloads,
     const std::string& channel_id
 ) {
+    // Pass 1: normalizeReplyPayloadsForDelivery (aligned with openclaw: payloads.ts)
+    const auto pass1 = normalize_reply_payloads_for_delivery(payloads);
+
+    // Pass 2: per-channel normalization
     std::vector<queue::MessagePayload> result;
-    for (const auto& payload : payloads) {
+    for (const auto& payload : pass1) {
         auto normalized = normalize_payload_for_channel(payload, channel_id);
         if (normalized.has_value()) {
             result.push_back(*normalized);
@@ -187,7 +252,49 @@ static std::optional<channels::ChannelOutboundAdapter> load_channel_outbound_ada
 // sendTextChunks
 // Aligned with openclaw: sendTextChunks (deliver.ts)
 // Applies chunker if available, otherwise sends as-is.
+// Supports chunkMode="newline" two-level chunking (aligned with openclaw).
 // ============================================================================
+
+// chunk_by_paragraph: split text by blank lines (aligned with openclaw: chunkByParagraph)
+static std::vector<std::string> chunk_by_paragraph(
+    const std::string& text,
+    int limit
+) {
+    // Split by double-newline (paragraph boundary)
+    std::vector<std::string> paragraphs;
+    std::string current;
+    size_t i = 0;
+    while (i < text.size()) {
+        // Detect blank line (\n\n or \r\n\r\n)
+        if (text[i] == '\n' && i + 1 < text.size() && text[i + 1] == '\n') {
+            if (!current.empty()) {
+                paragraphs.push_back(current);
+                current.clear();
+            }
+            i += 2;
+            continue;
+        }
+        current += text[i++];
+    }
+    if (!current.empty()) paragraphs.push_back(current);
+
+    // Merge short paragraphs to stay under limit
+    std::vector<std::string> result;
+    std::string merged;
+    for (const auto& para : paragraphs) {
+        if (merged.empty()) {
+            merged = para;
+        } else if (static_cast<int>(merged.size() + 2 + para.size()) <= limit) {
+            merged += "\n\n" + para;
+        } else {
+            result.push_back(merged);
+            merged = para;
+        }
+    }
+    if (!merged.empty()) result.push_back(merged);
+    return result;
+}
+
 static void send_text_chunks(
     const std::string& text,
     const channels::ChannelOutboundContext& base_ctx,
@@ -213,6 +320,31 @@ static void send_text_chunks(
     }
 
     int text_limit = *adapter.text_chunk_limit;
+
+    // Aligned with openclaw: chunkMode="newline" → two-level chunking
+    // Level 1: chunkByParagraph (split by blank lines)
+    // Level 2: adapter.chunker (split by character limit)
+    const std::string chunk_mode = adapter.chunk_mode.value_or("length");
+    if (chunk_mode == "newline") {
+        auto block_chunks = chunk_by_paragraph(text, text_limit);
+        if (block_chunks.empty() && !text.empty()) block_chunks.push_back(text);
+        for (const auto& block_chunk : block_chunks) {
+            auto chunks = adapter.chunker(block_chunk, text_limit);
+            if (chunks.empty() && !block_chunk.empty()) chunks.push_back(block_chunk);
+            for (const auto& chunk : chunks) {
+                throw_if_aborted(abort_signal);
+                channels::ChannelOutboundContext chunk_ctx = base_ctx;
+                chunk_ctx.text = chunk;
+                if (!adapter.send_text) throw std::runtime_error("send_text not implemented");
+                auto r = adapter.send_text(chunk_ctx);
+                if (r.is_err()) throw std::runtime_error(r.error);
+                results.push_back(r.get());
+            }
+        }
+        return;
+    }
+
+    // Default: single-level chunking (chunkMode="length" or unset)
     auto chunks = adapter.chunker(text, text_limit);
     if (chunks.empty() && !text.empty()) {
         chunks.push_back(text);
@@ -276,6 +408,19 @@ core::Result<std::vector<OutboundDeliveryResult>> deliver_outbound_payloads_core
             // throwIfAborted (aligned with openclaw)
             throw_if_aborted(params.abort_signal);
 
+            // ── message_sending hook (aligned with openclaw: applyMessageSendingHook) ──────────
+            // Aligned with openclaw: hookRunner.runMessageSending(...):
+            //   - May cancel the payload (hookResult.cancel === true)
+            //   - May modify the content (hookResult.content != null)
+            // HunterClaw: hook system is a future integration point.
+            // When hook_runner is available, call:
+            //   auto hook_result = hook_runner->run_message_sending(payload_summary, channel_id);
+            //   if (hook_result.cancelled) continue;
+            //   if (!hook_result.content.empty()) { payload_summary.text = hook_result.content; }
+            // For now, log the intent and proceed.
+            log()->debug("deliver_outbound_payloads_core: [hook] message_sending channel={}",
+                         channel_id);
+
             // Notify caller about this payload (aligned with openclaw: onPayload)
             if (params.on_payload) {
                 params.on_payload(payload_summary);
@@ -295,16 +440,27 @@ core::Result<std::vector<OutboundDeliveryResult>> deliver_outbound_payloads_core
                 if (send_payload_result.is_err()) {
                     throw std::runtime_error(send_payload_result.error);
                 }
-                results.push_back(send_payload_result.get());
+                const auto& delivery = send_payload_result.get();
+                results.push_back(delivery);
+                // Aligned with openclaw: emitMessageSent after sendPayload
+                log()->debug("deliver_outbound_payloads_core: [hook] message_sent channel={} "
+                             "messageId={} success=true", channel_id, delivery.message_id);
                 continue;
             }
 
             // ── Text-only path (aligned with openclaw: mediaUrls.length === 0) ──
             if (payload_summary.media_urls.empty()) {
+                const size_t before_count = results.size();
                 channels::ChannelOutboundContext text_ctx = base_ctx;
                 text_ctx.text = payload_summary.text;
                 send_text_chunks(payload_summary.text, text_ctx, outbound,
                                  params.abort_signal, results);
+                // Aligned with openclaw: emitMessageSent after sendTextChunks
+                const std::string last_msg_id = results.size() > before_count
+                    ? results.back().message_id : "";
+                log()->debug("deliver_outbound_payloads_core: [hook] message_sent channel={} "
+                             "messageId={} success={}", channel_id, last_msg_id,
+                             results.size() > before_count);
                 continue;
             }
 
@@ -336,6 +492,7 @@ core::Result<std::vector<OutboundDeliveryResult>> deliver_outbound_payloads_core
 
             // Send each media URL (aligned with openclaw: for (const url of mediaUrls))
             bool first = true;
+            std::string last_media_msg_id;
             for (const auto& url : payload_summary.media_urls) {
                 throw_if_aborted(params.abort_signal);
 
@@ -348,11 +505,19 @@ core::Result<std::vector<OutboundDeliveryResult>> deliver_outbound_payloads_core
                 if (!outbound.send_media) throw std::runtime_error("send_media not implemented");
                 auto r = outbound.send_media(media_ctx);
                 if (r.is_err()) throw std::runtime_error(r.error);
+                last_media_msg_id = r.get().message_id;
                 results.push_back(r.get());
             }
+            // Aligned with openclaw: emitMessageSent after media loop
+            log()->debug("deliver_outbound_payloads_core: [hook] message_sent channel={} "
+                         "messageId={} success=true", channel_id, last_media_msg_id);
 
         } catch (const std::exception& e) {
             std::string error_msg = e.what();
+
+            // Aligned with openclaw: emitMessageSent(success=false) on error
+            log()->debug("deliver_outbound_payloads_core: [hook] message_sent channel={} "
+                         "success=false error={}", channel_id, error_msg);
 
             if (!params.best_effort) {
                 // Re-throw (aligned with openclaw: if (!bestEffort) throw err)
@@ -366,6 +531,20 @@ core::Result<std::vector<OutboundDeliveryResult>> deliver_outbound_payloads_core
                 params.on_error(error_msg, payload_summary);
             }
         }
+    }
+
+    // ── mirror: transcript append (aligned with openclaw) ──────────────────────────────
+    // Aligned with openclaw: if (params.mirror && results.length > 0)
+    //   appendAssistantMessageToSessionTranscript(...)
+    // HunterClaw: mirror is a future integration point.
+    // When mirror is available, call:
+    //   session_manager->append_assistant_message(mirror.session_key, mirror.text)
+    // For now, log the intent.
+    if (params.mirror.has_value() && !results.empty()) {
+        log()->debug("deliver_outbound_payloads_core: [mirror] would append transcript "
+                     "session={} text_len={}",
+                     params.mirror->session_key,
+                     params.mirror->text.size());
     }
 
     return core::Result<std::vector<OutboundDeliveryResult>>::Ok(results);

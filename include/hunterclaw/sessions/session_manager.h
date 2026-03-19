@@ -91,7 +91,11 @@ struct SessionEntry {
     std::optional<std::string> label;          // 会话标签 (用户友好名称)
     std::optional<std::string> display_name;   // 显示名称
     std::optional<std::string> chat_type;      // 聊天类型: dm/group/channel
-    
+
+    // Aligned with openclaw: ttsAuto mode for this session
+    // "off" | "always" | "inbound" | "tagged"
+    std::optional<std::string> tts_auto;
+
     // 会话历史 (简化版，实际可能需要独立存储)
     std::vector<std::string> messages;
 };

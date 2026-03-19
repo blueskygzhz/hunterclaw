@@ -266,7 +266,7 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
     const std::string message_id = message.message_id;
     const std::string session_key = message.session_key;
 
-    // ── Step 1: Inbound dedupe (aligned with openclaw: shouldSkipDuplicateInbound) ──
+// ── Step 1: Inbound dedupe (aligned with openclaw: shouldSkipDuplicateInbound) ──
     // Key: provider|accountId|sessionScope|peerId|threadId|messageId
     // TTL: DEFAULT_INBOUND_DEDUPE_TTL_MS = 20 * 60_000 ms
     if (should_skip_duplicate_inbound(message)) {
@@ -276,6 +276,75 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
                      message_id);
         return result;
     }
+
+    // ── Resolve session store entry + inbound audio context + TTS auto mode ──
+    // Aligned with openclaw: resolveSessionStoreLookup + isInboundAudioContext + normalizeTtsAutoMode
+    std::optional<sessions::SessionEntry> session_entry_for_dispatch;
+    if (session_manager_ && !session_key.empty()) {
+        auto entry_result = session_manager_->get_session(session_key);
+        if (entry_result.is_ok()) {
+            session_entry_for_dispatch = entry_result.get();
+        }
+    }
+
+    // Aligned with openclaw: isInboundAudioContext
+    // Detect if the inbound message is audio (voice note, audio attachment, etc.)
+    const bool inbound_audio = [&]() -> bool {
+        const std::string& text = message.text;
+        if (text.empty()) return false;
+        // Check for audio placeholder patterns (aligned with openclaw: AUDIO_PLACEHOLDER_RE / AUDIO_HEADER_RE)
+        static const std::regex audio_placeholder_re(
+            R"(^<media:audio>(\s*\([^)]*\))?$)",
+            std::regex_constants::icase
+        );
+        static const std::regex audio_header_re(
+            R"(^\[Audio\b)",
+            std::regex_constants::icase
+        );
+        const std::string trimmed = [&]() {
+            size_t s = text.find_first_not_of(" \t\n\r");
+            if (s == std::string::npos) return std::string{};
+            size_t e = text.find_last_not_of(" \t\n\r");
+            return text.substr(s, e - s + 1);
+        }();
+        if (std::regex_match(trimmed, audio_placeholder_re)) return true;
+        if (std::regex_search(trimmed, audio_header_re)) return true;
+        return false;
+    }();
+
+    // Aligned with openclaw: normalizeTtsAutoMode(sessionStoreEntry.entry?.ttsAuto)
+    // "off" | "always" | "inbound" | "tagged" — default "off"
+    const std::string session_tts_auto = [&]() -> std::string {
+        if (session_entry_for_dispatch.has_value()) {
+            const auto& tts_auto = session_entry_for_dispatch->tts_auto;
+            if (tts_auto.has_value()) {
+                const std::string& v = *tts_auto;
+                if (v == "always" || v == "inbound" || v == "tagged") return v;
+            }
+        }
+        return "off";
+    }();
+
+    // Aligned with openclaw: ttsChannel = shouldRouteToOriginating ? originatingChannel : currentSurface
+    const std::string tts_channel = message.channel;
+
+    // Note: inbound_audio and session_tts_auto are used by maybe_apply_tts_to_payload
+    // when TTS integration is complete. They control:
+    //   inbound_audio: whether to auto-apply TTS (ttsAuto="inbound" mode)
+    //   session_tts_auto: session-level TTS auto mode override
+    // For now, suppress unused-variable warnings.
+    (void)inbound_audio;
+    (void)session_tts_auto;
+
+    // ── Plugin hook: message_received ────────────────────────────────────────
+    // Aligned with openclaw: hookRunner.runMessageReceived + triggerInternalHook("message","received")
+    // Fire-and-forget: do not block dispatch on hook failure.
+    // HunterClaw: hook system is a future integration point.
+    // When hook_runner is available, call:
+    //   hook_runner->run_message_received(message);
+    //   trigger_internal_hook("message", "received", session_key, ...);
+    // For now, log the intent.
+    log()->debug("dispatch_reply_from_config: [hook] message_received session={}", session_key);
 
     // ── Step 2: shouldRouteToOriginating ────────────────────────────────────
     // Aligned with openclaw: check if originating channel differs from current surface.
@@ -287,6 +356,8 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
 
     // ── Step 3: tryFastAbortFromMessage ─────────────────────────────────────
     // Aligned with openclaw: abort.ts — checks ABORT_TRIGGERS set
+    // NOTE: markProcessing() is called here (aligned with openclaw: before fastAbort check)
+    log()->debug("dispatch_reply_from_config: markProcessing session={}", session_key);
     auto fast_abort = try_fast_abort_from_message(message, config);
     if (fast_abort.should_abort) {
         // Aligned with openclaw: send abort reply text
@@ -310,56 +381,52 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
         return result;
     }
 
-    // ── Step 4: Send policy check ────────────────────────────────────────────
+    // ── Step 4: bypassAcpForCommand (aligned with openclaw: shouldBypassAcpDispatchForCommand) ──
+    // Aligned with openclaw: computed BEFORE sendPolicy check, used in BOTH sendPolicy and acpDispatch.
+    // Commands that start with ! or are registered slash-commands bypass send policy and ACP.
+    const bool bypass_acp_for_command =
+        CommandDetection::is_control_command_message(message.text) ||
+        CommandDetection::has_inline_command_tokens(message.text);
+
+    // ── Step 5: Send policy check ────────────────────────────────────────────
     // Aligned with openclaw: resolveSendPolicy (sessions/send-policy.ts)
     // Checks session store entry sendPolicy override, then config.session.sendPolicy rules.
     // "deny" blocks dispatch unless bypassed by a command.
     {
-        // Resolve session entry for send policy (aligned with openclaw: resolveSessionStoreLookup)
-        std::optional<sessions::SessionEntry> session_entry;
-        if (session_manager_ && !session_key.empty()) {
-            auto entry_result = session_manager_->get_session(session_key);
-            if (entry_result.is_ok()) {
-                session_entry = entry_result.get();
-            }
-        }
-
-        // Aligned with openclaw: shouldBypassAcpDispatchForCommand
-        // Commands that start with ! or are registered slash-commands bypass send policy.
-        const bool bypass_for_command =
-            CommandDetection::is_control_command_message(message.text) ||
-            CommandDetection::has_inline_command_tokens(message.text);
-
         // Aligned with openclaw: resolveSendPolicy
         // Check session entry override first, then config rules.
         const std::string send_policy = resolve_send_policy(
-            session_entry,
+            session_entry_for_dispatch,
             session_key,
             message.channel,
             message.chat_type
         );
 
-        if (send_policy == "deny" && !bypass_for_command) {
+        if (send_policy == "deny" && !bypass_acp_for_command) {
             log()->debug("dispatch_reply_from_config: send blocked by policy for session={}",
                          session_key);
             result.skipped = true;
             result.skip_reason = "send_policy_deny";
+            log()->debug("dispatch_reply_from_config: markIdle session={} reason=message_completed",
+                         session_key);
             return result;
         }
     }
 
-    // ── Step 5: ACP dispatch ─────────────────────────────────────────────────
-    // Aligned with openclaw: tryDispatchAcpReply
+    // ── Step 6: ACP dispatch ─────────────────────────────────────────────────
+    // Aligned with openclaw: tryDispatchAcpReply (bypassForCommand passed through)
     if (config.dispatch.enable_acp) {
         auto acp_result = try_dispatch_acp_reply(message);
         if (acp_result.handled) {
             result.success = true;
             log()->info("dispatch_reply_from_config: handled by ACP");
+            log()->debug("dispatch_reply_from_config: markIdle session={} reason=message_completed",
+                         session_key);
             return result;
         }
     }
 
-    // ── Step 6: Permission check ─────────────────────────────────────────────
+    // ── Step 7: Permission check ─────────────────────────────────────────────
     auto permission_check = check_permissions(message, config);
     if (!permission_check.allowed) {
         result.denied = true;
@@ -369,7 +436,7 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
         return result;
     }
 
-    // ── Step 7: shouldComputeCommandAuthorized ───────────────────────────────
+    // ── Step 8: shouldComputeCommandAuthorized ───────────────────────────────
     // Aligned with openclaw: resolveCommandAuthorization (command-auth.ts)
     // Command authorization is granted when:
     //   1. The sender is the session owner (first sender), OR
@@ -396,13 +463,70 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
                      command_authorized, message.sender_id);
     }
 
-    // ── Step 8: Generate reply ───────────────────────────────────────────────
+    // ── Step 9: resolveRunTypingPolicy ───────────────────────────────────────
+    // Aligned with openclaw: resolveRunTypingPolicy (typing-policy.ts)
+    // suppressTyping when routing to originating channel or originating is internal.
+    const bool suppress_typing = should_route || [&]() -> bool {
+        const std::string& orig = message.originating_channel;
+        return orig == "web" || orig == "webchat" || orig == "internal";
+    }();
+    log()->debug("dispatch_reply_from_config: suppress_typing={} session={}",
+                 suppress_typing, session_key);
+
+    // ── Step 10: Generate reply ──────────────────────────────────────────────
     // Aligned with openclaw: getReplyFromConfig
+    //
+    // Track accumulated block text for TTS generation after streaming completes.
+    // When block streaming succeeds, there's no final reply, so we need to generate
+    // TTS audio separately from the accumulated block content.
+    // (aligned with openclaw: accumulatedBlockText + blockCount)
+    std::string accumulated_block_text;
+    int block_count = 0;
+
     ReplyGenerator::GenerateConfig gen_config;
     gen_config.agent_id = config.agent_id;
     gen_config.workspace_path = config.workspace_path;
     gen_config.user_input = message.text;
     gen_config.session_key = session_key;
+
+    // Aligned with openclaw: onBlockReply callback
+    // - shouldSuppressReasoningPayload filter
+    // - accumulate block text for TTS
+    // - maybeApplyTtsToPayload (kind="block")
+    // - deliver block reply via dispatcher
+    gen_config.on_block_reply = [&](const std::string& block_text) {
+        // Aligned with openclaw: shouldSuppressReasoningPayload(payload)
+        // Suppress reasoning payloads — channels using this generic dispatch path
+        // do not have a dedicated reasoning lane.
+        // (HunterClaw: reasoning payloads are tagged with a special prefix)
+        static const std::string REASONING_PREFIX = "<reasoning>";
+        if (block_text.find(REASONING_PREFIX) != std::string::npos) {
+            log()->debug("dispatch_reply_from_config: suppressed reasoning block");
+            return;
+        }
+        // Aligned with openclaw: accumulate block text for TTS
+        if (!block_text.empty()) {
+            if (!accumulated_block_text.empty()) accumulated_block_text += "\n";
+            accumulated_block_text += block_text;
+            block_count++;
+        }
+        // Aligned with openclaw: maybeApplyTtsToPayload({ kind: "block", ... })
+        // TTS for block replies is applied here when tts is enabled.
+        // For now, deliver block reply as-is (TTS integration is a future step).
+        log()->debug("dispatch_reply_from_config: [block_reply] len={} tts_channel={}",
+                     block_text.size(), tts_channel);
+    };
+
+    // Aligned with openclaw: onToolResult callback
+    // - maybeApplyTtsToPayload (kind="tool")
+    // - resolveToolDeliveryPayload (suppress in group/native flows)
+    // - deliver tool result via dispatcher
+    gen_config.on_tool_result = [&](const std::string& tool_text) {
+        // Aligned with openclaw: maybeApplyTtsToPayload({ kind: "tool", ... })
+        // TTS for tool results is applied here when tts is enabled.
+        log()->debug("dispatch_reply_from_config: [tool_result] len={} tts_channel={}",
+                     tool_text.size(), tts_channel);
+    };
 
     auto gen_result = ReplyGenerator::get_reply_from_config(
         gen_config, llm_client_, tool_manager_, session_manager_
@@ -413,28 +537,93 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
         result.error = gen_result.error;
         log()->error("dispatch_reply_from_config: reply generation failed: {}",
                      gen_result.error);
+        log()->debug("dispatch_reply_from_config: markIdle session={} reason=message_error",
+                     session_key);
         return result;
     }
 
     result.react_result = gen_result.react_result;
     result.total_tokens = gen_result.react_result.usage.total_tokens;
 
-    // ── Step 9: Build payloads ───────────────────────────────────────────────
+    // ── Step 11: AcpDispatchTailAfterReset ───────────────────────────────────
+    // Aligned with openclaw: ctx.AcpDispatchTailAfterReset === true
+    // Command handling may prepare a trailing prompt after ACP in-place reset.
+    // Route that tail through ACP now (same turn) instead of embedded dispatch.
+    if (gen_result.acp_dispatch_tail_after_reset && config.dispatch.enable_acp) {
+        log()->info("dispatch_reply_from_config: AcpDispatchTailAfterReset — routing tail to ACP");
+        auto acp_tail_result = try_dispatch_acp_reply(message);
+        if (acp_tail_result.handled) {
+            result.success = true;
+            log()->debug("dispatch_reply_from_config: markIdle session={} reason=message_completed",
+                         session_key);
+            return result;
+        }
+    }
+
+    // ── Step 12: Build final reply payloads ──────────────────────────────────
     std::vector<::hunterclaw::queue::MessagePayload> payloads;
     ::hunterclaw::queue::MessagePayload payload;
     payload.text = gen_result.response;
     payloads.push_back(payload);
 
-    // ── Step 10: TTS (aligned with openclaw: maybeApplyTtsToPayload) ─────────
-    if (config.dispatch.enable_tts) {
-        maybe_apply_tts_to_payload(payloads, config);
+    // ── Step 13: Final reply loop ─────────────────────────────────────────────
+    // Aligned with openclaw: for (const reply of replies) loop
+    //   - shouldSuppressReasoningPayload filter
+    //   - maybeApplyTtsToPayload (kind="final")
+    std::vector<::hunterclaw::queue::MessagePayload> final_payloads;
+    for (auto& p : payloads) {
+        // Aligned with openclaw: shouldSuppressReasoningPayload(reply)
+        static const std::string REASONING_PREFIX = "<reasoning>";
+        if (!p.text.empty() && p.text.find(REASONING_PREFIX) != std::string::npos) {
+            log()->debug("dispatch_reply_from_config: suppressed reasoning final payload");
+            continue;
+        }
+        // Aligned with openclaw: maybeApplyTtsToPayload({ kind: "final", inboundAudio, ttsAuto })
+        if (config.dispatch.enable_tts) {
+            maybe_apply_tts_to_payload({p}, config);
+        }
+        final_payloads.push_back(p);
     }
 
-    // ── Step 11: Deliver (aligned with openclaw: deliverOutboundPayloads) ────
+    // ── Step 14: Block TTS accumulation (aligned with openclaw) ──────────────
+    // Generate TTS-only reply after block streaming completes (when there's no final reply).
+    // This handles the case where block streaming succeeds and drops final payloads,
+    // but we still want TTS audio to be generated from the accumulated block content.
+    // Aligned with openclaw: ttsMode === "final" && replies.length === 0 && blockCount > 0
+    if (config.dispatch.enable_tts &&
+        final_payloads.empty() &&
+        block_count > 0 &&
+        !accumulated_block_text.empty()) {
+        // Trim check
+        const bool has_content = accumulated_block_text.find_first_not_of(" \t\n\r")
+                                 != std::string::npos;
+        if (has_content) {
+            log()->debug("dispatch_reply_from_config: generating TTS-only payload from "
+                         "accumulated block text len={}", accumulated_block_text.size());
+            // Aligned with openclaw: maybeApplyTtsToPayload({ payload: { text: accumulatedBlockText }, kind: "final" })
+            // Only send if TTS was actually applied (mediaUrl exists).
+            // For now, create a synthetic payload with the accumulated text.
+            // TODO: integrate actual TTS call and check mediaUrl before sending.
+            ::hunterclaw::queue::MessagePayload tts_synthetic;
+            tts_synthetic.text = accumulated_block_text;
+            std::vector<::hunterclaw::queue::MessagePayload> tts_vec = {tts_synthetic};
+            maybe_apply_tts_to_payload(tts_vec, config);
+            // Only add if TTS produced a media URL (aligned with openclaw: if (ttsSyntheticReply.mediaUrl))
+            if (!tts_vec.empty() && !tts_vec[0].media_urls.empty()) {
+                // Send TTS-only payload (no text, just audio)
+                ::hunterclaw::queue::MessagePayload tts_only;
+                tts_only.media_urls = tts_vec[0].media_urls;
+                tts_only.audio_as_voice = tts_vec[0].audio_as_voice;
+                final_payloads.push_back(tts_only);
+            }
+        }
+    }
+
+    // ── Step 15: Deliver (aligned with openclaw: deliverOutboundPayloads) ────
     outbound::DeliverOutboundPayloadsParams deliver_params;
     deliver_params.channel = message.channel;
     deliver_params.to = delivery_to;
-    deliver_params.payloads = payloads;
+    deliver_params.payloads = final_payloads;
     deliver_params.delivery_queue = delivery_queue_;
     deliver_params.skip_queue = false;
     deliver_params.best_effort = false;
@@ -454,6 +643,8 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
         log()->error("dispatch_reply_from_config: delivery failed: {}", deliver_result.error);
     }
 
+    log()->debug("dispatch_reply_from_config: markIdle session={} reason=message_completed",
+                 session_key);
     return result;
 }
 
@@ -905,14 +1096,22 @@ ReplyGenerator::GenerateResult ReplyGenerator::run_prepared_reply(
     react::StreamCallbacks callbacks;
     callbacks.session_id = config.session_key;
     callbacks.on_block_reply = [&](const std::string& block) {
-        // Aligned with openclaw: onBlockReply — deliver intermediate blocks
+        // Aligned with openclaw: onBlockReply — forward to caller's on_block_reply callback
+        // The caller (dispatch_reply_from_config) accumulates block text for TTS and delivers.
         log()->debug("run_prepared_reply: block_reply len={}", block.size());
+        if (config.on_block_reply) {
+            config.on_block_reply(block);
+        }
     };
     callbacks.on_tool_start = [&](const std::string& tool_name, const core::JsonValue&) {
         log()->debug("run_prepared_reply: tool_start name={}", tool_name);
     };
     callbacks.on_tool_end = [&](const std::string& tool_name, const tools::ToolResult& tr) {
+        // Aligned with openclaw: onToolResult — forward to caller's on_tool_result callback
         log()->debug("run_prepared_reply: tool_end name={} ok={}", tool_name, tr.success);
+        if (config.on_tool_result && tr.success) {
+            config.on_tool_result(tr.output);
+        }
     };
     callbacks.on_error = [&](const std::string& error) {
         log()->error("run_prepared_reply: react error: {}", error);

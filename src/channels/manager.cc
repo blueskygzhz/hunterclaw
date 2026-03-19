@@ -240,22 +240,30 @@ public:
     
     core::Result<void> start_channels(const std::vector<ChannelId>& channel_ids) {
         std::vector<ChannelId> to_start;
-        
+
         if (channel_ids.empty()) {
-            // Start all configured channels
-            // TODO: Get from config
-            to_start = {}; // Would be populated from config
+            // Aligned with openclaw: startChannels() → for (const plugin of listChannelPlugins())
+            // Enumerate all registered channel plugins from the registry.
+            const auto& all_plugins = ChannelPluginRegistry::instance().list_plugins();
+            for (const auto& plugin : all_plugins) {
+                to_start.push_back(plugin.id.c_str());
+            }
+            log()->info("start_channels: starting {} registered channels", to_start.size());
         } else {
             to_start = channel_ids;
         }
-        
+
         for (const auto& channel_id : to_start) {
+            // Aligned with openclaw: await startChannel(plugin.id)
+            // listAccountIds from config — for now use "default" account
+            // TODO: resolve account IDs from config (plugin.config.listAccountIds(cfg))
             auto result = start_channel(channel_id, "default", {});
             if (result.is_err()) {
                 log()->warn("Failed to start channel {}: {}", channel_id, result.error);
+                // Aligned with openclaw: continue on per-channel failure (don't abort all)
             }
         }
-        
+
         return core::Result<void>::Ok();
     }
     

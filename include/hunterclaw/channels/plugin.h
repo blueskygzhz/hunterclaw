@@ -385,7 +385,12 @@ struct ChannelOutboundAdapter {
     // "direct" | "gateway" | "hybrid"
     std::string delivery_mode = "direct";
     std::function<std::vector<std::string>(const std::string&, int)> chunker;
-    std::string chunker_mode = "text";  // "text" | "markdown"
+    // Aligned with openclaw: chunkerMode "text" | "markdown"
+    std::string chunker_mode = "text";
+    // Aligned with openclaw: chunkMode "length" | "newline"
+    // "newline": two-level chunking (chunkByParagraph + chunker)
+    // "length": single-level chunking (chunker only)
+    std::optional<std::string> chunk_mode;  // default: "length"
     std::optional<int> text_chunk_limit;
     std::optional<int> poll_max_options;
     std::function<std::optional<std::string>(const core::Config&, const std::string&, const std::vector<std::string>&, const std::string&, const std::string&)> resolve_target;

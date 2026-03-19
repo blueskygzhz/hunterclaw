@@ -194,6 +194,15 @@ public:
         
         // 是否为心跳
         bool is_heartbeat = false;
+
+        // Aligned with openclaw: onBlockReply callback
+        // Called for each intermediate block reply during streaming.
+        // Receives the block text; caller accumulates for TTS and delivers.
+        std::function<void(const std::string& block_text)> on_block_reply;
+
+        // Aligned with openclaw: onToolResult callback
+        // Called after each tool execution with the tool result payload.
+        std::function<void(const std::string& tool_text)> on_tool_result;
     };
     
     // ✅ 生成结果
@@ -202,6 +211,10 @@ public:
         std::string response;
         react::ReactResult react_result;
         std::string error;
+
+        // Aligned with openclaw: ctx.AcpDispatchTailAfterReset
+        // Set to true when command handling prepared a trailing prompt after ACP in-place reset.
+        bool acp_dispatch_tail_after_reset = false;
     };
     
     // ✅ 对齐 OpenClaw: getReplyFromConfig (line 50-403)
