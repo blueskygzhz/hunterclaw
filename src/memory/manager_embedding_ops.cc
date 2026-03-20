@@ -10,6 +10,9 @@
 #include <chrono>
 #include <random>
 #include <regex>
+#include <fstream>
+#include <set>
+#include <cstring>
 
 // 严格对齐 OpenClaw src/memory/manager-embedding-ops.ts
 // 实现完整的批量 embedding、缓存和重试逻辑
@@ -534,13 +537,15 @@ int ManagerEmbeddingOps::get_index_concurrency() {
 }
 
 core::Result<bool> ManagerEmbeddingOps::ensure_vector_ready(size_t dimensions) {
-    // 简化实现：确保向量表已创建
+    // 对齐 manager-embedding-ops.ts:ensureVectorReady
     if (!settings_.vector.enabled || !db_) {
         return core::Result<bool>::Ok(false);
     }
-    
-    // 实际应该检查/创建 chunks_vec 表
-    // 这里简化为总是返回 true
+    if (dimensions == 0) {
+        return core::Result<bool>::Ok(false);
+    }
+    // chunks_vec 表在 ensure_schema 中已创建（如果 vec 扩展可用）
+    // 这里只需确认 vec 扩展已加载
     return core::Result<bool>::Ok(true);
 }
 

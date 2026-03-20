@@ -516,7 +516,8 @@ std::vector<std::string> normalize_extra_memory_paths(
 bool is_memory_path(const std::string& rel_path) {
     std::string normalized = normalize_rel_path(rel_path);
     if (normalized.empty()) return false;
-    if (normalized == "MEMORY.md" || normalized == "memory.md") return true;
+    // 对齐 openclaw: normalized === "MEMORY.md" || normalized.startsWith("memory/")
+    if (normalized == "MEMORY.md") return true;
     return normalized.rfind("memory/", 0) == 0;
 }
 

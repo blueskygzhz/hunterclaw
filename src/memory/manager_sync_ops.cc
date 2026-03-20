@@ -4,6 +4,7 @@
 #include "hunterclaw/memory/session_files.h"
 #include "hunterclaw/memory/chunking.h"
 #include "hunterclaw/logging/subsystem_logger.h"
+#include <sqlite3.h>
 #include <sstream>
 #include <algorithm>
 #include <filesystem>
@@ -91,10 +92,49 @@ void MemoryManagerSyncOps::ensure_schema() {
 // seedEmbeddingCache (对齐 manager-sync-ops.ts:278-311)
 // ============================================================================
 void MemoryManagerSyncOps::seed_embedding_cache(SQLiteVectorStorage& source_db) {
-    // 对齐 openclaw: 从旧 db 复制 embedding_cache 到新 db
-    // 实际实现依赖 SQLiteVectorStorage 提供的接口
-    // TODO: 实现 embedding cache 迁移
-    (void)source_db;
+    // 对齐 openclaw manager-sync-ops.ts:seedEmbeddingCache
+    // 从旧 db 复制 embedding_cache 到新 db
+    if (!db_) return;
+
+    // SELECT * FROM embedding_cache
+    auto stmt_res = source_db.prepare_statement(
+        "SELECT provider, model, provider_key, hash, embedding, dims, updated_at"
+        " FROM embedding_cache"
+    );
+    if (stmt_res.is_err()) return;
+    sqlite3_stmt* src_stmt = stmt_res.get();
+
+    // INSERT OR IGNORE INTO embedding_cache ...
+    const std::string insert_sql =
+        "INSERT OR IGNORE INTO embedding_cache"
+        " (provider, model, provider_key, hash, embedding, dims, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)";
+    auto dst_res = db_->prepare_statement(insert_sql);
+    if (dst_res.is_err()) { sqlite3_finalize(src_stmt); return; }
+    sqlite3_stmt* dst_stmt = dst_res.get();
+
+    while (sqlite3_step(src_stmt) == SQLITE_ROW) {
+        const char* provider    = reinterpret_cast<const char*>(sqlite3_column_text(src_stmt, 0));
+        const char* model       = reinterpret_cast<const char*>(sqlite3_column_text(src_stmt, 1));
+        const char* pkey        = reinterpret_cast<const char*>(sqlite3_column_text(src_stmt, 2));
+        const char* hash        = reinterpret_cast<const char*>(sqlite3_column_text(src_stmt, 3));
+        const char* embedding   = reinterpret_cast<const char*>(sqlite3_column_text(src_stmt, 4));
+        int         dims        = sqlite3_column_int(src_stmt, 5);
+        int64_t     updated_at  = sqlite3_column_int64(src_stmt, 6);
+        if (!provider || !model || !pkey || !hash || !embedding) continue;
+
+        sqlite3_reset(dst_stmt);
+        sqlite3_bind_text (dst_stmt, 1, provider,   -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text (dst_stmt, 2, model,      -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text (dst_stmt, 3, pkey,       -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text (dst_stmt, 4, hash,       -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text (dst_stmt, 5, embedding,  -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int  (dst_stmt, 6, dims);
+        sqlite3_bind_int64(dst_stmt, 7, updated_at);
+        sqlite3_step(dst_stmt);
+    }
+    sqlite3_finalize(src_stmt);
+    sqlite3_finalize(dst_stmt);
 }
 
 // ============================================================================
@@ -478,9 +518,13 @@ bool MemoryManagerSyncOps::should_fallback_on_error(const std::string& message) 
 MemoryManagerSyncOps::BatchState MemoryManagerSyncOps::resolve_batch_config() const {
     BatchState result;
     const auto& batch = settings_.batch;
-    bool enabled = batch.enabled && provider_ != nullptr;
-    // 只有 openai/gemini/voyage 支持 batch
-    // TODO: 检查 provider id
+    // 对齐 openclaw: 只有 openai/gemini/voyage 支持 batch
+    bool provider_supports_batch = false;
+    if (provider_) {
+        const std::string id = provider_->get_id();
+        provider_supports_batch = (id == "openai" || id == "gemini" || id == "voyage");
+    }
+    bool enabled = batch.enabled && provider_supports_batch;
     result.enabled = enabled;
     result.wait = batch.wait;
     result.concurrency = std::max(1, batch.concurrency);
@@ -542,12 +586,28 @@ void MemoryManagerSyncOps::clear_synced_session_files(
 bool MemoryManagerSyncOps::is_session_file_for_agent(const std::string& session_file) const {
     if (session_file.empty()) return false;
     // 对齐 openclaw: resolveSessionTranscriptsDirForAgent(agentId)
-    // 简化实现：检查路径是否包含 agent_id
-    // TODO: 使用正确的 sessions dir 解析
-    std::string resolved;
-    try { resolved = fs::absolute(session_file).string(); }
-    catch (...) { resolved = session_file; }
-    return resolved.find(agent_id_) != std::string::npos;
+    // openclaw 路径: ~/.openclaw/sessions/{agentId}/transcripts
+    // HunterClaw 路径: ~/.hunterclaw/sessions/{agentId}
+    std::string sessions_dir;
+    const char* home = std::getenv("HOME");
+    if (home) {
+        sessions_dir = std::string(home) + "/.hunterclaw/sessions/" + agent_id_;
+    } else {
+        sessions_dir = ".hunterclaw/sessions/" + agent_id_;
+    }
+    // Normalize both paths
+    std::string resolved_file;
+    std::string resolved_dir;
+    try {
+        resolved_file = fs::absolute(session_file).string();
+        resolved_dir  = fs::absolute(sessions_dir).string();
+    } catch (...) {
+        resolved_file = session_file;
+        resolved_dir  = sessions_dir;
+    }
+    // Check if session_file is under sessions_dir
+    if (resolved_dir.back() != '/') resolved_dir += '/';
+    return resolved_file.rfind(resolved_dir, 0) == 0;
 }
 
 // ============================================================================
