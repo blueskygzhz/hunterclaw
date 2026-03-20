@@ -8,6 +8,8 @@
 #include <functional>
 #include <cstdint>
 #include <memory>
+#include <variant>
+#include <nlohmann/json.hpp>
 
 namespace hunterclaw {
 namespace memory {
@@ -135,8 +137,8 @@ struct MemoryProviderStatus {
     };
     std::optional<BatchStatus> batch;
     
-    // 自定义字段
-    std::optional<std::map<std::string, std::string>> custom;
+    // 自定义字段 (对齐 openclaw: custom?: Record<string, unknown>)
+    std::optional<std::map<std::string, nlohmann::json>> custom;
 };
 
 // ============================================================================

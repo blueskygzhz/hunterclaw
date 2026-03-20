@@ -4,6 +4,7 @@
 #include <vector>
 #include <set>
 #include <unordered_set>
+#include <optional>
 #include <functional>
 
 namespace hunterclaw {
@@ -11,16 +12,26 @@ namespace memory {
 
 /**
  * Query expansion for FTS-only search mode.
- * 
+ *
  * When no embedding provider is available, we fall back to FTS (full-text search).
  * FTS works best with specific keywords, but users often ask conversational queries.
  * This module extracts meaningful keywords from such queries to improve FTS results.
  */
 
 // Check if a token is a stop word (multi-language)
+// (对齐 query-expansion.ts:isQueryStopWordToken)
 bool is_query_stop_word_token(const std::string& token);
 
+// Strip Korean trailing particle from a UTF-32 token
+// (对齐 query-expansion.ts:stripKoreanTrailingParticle)
+std::optional<std::u32string> strip_korean_trailing_particle(const std::u32string& token);
+
+// Check if a Korean stem is a useful keyword
+// (对齐 query-expansion.ts:isUsefulKoreanStem)
+bool is_useful_korean_stem(const std::u32string& stem);
+
 // Tokenize text into keywords (handles EN/ZH/JA/KO/AR/ES/PT)
+// (对齐 query-expansion.ts:tokenize)
 std::vector<std::string> tokenize_query(const std::string& text);
 
 // Extract keywords from conversational query

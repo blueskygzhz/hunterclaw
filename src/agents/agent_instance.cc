@@ -1,6 +1,6 @@
 #include "hunterclaw/agents/agent_instance.h"
 #include "hunterclaw/agents/agent_scope.h"
-#include "hunterclaw/memory/memory_provider_adapter.h"  // ✅ P3: MemoryProviderAdapter
+#include "hunterclaw/memory/memory_index_manager.h"  // MemoryIndexManager (openclaw manager.ts)
 #include "hunterclaw/core/utils.h"
 #include "hunterclaw/core/logging.h"
 #include "hunterclaw/react/react_engine.h"  // ✅ ReactEngine
@@ -298,75 +298,46 @@ void AgentInstance::initialize_workspace() {
 }
 
 void AgentInstance::initialize_memory() {
-    // ========== 初始化 Session 级别 Memory (对齐 OpenClaw) ==========
-    
+    // ========== 初始化 Memory (严格对齐 OpenClaw manager.ts) ==========
+    //
+    // openclaw 设计:
+    // - MemoryIndexManager::get(params) 是唯一入口 (manager.ts:135)
+    // - MemoryIndexManager 直接实现 MemorySearchManager 接口
+    // - 没有 MemoryManager 包装层，没有 MemoryProviderAdapter
+    // - Session memory 由 MemoryIndexManager 内部的 sessionsDirty/sessionDeltas 机制处理
+
     try {
-        // 1. 构建 Memory 工作空间路径
-        // 格式: {base_workspace}/{agent_id}/memory
-        std::string memory_workspace = ctx_.workspace_dir + "/memory";
-        
-        // 确保目录存在
+        // 1. 构建 workspace 路径 (对齐 openclaw resolveAgentWorkspaceDir)
+        std::string memory_workspace = ctx_.workspace_dir;
         std::filesystem::create_directories(memory_workspace);
-        
-        log()->info("[AgentInstance] Initializing memory: workspace={}", memory_workspace);
-        
-        // 2. 配置 MemoryManager (对齐 OpenClaw BuiltinMemoryManager)
-        memory::MemoryManager::Config memory_config;
-        
-        // 2.1 Workspace 配置
-        memory_config.workspace_dir = memory_workspace;
-        
-        // 2.2 Compaction 配置 (对齐 OpenClaw CompactionManager)
-        memory_config.compaction.context_window = 200000;
-        memory_config.compaction.reserve_tokens = 16384;
-        memory_config.compaction.keep_recent_tokens = 20000;
-        memory_config.compaction.auto_compress = true;
-        memory_config.compaction.soft_threshold_tokens = 4000;
-        
-        // 2.3 Session Memory 配置 (对齐 OpenClaw SessionMemoryProvider)
-        memory_config.session_memory.enabled = true;
-        memory_config.session_memory.export_dir = memory_workspace + "/sessions";
-        memory_config.session_memory.retention_days = 30;
-        
-        // 2.4 Memory Provider 配置
-        // ✅ 对齐 OpenClaw: 支持多种 Memory Provider
-        // - in_memory: 内存存储 (默认，适合开发和测试)
-        // - qdrant: 向量数据库 (生产环境推荐)
-        // - chroma: 向量数据库 (备选方案)
-        memory_config.provider_type = "in_memory";
-        
-        // 2.5 Embedding Provider 配置 (对齐 OpenClaw EmbeddingProvider)
-        memory_config.embedding.provider = "ollama";  // 默认 ollama
-        memory_config.embedding.model = "nomic-embed-text";
-        memory_config.embedding.fallback = "none";
-        
-        // 从配置读取 embedding 设置 (如果存在)
-        // ✅ 对齐 OpenClaw: 使用默认 embedding 配置，简化部署
-        // 生产环境可以通过环境变量或配置文件覆盖：
-        // - EMBEDDING_PROVIDER=openai
-        // - EMBEDDING_MODEL=text-embedding-3-small
-        
-        // 3. 创建 MemoryManager (传入 LLMClient 用于 compaction)
-        // ✅ LLMClient 在构造函数中已创建，可以复用
-        // 但为了避免循环依赖，这里暂时传入 nullptr
-        // Compaction 会在需要时创建独立的 LLMClient
-        std::shared_ptr<llm::LLMClient> llm_client = nullptr;
-        memory_mgr_ = std::make_shared<memory::MemoryManager>(memory_config, llm_client);
-        
-        // 4. 将 MemoryManager 转换为 MemoryProvider (适配器模式)
-        // 对齐 OpenClaw: AgentInstanceContext.memory 是统一的 MemoryProvider 接口
-        ctx_.memory = std::make_shared<memory::MemoryProviderAdapter>(memory_mgr_);
-        
-        log()->info(
-            "[AgentInstance] Memory initialized: session={}, workspace={}, provider={}, embedding={}",
-            ctx_.session_id, memory_workspace, 
-            memory_config.provider_type, memory_config.embedding.provider
-        );
-        
+
+        log()->info("[AgentInstance] Initializing memory: agent={}, workspace={}",
+                    ctx_.agent_id, memory_workspace);
+
+        // 2. 构建 MemoryIndexManager 参数 (对齐 manager.ts:135-175)
+        memory::MemoryIndexManager::Params params;
+        params.agent_id = ctx_.agent_id;
+        params.workspace_dir = memory_workspace;
+        // settings 使用默认值 (ResolvedMemorySearchConfig)
+
+        // 3. 获取或创建 MemoryIndexManager (带缓存，对齐 INDEX_CACHE)
+        auto mgr_result = memory::MemoryIndexManager::get(params);
+        if (mgr_result.is_err()) {
+            log()->warn("[AgentInstance] Memory initialization failed: {}", mgr_result.error);
+            // 不抛出异常，允许 Agent 在没有 Memory 的情况下运行
+            return;
+        }
+
+        // 4. MemoryIndexManager 直接是 MemorySearchManager，无需适配器
+        memory_mgr_ = mgr_result.get();
+        ctx_.memory = memory_mgr_;
+
+        log()->info("[AgentInstance] Memory initialized: agent={}, workspace={}",
+                    ctx_.agent_id, memory_workspace);
+
     } catch (const std::exception& e) {
         log()->error("[AgentInstance] Memory initialization failed: {}", e.what());
-        // 不抛出异常,允许 Agent 在没有 Memory 的情况下运行
-        // 对齐 OpenClaw: memory 是可选组件
+        // 不抛出异常，允许 Agent 在没有 Memory 的情况下运行
     }
 }
 
@@ -692,48 +663,26 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
     
     if (ctx_.memory) {
         try {
-            // ✅ 从 Memory 加载最近的对话历史
-            // 对齐 OpenClaw: 加载最近 N 条消息作为上下文
-            
-            // 使用 MemoryProviderAdapter 的便捷方法 search()
-            // 返回 vector<MemoryEntry>
-            auto memory_adapter = std::dynamic_pointer_cast<memory::MemoryProviderAdapter>(ctx_.memory);
-            
-            if (!memory_adapter) {
-                spdlog::get("default")->warn("[AgentInstance] Memory provider is not MemoryProviderAdapter");
-            } else {
-                auto search_result = memory_adapter->search("", 20);  // 空查询 + limit=20
-                
-                if (search_result.is_ok()) {
-                    const auto& entries = search_result.get();
-                    
-                    spdlog::get("default")->debug("[AgentInstance] Loaded {} history messages from memory", 
-                                 entries.size());
-                    
-                    // ✅ 转换 MemoryEntry -> LLMMessage
-                    // MemoryEntry 包含: id, content, file_path, timestamp
-                    // 角色信息存储在 file_path 中 (格式: "session/{session_id}/{role}/{timestamp}")
-                    for (const auto& entry : entries) {
-                        react::LLMMessage msg;
-                        
-                        // 从 file_path 解析角色
-                        // file_path 格式: "session/xxx/user/..." 或 "session/xxx/assistant/..."
-                        if (entry.file_path.find("/user/") != std::string::npos) {
-                            msg.role = llm::LLMMessageRole::User;
-                        } else if (entry.file_path.find("/assistant/") != std::string::npos) {
-                            msg.role = llm::LLMMessageRole::Assistant;
-                        } else if (entry.file_path.find("/system/") != std::string::npos) {
-                            msg.role = llm::LLMMessageRole::System;
-                        } else {
-                            // 默认为 user
-                            msg.role = llm::LLMMessageRole::User;
+            // Align with openclaw: warmSession() triggers memory sync on session start
+            // MemoryIndexManager handles session memory internally via sessionsDirty/sessionDeltas
+            // We call sync to ensure memory is up-to-date before processing
+            memory::SyncParams sync_params;
+            sync_params.reason = "session-start";
+            ctx_.memory->sync(sync_params);
+
+            spdlog::get("default")->debug("[AgentInstance] Memory warmed for session: {}",
+                         ctx_.session_id);
+        } catch (const std::exception& e) {
+            spdlog::get("default")->warn("[AgentInstance] Exception warming memory: {}", e.what());
+        }
+    }
                         }
                         
-                        msg.content = entry.content;
+                        msg.content = entry.snippet;  // MemorySearchResult uses snippet
                         history.push_back(msg);
                     }
                 } else {
-                    spdlog::get("default")->warn("[AgentInstance] Failed to load history: {}", 
+                    spdlog::get("default")->warn("[AgentInstance] Failed to load history: {}",
                                  search_result.error);
                 }
             }
@@ -754,46 +703,15 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
             
             // 检查是否成功
             if (result.success) {
-                // ✅ 保存到 Memory (对齐 OpenClaw)
+                // Align with openclaw: session memory is handled by MemoryIndexManager
+                // via sessionsDirty/sessionDeltas mechanism (manager.ts).
+                // Conversations are stored as JSONL files and indexed automatically.
+                // No manual add_memory() call needed here.
                 if (ctx_.memory) {
-                    try {
-                        // 保存用户消息
-                        std::map<std::string, std::string> user_metadata;
-                        user_metadata["role"] = "user";
-                        user_metadata["session_id"] = ctx_.session_id;
-                        user_metadata["agent_id"] = ctx_.agent_id;
-                        user_metadata["timestamp"] = std::to_string(
-                            std::chrono::system_clock::now().time_since_epoch().count()
-                        );
-                        
-                        auto user_result = ctx_.memory->add_memory(message, user_metadata);
-                        if (user_result.is_err()) {
-                            spdlog::get("default")->warn("[AgentInstance] Failed to save user message: {}", 
-                                         user_result.error);
-                        }
-                        
-                        // 保存助手回复
-                        std::map<std::string, std::string> assistant_metadata;
-                        assistant_metadata["role"] = "assistant";
-                        assistant_metadata["session_id"] = ctx_.session_id;
-                        assistant_metadata["agent_id"] = ctx_.agent_id;
-                        assistant_metadata["timestamp"] = std::to_string(
-                            std::chrono::system_clock::now().time_since_epoch().count()
-                        );
-                        
-                        auto assistant_result = ctx_.memory->add_memory(
-                            result.final_response, 
-                            assistant_metadata
-                        );
-                        if (assistant_result.is_err()) {
-                            spdlog::get("default")->warn("[AgentInstance] Failed to save assistant message: {}", 
-                                         assistant_result.error);
-                        } else {
-                            spdlog::get("default")->debug("[AgentInstance] Conversation saved to memory");
-                        }
-                    } catch (const std::exception& e) {
-                        spdlog::get("default")->warn("[AgentInstance] Exception saving to memory: {}", e.what());
-                    }
+                    // Trigger async sync to index any new session files
+                    memory::SyncParams sync_params;
+                    sync_params.reason = "session-end";
+                    ctx_.memory->sync(sync_params);
                 }
                 
                 spdlog::get("default")->info("[AgentInstance] Message processed: steps={}, tool_calls={}, duration={}ms",

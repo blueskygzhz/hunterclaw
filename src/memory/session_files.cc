@@ -4,6 +4,8 @@
 #include <sstream>
 #include <algorithm>
 #include <regex>
+#include <iomanip>
+#include <openssl/sha.h>
 
 // 严格对齐 OpenClaw src/memory/session-files.ts
 
@@ -15,12 +17,15 @@ namespace memory {
 
 namespace {
 
-// Hash text (simple implementation)
+// Hash text using SHA-256 (对齐 openclaw internal.ts:hashText)
 std::string hash_text(const std::string& text) {
-    // Simple hash for now (TODO: use proper hash function)
-    std::hash<std::string> hasher;
+    // Use SHA-256 via OpenSSL
+    unsigned char digest[32];
+    SHA256(reinterpret_cast<const unsigned char*>(text.data()), text.size(), digest);
     std::ostringstream oss;
-    oss << std::hex << hasher(text);
+    for (int i = 0; i < 32; ++i) {
+        oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(digest[i]);
+    }
     return oss.str();
 }
 
@@ -122,31 +127,39 @@ std::string extract_session_text(const json& content) {
 core::Result<std::vector<std::string>> list_session_files_for_agent(
     const std::string& agent_id
 ) {
-    // Resolve session transcripts directory
-    // TODO: Implement resolveSessionTranscriptsDirForAgent
-    std::string dir = ".openclaw/sessions/" + agent_id;
-    
+    // 对齐 openclaw: resolveSessionTranscriptsDirForAgent(agentId)
+    // openclaw 路径: ~/.openclaw/sessions/{agentId}/transcripts
+    // HunterClaw 路径: ~/.hunterclaw/sessions/{agentId}
+    std::string dir;
+    const char* home = std::getenv("HOME");
+    if (home) {
+        dir = std::string(home) + "/.hunterclaw/sessions/" + agent_id;
+    } else {
+        dir = ".hunterclaw/sessions/" + agent_id;
+    }
+
     std::vector<std::string> result;
-    
+
     try {
         if (!fs::exists(dir) || !fs::is_directory(dir)) {
             return core::Result<std::vector<std::string>>::Ok(result);
         }
-        
+
         for (const auto& entry : fs::directory_iterator(dir)) {
             if (!entry.is_regular_file()) {
                 continue;
             }
-            
+
             std::string filename = entry.path().filename().string();
             if (filename.size() > 6 && filename.substr(filename.size() - 6) == ".jsonl") {
                 result.push_back(entry.path().string());
             }
         }
-        
+
         return core::Result<std::vector<std::string>>::Ok(result);
-        
+
     } catch (const std::exception& e) {
+        // 对齐 openclaw: catch {} return []
         return core::Result<std::vector<std::string>>::Ok(result);
     }
 }
@@ -290,6 +303,8 @@ core::Result<SessionFileEntry> build_session_entry(const std::string& abs_path) 
         return core::Result<SessionFileEntry>::Ok(entry);
         
     } catch (const std::exception& e) {
+        // 对齐 openclaw: log.debug + return null
+        // 返回 Err 而非 null，调用方按 openclaw 语义处理（跳过该文件）
         return core::Result<SessionFileEntry>::Err(
             std::string("Failed reading session file: ") + e.what()
         );

@@ -14,35 +14,35 @@
 #include <future>
 
 // 严格对齐 OpenClaw src/memory/manager-embedding-ops.ts
-// 提供完整的批量 embedding、缓存和索引管理能力
+// MemoryManagerEmbeddingOps extends MemoryManagerSyncOps (对齐 openclaw 继承链)
 
 namespace hunterclaw {
 namespace memory {
 
 // 前向声明
-struct MemoryChunk;
-struct MemoryFileEntry;
 struct SessionFileEntry;
 class EmbeddingProvider;
 
 // ============================================================================
-// Embedding Cache Entry
+// Constants (对齐 manager-embedding-ops.ts:30-42)
 // ============================================================================
-
-struct EmbeddingCacheEntry {
-    std::string hash;
-    std::vector<float> embedding;
-};
+constexpr int EMBEDDING_BATCH_MAX_TOKENS = 8000;
+constexpr int EMBEDDING_INDEX_CONCURRENCY = 4;
+constexpr int EMBEDDING_RETRY_MAX_ATTEMPTS = 3;
+constexpr int EMBEDDING_RETRY_BASE_DELAY_MS = 500;
+constexpr int EMBEDDING_RETRY_MAX_DELAY_MS = 8000;
+constexpr int BATCH_FAILURE_LIMIT = 2;
+constexpr int EMBEDDING_QUERY_TIMEOUT_REMOTE_MS = 60000;
+constexpr int EMBEDDING_QUERY_TIMEOUT_LOCAL_MS = 300000;   // 5 min
+constexpr int EMBEDDING_BATCH_TIMEOUT_REMOTE_MS = 120000;  // 2 min
+constexpr int EMBEDDING_BATCH_TIMEOUT_LOCAL_MS = 600000;   // 10 min
 
 // ============================================================================
 // Batch Request Types (对齐 batch-*.ts)
 // ============================================================================
 
-struct BatchRequestBase {
+struct OpenAiBatchRequest {
     std::string custom_id;
-};
-
-struct OpenAiBatchRequest : BatchRequestBase {
     std::string method;  // "POST"
     std::string url;     // "/v1/embeddings"
     struct Body {
@@ -51,13 +51,12 @@ struct OpenAiBatchRequest : BatchRequestBase {
     } body;
 };
 
-struct GeminiBatchRequest : BatchRequestBase {
+struct GeminiBatchRequest {
+    std::string custom_id;
     struct Request {
         std::string model_path;
         struct Content {
-            struct Part {
-                std::string text;
-            };
+            struct Part { std::string text; };
             std::vector<Part> parts;
         } content;
         std::string task_type;  // "RETRIEVAL_DOCUMENT"
@@ -65,44 +64,33 @@ struct GeminiBatchRequest : BatchRequestBase {
     } request;
 };
 
-struct VoyageBatchRequest : BatchRequestBase {
-    struct Body {
-        std::string input;
-    } body;
+struct VoyageBatchRequest {
+    std::string custom_id;
+    struct Body { std::string input; } body;
 };
 
 // ============================================================================
-// Manager Embedding Operations
-// (TODO: 原本应继承自 ManagerSyncOps，但该类还未实现，暂时移除继承)
+// MemoryManagerEmbeddingOps
+// 严格对齐 openclaw manager-embedding-ops.ts:
+//   export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps
 // ============================================================================
-
-class ManagerEmbeddingOps {
+class MemoryManagerEmbeddingOps : public MemoryManagerSyncOps {
 protected:
-    // Core members
-    SQLiteVectorStorage* storage_ = nullptr;
-    MemoryConfig config_;
-    EmbeddingProvider* provider_ = nullptr;
-    
     // Batch failure tracking (对齐 manager-embedding-ops.ts:50-53)
     int batch_failure_count_ = 0;
-    std::string batch_failure_last_error_;
-    std::string batch_failure_last_provider_;
+    std::optional<std::string> batch_failure_last_error_;
+    std::optional<std::string> batch_failure_last_provider_;
     std::mutex batch_failure_mutex_;
-    std::shared_future<void> batch_failure_lock_;
 
 public:
-    explicit ManagerEmbeddingOps(
-        SQLiteVectorStorage* storage,
-        const MemoryConfig& config
-    );
-    virtual ~ManagerEmbeddingOps() = default;
+    virtual ~MemoryManagerEmbeddingOps() = default;
 
     // ========================================================================
     // Embedding Batching (对齐 manager-embedding-ops.ts:55-83)
     // ========================================================================
 
     // 将chunks分批，每批不超过EMBEDDING_BATCH_MAX_TOKENS
-    std::vector<std::vector<MemoryChunk>> 
+    std::vector<std::vector<MemoryChunk>>
     build_embedding_batches(const std::vector<MemoryChunk>& chunks);
 
     // ========================================================================
@@ -115,11 +103,12 @@ public:
 
     // 更新缓存 (对齐:127-155)
     void upsert_embedding_cache(
-        const std::vector<EmbeddingCacheEntry>& entries
+        const std::string& hash,
+        const std::vector<float>& embedding
     );
 
     // 清理缓存 (对齐:157-183)
-    void prune_embedding_cache_if_needed();
+    void prune_embedding_cache_if_needed() override;
 
     // ========================================================================
     // Core Embedding Logic (对齐 manager-embedding-ops.ts:185-286)
@@ -128,18 +117,6 @@ public:
     // 批量embedding (优先使用缓存) (对齐:185-226)
     core::Result<std::vector<std::vector<float>>>
     embed_chunks_in_batches(const std::vector<MemoryChunk>& chunks);
-
-    // 收集缓存的embeddings (对齐:288-307)
-    struct CachedEmbeddingsResult {
-        std::vector<std::vector<float>> embeddings;
-        struct MissingEntry {
-            int index;
-            MemoryChunk chunk;
-        };
-        std::vector<MissingEntry> missing;
-    };
-    CachedEmbeddingsResult 
-    collect_cached_embeddings(const std::vector<MemoryChunk>& chunks);
 
     // ========================================================================
     // Provider Batch API (对齐 manager-embedding-ops.ts:442-522)
@@ -185,17 +162,9 @@ public:
     core::Result<std::vector<std::vector<float>>>
     embed_batch_with_retry(const std::vector<std::string>& texts);
 
-    // Query timeout (对齐:615-626)
+    // Query embedding with timeout (对齐:615-626)
     core::Result<std::vector<float>>
     embed_query_with_timeout(const std::string& text);
-
-    // Timeout wrapper (对齐:628-647)
-    template<typename T>
-    core::Result<T> with_timeout(
-        std::function<core::Result<T>()> func,
-        int timeout_ms,
-        const std::string& message
-    );
 
     // ========================================================================
     // Batch Failure Management (对齐 manager-embedding-ops.ts:649-754)
@@ -216,14 +185,6 @@ public:
         bool force_disable = false
     );
 
-    // Batch fallback (对齐:723-754)
-    template<typename T>
-    core::Result<T> run_batch_with_fallback(
-        const std::string& provider,
-        std::function<core::Result<T>()> run_func,
-        std::function<core::Result<std::vector<std::vector<float>>>()> fallback_func
-    );
-
     // ========================================================================
     // File Indexing (对齐 manager-embedding-ops.ts:803-924)
     // ========================================================================
@@ -233,7 +194,13 @@ public:
         const MemoryFileEntry& entry,
         MemorySource source,
         const std::optional<std::string>& content = std::nullopt
-    );
+    ) override;
+
+    // 索引session文件 (对齐 manager-sync-ops.ts)
+    core::Result<void> index_session_file(
+        const SessionFileEntry& entry,
+        MemorySource source
+    ) override;
 
     // 清理索引数据 (对齐:760-778)
     void clear_indexed_file_data(
@@ -258,14 +225,14 @@ public:
     // ========================================================================
 
     // 计算 provider key (用于缓存隔离) (对齐:228-266)
-    std::string compute_provider_key() const;
+    std::string compute_provider_key() override;
 
     // ========================================================================
     // Utilities
     // ========================================================================
 
     // 获取索引并发度 (对齐:756-758)
-    int get_index_concurrency() const;
+    int get_index_concurrency() override;
 
     // 判断是否为重试错误 (对齐:601-605)
     bool is_retryable_embedding_error(const std::string& message) const;
@@ -273,14 +240,11 @@ public:
     // 判断是否为超时错误 (对齐:698-700)
     bool is_batch_timeout_error(const std::string& message) const;
 
-    // 判断structured input过大错误 (对齐:797-801)
-    bool is_structured_input_too_large_error(const std::string& message) const;
-
     // 解析embedding timeout (对齐:607-613)
     int resolve_embedding_timeout(const std::string& kind) const;  // "query" or "batch"
-    
+
     // 确保向量表准备就绪
-    core::Result<bool> ensure_vector_ready(size_t dimensions);
+    core::Result<bool> ensure_vector_ready(std::optional<int> dimensions = std::nullopt);
 
 protected:
     // ========================================================================
@@ -289,10 +253,6 @@ protected:
 
     // 等待重试 (对齐:592-599)
     void wait_for_embedding_retry(int delay_ms, const std::string& action);
-
-    // Batch failure lock (对齐:649-661)
-    template<typename T>
-    T with_batch_failure_lock(std::function<T()> func);
 
     // Build batch custom ID (对齐:309-318)
     std::string build_batch_custom_id(
@@ -308,20 +268,10 @@ protected:
         const std::map<std::string, std::pair<int, std::string>>& mapping,
         std::vector<std::vector<float>>& embeddings
     );
-
-private:
-    // Constants (对齐 manager-embedding-ops.ts:30-42)
-    static constexpr int EMBEDDING_BATCH_MAX_TOKENS = 8000;
-    static constexpr int EMBEDDING_INDEX_CONCURRENCY = 4;
-    static constexpr int EMBEDDING_RETRY_MAX_ATTEMPTS = 3;
-    static constexpr int EMBEDDING_RETRY_BASE_DELAY_MS = 500;
-    static constexpr int EMBEDDING_RETRY_MAX_DELAY_MS = 8000;
-    static constexpr int BATCH_FAILURE_LIMIT = 2;
-    static constexpr int EMBEDDING_QUERY_TIMEOUT_REMOTE_MS = 60000;
-    static constexpr int EMBEDDING_QUERY_TIMEOUT_LOCAL_MS = 300000;  // 5 min
-    static constexpr int EMBEDDING_BATCH_TIMEOUT_REMOTE_MS = 120000;  // 2 min
-    static constexpr int EMBEDDING_BATCH_TIMEOUT_LOCAL_MS = 600000;  // 10 min
 };
+
+// Backward compatibility alias
+using ManagerEmbeddingOps = MemoryManagerEmbeddingOps;
 
 }  // namespace memory
 }  // namespace hunterclaw

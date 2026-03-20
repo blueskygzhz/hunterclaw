@@ -374,18 +374,26 @@ core::Result<bool> MemoryManagerWithAutoReindex::run_safe_reindex() {
             }
         }
         
-        // 7. 同步会话文件 (对齐:1201-1210)
-        // 简化：暂时跳过会话文件同步
-        // TODO: 实现 should_sync_sessions() 和 sync_session_files()
+        // 7. 同步会话文件 (对齐 manager-sync-ops.ts:1201-1210)
+        // 对齐 openclaw: shouldSyncSessions && syncSessionFiles()
+        // 当 sources 包含 sessions 时，同步 session 文件
+        if (sync_callback_) {
+            SyncParams session_params;
+            session_params.reason = "reindex-sessions";
+            session_params.force = true;
+            // session_files 为空表示同步所有 session 文件
+            sync_callback_(session_params);
+        }
         
         // 8. 写入新的元数据 (对齐:1212-1228)
         MemoryIndexMeta next_meta{
             .model = current_provider_.model.empty() ? "fts-only" : current_provider_.model,
             .provider = current_provider_.provider.empty() ? "none" : current_provider_.provider,
-            .provider_key = std::nullopt,  // TODO: compute_provider_key()
+        .provider_key = current_provider_.provider.empty() ? std::nullopt
+                          : std::make_optional(current_provider_.provider + ":" + current_provider_.model),
             .sources = std::nullopt,
             .scope_hash = std::nullopt,
-            .chunk_tokens = 512,  // TODO: from settings
+            .chunk_tokens = 512,
             .chunk_overlap = 128,
             .vector_dims = current_provider_.output_dimensions > 0 
                           ? std::optional<int>(current_provider_.output_dimensions) 
@@ -491,8 +499,13 @@ core::Result<bool> MemoryManagerWithAutoReindex::run_unsafe_reindex() {
         }
     }
     
-    // 同步会话文件（暂时跳过）
-    // TODO: 实现 should_sync_sessions() 和 sync_session_files()
+    // 同步会话文件（对齐 openclaw: shouldSyncSessions && syncSessionFiles()）
+    if (sync_callback_) {
+        SyncParams session_params;
+        session_params.reason = "sync-sessions";
+        session_params.force = false;
+        sync_callback_(session_params);
+    }
     
     // 3. 写入元数据 (对齐:1285-1298)
     MemoryIndexMeta next_meta{
@@ -512,8 +525,15 @@ core::Result<bool> MemoryManagerWithAutoReindex::run_unsafe_reindex() {
     if (!write_result.is_ok()) {
         return core::Result<bool>::Err("Failed to write metadata: " + write_result.error);
     }
-    
-    // prune_embedding_cache_if_needed();  // TODO
+
+    // 清理过期缓存 (对齐 pruneEmbeddingCacheIfNeeded)
+    if (storage_) {
+        auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        // 保留最近 30 天的缓存
+        int64_t cutoff = now_ms - 30LL * 24 * 60 * 60 * 1000;
+        storage_->cleanup_old_cache(cutoff);
+    }
     
     return core::Result<bool>::Ok(true);
 }
@@ -686,9 +706,19 @@ core::Result<bool> MemoryManagerWithAutoReindex::write_meta(
             meta_json["scope_hash"] = meta.scope_hash.value();
         }
         
-        // 写入元数据表
-        // 使用 SQLite 的 metadata 表或者自定义实现
-        // TODO: 调用 storage->write_metadata(meta_json.dump())
+        // 写入元数据表 (对齐 openclaw: db.run("INSERT OR REPLACE INTO meta ..."))
+        if (storage_) {
+            std::string meta_str = meta_json.dump();
+            // Escape single quotes for SQL
+            std::string escaped;
+            for (char c : meta_str) {
+                if (c == '\'') escaped += "''";
+                else escaped += c;
+            }
+            storage_->exec_sql(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('index_meta', '" + escaped + "')"
+            );
+        }
         
         return core::Result<bool>::Ok(true);
         

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "hunterclaw/memory/provider.h"  // 🎯 使用统一的 provider 定义
+#include "hunterclaw/memory/types.h"  // MemorySearchManager (openclaw types.ts)
 #include "hunterclaw/plugins/plugin.h"
 #include "hunterclaw/core/result.h"
 
@@ -90,7 +90,7 @@ public:
      * 
      * @return MemoryProvider 实例 (非空)
      */
-    virtual std::shared_ptr<MemoryProvider> get_provider() = 0;
+    virtual std::shared_ptr<MemorySearchManager> get_manager() = 0;
     
     /**
      * Plugin 类型 (固定为 "memory")

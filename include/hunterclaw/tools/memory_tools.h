@@ -1,7 +1,7 @@
 #pragma once
 
 #include "hunterclaw/tools/tool.h"
-#include "hunterclaw/memory/provider.h"
+#include "hunterclaw/memory/types.h"
 #include "hunterclaw/core/result.h"
 #include <memory>
 #include <nlohmann/json.hpp>
@@ -14,7 +14,7 @@ using json = nlohmann::json;
 // 🎯 100% 对齐 OpenClaw: memory_search Tool
 class MemorySearchTool : public Tool {
 public:
-    explicit MemorySearchTool(std::shared_ptr<memory::MemoryProvider> provider);
+    explicit MemorySearchTool(std::shared_ptr<memory::MemorySearchManager> manager);
     
     std::string name() const override { return "memory_search"; }
     
@@ -52,13 +52,13 @@ public:
     core::Result<json> execute(const json& params) override;
 
 private:
-    std::shared_ptr<memory::MemoryProvider> provider_;
+    std::shared_ptr<memory::MemorySearchManager> manager_;
 };
 
 // 🎯 100% 对齐 OpenClaw: memory_get Tool
 class MemoryGetTool : public Tool {
 public:
-    explicit MemoryGetTool(std::shared_ptr<memory::MemoryProvider> provider);
+    explicit MemoryGetTool(std::shared_ptr<memory::MemorySearchManager> manager);
     
     std::string name() const override { return "memory_get"; }
     
@@ -93,24 +93,24 @@ public:
     core::Result<json> execute(const json& params) override;
 
 private:
-    std::shared_ptr<memory::MemoryProvider> provider_;
+    std::shared_ptr<memory::MemorySearchManager> manager_;
 };
 
 // 🎯 对齐 OpenClaw: Memory Tool Factory
 class MemoryToolFactory {
 public:
-    // 创建 memory_search 和 memory_get 工具
+    // 创建 memory_search 和 memory_get 工具 (对齐 openclaw memory-tool.ts)
     static std::vector<std::shared_ptr<Tool>> create_memory_tools(
-        std::shared_ptr<memory::MemoryProvider> provider
+        std::shared_ptr<memory::MemorySearchManager> manager
     );
     
     // 单独创建
     static std::shared_ptr<Tool> create_memory_search(
-        std::shared_ptr<memory::MemoryProvider> provider
+        std::shared_ptr<memory::MemorySearchManager> manager
     );
     
     static std::shared_ptr<Tool> create_memory_get(
-        std::shared_ptr<memory::MemoryProvider> provider
+        std::shared_ptr<memory::MemorySearchManager> manager
     );
 };
 

@@ -2,7 +2,7 @@
 -- OpenClaw: src/memory/memory-schema.ts
 
 -- ========================================
--- Meta Table
+-- Meta Table (对齐 OpenClaw)
 -- ========================================
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS files (
 );
 
 -- ========================================
--- Chunks Table (对齐 OpenClaw)
+-- Chunks Table (对齐 OpenClaw: 主表名为 chunks)
+-- embedding 存储为 TEXT (JSON array)，对齐 openclaw
 -- ========================================
 CREATE TABLE IF NOT EXISTS chunks (
     id TEXT PRIMARY KEY,
@@ -32,7 +33,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     hash TEXT NOT NULL,
     model TEXT NOT NULL,
     text TEXT NOT NULL,
-    embedding TEXT NOT NULL,  -- JSON array or BLOB
+    embedding TEXT NOT NULL,  -- JSON array (对齐 openclaw)
     updated_at INTEGER NOT NULL
 );
 
@@ -47,7 +48,7 @@ CREATE TABLE IF NOT EXISTS embedding_cache (
     model TEXT NOT NULL,
     provider_key TEXT NOT NULL,
     hash TEXT NOT NULL,
-    embedding TEXT NOT NULL,
+    embedding TEXT NOT NULL,  -- JSON array
     dims INTEGER,
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (provider, model, provider_key, hash)
@@ -69,16 +70,16 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
 );
 
 -- ========================================
--- Migration: 添加缺失字段 (兼容旧版本)
+-- sqlite-vec Virtual Table (可选，需要 sqlite-vec 扩展)
+-- 用于 ANN 向量搜索，镜像 chunks 表的 id 和 embedding
 -- ========================================
+-- CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
+--     id TEXT PRIMARY KEY,
+--     embedding FLOAT[1536]
+-- );
 
--- 检查并添加 source 字段
--- SQLite 不支持 IF NOT EXISTS for columns, 需要捕获错误
--- 实际实现应该用 PRAGMA table_info() 检查
-
--- ALTER TABLE files ADD COLUMN source TEXT NOT NULL DEFAULT 'memory';
--- ALTER TABLE chunks ADD COLUMN source TEXT NOT NULL DEFAULT 'memory';
--- ALTER TABLE chunks ADD COLUMN start_line INTEGER NOT NULL DEFAULT 1;
--- ALTER TABLE chunks ADD COLUMN end_line INTEGER NOT NULL DEFAULT 1;
--- ALTER TABLE chunks ADD COLUMN hash TEXT NOT NULL DEFAULT '';
--- ALTER TABLE chunks ADD COLUMN model TEXT NOT NULL DEFAULT 'unknown';
+-- ========================================
+-- Migration: ensureColumn (对齐 openclaw:ensureColumn)
+-- 通过 PRAGMA table_info() 检查列是否存在，再 ALTER TABLE
+-- 实际迁移逻辑在 sqlite_storage.cc:ensure_schema() 中实现
+-- ========================================

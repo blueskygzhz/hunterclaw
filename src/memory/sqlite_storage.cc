@@ -132,32 +132,133 @@ core::Result<bool> SQLiteVectorStorage::ensure_schema() {
     if (!db_) {
         return core::Result<bool>::Err("Database not open");
     }
-    
+
     std::string error;
-    
-    // Create chunks_vec table using SCHEMA_CHUNKS_VEC
-    if (!::hunterclaw::memory::exec_sql(db_, SCHEMA_CHUNKS_VEC, &error)) {
-        return core::Result<bool>::Err("Failed to create chunks_vec: " + error);
+
+    // 对齐 openclaw memory-schema.ts:ensureMemoryIndexSchema
+
+    // meta table
+    if (!::hunterclaw::memory::exec_sql(db_, R"(
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+    )", &error)) {
+        return core::Result<bool>::Err("Failed to create meta: " + error);
     }
-    
-    // Create FTS table using SCHEMA_CHUNKS_FTS if FTS available
-    if (fts_available_) {
-        if (!::hunterclaw::memory::exec_sql(db_, SCHEMA_CHUNKS_FTS, &error)) {
-            // Don't fail if FTS creation fails, just mark as unavailable
-            fts_available_ = false;
-            fts_error_ = error;
-        }
+
+    // files table (对齐 openclaw)
+    if (!::hunterclaw::memory::exec_sql(db_, R"(
+        CREATE TABLE IF NOT EXISTS files (
+            path TEXT PRIMARY KEY,
+            source TEXT NOT NULL DEFAULT 'memory',
+            hash TEXT NOT NULL,
+            mtime INTEGER NOT NULL,
+            size INTEGER NOT NULL
+        );
+    )", &error)) {
+        return core::Result<bool>::Err("Failed to create files: " + error);
     }
-    
-    // Create embedding_cache table
-    if (!::hunterclaw::memory::exec_sql(db_, SCHEMA_EMBEDDING_CACHE, &error)) {
+
+    // chunks table (对齐 openclaw: 主表名为 chunks，不是 chunks_vec)
+    if (!::hunterclaw::memory::exec_sql(db_, R"(
+        CREATE TABLE IF NOT EXISTS chunks (
+            id TEXT PRIMARY KEY,
+            path TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'memory',
+            start_line INTEGER NOT NULL,
+            end_line INTEGER NOT NULL,
+            hash TEXT NOT NULL,
+            model TEXT NOT NULL,
+            text TEXT NOT NULL,
+            embedding TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+    )", &error)) {
+        return core::Result<bool>::Err("Failed to create chunks: " + error);
+    }
+
+    // embedding_cache table (对齐 openclaw schema)
+    if (!::hunterclaw::memory::exec_sql(db_, R"(
+        CREATE TABLE IF NOT EXISTS embedding_cache (
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            provider_key TEXT NOT NULL,
+            hash TEXT NOT NULL,
+            embedding TEXT NOT NULL,
+            dims INTEGER,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (provider, model, provider_key, hash)
+        );
+    )", &error)) {
         return core::Result<bool>::Err("Failed to create embedding_cache: " + error);
     }
-    
-    // Create indices
-    ::hunterclaw::memory::exec_sql(db_, "CREATE INDEX IF NOT EXISTS idx_chunks_vec_path ON chunks_vec(path)");
-    ::hunterclaw::memory::exec_sql(db_, "CREATE INDEX IF NOT EXISTS idx_chunks_vec_source ON chunks_vec(source)");
-    
+
+    ::hunterclaw::memory::exec_sql(db_,
+        "CREATE INDEX IF NOT EXISTS idx_embedding_cache_updated_at ON embedding_cache(updated_at);");
+
+    // FTS5 table (对齐 openclaw: chunks_fts)
+    if (config_.enable_fts) {
+        std::string fts_error;
+        bool fts_ok = ::hunterclaw::memory::exec_sql(db_, R"(
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+                text,
+                id UNINDEXED,
+                path UNINDEXED,
+                source UNINDEXED,
+                model UNINDEXED,
+                start_line UNINDEXED,
+                end_line UNINDEXED
+            );
+        )", &fts_error);
+        if (fts_ok) {
+            fts_available_ = true;
+        } else {
+            fts_available_ = false;
+            fts_error_ = fts_error;
+        }
+    }
+
+    // ensureColumn migrations (对齐 openclaw:ensureColumn)
+    auto ensure_column = [&](const char* table, const char* column, const char* definition) {
+        // Check if column exists via PRAGMA table_info
+        std::string pragma = std::string("PRAGMA table_info(") + table + ")";
+        sqlite3_stmt* stmt = prepare_stmt(db_, pragma);
+        if (!stmt) return;
+        bool found = false;
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            const char* col_name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+            if (col_name && std::string(col_name) == column) {
+                found = true;
+                break;
+            }
+        }
+        sqlite3_finalize(stmt);
+        if (!found) {
+            std::string alter = std::string("ALTER TABLE ") + table + " ADD COLUMN " + column + " " + definition;
+            ::hunterclaw::memory::exec_sql(db_, alter);
+        }
+    };
+
+    ensure_column("files", "source", "TEXT NOT NULL DEFAULT 'memory'");
+    ensure_column("chunks", "source", "TEXT NOT NULL DEFAULT 'memory'");
+
+    // Indices
+    ::hunterclaw::memory::exec_sql(db_, "CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);");
+    ::hunterclaw::memory::exec_sql(db_, "CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source);");
+
+    // sqlite-vec virtual table (chunks_vec) - only if vec extension loaded
+    if (vec_available_) {
+        // chunks_vec is a separate virtual table for vector search
+        // It mirrors chunk IDs and embeddings for fast ANN search
+        ::hunterclaw::memory::exec_sql(db_, R"(
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
+                id TEXT PRIMARY KEY,
+                embedding FLOAT[1536]
+            );
+        )");
+    }
+
     return core::Result<bool>::Ok(true);
 }
 
@@ -502,13 +603,51 @@ core::Result<std::vector<MemorySearchResult>> SQLiteVectorStorage::vector_search
         return core::Result<std::vector<MemorySearchResult>>::Err("Database not open");
     }
     
-    if (!vec_available_) {
-        return core::Result<std::vector<MemorySearchResult>>::Err("Vector search not available");
+    // 对齐 openclaw: 向量搜索通过 manager_search.cc 的 search_vector_impl 实现
+    // 这里提供一个简单的 fallback: 内存余弦相似度
+    const char* sql = "SELECT id, path, start_line, end_line, text, embedding, source FROM chunks WHERE model != ''";
+    sqlite3_stmt* stmt = prepare_stmt(db_, sql);
+    if (!stmt) return core::Result<std::vector<MemorySearchResult>>::Ok({});
+
+    auto cosine_sim = [](const std::vector<float>& a, const std::vector<float>& b) -> double {
+        if (a.size() != b.size() || a.empty()) return 0.0;
+        double dot = 0.0, na = 0.0, nb = 0.0;
+        for (size_t i = 0; i < a.size(); ++i) {
+            dot += a[i]*b[i]; na += a[i]*a[i]; nb += b[i]*b[i];
+        }
+        return (na == 0.0 || nb == 0.0) ? 0.0 : dot / (std::sqrt(na) * std::sqrt(nb));
+    };
+
+    struct Cand { MemorySearchResult r; double s; };
+    std::vector<Cand> cands;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char* emb_text = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5));
+        if (!emb_text) continue;
+        std::string emb_str(emb_text);
+        std::vector<float> emb;
+        if (!emb_str.empty() && emb_str[0] == '[') {
+            std::string s = emb_str.substr(1, emb_str.size()-2);
+            std::istringstream iss(s); std::string tok;
+            while (std::getline(iss, tok, ',')) { try { emb.push_back(std::stof(tok)); } catch (...) {} }
+        }
+        double score = cosine_sim(query_embedding, emb);
+        if (score < min_score || !std::isfinite(score)) continue;
+        MemorySearchResult res;
+        res.path       = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        res.start_line = sqlite3_column_int(stmt, 2);
+        res.end_line   = sqlite3_column_int(stmt, 3);
+        res.snippet    = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
+        std::string src = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
+        res.source     = (src == "sessions") ? MemorySource::Sessions : MemorySource::Memory;
+        res.score      = score;
+        cands.push_back({std::move(res), score});
     }
-    
-    // TODO: Implement vector search using sqlite-vec
-    // For now, return empty results
-    return core::Result<std::vector<MemorySearchResult>>::Ok(std::vector<MemorySearchResult>());
+    sqlite3_finalize(stmt);
+    std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b){ return a.s > b.s; });
+    std::vector<MemorySearchResult> results;
+    for (size_t i = 0; i < cands.size() && static_cast<int>(i) < limit; ++i)
+        results.push_back(std::move(cands[i].r));
+    return core::Result<std::vector<MemorySearchResult>>::Ok(std::move(results));
 }
 
 core::Result<std::vector<MemorySearchResult>> SQLiteVectorStorage::vector_search_filtered(
@@ -517,8 +656,19 @@ core::Result<std::vector<MemorySearchResult>> SQLiteVectorStorage::vector_search
     double min_score,
     const std::string& source_filter) {
     
-    // TODO: Implement filtered vector search
-    return vector_search(query_embedding, limit, min_score);
+    // 对齐 openclaw: 带 source 过滤的向量搜索
+    // 利用 vector_search 的结果再过滤
+    auto res = vector_search(query_embedding, limit * 2, min_score);
+    if (res.is_err()) return res;
+    std::vector<MemorySearchResult> filtered;
+    for (auto& r : res.get()) {
+        std::string src = (r.source == MemorySource::Sessions) ? "sessions" : "memory";
+        if (source_filter.empty() || src == source_filter) {
+            filtered.push_back(std::move(r));
+            if (static_cast<int>(filtered.size()) >= limit) break;
+        }
+    }
+    return core::Result<std::vector<MemorySearchResult>>::Ok(std::move(filtered));
 }
 
 // ============================================================================
@@ -625,7 +775,9 @@ core::Result<std::optional<std::vector<float>>> SQLiteVectorStorage::get_cached_
         return core::Result<std::optional<std::vector<float>>>::Err("Database not open");
     }
     
-    const char* sql = "SELECT embedding FROM embedding_cache WHERE content_hash = ? AND model = ?";
+    // 对齐 openclaw embedding_cache 表结构: (provider, model, provider_key, hash, embedding, dims, updated_at)
+    // provider_key = provider + ":" + model
+    const char* sql = "SELECT embedding FROM embedding_cache WHERE hash = ? AND model = ?";
     
     std::string error;
     sqlite3_stmt* stmt = prepare_stmt(db_, sql, &error);
@@ -639,10 +791,32 @@ core::Result<std::optional<std::vector<float>>> SQLiteVectorStorage::get_cached_
     std::optional<std::vector<float>> result;
     
     if (sqlite3_step(stmt) == SQLITE_ROW) {
-        int blob_size = sqlite3_column_bytes(stmt, 0);
-        const char* blob_data = static_cast<const char*>(sqlite3_column_blob(stmt, 0));
-        std::string blob(blob_data, blob_size);
-        result = deserialize_embedding(blob);
+        // 对齐 openclaw: embedding 存储为 JSON array 字符串
+        const char* emb_text = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        if (emb_text) {
+            // Try JSON parse first, then blob fallback
+            std::string emb_str(emb_text);
+            if (!emb_str.empty() && emb_str[0] == '[') {
+                // JSON array format
+                std::vector<float> embedding;
+                // Simple JSON float array parser
+                std::string s = emb_str.substr(1, emb_str.size() - 2);
+                std::istringstream iss(s);
+                std::string token;
+                while (std::getline(iss, token, ',')) {
+                    try { embedding.push_back(std::stof(token)); } catch (...) {}
+                }
+                if (!embedding.empty()) result = embedding;
+            } else {
+                // Blob format
+                int blob_size = sqlite3_column_bytes(stmt, 0);
+                const char* blob_data = static_cast<const char*>(sqlite3_column_blob(stmt, 0));
+                if (blob_data && blob_size > 0) {
+                    std::string blob(blob_data, blob_size);
+                    result = deserialize_embedding(blob);
+                }
+            }
+        }
     }
     
     sqlite3_finalize(stmt);
@@ -653,15 +827,39 @@ core::Result<std::optional<std::vector<float>>> SQLiteVectorStorage::get_cached_
 core::Result<bool> SQLiteVectorStorage::cache_embedding(
     const std::string& content_hash,
     const std::vector<float>& embedding,
-    const std::string& model) {
+    const std::string& provider_key) {
     
     if (!db_) {
         return core::Result<bool>::Err("Database not open");
     }
     
+    // 对齐 openclaw embedding_cache 表结构:
+    // (provider, model, provider_key, hash, embedding, dims, updated_at)
+    // provider_key 格式: "provider:model"
+    std::string provider, model;
+    auto colon = provider_key.find(':');
+    if (colon != std::string::npos) {
+        provider = provider_key.substr(0, colon);
+        model = provider_key.substr(colon + 1);
+    } else {
+        provider = provider_key;
+        model = provider_key;
+    }
+
+    // 对齐 openclaw: embedding 存储为 JSON array 字符串
+    std::ostringstream emb_json;
+    emb_json << "[";
+    for (size_t i = 0; i < embedding.size(); ++i) {
+        if (i > 0) emb_json << ",";
+        emb_json << embedding[i];
+    }
+    emb_json << "]";
+    std::string emb_str = emb_json.str();
+
     const char* sql = R"(
-        INSERT OR REPLACE INTO embedding_cache (content_hash, model, embedding, created_at)
-        VALUES (?, ?, ?, ?)
+        INSERT OR REPLACE INTO embedding_cache
+        (provider, model, provider_key, hash, embedding, dims, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
     )";
     
     std::string error;
@@ -670,15 +868,16 @@ core::Result<bool> SQLiteVectorStorage::cache_embedding(
         return core::Result<bool>::Err("Failed to prepare cache insert: " + error);
     }
     
-    sqlite3_bind_text(stmt, 1, content_hash.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, model.c_str(), -1, SQLITE_TRANSIENT);
-    
-    std::string blob = serialize_embedding(embedding);
-    sqlite3_bind_blob(stmt, 3, blob.data(), blob.size(), SQLITE_TRANSIENT);
-    
-    int64_t created_at = std::chrono::duration_cast<std::chrono::milliseconds>(
+    int64_t updated_at = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
-    sqlite3_bind_int64(stmt, 4, created_at);
+
+    sqlite3_bind_text(stmt, 1, provider.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, model.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, provider_key.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, content_hash.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 5, emb_str.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 6, static_cast<int>(embedding.size()));
+    sqlite3_bind_int64(stmt, 7, updated_at);
     
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
@@ -695,7 +894,8 @@ core::Result<int> SQLiteVectorStorage::cleanup_old_cache(int64_t older_than_time
         return core::Result<int>::Err("Database not open");
     }
     
-    const char* sql = "DELETE FROM embedding_cache WHERE created_at < ?";
+    // 对齐 openclaw: updated_at 字段
+    const char* sql = "DELETE FROM embedding_cache WHERE updated_at < ?";
     
     std::string error;
     sqlite3_stmt* stmt = prepare_stmt(db_, sql, &error);
@@ -727,8 +927,8 @@ core::Result<SQLiteVectorStorage::Stats> SQLiteVectorStorage::get_stats() {
     
     Stats stats{};
     
-    // Count total chunks
-    const char* count_sql = "SELECT COUNT(*) FROM chunks_vec";
+    // Count total chunks (对齐 openclaw: SELECT COUNT(*) as c FROM chunks)
+    const char* count_sql = "SELECT COUNT(*) FROM chunks";
     sqlite3_stmt* stmt = prepare_stmt(db_, count_sql);
     if (stmt && sqlite3_step(stmt) == SQLITE_ROW) {
         stats.total_chunks = sqlite3_column_int(stmt, 0);
@@ -736,22 +936,22 @@ core::Result<SQLiteVectorStorage::Stats> SQLiteVectorStorage::get_stats() {
     sqlite3_finalize(stmt);
     
     // Count by source
-    const char* memory_sql = "SELECT COUNT(*) FROM chunks_vec WHERE source = 'memory'";
+    const char* memory_sql = "SELECT COUNT(*) FROM chunks WHERE source = 'memory'";
     stmt = prepare_stmt(db_, memory_sql);
     if (stmt && sqlite3_step(stmt) == SQLITE_ROW) {
         stats.memory_chunks = sqlite3_column_int(stmt, 0);
     }
     sqlite3_finalize(stmt);
     
-    const char* sessions_sql = "SELECT COUNT(*) FROM chunks_vec WHERE source = 'sessions'";
+    const char* sessions_sql = "SELECT COUNT(*) FROM chunks WHERE source = 'sessions'";
     stmt = prepare_stmt(db_, sessions_sql);
     if (stmt && sqlite3_step(stmt) == SQLITE_ROW) {
         stats.sessions_chunks = sqlite3_column_int(stmt, 0);
     }
     sqlite3_finalize(stmt);
     
-    // Count unique files
-    const char* files_sql = "SELECT COUNT(DISTINCT path) FROM chunks_vec";
+    // Count unique files (对齐 openclaw: SELECT COUNT(*) as c FROM files)
+    const char* files_sql = "SELECT COUNT(*) FROM files";
     stmt = prepare_stmt(db_, files_sql);
     if (stmt && sqlite3_step(stmt) == SQLITE_ROW) {
         stats.total_files = sqlite3_column_int(stmt, 0);
@@ -781,7 +981,8 @@ core::Result<std::vector<MemoryProviderStatus::SourceCount>> SQLiteVectorStorage
         return core::Result<std::vector<MemoryProviderStatus::SourceCount>>::Err("Database not open");
     }
     
-    const char* sql = "SELECT source, COUNT(DISTINCT path), COUNT(*) FROM chunks_vec GROUP BY source";
+    // 对齐 openclaw: SELECT source, COUNT(*) as c FROM files GROUP BY source
+    const char* sql = "SELECT source, COUNT(DISTINCT path) as files, COUNT(*) as chunks FROM chunks GROUP BY source";
     
     std::string error;
     sqlite3_stmt* stmt = prepare_stmt(db_, sql, &error);

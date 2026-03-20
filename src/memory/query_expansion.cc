@@ -110,6 +110,45 @@ const std::unordered_set<std::string> STOP_WORDS_PT = {
     "que", "quando", "onde", "porquê"
 };
 
+// Korean trailing particles to strip (对齐 mmr.ts:KO_TRAILING_PARTICLES)
+// Sorted by descending length so longest-match-first is guaranteed.
+const std::vector<std::u32string> KO_TRAILING_PARTICLES = {
+    U"에서", U"으로", U"에게", U"한테", U"처럼", U"같이", U"보다",
+    U"까지", U"부터", U"마다", U"밖에", U"대로",
+    U"은", U"는", U"이", U"가", U"을", U"를", U"의", U"에",
+    U"로", U"와", U"과", U"도", U"만"
+};
+
+// Strip Korean trailing particle (对齐 query-expansion.ts:stripKoreanTrailingParticle)
+std::optional<std::u32string> strip_korean_trailing_particle(const std::u32string& token) {
+    for (const auto& particle : KO_TRAILING_PARTICLES) {
+        if (token.size() > particle.size() &&
+            token.size() - particle.size() > 0 &&
+            token.compare(token.size() - particle.size(), particle.size(), particle) == 0) {
+            return token.substr(0, token.size() - particle.size());
+        }
+    }
+    return std::nullopt;
+}
+
+// Check if Korean stem is useful (对齐 query-expansion.ts:isUsefulKoreanStem)
+bool is_useful_korean_stem(const std::u32string& stem) {
+    if (stem.empty()) return false;
+    // Check if contains Hangul syllables
+    bool has_hangul = false;
+    bool all_ascii  = true;
+    for (char32_t c : stem) {
+        if (c >= 0xAC00 && c <= 0xD7AF) { has_hangul = true; all_ascii = false; }
+        else if (c > 127) { all_ascii = false; }
+    }
+    if (has_hangul) {
+        // Prevent bogus one-syllable stems
+        return stem.size() >= 2;
+    }
+    // Keep stripped ASCII stems for mixed tokens like "API를" -> "api"
+    return all_ascii && stem.size() >= 1;
+}
+
 // Check if character is CJK
 bool is_cjk(char32_t c) {
     return (c >= 0x4E00 && c <= 0x9FFF);  // CJK Unified Ideographs
@@ -186,21 +225,21 @@ std::string to_lower(const std::string& s) {
     return result;
 }
 
-// Check if token is valid keyword
+// Check if token is valid keyword (对齐 query-expansion.ts:isValidKeyword)
 bool is_valid_keyword(const std::string& token) {
     if (token.empty()) return false;
-    
-    // Skip very short English words
-    bool is_ascii = true;
+
+    // Skip very short English words (likely stop words or fragments)
+    bool is_ascii_alpha = true;
     for (char c : token) {
         if (!std::isalpha(static_cast<unsigned char>(c))) {
-            is_ascii = false;
+            is_ascii_alpha = false;
             break;
         }
     }
-    if (is_ascii && token.length() < 3) return false;
-    
-    // Skip pure numbers
+    if (is_ascii_alpha && token.length() < 3) return false;
+
+    // Skip pure numbers (not useful for semantic search)
     bool is_number = true;
     for (char c : token) {
         if (!std::isdigit(static_cast<unsigned char>(c))) {
@@ -209,7 +248,17 @@ bool is_valid_keyword(const std::string& token) {
         }
     }
     if (is_number) return false;
-    
+
+    // Skip tokens that are all punctuation (对齐 /^[\p{P}\p{S}]+$/u)
+    bool all_punct = true;
+    for (char c : token) {
+        if (!std::ispunct(static_cast<unsigned char>(c))) {
+            all_punct = false;
+            break;
+        }
+    }
+    if (all_punct) return false;
+
     return true;
 }
 
@@ -225,59 +274,161 @@ bool is_query_stop_word_token(const std::string& token) {
            STOP_WORDS_PT.count(token) > 0;
 }
 
+// Check if a UTF-32 codepoint is whitespace or ASCII punctuation
+// (对齐 openclaw: split(/[\s\p{P}]+/u))
+static bool is_segment_separator(char32_t c) {
+    // ASCII whitespace
+    if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v') return true;
+    // ASCII punctuation
+    if (c >= 0x21 && c <= 0x7E) {
+        // Keep alphanumeric and underscore as non-separators
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '_') return false;
+        return true;  // All other ASCII printable chars are punctuation/separators
+    }
+    // Unicode general punctuation block (U+2000–U+206F)
+    if (c >= 0x2000 && c <= 0x206F) return true;
+    // CJK punctuation (U+3000–U+303F)
+    if (c >= 0x3000 && c <= 0x303F) return true;
+    // Fullwidth punctuation (U+FF00–U+FFEF)
+    if (c >= 0xFF00 && c <= 0xFFEF) return true;
+    return false;
+}
+
 std::vector<std::string> tokenize_query(const std::string& text) {
-    std::vector<std::string> tokens;
+    // 对齐 openclaw query-expansion.ts:tokenize
+    // 1. normalized = text.toLowerCase().trim()
+    // 2. segments = normalized.split(/[\s\p{P}]+/u).filter(Boolean)
+    // 3. For each segment: detect script and process accordingly
+
     std::string normalized = to_lower(text);
-    
-    // Convert to UTF-32 for proper Unicode handling
+    // trim
+    {
+        size_t s = normalized.find_first_not_of(" \t\n\r\f\v");
+        if (s == std::string::npos) return {};
+        size_t e = normalized.find_last_not_of(" \t\n\r\f\v");
+        normalized = normalized.substr(s, e - s + 1);
+    }
+
+    // Split into segments by whitespace/punctuation
     std::u32string utf32_text = utf8_to_utf32(normalized);
-    
-    std::u32string current_token;
-    for (size_t i = 0; i < utf32_text.size(); ++i) {
-        char32_t c = utf32_text[i];
-        
-        // Handle CJK characters (Chinese)
-        if (is_cjk(c)) {
-            // Flush current token
-            if (!current_token.empty()) {
-                tokens.push_back(utf32_to_utf8(current_token));
-                current_token.clear();
+    std::vector<std::u32string> segments;
+    std::u32string current_seg;
+    for (char32_t c : utf32_text) {
+        if (is_segment_separator(c)) {
+            if (!current_seg.empty()) {
+                segments.push_back(current_seg);
+                current_seg.clear();
             }
-            
-            // Add single character
-            std::u32string single_char(1, c);
-            tokens.push_back(utf32_to_utf8(single_char));
-            
-            // Add bigram if possible
-            if (i + 1 < utf32_text.size() && is_cjk(utf32_text[i + 1])) {
+        } else {
+            current_seg.push_back(c);
+        }
+    }
+    if (!current_seg.empty()) segments.push_back(current_seg);
+
+    std::vector<std::string> tokens;
+
+    for (const auto& seg : segments) {
+        if (seg.empty()) continue;
+
+        // Detect script of segment
+        bool has_japanese = false;
+        bool has_cjk = false;
+        bool has_hangul = false;
+        for (char32_t c : seg) {
+            if (is_japanese(c)) has_japanese = true;
+            if (is_cjk(c)) has_cjk = true;
+            if (is_hangul(c)) has_hangul = true;
+        }
+
+        if (has_japanese) {
+            // 对齐 openclaw: Japanese text - extract script-specific chunks
+            // match /[a-z0-9_]+|[\u30a0-\u30ffー]+|[\u4e00-\u9fff]+|[\u3040-\u309f]{2,}/g
+            std::u32string jp_current;
+            enum class JpMode { None, Ascii, Katakana, Kanji, Hiragana } mode = JpMode::None;
+
+            auto flush_jp = [&]() {
+                if (jp_current.empty()) return;
+                std::string part = utf32_to_utf8(jp_current);
+                // For CJK (kanji) parts: add unigrams + bigrams
+                bool all_kanji = true;
+                for (char32_t c : jp_current) {
+                    if (!is_cjk(c)) { all_kanji = false; break; }
+                }
+                if (all_kanji && jp_current.size() >= 1) {
+                    tokens.push_back(part);
+                    for (size_t i = 0; i + 1 < jp_current.size(); ++i) {
+                        std::u32string bigram;
+                        bigram.push_back(jp_current[i]);
+                        bigram.push_back(jp_current[i+1]);
+                        tokens.push_back(utf32_to_utf8(bigram));
+                    }
+                } else {
+                    tokens.push_back(part);
+                }
+                jp_current.clear();
+            };
+
+            for (char32_t c : seg) {
+                JpMode new_mode;
+                if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
+                    new_mode = JpMode::Ascii;
+                } else if ((c >= 0x30A0 && c <= 0x30FF) || c == 0x30FC) {
+                    new_mode = JpMode::Katakana;
+                } else if (is_cjk(c)) {
+                    new_mode = JpMode::Kanji;
+                } else if (c >= 0x3040 && c <= 0x309F) {
+                    new_mode = JpMode::Hiragana;
+                } else {
+                    flush_jp();
+                    mode = JpMode::None;
+                    continue;
+                }
+                // Hiragana: only keep sequences of 2+
+                if (new_mode != mode) {
+                    flush_jp();
+                    mode = new_mode;
+                }
+                jp_current.push_back(c);
+            }
+            flush_jp();
+
+        } else if (has_cjk) {
+            // 对齐 openclaw: Chinese - unigrams + bigrams
+            std::vector<char32_t> chars;
+            for (char32_t c : seg) {
+                if (is_cjk(c)) chars.push_back(c);
+            }
+            for (char32_t c : chars) {
+                std::u32string s(1, c);
+                tokens.push_back(utf32_to_utf8(s));
+            }
+            for (size_t i = 0; i + 1 < chars.size(); ++i) {
                 std::u32string bigram;
-                bigram.push_back(c);
-                bigram.push_back(utf32_text[i + 1]);
+                bigram.push_back(chars[i]);
+                bigram.push_back(chars[i+1]);
                 tokens.push_back(utf32_to_utf8(bigram));
             }
-        }
-        // Handle Hangul/Japanese - keep as continuous segments
-        else if (is_hangul(c) || is_japanese(c)) {
-            current_token.push_back(c);
-        }
-        // Handle ASCII alphanumeric
-        else if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
-            current_token.push_back(c);
-        }
-        // Whitespace or punctuation - token boundary
-        else {
-            if (!current_token.empty()) {
-                tokens.push_back(utf32_to_utf8(current_token));
-                current_token.clear();
+
+        } else if (has_hangul) {
+            // 对齐 openclaw: Korean - keep word, strip trailing particles
+            std::string seg_str = utf32_to_utf8(seg);
+            auto stem = strip_korean_trailing_particle(seg);
+            bool stem_is_stop = stem && STOP_WORDS_KO.count(utf32_to_utf8(*stem)) > 0;
+
+            if (!STOP_WORDS_KO.count(seg_str) && !stem_is_stop) {
+                tokens.push_back(seg_str);
             }
+            if (stem && !STOP_WORDS_KO.count(utf32_to_utf8(*stem)) && is_useful_korean_stem(*stem)) {
+                tokens.push_back(utf32_to_utf8(*stem));
+            }
+
+        } else {
+            // Non-CJK: keep as single token
+            tokens.push_back(utf32_to_utf8(seg));
         }
     }
-    
-    // Flush remaining token
-    if (!current_token.empty()) {
-        tokens.push_back(utf32_to_utf8(current_token));
-    }
-    
+
     return tokens;
 }
 

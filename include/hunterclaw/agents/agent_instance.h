@@ -6,7 +6,7 @@
 #include "hunterclaw/skills/skill.h"
 #include "hunterclaw/channels/channel.h"
 #include "hunterclaw/channels/manager.h"
-#include "hunterclaw/memory/memory_manager.h"  // ✅ 新增: MemoryManager 支持
+#include "hunterclaw/memory/memory_index_manager.h"  // MemoryIndexManager (对齐 openclaw manager.ts)
 #include "hunterclaw/react/react_engine.h"     // ✅ 新增: ReactEngine (直接包含，不使用前向声明)
 #include <memory>
 #include <string>
@@ -31,7 +31,7 @@ struct AgentInstanceContext {
     
     // 独立资源
     std::string workspace_dir;          // {workspace}/{agent_id}/sessions/{session_id}
-    std::shared_ptr<memory::MemoryProvider> memory;  // Session 级别 Memory (使用完整命名空间)
+    std::shared_ptr<memory::MemorySearchManager> memory;  // Session 级别 Memory (对齐 openclaw MemorySearchManager)
     std::vector<std::string> tools;     // Agent 配置过滤后的工具
     
     // 配置
@@ -163,7 +163,7 @@ private:
     std::shared_ptr<skills::SkillManager> skill_mgr_;
     std::shared_ptr<channels::ChannelManager> channel_mgr_;
     std::shared_ptr<react::ReactEngine> react_engine_;  // ✅ 使用完整命名空间
-    std::shared_ptr<memory::MemoryManager> memory_mgr_;  // ✅ Memory 管理器
+    std::shared_ptr<memory::MemoryIndexManager> memory_mgr_;  // Memory 管理器 (对齐 openclaw MemoryIndexManager)
     
     // ✅ OpenClaw 对齐: Reasoning stream 状态跟踪
     std::string last_streamed_reasoning_;  // 用于去重和增量计算
