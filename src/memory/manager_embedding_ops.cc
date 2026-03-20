@@ -3,6 +3,7 @@
 #include "hunterclaw/memory/sqlite_storage.h"
 #include "hunterclaw/memory/embedding_provider.h"
 #include "hunterclaw/memory/chunking.h"
+#include "hunterclaw/memory/session_files.h"
 #include <algorithm>
 #include <sstream>
 #include <cmath>
@@ -337,6 +338,8 @@ ManagerEmbeddingOps::embed_chunks_in_batches(const std::vector<MemoryChunk>& chu
 
     // 更新缓存 (对齐:224)
     upsert_embedding_cache(to_cache);
+
+    return core::Result<std::vector<std::vector<float>>>::Ok(embeddings);
 }
 
 // ============================================================================
@@ -691,6 +694,42 @@ void ManagerEmbeddingOps::delete_file_record(
     sqlite3_finalize(s.get());
 }
 
+// ============================================================================
+// upsert_session_file_record (对齐 manager-embedding-ops.ts:upsertFileRecord for SessionFileEntry)
+// ============================================================================
+
+void ManagerEmbeddingOps::upsert_session_file_record(
+    const SessionFileEntry& entry,
+    MemorySource source
+) {
+    if (!db_) return;
+    const std::string source_str = (source == MemorySource::Memory) ? "memory" : "sessions";
+
+    // 对齐 manager-embedding-ops.ts:upsertFileRecord
+    // SessionFileEntry 与 MemoryFileEntry 共享相同的 files 表结构
+    const std::string sql =
+        "INSERT INTO files (path, source, hash, mtime, size) VALUES (?, ?, ?, ?, ?)"
+        " ON CONFLICT(path) DO UPDATE SET"
+        "   source=excluded.source,"
+        "   hash=excluded.hash,"
+        "   mtime=excluded.mtime,"
+        "   size=excluded.size";
+
+    auto s = db_->prepare_statement(sql);
+    if (s.is_err()) return;
+    sqlite3_bind_text (s.get(), 1, entry.path.c_str(),                    -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text (s.get(), 2, source_str.c_str(),                    -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text (s.get(), 3, entry.hash.c_str(),                    -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(s.get(), 4, entry.mtime_ms);
+    sqlite3_bind_int64(s.get(), 5, static_cast<int64_t>(entry.size));
+    sqlite3_step(s.get());
+    sqlite3_finalize(s.get());
+}
+
+// ============================================================================
+// index_file (对齐 manager-embedding-ops.ts:indexFile)
+// ============================================================================
+
 core::Result<void> ManagerEmbeddingOps::index_file(
     const MemoryFileEntry& entry,
     MemorySource source,
@@ -722,7 +761,7 @@ core::Result<void> ManagerEmbeddingOps::index_file(
     chunking_cfg.overlap = settings_.chunking.overlap;
     auto chunks = chunk_markdown(file_content, chunking_cfg);
 
-    // 过滤空 chunks
+    // 过滤空 chunks (对齐 openclaw: .filter(chunk => chunk.text.trim().length > 0))
     chunks.erase(
         std::remove_if(chunks.begin(), chunks.end(),
             [](const MemoryChunk& c) {
@@ -730,6 +769,19 @@ core::Result<void> ManagerEmbeddingOps::index_file(
             }),
         chunks.end()
     );
+
+    // 对齐 openclaw: enforceEmbeddingMaxInputTokens(this.provider, chunks, EMBEDDING_BATCH_MAX_TOKENS)
+    // 使用 provider 的 maxInputTokens 和 EMBEDDING_BATCH_MAX_TOKENS 中的较小值
+    {
+        const int provider_max = resolve_embedding_max_input_tokens(
+            provider_->get_id(), provider_->get_model(),
+            provider_->get_max_input_tokens()
+        );
+        const int max_tokens = (EMBEDDING_BATCH_MAX_TOKENS > 0)
+            ? std::min(provider_max, EMBEDDING_BATCH_MAX_TOKENS)
+            : provider_max;
+        chunks = enforce_embedding_max_input_tokens(chunks, max_tokens);
+    }
 
     if (chunks.empty()) {
         clear_indexed_file_data(entry.path, source);
@@ -945,6 +997,198 @@ ManagerEmbeddingOps::embed_chunks_with_voyage_batch(
     // 简化实现: 实际应该调用 Voyage Batch API
     // 对齐 manager-embedding-ops.ts:442-463
     return embed_chunks_in_batches(chunks);
+}
+
+// ============================================================================
+// index_session_file (对齐 manager-embedding-ops.ts:indexFile with SessionFileEntry)
+// Session 文件与 memory 文件的索引逻辑相同，但需要 remap_chunk_lines
+// ============================================================================
+
+core::Result<void> ManagerEmbeddingOps::index_session_file(
+    const SessionFileEntry& entry,
+    MemorySource source
+) {
+    // 对齐 openclaw manager-embedding-ops.ts:indexFile (SessionFileEntry branch)
+
+    // FTS-only mode: skip (对齐:807-814)
+    if (!provider_ || !db_) {
+        return core::Result<void>::Ok();
+    }
+
+    // 分块 (对齐 openclaw: chunkMarkdown(content, this.settings.chunking))
+    ChunkingConfig chunking_cfg;
+    chunking_cfg.tokens  = settings_.chunking.tokens;
+    chunking_cfg.overlap = settings_.chunking.overlap;
+    auto chunks = chunk_markdown(entry.content, chunking_cfg);
+
+    // 过滤空 chunks (对齐 openclaw: .filter(chunk => chunk.text.trim().length > 0))
+    chunks.erase(
+        std::remove_if(chunks.begin(), chunks.end(),
+            [](const MemoryChunk& c) {
+                return c.text.find_first_not_of(" \t\n\r") == std::string::npos;
+            }),
+        chunks.end()
+    );
+
+    // 对齐 openclaw: enforceEmbeddingMaxInputTokens(this.provider, chunks, EMBEDDING_BATCH_MAX_TOKENS)
+    {
+        const int provider_max = resolve_embedding_max_input_tokens(
+            provider_->get_id(), provider_->get_model(),
+            provider_->get_max_input_tokens()
+        );
+        const int max_tokens = (EMBEDDING_BATCH_MAX_TOKENS > 0)
+            ? std::min(provider_max, EMBEDDING_BATCH_MAX_TOKENS)
+            : provider_max;
+        chunks = enforce_embedding_max_input_tokens(chunks, max_tokens);
+    }
+
+    // 对齐 openclaw: if (options.source === "sessions" && "lineMap" in entry) remapChunkLines(chunks, entry.lineMap)
+    if (source == MemorySource::Sessions && !entry.line_map.empty()) {
+        remap_chunk_lines(chunks, entry.line_map);
+    }
+
+    if (chunks.empty()) {
+        clear_indexed_file_data(entry.path, source);
+        upsert_session_file_record(entry, source);
+        return core::Result<void>::Ok();
+    }
+
+    // Batch embedding (对齐:840-844)
+    core::Result<std::vector<std::vector<float>>> embeddings_result;
+    if (settings_.batch.enabled) {
+        // session 文件使用 embed_chunks_in_batches（batch API 需要 MemoryFileEntry）
+        embeddings_result = embed_chunks_in_batches(chunks);
+    } else {
+        embeddings_result = embed_chunks_in_batches(chunks);
+    }
+
+    if (!embeddings_result.is_ok()) {
+        return core::Result<void>::Err(embeddings_result.error);
+    }
+    auto embeddings = embeddings_result.get();
+
+    // Ensure vector ready (对齐:865-866)
+    bool vector_ready = false;
+    for (const auto& emb : embeddings) {
+        if (!emb.empty()) {
+            auto r = ensure_vector_ready(emb.size());
+            vector_ready = r.is_ok() && r.get();
+            break;
+        }
+    }
+
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count();
+
+    // 清理旧数据 (对齐:868)
+    clear_indexed_file_data(entry.path, source);
+
+    const std::string source_str = (source == MemorySource::Memory) ? "memory" : "sessions";
+
+    const std::string sql_chunks =
+        "INSERT INTO chunks"
+        " (id, path, source, start_line, end_line, hash, model, text, embedding, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        " ON CONFLICT(id) DO UPDATE SET"
+        "   hash=excluded.hash,"
+        "   model=excluded.model,"
+        "   text=excluded.text,"
+        "   embedding=excluded.embedding,"
+        "   updated_at=excluded.updated_at";
+
+    auto stmt_chunks_res = db_->prepare_statement(sql_chunks);
+    if (stmt_chunks_res.is_err()) {
+        return core::Result<void>::Err("Failed to prepare chunks insert: " + stmt_chunks_res.error);
+    }
+    sqlite3_stmt* stmt_chunks = stmt_chunks_res.get();
+
+    sqlite3_stmt* stmt_vec = nullptr;
+    if (vector_ready) {
+        const std::string sql_vec = "INSERT INTO chunks_vec (id, embedding) VALUES (?, ?)";
+        auto r = db_->prepare_statement(sql_vec);
+        if (r.is_ok()) stmt_vec = r.get();
+    }
+
+    sqlite3_stmt* stmt_fts = nullptr;
+    if (settings_.fts.enabled && fts_available_) {
+        const std::string sql_fts =
+            "INSERT INTO chunks_fts"
+            " (text, id, path, source, model, start_line, end_line)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)";
+        auto r = db_->prepare_statement(sql_fts);
+        if (r.is_ok()) stmt_fts = r.get();
+    }
+
+    for (size_t i = 0; i < chunks.size(); ++i) {
+        const auto& chunk     = chunks[i];
+        const auto& embedding = (i < embeddings.size()) ? embeddings[i] : std::vector<float>{};
+
+        // 对齐 openclaw: id = hashText(`${source}:${path}:${startLine}:${endLine}:${hash}:${model}`)
+        std::ostringstream id_oss;
+        id_oss << source_str << ":" << entry.path << ":"
+               << chunk.start_line << ":" << chunk.end_line << ":"
+               << chunk.hash << ":" << provider_->get_model();
+        const std::string id = hash_text(id_oss.str());
+
+        std::ostringstream emb_json;
+        emb_json << "[";
+        for (size_t j = 0; j < embedding.size(); ++j) {
+            if (j > 0) emb_json << ",";
+            emb_json << embedding[j];
+        }
+        emb_json << "]";
+        std::string emb_str = emb_json.str();
+
+        sqlite3_reset(stmt_chunks);
+        sqlite3_bind_text (stmt_chunks, 1, id.c_str(),                       -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text (stmt_chunks, 2, entry.path.c_str(),               -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text (stmt_chunks, 3, source_str.c_str(),               -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int  (stmt_chunks, 4, chunk.start_line);
+        sqlite3_bind_int  (stmt_chunks, 5, chunk.end_line);
+        sqlite3_bind_text (stmt_chunks, 6, chunk.hash.c_str(),               -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text (stmt_chunks, 7, provider_->get_model().c_str(),   -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text (stmt_chunks, 8, chunk.text.c_str(),               -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text (stmt_chunks, 9, emb_str.c_str(),                  -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt_chunks, 10, now);
+        sqlite3_step(stmt_chunks);
+
+        if (stmt_vec && !embedding.empty()) {
+            auto del_res = db_->prepare_statement("DELETE FROM chunks_vec WHERE id = ?");
+            if (del_res.is_ok()) {
+                sqlite3_bind_text(del_res.get(), 1, id.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_step(del_res.get());
+                sqlite3_finalize(del_res.get());
+            }
+            std::vector<uint8_t> blob(embedding.size() * sizeof(float));
+            std::memcpy(blob.data(), embedding.data(), blob.size());
+            sqlite3_reset(stmt_vec);
+            sqlite3_bind_text(stmt_vec, 1, id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_blob(stmt_vec, 2, blob.data(), static_cast<int>(blob.size()), SQLITE_TRANSIENT);
+            sqlite3_step(stmt_vec);
+        }
+
+        if (stmt_fts) {
+            sqlite3_reset(stmt_fts);
+            sqlite3_bind_text(stmt_fts, 1, chunk.text.c_str(),              -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt_fts, 2, id.c_str(),                      -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt_fts, 3, entry.path.c_str(),              -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt_fts, 4, source_str.c_str(),              -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt_fts, 5, provider_->get_model().c_str(),  -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int (stmt_fts, 6, chunk.start_line);
+            sqlite3_bind_int (stmt_fts, 7, chunk.end_line);
+            sqlite3_step(stmt_fts);
+        }
+    }
+
+    sqlite3_finalize(stmt_chunks);
+    if (stmt_vec) sqlite3_finalize(stmt_vec);
+    if (stmt_fts) sqlite3_finalize(stmt_fts);
+
+    // 更新文件记录 (对齐:923)
+    upsert_session_file_record(entry, source);
+
+    return core::Result<void>::Ok();
 }
 
 }  // namespace memory

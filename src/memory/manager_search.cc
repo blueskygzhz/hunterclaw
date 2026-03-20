@@ -97,8 +97,7 @@ core::Result<std::vector<SearchRowResult>> search_vector_impl(
         return core::Result<std::vector<SearchRowResult>>::Ok({});
     }
 
-    auto source_filter_vec    = build_source_filter(source_filter_list);
-    auto source_filter_chunks = build_source_filter(source_filter_list);
+    auto source_filter_vec = build_source_filter(source_filter_list);
 
     // 1. 尝试 sqlite-vec 向量搜索 (对齐 ensureVectorReady 分支)
     if (db.is_vec_available()) {
@@ -163,7 +162,7 @@ core::Result<std::vector<SearchRowResult>> search_vector_impl(
     std::string sql =
         "SELECT id, path, start_line, end_line, text, embedding, source"
         "  FROM chunks"
-        " WHERE model = ?" + source_filter_chunks.sql;
+        " WHERE model = ?" + source_filter_vec.sql;
 
     auto stmt_result = db.prepare_statement(sql);
     if (stmt_result.is_err()) {
@@ -173,7 +172,7 @@ core::Result<std::vector<SearchRowResult>> search_vector_impl(
     sqlite3_stmt* stmt = stmt_result.get();
     sqlite3_bind_text(stmt, 1, provider_model.c_str(), -1, SQLITE_TRANSIENT);
     int param_idx = 2;
-    for (const auto& p : source_filter_chunks.params) {
+    for (const auto& p : source_filter_vec.params) {
         sqlite3_bind_text(stmt, param_idx++, p.c_str(), -1, SQLITE_TRANSIENT);
     }
 

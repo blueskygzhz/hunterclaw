@@ -3,6 +3,7 @@
 #include <optional>
 #include "hunterclaw/memory/types.h"
 #include "hunterclaw/memory/manager_embedding_ops.h"  // MemoryManagerEmbeddingOps (继承链)
+#include "hunterclaw/memory/embedding_provider.h"     // EmbeddingProvider 完整定义
 #include "hunterclaw/memory/chunking.h"
 #include "hunterclaw/core/types.h"
 #include <memory>
@@ -35,6 +36,8 @@ public:
         std::string agent_id;
         std::string workspace_dir;
         ResolvedMemorySearchConfig settings;
+        // 对齐 manager.ts: purpose?: "default" | "status"
+        std::string purpose;  // "default" or "status"
     };
 
     // 获取或创建 MemoryIndexManager 实例 (带缓存，对齐 INDEX_CACHE)
@@ -94,13 +97,17 @@ private:
     // 缓存 key (对齐 manager.ts:cacheKey)
     std::string cache_key_;
 
+    // purpose (对齐 manager.ts: purpose?: "default" | "status")
+    std::string purpose_;
+
     // Session warm tracking (对齐 manager.ts:sessionWarm)
     std::set<std::string> session_warm_;
 
     // 同步状态 (对齐 manager.ts:syncing/queuedSessionFiles/queuedSessionSync)
-    std::shared_ptr<std::future<void>> syncing_;
+    bool syncing_ = false;          // 是否正在同步
+    std::mutex syncing_mutex_;      // 保护 syncing_ 状态
     std::set<std::string> queued_session_files_;
-    std::shared_ptr<std::future<void>> queued_session_sync_;
+    bool queued_session_sync_ = false;
 
     // Readonly recovery 状态 (对齐 manager.ts:readonlyRecovery*)
     int readonly_recovery_attempts_ = 0;
@@ -126,6 +133,15 @@ private:
 
     // 检测 readonly 错误 (对齐 manager.ts:isReadonlyDbError)
     bool is_readonly_db_error(const std::exception& e) const;
+
+    // 提取错误原因 (对齐 manager.ts:extractErrorReason)
+    std::string extract_error_reason(const std::exception& e) const;
+
+    // 启动定时同步 (对齐 manager.ts:ensureIntervalSync)
+    void ensure_interval_sync();
+
+    // 停止定时同步 (对齐 manager.ts:clearInterval(intervalTimer))
+    void stop_interval_sync() { /* 定时器在 stop_memory_watcher 中一并停止 */ }
 
     // MemoryManagerSyncOps 抄象方法实现
     std::string compute_provider_key() override;

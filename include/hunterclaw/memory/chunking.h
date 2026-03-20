@@ -1,10 +1,15 @@
 #pragma once
 
 #include "hunterclaw/core/result.h"
+#include "hunterclaw/memory/multimodal.h"
 #include <string>
 #include <vector>
 #include <optional>
 #include <cstdint>
+#include <map>
+#include <algorithm>
+#include <functional>
+#include <cmath>
 
 namespace hunterclaw {
 namespace memory {
@@ -47,7 +52,7 @@ struct MemoryFileEntry {
     std::optional<std::string> data_hash;   // for multimodal files
     std::string kind;                        // "markdown" | "multimodal"
     std::optional<std::string> content_text; // for multimodal label
-    std::optional<std::string> modality;     // "image" | "audio" | "video"
+    std::optional<MemoryMultimodalModality> modality;  // for multimodal files
     std::optional<std::string> mime_type;
 };
 
@@ -130,19 +135,23 @@ bool is_memory_path(const std::string& rel_path);
 /**
  * List all memory files in workspace (对齐 openclaw internal.ts:listMemoryFiles)
  * Scans MEMORY.md, memory.md, memory/ directory, and extra_paths
+ * multimodal: optional multimodal settings for non-markdown file support
  */
 core::Result<std::vector<std::string>> list_memory_files(
     const std::string& workspace_dir,
-    const std::vector<std::string>& extra_paths = {}
+    const std::vector<std::string>& extra_paths = {},
+    const MemoryMultimodalSettings* multimodal = nullptr
 );
 
 /**
  * Build a MemoryFileEntry for a given file (对齐 openclaw internal.ts:buildFileEntry)
  * Returns nullopt if file is missing or invalid
+ * multimodal: optional multimodal settings for non-markdown file support
  */
 std::optional<MemoryFileEntry> build_file_entry(
     const std::string& abs_path,
-    const std::string& workspace_dir
+    const std::string& workspace_dir,
+    const MemoryMultimodalSettings* multimodal = nullptr
 );
 
 /**
@@ -158,6 +167,47 @@ std::string ensure_dir(const std::string& dir);
  * Build a text-only EmbeddingInput (对齐 buildTextEmbeddingInput)
  */
 EmbeddingInput build_text_embedding_input(const std::string& text);
+
+/**
+ * Sanitize and normalize embedding vector
+ * (对齐 openclaw embedding-vectors.ts:sanitizeAndNormalizeEmbedding)
+ */
+std::vector<float> sanitize_and_normalize_embedding(const std::vector<float>& embedding);
+
+// ============================================================================
+// Embedding Input Limits (对齐 openclaw embedding-input-limits.ts)
+// ============================================================================
+
+/**
+ * Estimate UTF-8 byte length of a string
+ * (对齐 openclaw embedding-input-limits.ts:estimateUtf8Bytes)
+ */
+int estimate_utf8_bytes(const std::string& text);
+
+/**
+ * Split text to UTF-8 byte limit using binary search
+ * (对齐 openclaw embedding-input-limits.ts:splitTextToUtf8ByteLimit)
+ */
+std::vector<std::string> split_text_to_byte_limit(const std::string& text, int max_bytes);
+
+/**
+ * Enforce embedding max input tokens by splitting large chunks
+ * (对齐 openclaw embedding-chunk-limits.ts:enforceEmbeddingMaxInputTokens)
+ */
+std::vector<MemoryChunk> enforce_embedding_max_input_tokens(
+    const std::vector<MemoryChunk>& chunks,
+    int max_input_tokens
+);
+
+/**
+ * Resolve embedding max input tokens for a provider/model
+ * (对齐 openclaw embedding-model-limits.ts:resolveEmbeddingMaxInputTokens)
+ */
+int resolve_embedding_max_input_tokens(
+    const std::string& provider_id,
+    const std::string& model,
+    std::optional<int> provider_max_input_tokens = std::nullopt
+);
 
 // ============================================================================
 // Concurrency Helper (对齐 openclaw internal.ts:runWithConcurrency)

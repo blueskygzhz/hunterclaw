@@ -101,10 +101,15 @@ public:
     std::map<std::string, std::vector<float>>
     load_embedding_cache(const std::vector<std::string>& hashes);
 
-    // 更新缓存 (对齐:127-155)
+    // 缓存条目 (对齐 manager-embedding-ops.ts:upsertEmbeddingCache entries)
+    struct EmbeddingCacheEntry {
+        std::string hash;
+        std::vector<float> embedding;
+    };
+
+    // 批量更新缓存 (对齐:127-155)
     void upsert_embedding_cache(
-        const std::string& hash,
-        const std::vector<float>& embedding
+        const std::vector<EmbeddingCacheEntry>& entries
     );
 
     // 清理缓存 (对齐:157-183)
@@ -214,6 +219,12 @@ public:
         MemorySource source
     );
 
+    // 更新 session 文件记录 (对齐 upsertFileRecord for SessionFileEntry)
+    void upsert_session_file_record(
+        const SessionFileEntry& entry,
+        MemorySource source
+    );
+
     // 删除文件记录 (对齐:793-795)
     void delete_file_record(
         const std::string& pathname,
@@ -244,7 +255,10 @@ public:
     int resolve_embedding_timeout(const std::string& kind) const;  // "query" or "batch"
 
     // 确保向量表准备就绪
-    core::Result<bool> ensure_vector_ready(std::optional<int> dimensions = std::nullopt);
+    core::Result<bool> ensure_vector_ready(size_t dimensions = 0);
+
+    // FTS 可用状态 (由 db_ 初始化后设置)
+    bool fts_available_ = false;
 
 protected:
     // ========================================================================

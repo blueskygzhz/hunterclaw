@@ -71,17 +71,14 @@ std::string build_case_insensitive_extension_glob(const std::string& extension) 
         return "*";
     }
     
-    // Build case-insensitive pattern
+    // Build case-insensitive pattern: every char gets [lowerUpper] bracket
+    // (对齐 openclaw: Array.from(normalized, char => `[${char.toLowerCase()}${char.toUpperCase()}]`))
     std::string result = "*.";
     for (char c : normalized) {
-        if (std::isalpha(static_cast<unsigned char>(c))) {
-            result += '[';
-            result += std::tolower(c);
-            result += std::toupper(c);
-            result += ']';
-        } else {
-            result += c;
-        }
+        result += '[';
+        result += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        result += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        result += ']';
     }
     
     return result;
@@ -95,7 +92,11 @@ std::optional<MemoryMultimodalModality> classify_memory_multimodal_path(
         return std::nullopt;
     }
     
-    std::string lower_path = to_lower(file_path);
+    // 对齐 openclaw: filePath.trim().toLowerCase()
+    std::string trimmed = file_path;
+    trimmed.erase(0, trimmed.find_first_not_of(" \t\n\r"));
+    trimmed.erase(trimmed.find_last_not_of(" \t\n\r") + 1);
+    std::string lower_path = to_lower(trimmed);
     
     for (const auto& modality : settings.modalities) {
         auto extensions = get_memory_multimodal_extensions(modality);
@@ -156,19 +157,20 @@ bool supports_memory_multimodal_embeddings(
 std::set<MemoryMultimodalModality> normalize_memory_multimodal_modalities(
     const std::vector<std::string>& raw
 ) {
-    std::set<MemoryMultimodalModality> result;
+    // 对齐 openclaw: raw === undefined || raw.includes("all") -> return all modalities
+    if (raw.empty()) {
+        return {MemoryMultimodalModality::IMAGE, MemoryMultimodalModality::AUDIO};
+    }
     
     // Check for "all"
     for (const auto& item : raw) {
-        std::string lower = to_lower(item);
-        if (lower == "all") {
-            result.insert(MemoryMultimodalModality::IMAGE);
-            result.insert(MemoryMultimodalModality::AUDIO);
-            return result;
+        if (to_lower(item) == "all") {
+            return {MemoryMultimodalModality::IMAGE, MemoryMultimodalModality::AUDIO};
         }
     }
     
     // Parse individual modalities
+    std::set<MemoryMultimodalModality> result;
     for (const auto& item : raw) {
         std::string lower = to_lower(item);
         if (lower == "image") {
@@ -189,11 +191,12 @@ MemoryMultimodalSettings normalize_memory_multimodal_settings(
     MemoryMultimodalSettings settings;
     settings.enabled = enabled;
     
-    // Validate max_file_bytes
-    if (max_file_bytes == 0 || max_file_bytes > 1024ULL * 1024 * 1024) {
+    // 对齐 openclaw: Math.max(1, Math.floor(raw.maxFileBytes)) if finite number, else default
+    // max_file_bytes == 0 视为未提供，使用默认值
+    if (max_file_bytes == 0) {
         settings.max_file_bytes = DEFAULT_MEMORY_MULTIMODAL_MAX_FILE_BYTES;
     } else {
-        settings.max_file_bytes = max_file_bytes;
+        settings.max_file_bytes = std::max(static_cast<size_t>(1), max_file_bytes);
     }
     
     // Parse modalities only if enabled

@@ -137,8 +137,16 @@ struct MemoryProviderStatus {
     };
     std::optional<BatchStatus> batch;
     
-    // 自定义字段 (对齐 openclaw: custom?: Record<string, unknown>)
-    std::optional<std::map<std::string, nlohmann::json>> custom;
+    // 自定义字段 (对齐 openclaw: custom: { searchMode, providerUnavailableReason, readonlyRecovery })
+    struct CustomStatus {
+        std::string search_mode;  // "hybrid" | "fts-only"
+        std::optional<std::string> provider_unavailable_reason;
+        int readonly_recovery_attempts  = 0;
+        int readonly_recovery_successes = 0;
+        int readonly_recovery_failures  = 0;
+        std::optional<std::string> readonly_recovery_last_error;
+    };
+    std::optional<CustomStatus> custom;
 };
 
 // ============================================================================
@@ -162,6 +170,7 @@ struct ReadFileParams {
 struct ReadFileResult {
     std::string text;
     std::string path;
+    std::optional<std::string> error;  // 对齐 openclaw: throw new Error("path required")
 };
 
 // ============================================================================
@@ -301,6 +310,7 @@ struct ResolvedMemorySearchConfig {
     
     struct VectorConfig {
         bool enabled = true;
+        std::optional<std::string> extension_path;  // 对齐 openclaw: store.vector.extensionPath
     } vector;
     
     struct FtsConfig {
@@ -321,7 +331,11 @@ struct ResolvedMemorySearchConfig {
         bool watch = true;
         int watch_debounce_ms = 5000;
         std::optional<int> interval_minutes;
-        
+        // 对齐 openclaw: sync.onSessionStart / sync.onSearch / sync.interval
+        bool on_session_start = true;   // 对齐 openclaw: onSessionStart
+        bool on_search        = true;   // 对齐 openclaw: onSearch
+        int  interval_ms      = 0;      // 对齐 openclaw: interval (ms, 0=disabled)
+
         struct SessionsConfig {
             int delta_bytes = 0;
             int delta_messages = 0;

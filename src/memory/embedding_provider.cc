@@ -1,5 +1,6 @@
 #include <optional>
 #include "hunterclaw/memory/embedding_provider.h"
+#include "hunterclaw/memory/chunking.h"
 #include "hunterclaw/memory/http_client.h"
 #include <nlohmann/json.hpp>
 #include <sstream>
@@ -130,36 +131,12 @@ private:
 };
 
 // ============================================================================
-// Helper: Vector normalization
+// Helper: Vector normalization (delegates to sanitize_and_normalize_embedding)
 // ============================================================================
 
-std::vector<float> normalize_embedding(const std::vector<float>& vec) {
-    double sum_sq = 0.0;
-    for (float v : vec) {
-        if (!std::isfinite(v)) {
-            // Sanitize: replace NaN/Inf with 0
-            continue;
-        }
-        sum_sq += v * v;
-    }
-    
-    if (sum_sq == 0.0) {
-        return std::vector<float>(vec.size(), 0.0f);
-    }
-    
-    float norm = std::sqrt(sum_sq);
-    std::vector<float> normalized;
-    normalized.reserve(vec.size());
-    
-    for (float v : vec) {
-        if (!std::isfinite(v)) {
-            normalized.push_back(0.0f);
-        } else {
-            normalized.push_back(v / norm);
-        }
-    }
-    
-    return normalized;
+static std::vector<float> normalize_embedding(const std::vector<float>& vec) {
+    // 对齐 openclaw embedding-vectors.ts:sanitizeAndNormalizeEmbedding
+    return sanitize_and_normalize_embedding(vec);
 }
 
 // ============================================================================

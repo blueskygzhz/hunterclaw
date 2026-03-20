@@ -1,6 +1,7 @@
 #include <optional>
 #include "hunterclaw/memory/qmd_manager.h"
 #include "hunterclaw/memory/json_parser.h"
+#include "hunterclaw/memory/qmd_query_parser.h"
 #include <stdexcept>
 #include <sstream>
 #include <cstdlib>
@@ -223,11 +224,13 @@ void QmdMemoryManager::add_collection(
     const std::string& name,
     const std::string& pattern
 ) {
+    // 对齐 openclaw qmd-manager.ts:addCollection
+    // args: ["collection", "add", path, "--name", name, "--mask", pattern]
     std::vector<std::string> args = {
         "collection", "add",
         path,
         "--name", name,
-        "--glob", pattern
+        "--mask", pattern
     };
     
     QmdCommandOptions opts{qmd_config_.update.command_timeout_ms, {}};
@@ -443,31 +446,22 @@ std::vector<QmdQueryResult> QmdMemoryManager::parse_qmd_query_json(
     const std::string& stdout_data,
     const std::string& stderr_data
 ) {
-    // Simplified JSON parsing (real implementation would use nlohmann/json or similar)
-    std::vector<QmdQueryResult> results;
-    
-    // Check for "no results found" marker
-    if (stdout_data.find("no results found") != std::string::npos ||
-        stdout_data.find("No results found") != std::string::npos) {
-        return results;
-    }
-    
-    // Real implementation would properly parse JSON array
-    // Format: [{"docid":"...","score":0.85,"collection":"...","file":"...","snippet":"..."}]
-    
-    return results;
+    // 对齐 openclaw qmd-manager.ts: parseQmdQueryJson(result.stdout, result.stderr)
+    // 委托给 qmd_query_parser.cc 中的实现（严格对齐 openclaw qmd-query-parser.ts）
+    return hunterclaw::memory::parse_qmd_query_json(stdout_data, stderr_data);
 }
 
 MemorySearchResult QmdMemoryManager::qmd_result_to_memory_result(const QmdQueryResult& qmd_result) {
     MemorySearchResult result;
-    result.path = qmd_result.file;
+    result.path = qmd_result.file.value_or("");
     result.start_line = 0;  // QMD doesn't provide line numbers in simple mode
     result.end_line = 0;
-    result.score = qmd_result.score;
-    result.snippet = qmd_result.snippet;
+    result.score = qmd_result.score.value_or(0.0);
+    result.snippet = qmd_result.snippet.value_or("");
     
     // Determine source from collection
-    auto it = collection_roots_.find(qmd_result.collection);
+    const std::string collection = qmd_result.collection.value_or("");
+    auto it = collection_roots_.find(collection);
     result.source = (it != collection_roots_.end()) 
         ? it->second.kind 
         : MemorySource::Memory;

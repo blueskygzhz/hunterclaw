@@ -217,12 +217,7 @@ std::vector<TemporalDecayEntry> apply_temporal_decay_to_hybrid_results(
         entry.score = apply_temporal_decay_to_score(entry.score, age_in_days, config.half_life_days);
     }
 
-    // 对齐 openclaw: decayed.toSorted((a, b) => b.score - a.score)
-    std::sort(results.begin(), results.end(),
-              [](const TemporalDecayEntry& a, const TemporalDecayEntry& b) {
-                  return a.score > b.score;
-              });
-
+    // 对齐 openclaw: 直接返回（不排序，排序由调用方 mergeHybridResults 负责）
     return results;
 }
 

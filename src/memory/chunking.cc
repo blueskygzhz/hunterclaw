@@ -1,4 +1,5 @@
 #include "hunterclaw/memory/chunking.h"
+#include "hunterclaw/memory/multimodal.h"
 #include <algorithm>
 #include <cctype>
 #include <fstream>
@@ -7,6 +8,9 @@
 #include <functional>
 #include <openssl/sha.h>
 #include <iomanip>
+#include <map>
+#include <cmath>
+#include <set>
 
 namespace fs = std::filesystem;
 
@@ -464,20 +468,17 @@ float cosine_similarity(const std::vector<float>& a, const std::vector<float>& b
 // ============================================================================
 std::string normalize_rel_path(const std::string& value) {
     std::string trimmed = value;
-    // trim whitespace
+    // trim whitespace (对齐 openclaw: value.trim())
     trimmed.erase(0, trimmed.find_first_not_of(" \t\n\r"));
+    if (trimmed.empty()) return "";
     trimmed.erase(trimmed.find_last_not_of(" \t\n\r") + 1);
-    // strip leading "./" or "/"
-    while (!trimmed.empty() && (trimmed[0] == '.' || trimmed[0] == '/')) {
-        if (trimmed.size() >= 2 && trimmed[0] == '.' && trimmed[1] == '/') {
-            trimmed = trimmed.substr(2);
-        } else if (trimmed[0] == '/') {
-            trimmed = trimmed.substr(1);
-        } else {
-            break;
-        }
+    // 对齐 openclaw: .replace(/^[./]+/, "") — 去掉所有前导 '.' 和 '/'
+    size_t start = 0;
+    while (start < trimmed.size() && (trimmed[start] == '.' || trimmed[start] == '/')) {
+        ++start;
     }
-    // normalize backslashes
+    trimmed = trimmed.substr(start);
+    // normalize backslashes (对齐 openclaw: .replace(/\\/g, "/"))
     std::replace(trimmed.begin(), trimmed.end(), '\\', '/');
     return trimmed;
 }
@@ -516,20 +517,39 @@ std::vector<std::string> normalize_extra_memory_paths(
 bool is_memory_path(const std::string& rel_path) {
     std::string normalized = normalize_rel_path(rel_path);
     if (normalized.empty()) return false;
-    // 对齐 openclaw: normalized === "MEMORY.md" || normalized.startsWith("memory/")
-    if (normalized == "MEMORY.md") return true;
+    // 对齐 openclaw internal.ts:73-76:
+    // normalized === "MEMORY.md" || normalized === "memory.md" || normalized.startsWith("memory/")
+    if (normalized == "MEMORY.md" || normalized == "memory.md") return true;
     return normalized.rfind("memory/", 0) == 0;
 }
 
 // ============================================================================
 // list_memory_files (对齐 openclaw internal.ts:listMemoryFiles)
 // ============================================================================
-static void walk_dir(const std::string& dir, std::vector<std::string>& files) {
+
+// isAllowedMemoryFilePath (对齐 openclaw internal.ts:isAllowedMemoryFilePath)
+static bool is_allowed_memory_file_path(
+    const std::string& file_path,
+    const MemoryMultimodalSettings* multimodal) {
+    if (file_path.size() >= 3 &&
+        file_path.substr(file_path.size() - 3) == ".md") {
+        return true;
+    }
+    if (multimodal) {
+        return classify_memory_multimodal_path(file_path, *multimodal).has_value();
+    }
+    return false;
+}
+
+static void walk_dir(
+    const std::string& dir,
+    std::vector<std::string>& files,
+    const MemoryMultimodalSettings* multimodal = nullptr) {
     try {
         for (const auto& entry : fs::recursive_directory_iterator(dir)) {
             if (entry.is_symlink()) continue;
             if (!entry.is_regular_file()) continue;
-            if (entry.path().extension() == ".md") {
+            if (is_allowed_memory_file_path(entry.path().string(), multimodal)) {
                 files.push_back(entry.path().string());
             }
         }
@@ -538,16 +558,18 @@ static void walk_dir(const std::string& dir, std::vector<std::string>& files) {
 
 core::Result<std::vector<std::string>> list_memory_files(
     const std::string& workspace_dir,
-    const std::vector<std::string>& extra_paths) {
+    const std::vector<std::string>& extra_paths,
+    const MemoryMultimodalSettings* multimodal) {
 
     std::vector<std::string> result;
 
-    // 1. MEMORY.md
+    // 1. MEMORY.md + memory.md (对齐 openclaw: addMarkdownFile)
     auto add_md = [&](const std::string& abs_path) {
         try {
             auto stat = fs::symlink_status(abs_path);
             if (!fs::is_symlink(stat) && fs::is_regular_file(stat)) {
-                if (abs_path.ends_with(".md")) {
+                if (abs_path.size() >= 3 &&
+                    abs_path.substr(abs_path.size() - 3) == ".md") {
                     result.push_back(abs_path);
                 }
             }
@@ -566,21 +588,22 @@ core::Result<std::vector<std::string>> list_memory_files(
         }
     } catch (...) {}
 
-    // 3. extra_paths
+    // 3. extra_paths (对齐 openclaw: normalizedExtraPaths)
     auto normalized = normalize_extra_memory_paths(workspace_dir, extra_paths);
     for (const auto& p : normalized) {
         try {
             auto stat = fs::symlink_status(p);
             if (fs::is_symlink(stat)) continue;
             if (fs::is_directory(stat)) {
-                walk_dir(p, result);
-            } else if (fs::is_regular_file(stat) && p.ends_with(".md")) {
+                walk_dir(p, result, multimodal);
+            } else if (fs::is_regular_file(stat) &&
+                       is_allowed_memory_file_path(p, multimodal)) {
                 result.push_back(p);
             }
         } catch (...) {}
     }
 
-    // 4. deduplicate
+    // 4. deduplicate (对齐 openclaw: deduped via realpath)
     if (result.size() > 1) {
         std::vector<std::string> deduped;
         std::set<std::string> seen;
@@ -602,32 +625,78 @@ core::Result<std::vector<std::string>> list_memory_files(
 // ============================================================================
 std::optional<MemoryFileEntry> build_file_entry(
     const std::string& abs_path,
-    const std::string& workspace_dir) {
+    const std::string& workspace_dir,
+    const MemoryMultimodalSettings* multimodal) {
 
     try {
         auto stat = fs::status(abs_path);
         if (!fs::is_regular_file(stat)) return std::nullopt;
 
-        // relative path
+        // relative path (对齐 openclaw: path.relative + replace backslash)
         auto rel = fs::relative(abs_path, workspace_dir).string();
         std::replace(rel.begin(), rel.end(), '\\', '/');
-
-        // read content
-        std::ifstream file(abs_path);
-        if (!file.is_open()) return std::nullopt;
-        std::string content((std::istreambuf_iterator<char>(file)),
-                             std::istreambuf_iterator<char>());
 
         auto mtime = fs::last_write_time(abs_path);
         auto mtime_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             mtime.time_since_epoch()
         ).count();
+        int64_t file_size = static_cast<int64_t>(fs::file_size(abs_path));
+
+        // 检查是否是 multimodal 文件 (对齐 openclaw: classifyMemoryMultimodalPath)
+        if (multimodal) {
+            auto modality = classify_memory_multimodal_path(abs_path, *multimodal);
+            if (modality.has_value()) {
+                // 对齐 openclaw: size > maxFileBytes -> return null
+                if (file_size > static_cast<int64_t>(multimodal->max_file_bytes)) {
+                    return std::nullopt;
+                }
+                // 读取文件内容
+                std::ifstream bin_file(abs_path, std::ios::binary);
+                if (!bin_file.is_open()) return std::nullopt;
+                std::string buffer((std::istreambuf_iterator<char>(bin_file)),
+                                    std::istreambuf_iterator<char>());
+
+                // 对齐 openclaw: mimeType check (mimeType.startsWith(`${modality}/`))
+                // HunterClaw 简化：跳过 MIME 检测，直接按扩展名分类
+                std::string modality_str;
+                if (*modality == MemoryMultimodalModality::IMAGE) modality_str = "image";
+                else if (*modality == MemoryMultimodalModality::AUDIO) modality_str = "audio";
+
+                std::string content_text = build_memory_multimodal_label(*modality, rel);
+                std::string data_hash = hash_text(buffer);
+
+                // chunkHash = hashText(JSON.stringify({path, contentText, mimeType, dataHash}))
+                // 对齐 openclaw: 使用相同的 hash 输入
+                std::string hash_input = "{\"path\":\"" + rel +
+                    "\",\"contentText\":\"" + content_text +
+                    "\",\"dataHash\":\"" + data_hash + "\"}";  // mimeType 省略
+                std::string chunk_hash = hash_text(hash_input);
+
+                MemoryFileEntry entry;
+                entry.path = rel;
+                entry.abs_path = abs_path;
+                entry.mtime_ms = mtime_ms;
+                entry.size = file_size;
+                entry.hash = chunk_hash;
+                entry.data_hash = data_hash;
+                entry.kind = "multimodal";
+                entry.content_text = content_text;
+                entry.modality = *modality;
+                return entry;
+            }
+        }
+
+        // Markdown 文件 (对齐 openclaw: readFile + hashText)
+        std::ifstream file(abs_path);
+        if (!file.is_open()) return std::nullopt;
+        std::string content((std::istreambuf_iterator<char>(file)),
+                             std::istreambuf_iterator<char>());
 
         MemoryFileEntry entry;
         entry.path = rel;
         entry.abs_path = abs_path;
         entry.mtime_ms = mtime_ms;
-        entry.size = static_cast<int64_t>(fs::file_size(abs_path));
+        entry.size = file_size;
         entry.hash = hash_text(content);
         entry.kind = "markdown";
 
@@ -661,46 +730,199 @@ EmbeddingInput build_text_embedding_input(const std::string& text) {
 }
 
 // ============================================================================
+// sanitize_and_normalize_embedding
+// (对齐 openclaw embedding-vectors.ts:sanitizeAndNormalizeEmbedding)
+// ============================================================================
+std::vector<float> sanitize_and_normalize_embedding(const std::vector<float>& embedding) {
+    // 1. sanitize: replace NaN/Inf with 0
+    std::vector<float> sanitized;
+    sanitized.reserve(embedding.size());
+    for (float v : embedding) {
+        sanitized.push_back(std::isfinite(v) ? v : 0.0f);
+    }
+
+    // 2. compute magnitude
+    double sum_sq = 0.0;
+    for (float v : sanitized) {
+        sum_sq += static_cast<double>(v) * v;
+    }
+    double magnitude = std::sqrt(sum_sq);
+
+    // 3. if magnitude < 1e-10, return sanitized as-is (对齐 openclaw)
+    if (magnitude < 1e-10) {
+        return sanitized;
+    }
+
+    // 4. normalize
+    std::vector<float> normalized;
+    normalized.reserve(sanitized.size());
+    for (float v : sanitized) {
+        normalized.push_back(static_cast<float>(v / magnitude));
+    }
+    return normalized;
+}
+
+// ============================================================================
 // Embedding Input Limits
 // ============================================================================
 
+// ============================================================================
+// estimate_utf8_bytes (对齐 openclaw embedding-input-limits.ts:estimateUtf8Bytes)
+// ============================================================================
+int estimate_utf8_bytes(const std::string& text) {
+    // UTF-8 字节数 = 字符串的字节长度（std::string 存储 UTF-8）
+    return static_cast<int>(text.size());
+}
+
+// ============================================================================
+// split_text_to_byte_limit (对齐 openclaw embedding-input-limits.ts:splitTextToUtf8ByteLimit)
+// 使用二分查找精确按 UTF-8 字节边界分割，避免切断多字节字符
+// ============================================================================
 std::vector<std::string> split_text_to_byte_limit(
     const std::string& text,
     int max_bytes) {
-    
-    if (text.length() <= static_cast<size_t>(max_bytes)) {
+
+    if (max_bytes <= 0) {
         return {text};
     }
-    
-    return chunk_by_length(text, max_bytes);
+    if (static_cast<int>(text.size()) <= max_bytes) {
+        return {text};
+    }
+
+    std::vector<std::string> parts;
+    size_t cursor = 0;
+    const size_t n = text.size();
+
+    while (cursor < n) {
+        // 二分查找最大合法分割点（不超过 max_bytes 字节）
+        size_t low = cursor + 1;
+        size_t high = std::min(n, cursor + static_cast<size_t>(max_bytes));
+        size_t best = cursor;
+
+        while (low <= high) {
+            size_t mid = (low + high) / 2;
+            int bytes = static_cast<int>(mid - cursor);
+            if (bytes <= max_bytes) {
+                best = mid;
+                low = mid + 1;
+            } else {
+                high = mid - 1;
+            }
+        }
+
+        if (best <= cursor) {
+            best = std::min(n, cursor + 1);
+        }
+
+        // 避免切断 UTF-8 多字节序列（对齐 openclaw 的 surrogate pair 检查）
+        // UTF-8 continuation bytes: 10xxxxxx (0x80-0xBF)
+        while (best < n && best > cursor &&
+               (static_cast<unsigned char>(text[best]) & 0xC0) == 0x80) {
+            --best;
+        }
+        if (best <= cursor) {
+            best = cursor + 1;
+        }
+
+        std::string part = text.substr(cursor, best - cursor);
+        if (part.empty()) break;
+        parts.push_back(std::move(part));
+        cursor = best;
+    }
+
+    return parts;
 }
 
+// ============================================================================
+// resolve_embedding_max_input_tokens
+// (对齐 openclaw embedding-model-limits.ts:resolveEmbeddingMaxInputTokens)
+// ============================================================================
+int resolve_embedding_max_input_tokens(
+    const std::string& provider_id,
+    const std::string& model,
+    std::optional<int> provider_max_input_tokens) {
+
+    // 优先使用 provider 自身声明的 maxInputTokens
+    if (provider_max_input_tokens.has_value()) {
+        return provider_max_input_tokens.value();
+    }
+
+    // 已知模型的精确限制 (对齐 KNOWN_EMBEDDING_MAX_INPUT_TOKENS)
+    static const std::map<std::string, int> KNOWN_LIMITS = {
+        {"openai:text-embedding-3-small",    8192},
+        {"openai:text-embedding-3-large",    8192},
+        {"openai:text-embedding-ada-002",    8191},
+        {"gemini:text-embedding-004",        2048},
+        {"gemini:gemini-embedding-001",      2048},
+        {"gemini:gemini-embedding-2-preview",8192},
+        {"voyage:voyage-3",                 32000},
+        {"voyage:voyage-3-lite",            16000},
+        {"voyage:voyage-code-3",            32000},
+    };
+
+    // 构造 key: "provider:model" (小写)
+    std::string key = provider_id + ":" + model;
+    std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+
+    auto it = KNOWN_LIMITS.find(key);
+    if (it != KNOWN_LIMITS.end()) {
+        return it->second;
+    }
+
+    // Provider 级别的保守回退
+    std::string pid = provider_id;
+    std::transform(pid.begin(), pid.end(), pid.begin(), ::tolower);
+    if (pid == "gemini") return 2048;
+    if (pid == "local")  return 2048;  // DEFAULT_LOCAL_EMBEDDING_MAX_INPUT_TOKENS
+
+    return 8192;  // DEFAULT_EMBEDDING_MAX_INPUT_TOKENS
+}
+
+// ============================================================================
+// enforce_embedding_max_input_tokens
+// (对齐 openclaw embedding-chunk-limits.ts:enforceEmbeddingMaxInputTokens)
+// ============================================================================
 std::vector<MemoryChunk> enforce_embedding_max_input_tokens(
     const std::vector<MemoryChunk>& chunks,
     int max_input_tokens) {
-    
+
     std::vector<MemoryChunk> result;
-    
+
     for (const auto& chunk : chunks) {
+        // 对齐 openclaw: hasNonTextEmbeddingParts -> 直接保留（multimodal chunk）
+        if (!chunk.embedding_input.parts.empty()) {
+            bool has_non_text = false;
+            for (const auto& part : chunk.embedding_input.parts) {
+                if (part.type != "text") {
+                    has_non_text = true;
+                    break;
+                }
+            }
+            if (has_non_text) {
+                result.push_back(chunk);
+                continue;
+            }
+        }
+
         int estimated_bytes = estimate_utf8_bytes(chunk.text);
-        
         if (estimated_bytes <= max_input_tokens) {
             result.push_back(chunk);
             continue;
         }
-        
-        // Split large chunk
+
+        // 按字节限制分割
         auto split_texts = split_text_to_byte_limit(chunk.text, max_input_tokens);
-        
         for (const auto& text : split_texts) {
-            MemoryChunk new_chunk = chunk;
-            new_chunk.text = text;
-            new_chunk.hash = hash_text(text);
-            new_chunk.embedding_input.text = text;
-            result.push_back(new_chunk);
+            MemoryChunk new_chunk;
+            new_chunk.start_line = chunk.start_line;
+            new_chunk.end_line   = chunk.end_line;
+            new_chunk.text       = text;
+            new_chunk.hash       = hash_text(text);
+            new_chunk.embedding_input = build_text_embedding_input(text);
+            result.push_back(std::move(new_chunk));
         }
     }
-    
+
     return result;
 }
 

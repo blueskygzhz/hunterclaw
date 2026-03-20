@@ -1277,7 +1277,11 @@ core::Result<void> MemoryManagerSyncOps::run_sync(const SyncParams& params) {
         } catch (const std::exception& e) {
             std::string reason = e.what();
             if (should_fallback_on_error(reason) && activate_fallback_provider(reason)) {
-                return run_safe_reindex(params);
+                // 对齐 openclaw: runSafeReindex({ reason: params?.reason ?? "fallback", force: true })
+                SyncParams fallback_params;
+                fallback_params.reason = (params.reason && !params.reason->empty()) ? params.reason : std::make_optional<std::string>("fallback");
+                fallback_params.force  = true;
+                return run_safe_reindex(fallback_params);
             }
             return core::Result<void>::Err(reason);
         }
@@ -1332,7 +1336,11 @@ core::Result<void> MemoryManagerSyncOps::run_sync(const SyncParams& params) {
     } catch (const std::exception& e) {
         std::string reason = e.what();
         if (should_fallback_on_error(reason) && activate_fallback_provider(reason)) {
-            return run_safe_reindex(params);
+            // 对齐 openclaw: runSafeReindex({ reason: params?.reason ?? "fallback", force: true })
+            SyncParams fallback_params;
+            fallback_params.reason = (params.reason && !params.reason->empty()) ? params.reason : std::make_optional<std::string>("fallback");
+            fallback_params.force  = true;
+            return run_safe_reindex(fallback_params);
         }
         return core::Result<void>::Err(reason);
     }
