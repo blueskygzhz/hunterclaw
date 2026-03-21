@@ -1145,5 +1145,9 @@ std::shared_ptr<agents::AgentPool> GatewayServer::agent_pool() const {
     return impl_->agent_pool;
 }
 
+std::shared_ptr<core::Config> GatewayServer::config() const {
+    return impl_->config;
+}
+
 } // namespace gateway
 } // namespace hunterclaw

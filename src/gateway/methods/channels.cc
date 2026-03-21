@@ -96,10 +96,16 @@ static json build_channel_account_snapshot(
     if (runtime.last_stop_at.has_value()) {
         snap["lastStopAt"] = runtime.last_stop_at.value();
     }
-    if (runtime.last_message_at.has_value()) {
-        snap["lastInboundAt"] = runtime.last_message_at.value();
-    }
-    return snap;
+        // 🎯 OpenClaw 对齐: lastInboundAt / lastOutboundAt
+        // 对应 OpenClaw channels.ts: getChannelActivity({ channel, accountId })
+        if (runtime.last_message_at.has_value()) {
+            snap["lastInboundAt"] = runtime.last_message_at.value();
+        } else {
+            snap["lastInboundAt"] = nullptr;
+        }
+        // lastOutboundAt: HunterClaw 暂时没有这个字段，设为 null
+        snap["lastOutboundAt"] = nullptr;
+        return snap;
 }
 
 // ============================================================================
@@ -247,7 +253,7 @@ core::Result<json> method_channel_status(
 
 // channels.logout - 登出渠道账户
 // 🎯 OpenClaw 严格对齐: server-methods/channels.ts channelsHandlers["channels.logout"]
-// 流程: validateParams → stopChannel → plugin.gateway.logoutAccount → markChannelLoggedOut
+// 流程: validateParams → 检查 config 有效性 → stopChannel → plugin.gateway.logoutAccount → markChannelLoggedOut
 core::Result<json> method_channel_logout(
     std::shared_ptr<GatewayServer> server,
     std::shared_ptr<MethodGuard> method_guard,
@@ -276,6 +282,13 @@ core::Result<json> method_channel_logout(
     }
 
     auto channel_mgr = server->channel_manager();
+
+    // 🎯 OpenClaw 对齐: 检查 config 有效性
+    // 对应 OpenClaw: if (!snapshot.valid) respond(false, ..., "config invalid; fix it before logging out")
+    auto config = server->config();
+    if (!config) {
+        return core::Result<json>::Err("config invalid; fix it before logging out");
+    }
 
     // 🎯 OpenClaw 对齐: stopChannel(channelId, accountId)
     auto stop_result = channel_mgr->stop_channel(channel_id.c_str(), account_id);

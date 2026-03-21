@@ -20,15 +20,29 @@ core::Result<json> method_wake(
     const ClientContext& client_ctx,
     const json& params
 ) {
+    // 🎯 OpenClaw 对齐: wake 参数验证
+    // 对应 OpenClaw cron.ts: validateWakeParams
+    // mode: "now" | "next-heartbeat" (optional, default "next-heartbeat")
+    // text: string (optional)
+    std::string mode = "next-heartbeat";
+    if (params.contains("mode") && params["mode"].is_string()) {
+        mode = params["mode"].get<std::string>();
+        if (mode != "now" && mode != "next-heartbeat") {
+            return core::Result<json>::Err("invalid wake params: mode must be 'now' or 'next-heartbeat'");
+        }
+    }
+    std::string text = params.value("text", "");
+
     // TODO: 实现心跳触发逻辑
     // auto cron_svc = server->cron_service();
     // if (cron_svc) {
-    //     cron_svc->wake();
+    //     cron_svc->wake({ mode, text });
     // }
-    
+
     json result;
     result["ok"] = true;
     result["woke"] = true;
+    result["mode"] = mode;
     result["timestamp"] = core::utils::now().time_since_epoch().count();
     return core::Result<json>::Ok(result);
 }
@@ -286,26 +300,55 @@ core::Result<json> method_cron_runs(
     const ClientContext& client_ctx,
     const json& params
 ) {
-    std::string scope = params.value("scope", "all");  // "job" | "all"
+    // 🎯 OpenClaw 对齐: scope 参数
+    std::string scope = params.value("scope", "");  // "job" | "all"
     std::string job_id = params.value("id", params.value("jobId", ""));
     int limit = params.value("limit", 50);
     int offset = params.value("offset", 0);
-    std::string status = params.value("status", "all");  // all | ok | error | skipped
-    std::string delivery_status = params.value("deliveryStatus", "");
-    std::string query = params.value("query", "");
     std::string sort_dir = params.value("sortDir", "desc");
-    
+
+    // 🎯 OpenClaw 对齐: statuses 数组参数 (OpenClaw 优先使用 statuses 数组)
+    // 对应 OpenClaw: statuses?: Array<"ok" | "error" | "skipped">
+    std::vector<std::string> statuses;
+    if (params.contains("statuses") && params["statuses"].is_array()) {
+        for (const auto& s : params["statuses"]) {
+            if (s.is_string()) statuses.push_back(s.get<std::string>());
+        }
+    } else if (params.contains("status") && params["status"].is_string()) {
+        // 对齐 OpenClaw: status?: "all" | "ok" | "error" | "skipped" (单个字符串形式)
+        std::string status = params["status"].get<std::string>();
+        if (status != "all") statuses.push_back(status);
+    }
+
+    // 🎯 OpenClaw 对齐: deliveryStatuses 数组参数
+    std::vector<std::string> delivery_statuses;
+    if (params.contains("deliveryStatuses") && params["deliveryStatuses"].is_array()) {
+        for (const auto& s : params["deliveryStatuses"]) {
+            if (s.is_string()) delivery_statuses.push_back(s.get<std::string>());
+        }
+    } else if (params.contains("deliveryStatus") && params["deliveryStatus"].is_string()) {
+        delivery_statuses.push_back(params["deliveryStatus"].get<std::string>());
+    }
+
+    std::string query = params.value("query", "");
+
+    // 🎯 OpenClaw 对齐: scope 推断逻辑
+    // 对应 OpenClaw: const scope = explicitScope ?? (jobId ? "job" : "all");
+    if (scope.empty()) {
+        scope = job_id.empty() ? "all" : "job";
+    }
+
     // 限制
     if (limit > 200) limit = 200;
-    
+
     // scope = "job" 时必须提供 job_id
     if (scope == "job" && job_id.empty()) {
-        return core::Result<json>::Err("job_id required when scope=job");
+        return core::Result<json>::Err("invalid cron.runs params: missing id");
     }
-    
+
     // TODO: 从运行日志读取
     json entries = json::array();
-    
+
     // CronRunLogEntry 结构 (对齐 OpenClaw):
     // {
     //   "runId": "run-uuid",
@@ -318,17 +361,17 @@ core::Result<json> method_cron_runs(
     //   "error": "...",
     //   "delivery": {
     //     "attempted": true,
-    //     "status": "delivered" | "not-delivered" | "unknown",
+    //     "status": "delivered" | "not-delivered" | "unknown" | "not-requested",
     //     "error": "..."
     //   }
     // }
-    
+
     json result;
     result["entries"] = entries;
     result["total"] = 0;
     result["limit"] = limit;
     result["offset"] = offset;
-    
+
     return core::Result<json>::Ok(result);
 }
 

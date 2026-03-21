@@ -146,6 +146,9 @@ public:
     std::shared_ptr<skills::SkillManager> skill_manager() const;
     std::shared_ptr<plugins::PluginManager> plugin_manager() const;
     
+    // Config access
+    std::shared_ptr<core::Config> config() const;
+    
     // State access
     std::shared_ptr<GatewayRuntimeState> runtime_state() const;
     

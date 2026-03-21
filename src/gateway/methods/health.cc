@@ -4,6 +4,8 @@
 #include "hunterclaw/core/utils.h"
 #include <nlohmann/json.hpp>
 #include <chrono>
+#include <mutex>
+#include <optional>
 
 using json = nlohmann::json;
 
@@ -12,23 +14,26 @@ namespace gateway {
 namespace methods {
 
 // ============================================================================
-// Core Methods (Health & Debug) - 完全对齐 OpenClaw
+// 🎯 OpenClaw 严格对齐: 健康缓存 (HEALTH_REFRESH_INTERVAL_MS = 60000)
+// 对应 OpenClaw health.ts: getHealthCache / refreshHealthSnapshot
 // ============================================================================
+namespace {
 
-// ============================================================================
-// health - 完整健康检查
-// 🎯 OpenClaw 严格对齐: server-methods/health.ts healthHandlers["health"]
-// 对应 OpenClaw: getStatusSummary + refreshHealthSnapshot
-// ============================================================================
-core::Result<json> method_health(
+struct HealthCache {
+    json snapshot;
+    int64_t ts = 0;
+};
+
+static std::mutex g_health_cache_mutex;
+static std::optional<HealthCache> g_health_cache;
+
+// 60s 缓存 TTL，对齐 OpenClaw HEALTH_REFRESH_INTERVAL_MS
+static constexpr int64_t HEALTH_REFRESH_INTERVAL_MS = 60000;
+
+static json build_health_snapshot(
     std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
+    bool wants_probe
 ) {
-    // 🎯 OpenClaw 对齐: probe 参数
-    bool wants_probe = params.value("probe", false);
-
     int64_t ts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()
     ).count();
@@ -61,14 +66,57 @@ core::Result<json> method_health(
         channels_map[ch_id_str] = ch_info;
     }
 
-    // 🎯 OpenClaw 对齐: 返回 getStatusSummary 格式
-    json result;
-    result["ts"] = ts_ms;
-    result["ok"] = true;
-    result["channels"] = channels_map;
-    result["channelOrder"] = channel_order;
+    json snap;
+    snap["ts"] = ts_ms;
+    snap["ok"] = true;
+    snap["channels"] = channels_map;
+    snap["channelOrder"] = channel_order;
+    return snap;
+}
 
-    return core::Result<json>::Ok(result);
+} // anonymous namespace
+
+// ============================================================================
+// health - 完整健康检查
+// 🎯 OpenClaw 严格对齐: server-methods/health.ts healthHandlers["health"]
+// 对应 OpenClaw: getHealthCache + refreshHealthSnapshot (带 60s 缓存)
+// ============================================================================
+core::Result<json> method_health(
+    std::shared_ptr<GatewayServer> server,
+    std::shared_ptr<MethodGuard> method_guard,
+    const ClientContext& client_ctx,
+    const json& params
+) {
+    // 🎯 OpenClaw 对齐: probe 参数
+    bool wants_probe = params.value("probe", false);
+
+    int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count();
+
+    // 🎯 OpenClaw 严格对齐: 缓存逻辑
+    // 对应 OpenClaw health.ts:
+    //   if (!wantsProbe && cached && now - cached.ts < HEALTH_REFRESH_INTERVAL_MS)
+    //     respond(true, cached, undefined, { cached: true });
+    if (!wants_probe) {
+        std::lock_guard<std::mutex> lock(g_health_cache_mutex);
+        if (g_health_cache.has_value() &&
+            (now_ms - g_health_cache->ts) < HEALTH_REFRESH_INTERVAL_MS) {
+            // 返回缓存的健康快照
+            return core::Result<json>::Ok(g_health_cache->snapshot);
+        }
+    }
+
+    // 构建新的健康快照
+    json snap = build_health_snapshot(server, wants_probe);
+
+    // 更新缓存 (probe 结果不缓存)
+    if (!wants_probe) {
+        std::lock_guard<std::mutex> lock(g_health_cache_mutex);
+        g_health_cache = HealthCache{snap, now_ms};
+    }
+
+    return core::Result<json>::Ok(snap);
 }
 
 // ============================================================================

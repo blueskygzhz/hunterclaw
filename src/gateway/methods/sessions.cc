@@ -370,8 +370,11 @@ core::Result<json> method_session_delete(
     }
     
     // 🎯 OpenClaw 对齐: 不允许删除 main session
-    if (key == "agent:main:main" || key == "global") {
-        return core::Result<json>::Err("Cannot delete the main session");
+    // 对应 OpenClaw: if (target.canonicalKey === mainKey) respond(false, ..., "Cannot delete the main session")
+    // HunterClaw 简化版: 检查常见的 main session key 格式
+    if (key == "agent:main:main" || key == "global" ||
+        key.find("agent:main:") == 0 && key.find(":main") == key.size() - 5) {
+        return core::Result<json>::Err("Cannot delete the main session (" + key + ").");
     }
     
     // 🎯 OpenClaw 对齐: deleteTranscript 参数 (默认 true)
@@ -442,7 +445,8 @@ core::Result<json> method_session_get(
 
 // ============================================================================
 // sessions.compact - 压缩会话 (严格对齐 OpenClaw)
-// 参考: openclaw-analysis/src/gateway/server-methods/sessions.ts:345+
+// 对应 OpenClaw sessions.ts: sessions.compact
+// 实现: 读取 transcript 文件 → 保留最后 N 行 → 归档旧文件
 // ============================================================================
 core::Result<json> method_session_compact(
     std::shared_ptr<GatewayServer> server,
@@ -453,26 +457,39 @@ core::Result<json> method_session_compact(
     if (!params.contains("key")) {
         return core::Result<json>::Err("Missing 'key' parameter");
     }
-    
+
     std::string key = params["key"].get<std::string>();
     if (key.empty()) {
         return core::Result<json>::Err("key required");
     }
-    
-    // TODO: HunterClaw session compression not yet implemented
-    // This would integrate with memory compactor
-    
+
+    // 🎯 OpenClaw 对齐: maxLines 参数 (default 400)
+    // 对应 OpenClaw: const maxLines = typeof p.maxLines === "number" ? Math.max(1, Math.floor(p.maxLines)) : 400;
+    int max_lines = 400;
+    if (params.contains("maxLines") && params["maxLines"].is_number()) {
+        max_lines = std::max(1, params["maxLines"].get<int>());
+    }
+
+    // TODO: 当 session manager 集成后，从 session store 获取 sessionId 和 transcript 路径
+    // 对应 OpenClaw:
+    //   1. updateSessionStore 获取 entry.sessionId
+    //   2. resolveSessionTranscriptCandidates 找到 transcript 文件
+    //   3. 读取所有行，如果 lines.length <= maxLines 则返回 compacted=false
+    //   4. archiveFileOnDisk 归档旧文件
+    //   5. 写入最后 maxLines 行
+    //   6. 清除 token 计数器
+
     json result;
     result["ok"] = true;
     result["key"] = key;
-    result["compacted"] = false;  // Placeholder
-    result["reason"] = "Not implemented yet";
-    
+    result["compacted"] = false;
+    result["reason"] = "session manager not yet integrated";
+
     return core::Result<json>::Ok(result);
 }
 
 // ============================================================================
-// sessions.resolve - 解析 session key (严格对齐 OpenClaw)
+// sessions.resolve// sessions.resolve - 解析 session key (严格对齐 OpenClaw)
 // 用于从 label 或其他标识符解析到实际的 session key
 // ============================================================================
 core::Result<json> method_session_resolve(

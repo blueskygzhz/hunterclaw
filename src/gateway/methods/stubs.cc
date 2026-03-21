@@ -847,6 +847,9 @@ core::Result<json> method_doctor_memory_status(
 // ============================================================================
 
 // gateway.identity.get
+// \ud83c\udfaf OpenClaw \u5bf9\u9f50: system.ts systemHandlers["gateway.identity.get"]
+// \u5bf9\u5e94 OpenClaw: { deviceId, publicKey }
+// \u5bf9\u5e94 OpenClaw: loadOrCreateDeviceIdentity() + publicKeyRawBase64UrlFromPem()
 core::Result<json> method_gateway_identity_get(
     std::shared_ptr<GatewayServer> server,
     std::shared_ptr<MethodGuard> method_guard,
@@ -854,10 +857,12 @@ core::Result<json> method_gateway_identity_get(
     const json& params
 ) {
     (void)server; (void)method_guard; (void)client_ctx; (void)params;
+    // TODO: \u52a0\u8f7d\u771f\u5b9e\u7684\u8bbe\u5907\u8eab\u4efd (device-identity.ts \u5bf9\u5e94\u5b9e\u73b0)
+    // \u5bf9\u5e94 OpenClaw: const identity = loadOrCreateDeviceIdentity();
+    // respond(true, { deviceId: identity.deviceId, publicKey: publicKeyRawBase64UrlFromPem(identity.publicKeyPem) })
     json result;
-    result["gatewayId"] = "hunterclaw";
-    result["version"] = "1.0.0";
-    result["ts"] = now_ms();
+    result["deviceId"] = "hunterclaw-device-id";  // TODO: \u4ece\u8bbe\u5907\u8eab\u4efd\u6587\u4ef6\u52a0\u8f7d
+    result["publicKey"] = nullptr;                 // TODO: \u4ece\u8bbe\u5907\u8eab\u4efd\u6587\u4ef6\u52a0\u8f7d
     STUB_METHOD_OK(result);
 }
 
