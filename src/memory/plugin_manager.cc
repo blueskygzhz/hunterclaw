@@ -120,13 +120,13 @@ core::Result<std::vector<PluginManifest>> MemoryPluginLoader::discover_plugins()
             }
 
             auto result = parse_manifest(entry.path().string());
-            if (!result.ok()) {
+            if (!result.ok) {
                 log()->warn("MemoryPluginLoader: failed to parse {}: {}",
-                    entry.path().string(), result.error());
+                    entry.path().string(), result.error);
                 continue;
             }
 
-            auto manifest = result.value();
+            auto manifest = result.get();
             if (manifest.kind != "memory") {
                 log()->debug("MemoryPluginLoader: skipping non-memory plugin {} (kind: {})",
                     manifest.id, manifest.kind);
@@ -139,27 +139,27 @@ core::Result<std::vector<PluginManifest>> MemoryPluginLoader::discover_plugins()
         }
     }
 
-    return core::Result<std::vector<PluginManifest>>::ok(std::move(manifests));
+    return core::Result<std::vector<PluginManifest>>::Ok(std::move(manifests));
 }
 
 core::Result<void> MemoryPluginLoader::load_plugin(const std::string& manifest_path) {
     auto manifest_result = parse_manifest(manifest_path);
-    if (!manifest_result.ok()) {
-        return core::Result<void>::err(manifest_result.error());
+    if (!manifest_result.ok) {
+        return core::Result<void>::Err(manifest_result.error);
     }
 
-    const auto& manifest = manifest_result.value();
+    const auto& manifest = manifest_result.get();
 
     auto validate_result = validate_manifest(manifest);
-    if (!validate_result.ok()) {
-        return core::Result<void>::err(validate_result.error());
+    if (!validate_result.ok) {
+        return core::Result<void>::Err(validate_result.error);
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (handles_.count(manifest.id)) {
         log()->debug("MemoryPluginLoader: plugin '{}' already loaded", manifest.id);
-        return core::Result<void>::ok();
+        return core::Result<void>::Ok();
     }
 
     // Locate .so file
@@ -167,7 +167,7 @@ core::Result<void> MemoryPluginLoader::load_plugin(const std::string& manifest_p
     const fs::path so_path = manifest_dir / manifest.main;
 
     if (!fs::exists(so_path)) {
-        return core::Result<void>::err("Plugin library not found: " + so_path.string());
+        return core::Result<void>::Err("Plugin library not found: " + so_path.string());
     }
 
     // dlopen
@@ -196,27 +196,27 @@ core::Result<void> MemoryPluginLoader::load_plugin(const std::string& manifest_p
     handles_[manifest.id] = handle;
     log()->info("MemoryPluginLoader: loaded plugin '{}' from {}", manifest.id, so_path.string());
 
-    return core::Result<void>::ok();
+    return core::Result<void>::Ok();
 }
 
 core::Result<int> MemoryPluginLoader::load_all_plugins() {
     auto discover_result = discover_plugins();
-    if (!discover_result.ok()) {
-        return core::Result<int>::err(discover_result.error());
+    if (!discover_result.ok) {
+        return core::Result<int>::Err(discover_result.error);
     }
 
     int loaded = 0;
-    for (const auto& manifest : discover_result.value()) {
+    for (const auto& manifest : discover_result.get()) {
         // Re-derive manifest path from directories
         for (const auto& dir : plugin_dirs_) {
             const fs::path candidate = fs::path(dir) / (manifest.id + ".plugin.json");
             if (fs::exists(candidate)) {
                 auto r = load_plugin(candidate.string());
-                if (r.ok()) {
+                if (r.ok) {
                     ++loaded;
                 } else {
                     log()->warn("MemoryPluginLoader: failed to load '{}': {}",
-                        manifest.id, r.error());
+                        manifest.id, r.error);
                 }
                 break;
             }
@@ -224,7 +224,7 @@ core::Result<int> MemoryPluginLoader::load_all_plugins() {
     }
 
     log()->info("MemoryPluginLoader: loaded {} plugin(s)", loaded);
-    return core::Result<int>::ok(loaded);
+    return core::Result<int>::Ok(loaded);
 }
 
 core::Result<void> MemoryPluginLoader::unload_plugin(const std::string& plugin_id) {
@@ -232,14 +232,14 @@ core::Result<void> MemoryPluginLoader::unload_plugin(const std::string& plugin_i
 
     auto it = handles_.find(plugin_id);
     if (it == handles_.end()) {
-        return core::Result<void>::err("Plugin not loaded: " + plugin_id);
+        return core::Result<void>::Err("Plugin not loaded: " + plugin_id);
     }
 
     dlclose(it->second);
     handles_.erase(it);
 
     log()->info("MemoryPluginLoader: unloaded plugin '{}'", plugin_id);
-    return core::Result<void>::ok();
+    return core::Result<void>::Ok();
 }
 
 // ============================================================================
@@ -251,7 +251,7 @@ core::Result<PluginManifest> MemoryPluginLoader::parse_manifest(
 {
     std::ifstream file(manifest_path);
     if (!file.is_open()) {
-        return core::Result<PluginManifest>::err("Cannot open: " + manifest_path);
+        return core::Result<PluginManifest>::Err("Cannot open: " + manifest_path);
     }
 
     json root;
@@ -269,20 +269,20 @@ core::Result<PluginManifest> MemoryPluginLoader::parse_manifest(
             return core::Result<std::string>::err(
                 std::string("Missing or invalid field: ") + field);
         }
-        return core::Result<std::string>::ok(root[field].get<std::string>());
+        return core::Result<std::string>::Ok(root[field].get<std::string>());
     };
 
     auto id_r = require_string("id");
-    if (!id_r.ok()) return core::Result<PluginManifest>::err(id_r.error());
-    m.id = id_r.value();
+    if (!id_r.ok) return core::Result<PluginManifest>::Err(id_r.error);
+    m.id = id_r.get();
 
     auto name_r = require_string("name");
-    if (!name_r.ok()) return core::Result<PluginManifest>::err(name_r.error());
-    m.name = name_r.value();
+    if (!name_r.ok) return core::Result<PluginManifest>::Err(name_r.error);
+    m.name = name_r.get();
 
     auto version_r = require_string("version");
-    if (!version_r.ok()) return core::Result<PluginManifest>::err(version_r.error());
-    m.version = version_r.value();
+    if (!version_r.ok) return core::Result<PluginManifest>::Err(version_r.error);
+    m.version = version_r.get();
 
     // "kind" (preferred) or legacy "type"
     if (root.contains("kind") && root["kind"].is_string()) {
@@ -290,12 +290,12 @@ core::Result<PluginManifest> MemoryPluginLoader::parse_manifest(
     } else if (root.contains("type") && root["type"].is_string()) {
         m.kind = root["type"].get<std::string>();
     } else {
-        return core::Result<PluginManifest>::err("Missing field: kind (or type)");
+        return core::Result<PluginManifest>::Err("Missing field: kind (or type)");
     }
 
     auto main_r = require_string("main");
-    if (!main_r.ok()) return core::Result<PluginManifest>::err(main_r.error());
-    m.main = main_r.value();
+    if (!main_r.ok) return core::Result<PluginManifest>::Err(main_r.error);
+    m.main = main_r.get();
 
     // Optional fields
     if (root.contains("description") && root["description"].is_string())
@@ -318,17 +318,17 @@ core::Result<PluginManifest> MemoryPluginLoader::parse_manifest(
         }
     }
 
-    return core::Result<PluginManifest>::ok(std::move(m));
+    return core::Result<PluginManifest>::Ok(std::move(m));
 }
 
 core::Result<void> MemoryPluginLoader::validate_manifest(const PluginManifest& m) {
     if (m.id.empty())
-        return core::Result<void>::err("Manifest id is empty");
+        return core::Result<void>::Err("Manifest id is empty");
     if (m.kind != "memory")
-        return core::Result<void>::err("Manifest kind is not 'memory': " + m.kind);
+        return core::Result<void>::Err("Manifest kind is not 'memory': " + m.kind);
     if (m.main.empty())
-        return core::Result<void>::err("Manifest main is empty");
-    return core::Result<void>::ok();
+        return core::Result<void>::Err("Manifest main is empty");
+    return core::Result<void>::Ok();
 }
 
 } // namespace memory

@@ -303,6 +303,9 @@ struct Result {
         r.error = std::move(err);
         return r;
     }
+
+    // Lowercase alias for compatibility
+    static Result<T> err(std::string e) { return Err(std::move(e)); }
     
     bool is_ok() const { return ok; }
     bool is_err() const { return !ok; }
@@ -347,6 +350,9 @@ struct Result<void> {
     static Result<void> Err(std::string err) {
         return Result<void>{false, std::move(err)};
     }
+
+    // Lowercase alias for compatibility
+    static Result<void> err(std::string e) { return Err(std::move(e)); }
     
     bool is_ok() const { return ok; }
     bool is_err() const { return !ok; }

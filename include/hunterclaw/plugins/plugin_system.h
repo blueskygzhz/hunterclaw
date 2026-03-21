@@ -23,7 +23,8 @@ class PluginRegistry;
 
 enum class PluginKind {
   MEMORY,
-  CONTEXT_ENGINE
+  CONTEXT_ENGINE,
+  GENERAL
 };
 
 enum class PluginOrigin {

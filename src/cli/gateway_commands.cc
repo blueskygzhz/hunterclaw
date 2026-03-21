@@ -101,7 +101,7 @@ std::vector<CommandOption> GatewayStartCommand::get_options() const {
 core::Result<void> GatewayStartCommand::execute(const std::vector<std::string>& args) {
     auto parse_result = CommandParser::parse(args, get_options());
     if (!parse_result.is_ok()) {
-        return core::Result<void>::err(parse_result.error());
+        return core::Result<void>::err(parse_result.error);
     }
     
     auto cmd_args = parse_result.value();
@@ -173,7 +173,7 @@ core::Result<void> GatewayStartCommand::execute(const std::vector<std::string>& 
     
     auto start_result = gateway->start();
     if (!start_result.is_ok()) {
-        return core::Result<void>::err("Failed to start Gateway: " + start_result.error());
+        return core::Result<void>::err("Failed to start Gateway: " + start_result.error);
     }
     
     if (!daemon) {
@@ -201,7 +201,7 @@ std::vector<CommandOption> GatewayStopCommand::get_options() const {
 core::Result<void> GatewayStopCommand::execute(const std::vector<std::string>& args) {
     auto parse_result = CommandParser::parse(args, get_options());
     if (!parse_result.is_ok()) {
-        return core::Result<void>::err(parse_result.error());
+        return core::Result<void>::err(parse_result.error);
     }
     
     auto cmd_args = parse_result.value();
@@ -283,7 +283,7 @@ std::vector<CommandOption> GatewayStatusCommand::get_options() const {
 core::Result<void> GatewayStatusCommand::execute(const std::vector<std::string>& args) {
     auto parse_result = CommandParser::parse(args, get_options());
     if (!parse_result.is_ok()) {
-        return core::Result<void>::err(parse_result.error());
+        return core::Result<void>::err(parse_result.error);
     }
     
     // Check if running
@@ -327,7 +327,7 @@ std::vector<CommandOption> GatewayLogsCommand::get_options() const {
 core::Result<void> GatewayLogsCommand::execute(const std::vector<std::string>& args) {
     auto parse_result = CommandParser::parse(args, get_options());
     if (!parse_result.is_ok()) {
-        return core::Result<void>::err(parse_result.error());
+        return core::Result<void>::err(parse_result.error);
     }
     
     auto cmd_args = parse_result.value();
@@ -365,7 +365,7 @@ std::vector<CommandOption> GatewayConfigCommand::get_options() const {
 core::Result<void> GatewayConfigCommand::execute(const std::vector<std::string>& args) {
     auto parse_result = CommandParser::parse(args, get_options());
     if (!parse_result.is_ok()) {
-        return core::Result<void>::err(parse_result.error());
+        return core::Result<void>::err(parse_result.error);
     }
     
     auto cmd_args = parse_result.value();

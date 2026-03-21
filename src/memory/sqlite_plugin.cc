@@ -44,7 +44,7 @@ public:
     core::Result<void> init_database() {
         int rc = sqlite3_open(config.db_path.c_str(), &db);
         if (rc != SQLITE_OK) {
-            return core::Result<void>::err(
+            return core::Result<void>::Err(
                 "Failed to open database: " + std::string(sqlite3_errmsg(db)));
         }
 
@@ -96,11 +96,11 @@ public:
         if (rc != SQLITE_OK) {
             std::string error = err_msg ? err_msg : "unknown";
             sqlite3_free(err_msg);
-            return core::Result<void>::err("Schema error: " + error);
+            return core::Result<void>::Err("Schema error: " + error);
         }
 
         log()->info("SQLiteMemoryManager: database initialized at {}", config.db_path);
-        return core::Result<void>::ok();
+        return core::Result<void>::Ok();
     }
 
     // Cosine similarity
@@ -126,8 +126,8 @@ SQLiteMemoryManager::SQLiteMemoryManager(const Config& config)
 {
     impl_->config = config;
     auto r = impl_->init_database();
-    if (!r.ok()) {
-        log()->error("SQLiteMemoryManager: init failed: {}", r.error());
+    if (!r.ok) {
+        log()->error("SQLiteMemoryManager: init failed: {}", r.error);
     }
 }
 

@@ -66,7 +66,7 @@ std::vector<CommandOption> ChannelsListCommand::get_options() const {
 core::Result<void> ChannelsListCommand::execute(const std::vector<std::string>& args) {
     auto parse_result = CommandParser::parse(args, get_options());
     if (!parse_result.is_ok()) {
-        return core::Result<void>::err(parse_result.error());
+        return core::Result<void>::err(parse_result.error);
     }
     
     // Load channels config
@@ -74,7 +74,7 @@ core::Result<void> ChannelsListCommand::execute(const std::vector<std::string>& 
     if (!config_result.is_ok()) {
         JsonOutput output{false, "error", "Failed to load channels config"};
         output.print();
-        return core::Result<void>::err(config_result.error());
+        return core::Result<void>::err(config_result.error);
     }
     
     JsonOutput output{true, "success", "Channels listed"};
@@ -98,7 +98,7 @@ std::vector<CommandOption> ChannelsAddCommand::get_options() const {
 core::Result<void> ChannelsAddCommand::execute(const std::vector<std::string>& args) {
     auto parse_result = CommandParser::parse(args, get_options());
     if (!parse_result.is_ok()) {
-        return core::Result<void>::err(parse_result.error());
+        return core::Result<void>::err(parse_result.error);
     }
     
     auto cmd_args = parse_result.value();
@@ -111,7 +111,7 @@ core::Result<void> ChannelsAddCommand::execute(const std::vector<std::string>& a
     if (!config_result.is_ok()) {
         JsonOutput output{false, "error", "Failed to load channels config"};
         output.print();
-        return core::Result<void>::err(config_result.error());
+        return core::Result<void>::err(config_result.error);
     }
     
     // TODO: Add channel to config
@@ -121,7 +121,7 @@ core::Result<void> ChannelsAddCommand::execute(const std::vector<std::string>& a
     if (!save_result.is_ok()) {
         JsonOutput output{false, "error", "Failed to save channels config"};
         output.print();
-        return core::Result<void>::err(save_result.error());
+        return core::Result<void>::err(save_result.error);
     }
     
     JsonOutput output{true, "success", "Channel added successfully"};
@@ -142,7 +142,7 @@ std::vector<CommandOption> ChannelsRemoveCommand::get_options() const {
 core::Result<void> ChannelsRemoveCommand::execute(const std::vector<std::string>& args) {
     auto parse_result = CommandParser::parse(args, get_options());
     if (!parse_result.is_ok()) {
-        return core::Result<void>::err(parse_result.error());
+        return core::Result<void>::err(parse_result.error);
     }
     
     auto cmd_args = parse_result.value();
@@ -153,7 +153,7 @@ core::Result<void> ChannelsRemoveCommand::execute(const std::vector<std::string>
     if (!config_result.is_ok()) {
         JsonOutput output{false, "error", "Failed to load channels config"};
         output.print();
-        return core::Result<void>::err(config_result.error());
+        return core::Result<void>::err(config_result.error);
     }
     
     // TODO: Remove channel from config
@@ -163,7 +163,7 @@ core::Result<void> ChannelsRemoveCommand::execute(const std::vector<std::string>
     if (!save_result.is_ok()) {
         JsonOutput output{false, "error", "Failed to save channels config"};
         output.print();
-        return core::Result<void>::err(save_result.error());
+        return core::Result<void>::err(save_result.error);
     }
     
     JsonOutput output{true, "success", "Channel removed successfully"};
@@ -183,7 +183,7 @@ std::vector<CommandOption> ChannelsEnableCommand::get_options() const {
 core::Result<void> ChannelsEnableCommand::execute(const std::vector<std::string>& args) {
     auto parse_result = CommandParser::parse(args, get_options());
     if (!parse_result.is_ok()) {
-        return core::Result<void>::err(parse_result.error());
+        return core::Result<void>::err(parse_result.error);
     }
     
     auto cmd_args = parse_result.value();
@@ -206,7 +206,7 @@ std::vector<CommandOption> ChannelsDisableCommand::get_options() const {
 core::Result<void> ChannelsDisableCommand::execute(const std::vector<std::string>& args) {
     auto parse_result = CommandParser::parse(args, get_options());
     if (!parse_result.is_ok()) {
-        return core::Result<void>::err(parse_result.error());
+        return core::Result<void>::err(parse_result.error);
     }
     
     auto cmd_args = parse_result.value();
@@ -229,7 +229,7 @@ std::vector<CommandOption> ChannelsStatusCommand::get_options() const {
 core::Result<void> ChannelsStatusCommand::execute(const std::vector<std::string>& args) {
     auto parse_result = CommandParser::parse(args, get_options());
     if (!parse_result.is_ok()) {
-        return core::Result<void>::err(parse_result.error());
+        return core::Result<void>::err(parse_result.error);
     }
     
     auto cmd_args = parse_result.value();
@@ -252,7 +252,7 @@ std::vector<CommandOption> ChannelsTestCommand::get_options() const {
 core::Result<void> ChannelsTestCommand::execute(const std::vector<std::string>& args) {
     auto parse_result = CommandParser::parse(args, get_options());
     if (!parse_result.is_ok()) {
-        return core::Result<void>::err(parse_result.error());
+        return core::Result<void>::err(parse_result.error);
     }
     
     auto cmd_args = parse_result.value();
