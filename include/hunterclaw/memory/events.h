@@ -1,6 +1,6 @@
 #pragma once
 
-#include "hunterclaw/memory/provider.h"
+#include "hunterclaw/memory/types.h"
 #include "hunterclaw/gateway/connection_pool.h"  // 使用已实现的 ConnectionPool
 #include "hunterclaw/core/result.h"
 #include <nlohmann/json.hpp>

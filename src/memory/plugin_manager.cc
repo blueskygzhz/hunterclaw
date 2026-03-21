@@ -199,8 +199,8 @@ core::Result<std::shared_ptr<MemoryPlugin>> MemoryPluginManager::load_plugin(
         return core::Result<std::shared_ptr<MemoryPlugin>>::Err("Failed to initialize plugin: " + init_result.error);
     }
     
-    // 9. 获取 Provider 并注册
-    auto provider = plugin->get_provider();
+    // 9. 获取 Manager 并注册
+    auto provider = plugin->get_manager();
     if (!provider) {
         dlclose(handle);
         return core::Result<std::shared_ptr<MemoryPlugin>>::Err("Plugin returned null provider");

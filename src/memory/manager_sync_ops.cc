@@ -3,6 +3,7 @@
 #include "hunterclaw/memory/sqlite_storage.h"
 #include "hunterclaw/memory/session_files.h"
 #include "hunterclaw/memory/chunking.h"
+#include "hunterclaw/memory/embedding_provider.h"
 #include "hunterclaw/logging/subsystem_logger.h"
 #include <sqlite3.h>
 #include <sstream>
@@ -908,7 +909,7 @@ core::Result<void> MemoryManagerSyncOps::sync_memory_files(
                     db_->exec_sql(
                         "DELETE FROM " + std::string(FTS_TABLE) +
                         " WHERE path = '" + sp + "' AND source = 'memory' AND model = '" +
-                        provider_->model() + "'");
+                        provider_->get_model() + "'");
                 } catch (...) {}
             }
         }
@@ -1069,7 +1070,7 @@ core::Result<void> MemoryManagerSyncOps::sync_session_files(
                         db_->exec_sql(
                             "DELETE FROM " + std::string(FTS_TABLE) +
                             " WHERE path = '" + sp + "' AND source = 'sessions' AND model = '" +
-                            provider_->model() + "'");
+                            provider_->get_model() + "'");
                     } catch (...) {}
                 }
             }
@@ -1145,14 +1146,14 @@ core::Result<void> MemoryManagerSyncOps::run_safe_reindex(const SyncParams& para
         if (original_db) seed_embedding_cache(*original_db);
 
         bool should_sync_memory = sources_.count(MemorySource::Memory) > 0;
-        bool should_sync_sessions = should_sync_sessions(params, true);
+        bool do_sync_sessions = should_sync_sessions(params, true);
 
         if (should_sync_memory) {
             auto r = sync_memory_files(true, nullptr);
             if (!r.is_ok()) throw std::runtime_error(r.error);
             dirty_ = false;
         }
-        if (should_sync_sessions) {
+        if (do_sync_sessions) {
             auto r = sync_session_files(true, std::nullopt, nullptr);
             if (!r.is_ok()) throw std::runtime_error(r.error);
             sessions_dirty_ = false;
@@ -1163,8 +1164,8 @@ core::Result<void> MemoryManagerSyncOps::run_safe_reindex(const SyncParams& para
             sessions_dirty_ = false;
         }
 
-        next_meta.model = provider_ ? provider_->model() : "fts-only";
-        next_meta.provider = provider_ ? provider_->id() : "none";
+        next_meta.model = provider_ ? provider_->get_model() : "fts-only";
+        next_meta.provider = provider_ ? provider_->get_id() : "none";
         next_meta.provider_key = provider_key_;
         next_meta.sources = resolve_configured_sources_for_meta();
         next_meta.scope_hash = resolve_configured_scope_hash();
@@ -1213,14 +1214,14 @@ core::Result<void> MemoryManagerSyncOps::run_unsafe_reindex(const SyncParams& pa
     reset_index();
 
     bool should_sync_memory = sources_.count(MemorySource::Memory) > 0;
-    bool should_sync_sessions = should_sync_sessions(params, true);
+    bool do_sync_sessions = should_sync_sessions(params, true);
 
     if (should_sync_memory) {
         auto r = sync_memory_files(true, nullptr);
         if (!r.is_ok()) return r;
         dirty_ = false;
     }
-    if (should_sync_sessions) {
+    if (do_sync_sessions) {
         auto r = sync_session_files(true, std::nullopt, nullptr);
         if (!r.is_ok()) return r;
         sessions_dirty_ = false;
@@ -1232,8 +1233,8 @@ core::Result<void> MemoryManagerSyncOps::run_unsafe_reindex(const SyncParams& pa
     }
 
     MemoryIndexMeta meta;
-    meta.model = provider_ ? provider_->model() : "fts-only";
-    meta.provider = provider_ ? provider_->id() : "none";
+    meta.model = provider_ ? provider_->get_model() : "fts-only";
+    meta.provider = provider_ ? provider_->get_id() : "none";
     meta.provider_key = provider_key_;
     meta.sources = resolve_configured_sources_for_meta();
     meta.scope_hash = resolve_configured_scope_hash();
@@ -1292,8 +1293,8 @@ core::Result<void> MemoryManagerSyncOps::run_sync(const SyncParams& params) {
     bool needs_full_reindex =
         (params.force && *params.force && !has_target_session_files) ||
         !meta ||
-        (provider_ && meta->model != provider_->model()) ||
-        (provider_ && meta->provider != provider_->id()) ||
+        (provider_ && meta->model != provider_->get_model()) ||
+        (provider_ && meta->provider != provider_->get_id()) ||
         meta->provider_key != provider_key_ ||
         meta_sources_differ(*meta, configured_sources) ||
         meta->scope_hash != configured_scope_hash ||

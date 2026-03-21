@@ -1,7 +1,7 @@
 #pragma once
 
 #include "hunterclaw/memory/plugin.h"
-#include "hunterclaw/memory/provider.h"
+#include "hunterclaw/memory/types.h"
 #include "hunterclaw/core/result.h"
 #include <string>
 #include <map>

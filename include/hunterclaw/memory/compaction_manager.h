@@ -1,7 +1,7 @@
 #pragma once
 
 #include "hunterclaw/memory/compaction.h"
-#include "hunterclaw/memory/memory_provider.h"
+#include "hunterclaw/memory/types.h"
 #include "hunterclaw/core/result.h"
 #include <memory>
 #include <functional>
@@ -70,7 +70,7 @@ public:
     CompactionManager(
         const CompactionConfig& config,
         std::shared_ptr<hunterclaw::llm::LLMClient> llm_client = nullptr,
-        std::shared_ptr<MemoryProvider> memory_provider = nullptr
+        std::shared_ptr<MemorySearchManager> memory_provider = nullptr
     );
     
     /**
@@ -146,7 +146,7 @@ private:
     CompactionConfig config_;
     MemoryCompactor compactor_;
     MemoryFlusher flusher_;
-    std::shared_ptr<MemoryProvider> memory_provider_;
+    std::shared_ptr<MemorySearchManager> memory_provider_;
     
     // 统计
     struct InternalStats {

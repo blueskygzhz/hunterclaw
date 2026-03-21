@@ -1,6 +1,6 @@
 #pragma once
 
-#include "hunterclaw/memory/provider.h"
+#include "hunterclaw/memory/types.h"
 #include "hunterclaw/memory/plugin.h"
 #include "hunterclaw/core/result.h"
 #include <memory>

@@ -124,6 +124,21 @@ public:
     embed_chunks_in_batches(const std::vector<MemoryChunk>& chunks);
 
     // ========================================================================
+    // Cached Embeddings (对齐 manager-embedding-ops.ts:288-307)
+    // ========================================================================
+
+    struct CachedEmbeddingsResult {
+        struct MissingEntry {
+            int index;
+            MemoryChunk chunk;
+        };
+        std::vector<std::vector<float>> embeddings;
+        std::vector<MissingEntry> missing;
+    };
+
+    CachedEmbeddingsResult collect_cached_embeddings(const std::vector<MemoryChunk>& chunks);
+
+    // ========================================================================
     // Provider Batch API (对齐 manager-embedding-ops.ts:442-522)
     // ========================================================================
 
@@ -247,6 +262,9 @@ public:
 
     // 判断是否为重试错误 (对齐:601-605)
     bool is_retryable_embedding_error(const std::string& message) const;
+
+    // 判断是否为超大输入错误 (对齐:797-801)
+    bool is_structured_input_too_large_error(const std::string& message) const;
 
     // 判断是否为超时错误 (对齐:698-700)
     bool is_batch_timeout_error(const std::string& message) const;

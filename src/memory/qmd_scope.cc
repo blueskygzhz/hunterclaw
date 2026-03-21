@@ -79,18 +79,26 @@ std::optional<std::string> normalize_qmd_session_key(
     
     // Simple normalization: parse agent session key format
     // Full implementation would use parseAgentSessionKey from sessions module
+    // 对齐 openclaw: parseAgentSessionKey(trimmed) -> use rest, fallback to trimmed
+    // parseAgentSessionKey strips the "agent:<id>:" prefix and returns the rest
     std::string normalized = to_lower(trimmed);
-    
-    // Remove "agent:" prefix if present
+
+    // Strip "agent:<id>:" prefix if present (simulates parseAgentSessionKey)
     if (starts_with(normalized, "agent:")) {
-        normalized = normalized.substr(6);
+        // Find the second colon to skip "agent:<id>:"
+        size_t second_colon = normalized.find(':', 6);
+        if (second_colon != std::string::npos) {
+            normalized = normalized.substr(second_colon + 1);
+        } else {
+            normalized = normalized.substr(6);
+        }
     }
-    
+
     // Skip subagent keys
     if (starts_with(normalized, "subagent:")) {
         return std::nullopt;
     }
-    
+
     return normalized;
 }
 
@@ -108,18 +116,31 @@ ParsedQmdSessionScope parse_qmd_session_scope(
     
     auto parts = split(normalized.value(), ':');
     
-    // Pattern: channel:type:...
+// Pattern: channel:type:...
+    // 对齐 openclaw: parts[1] === "group" || "channel" || "direct" || "dm"
     if (parts.size() >= 2) {
-        auto maybe_type = parse_chat_type(parts[1]);
-        if (maybe_type.has_value()) {
+        const std::string& p1 = parts[1];
+        if (p1 == "group" || p1 == "channel" || p1 == "direct" || p1 == "dm") {
             ParsedQmdSessionScope result;
             result.normalized_key = normalized;
             result.channel = to_lower(parts[0]);
-            result.chat_type = maybe_type.value();
+            // 对齐 openclaw: parts.includes("group") / parts.includes("channel")
+            bool has_group = false, has_channel = false;
+            for (const auto& p : parts) {
+                if (p == "group") has_group = true;
+                if (p == "channel") has_channel = true;
+            }
+            if (has_group) {
+                result.chat_type = ChatType::GROUP;
+            } else if (has_channel) {
+                result.chat_type = ChatType::CHANNEL;
+            } else {
+                result.chat_type = ChatType::DIRECT;
+            }
             return result;
         }
     }
-    
+
     // Check for embedded type markers
     std::string norm = normalized.value();
     if (norm.find(":group:") != std::string::npos) {
@@ -128,7 +149,7 @@ ParsedQmdSessionScope parse_qmd_session_scope(
     if (norm.find(":channel:") != std::string::npos) {
         return {std::nullopt, ChatType::CHANNEL, normalized};
     }
-    
+
     // Default to direct
     return {std::nullopt, ChatType::DIRECT, normalized};
 }
@@ -157,6 +178,12 @@ bool is_qmd_scope_allowed(
     const QmdScopeConfig& scope,
     const std::optional<std::string>& session_key
 ) {
+    // 对齐 openclaw: if (!scope) return true
+    // 在 C++ 中，scope 始终存在，用 rules.empty() 且 default 为 allow 表示"无配置"
+    if (scope.rules.empty() && scope.default_action == "allow") {
+        return true;
+    }
+
     // Parse session components
     auto parsed = parse_qmd_session_scope(session_key);
     auto channel = parsed.channel;
@@ -166,6 +193,9 @@ bool is_qmd_scope_allowed(
     
     // Check each rule
     for (const auto& rule : scope.rules) {
+        if (rule.action.empty()) {
+            continue;
+        }
         const auto& match = rule.match;
         
         // Check channel match
@@ -179,36 +209,37 @@ bool is_qmd_scope_allowed(
         }
         
         // Check raw key prefix
+        std::string raw_prefix;
         if (match.raw_key_prefix.has_value()) {
-            std::string raw_prefix = to_lower(trim(match.raw_key_prefix.value()));
-            if (!starts_with(raw_key, raw_prefix)) {
-                continue;
-            }
+            raw_prefix = to_lower(trim(match.raw_key_prefix.value()));
         }
-        
+        if (!raw_prefix.empty() && !starts_with(raw_key, raw_prefix)) {
+            continue;
+        }
+
         // Check normalized key prefix
         if (match.key_prefix.has_value()) {
             std::string norm_prefix = to_lower(trim(match.key_prefix.value()));
-            
-            // Backward compat: legacy configs used "agent:<id>:..." for raw keys
-            bool is_legacy_raw = starts_with(norm_prefix, "agent:");
-            if (is_legacy_raw) {
-                if (!starts_with(raw_key, norm_prefix)) {
-                    continue;
-                }
-            } else {
-                if (!starts_with(normalized_key, norm_prefix)) {
+            if (!norm_prefix.empty()) {
+                // Backward compat: older configs used `keyPrefix: "agent:<id>:..."` to match raw keys
+                bool is_legacy_raw = starts_with(norm_prefix, "agent:");
+                if (is_legacy_raw) {
+                    if (!starts_with(raw_key, norm_prefix)) {
+                        continue;
+                    }
+                } else if (!starts_with(normalized_key, norm_prefix)) {
                     continue;
                 }
             }
         }
-        
+
         // Rule matched
         return rule.action == "allow";
     }
-    
-    // No rule matched, use default
-    return scope.default_action == "allow";
+
+    // No rule matched, use default (对齐 openclaw: scope.default ?? "allow")
+    std::string fallback = scope.default_action.empty() ? "allow" : scope.default_action;
+    return fallback == "allow";
 }
 
 }  // namespace memory

@@ -40,7 +40,7 @@ const std::unordered_set<std::string> STOP_WORDS_ZH = {
     "我", "我们", "你", "你们", "他", "她", "它", "他们",
     "这", "那", "这个", "那个", "这些", "那些",
     // Auxiliary
-    "的", "了", "着", "过", "得", "地", "吗", "呢", "吧", "啊",
+    "的", "了", "着", "过", "得", "地", "吗", "呢", "吧", "啊", "呀", "嘛", "啦",
     // Verbs (common)
     "是", "有", "在", "被", "把", "给", "让", "用",
     "到", "去", "来", "做", "说", "看", "找", "想", "要", "能", "会", "可以",
@@ -113,19 +113,41 @@ const std::unordered_set<std::string> STOP_WORDS_AR = {
 };
 
 const std::unordered_set<std::string> STOP_WORDS_ES = {
-    "el", "la", "los", "las", "un", "una", "este", "esta", "ese", "esa",
-    "yo", "me", "mi", "tu", "usted", "nosotros", "ellos",
-    "de", "del", "a", "en", "con", "por", "para", "sobre", "y", "o", "pero",
-    "es", "son", "fue", "ser", "estar", "haber", "tener", "hacer",
-    "que", "qué", "cómo", "cuando", "donde", "porqué"
+    // Articles and determiners
+    "el", "la", "los", "las", "un", "una", "unos", "unas",
+    "este", "esta", "ese", "esa",
+    // Pronouns
+    "yo", "me", "mi", "nosotros", "nosotras",
+    "tu", "tus", "usted", "ustedes", "ellos", "ellas",
+    // Prepositions and conjunctions
+    "de", "del", "a", "en", "con", "por", "para", "sobre", "entre",
+    "y", "o", "pero", "si", "porque", "como",
+    // Common verbs / auxiliaries
+    "es", "son", "fue", "fueron", "ser", "estar", "haber", "tener", "hacer",
+    // Time references (vague)
+    "ayer", "hoy", "mañana", "antes", "despues", "después", "ahora", "recientemente",
+    // Question/request words
+    "que", "qué", "cómo", "cuando", "cuándo", "donde", "dónde", "porqué",
+    "favor", "ayuda"
 };
 
 const std::unordered_set<std::string> STOP_WORDS_PT = {
-    "o", "a", "os", "as", "um", "uma", "este", "esta", "esse", "essa",
-    "eu", "me", "meu", "você", "ele", "ela", "eles",
-    "de", "do", "da", "em", "com", "por", "para", "sobre", "e", "ou", "mas",
-    "é", "são", "foi", "ser", "estar", "ter", "fazer",
-    "que", "quando", "onde", "porquê"
+    // Articles and determiners
+    "o", "a", "os", "as", "um", "uma", "uns", "umas",
+    "este", "esta", "esse", "essa",
+    // Pronouns
+    "eu", "me", "meu", "minha", "nos", "nós",
+    "você", "vocês", "ele", "ela", "eles", "elas",
+    // Prepositions and conjunctions
+    "de", "do", "da", "em", "com", "por", "para", "sobre", "entre",
+    "e", "ou", "mas", "se", "porque", "como",
+    // Common verbs / auxiliaries
+    "é", "são", "foi", "foram", "ser", "estar", "ter", "fazer",
+    // Time references (vague)
+    "ontem", "hoje", "amanhã", "antes", "depois", "agora", "recentemente",
+    // Question/request words
+    "que", "quê", "quando", "onde", "porquê",
+    "favor", "ajuda"
 };
 
 // Korean trailing particles to strip (对齐 mmr.ts:KO_TRAILING_PARTICLES)
@@ -136,36 +158,6 @@ const std::vector<std::u32string> KO_TRAILING_PARTICLES = {
     U"은", U"는", U"이", U"가", U"을", U"를", U"의", U"에",
     U"로", U"와", U"과", U"도", U"만"
 };
-
-// Strip Korean trailing particle (对齐 query-expansion.ts:stripKoreanTrailingParticle)
-std::optional<std::u32string> strip_korean_trailing_particle(const std::u32string& token) {
-    for (const auto& particle : KO_TRAILING_PARTICLES) {
-        if (token.size() > particle.size() &&
-            token.size() - particle.size() > 0 &&
-            token.compare(token.size() - particle.size(), particle.size(), particle) == 0) {
-            return token.substr(0, token.size() - particle.size());
-        }
-    }
-    return std::nullopt;
-}
-
-// Check if Korean stem is useful (对齐 query-expansion.ts:isUsefulKoreanStem)
-bool is_useful_korean_stem(const std::u32string& stem) {
-    if (stem.empty()) return false;
-    // Check if contains Hangul syllables
-    bool has_hangul = false;
-    bool all_ascii  = true;
-    for (char32_t c : stem) {
-        if (c >= 0xAC00 && c <= 0xD7AF) { has_hangul = true; all_ascii = false; }
-        else if (c > 127) { all_ascii = false; }
-    }
-    if (has_hangul) {
-        // Prevent bogus one-syllable stems
-        return stem.size() >= 2;
-    }
-    // Keep stripped ASCII stems for mixed tokens like "API를" -> "api"
-    return all_ascii && stem.size() >= 1;
-}
 
 // Check if character is CJK
 bool is_cjk(char32_t c) {
@@ -284,12 +276,12 @@ bool is_valid_keyword(const std::string& token) {
 
 bool is_query_stop_word_token(const std::string& token) {
     return STOP_WORDS_EN.count(token) > 0 ||
-           STOP_WORDS_ZH.count(token) > 0 ||
-           STOP_WORDS_JA.count(token) > 0 ||
-           STOP_WORDS_KO.count(token) > 0 ||
-           STOP_WORDS_AR.count(token) > 0 ||
            STOP_WORDS_ES.count(token) > 0 ||
-           STOP_WORDS_PT.count(token) > 0;
+           STOP_WORDS_PT.count(token) > 0 ||
+           STOP_WORDS_AR.count(token) > 0 ||
+           STOP_WORDS_ZH.count(token) > 0 ||
+           STOP_WORDS_KO.count(token) > 0 ||
+           STOP_WORDS_JA.count(token) > 0;
 }
 
 // Check if a UTF-32 codepoint is whitespace or ASCII punctuation

@@ -11,23 +11,6 @@
 namespace hunterclaw {
 namespace memory {
 
-// ============================================================================
-// Internal Types
-// ============================================================================
-
-// KeywordSearchResult from SQLiteStorage (internal type)
-struct KeywordSearchResultWithScore {
-    std::string id;
-    std::string path;
-    int start_line;
-    int end_line;
-    double text_score;
-    double score;
-    std::string snippet;
-    std::string text;
-    MemorySource source;
-};
-
 namespace {
 
 // Truncate UTF-8 string safely (对齐 utils.ts:truncateUtf16Safe)

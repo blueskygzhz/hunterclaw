@@ -1,7 +1,7 @@
 #pragma once
 
 #include "hunterclaw/memory/plugin.h"
-#include "hunterclaw/memory/provider.h"
+#include "hunterclaw/memory/types.h"
 #include "hunterclaw/core/result.h"
 #include <memory>
 
@@ -136,14 +136,14 @@ public:
     // ========================================
     
     /**
-     * 获取 Memory Provider 实例
+     * 获取 Memory Manager 实例
      */
-    std::shared_ptr<MemoryProvider> get_provider() override {
-        return provider_;
+    std::shared_ptr<MemorySearchManager> get_manager() override {
+        return manager_;
     }
     
 private:
-    std::shared_ptr<MemoryProvider> provider_;
+    std::shared_ptr<MemorySearchManager> manager_;
 };
 
 // ========================================
@@ -151,11 +151,11 @@ private:
 // ========================================
 
 /**
- * SQLite Memory Provider
+ * SQLite Memory Provider (implements MemorySearchManager)
  * 
- * 对齐 OpenClaw src/memory/manager.ts (803 行)
+ * 对齐 OpenClaw src/memory/manager.ts
  */
-class SQLiteMemoryProvider : public MemoryProvider {
+class SQLiteMemoryProvider : public MemorySearchManager {
 public:
     /**
      * 构造函数
@@ -170,47 +170,26 @@ public:
         const std::map<std::string, std::string>& config = {}
     );
     
-    ~SQLiteMemoryProvider() override;
+    ~SQLiteMemoryProvider() = default;
     
     // ========================================
-    // 🎯 OpenClaw 核心 API (1:1 对齐)
+    // 🎯 MemorySearchManager interface
     // ========================================
     
-    core::Result<std::string> add_memory(
-        const std::string& content,
-        const std::map<std::string, std::string>& metadata = {}
-    ) override;
-    
-    core::Result<std::vector<MemorySearchResult>> search_memories(
+    std::vector<MemorySearchResult> search(
         const std::string& query,
-        const SearchOptions& options = SearchOptions()
+        const SearchOptions& opts = SearchOptions()
     ) override;
     
-    core::Result<bool> remove_memory(const std::string& id) override;
+    void sync(const SyncParams& params = SyncParams()) override;
     
-    core::Result<bool> update_memory(
-        const std::string& id,
-        const std::string& content,
-        const std::map<std::string, std::string>& metadata = {}
-    ) override;
+    MemoryProviderStatus status() override;
     
-    core::Result<bool> clear_memories() override;
+    MemoryEmbeddingProbeResult probe_embedding_availability() override;
     
-    core::Result<MemoryStats> get_stats() override;
+    bool probe_vector_availability() override { return false; }
     
-    // ========================================
-    // 🎯 OpenClaw 扩展 API
-    // ========================================
-    
-    core::Result<Memory> get_memory(const std::string& id) override;
-    
-    // ========================================
-    // Provider 元信息
-    // ========================================
-    
-    std::string provider_id() const override { return "sqlite-memory"; }
-    std::string provider_name() const override { return "SQLite Memory Provider"; }
-    std::string provider_version() const override { return "1.0.0"; }
+    ReadFileResult read_file(const ReadFileParams& params) override;
     
     // ========================================
     // 🎯 OpenClaw 特有功能
@@ -218,41 +197,14 @@ public:
     
     /**
      * 混合搜索 (Hybrid Search)
-     * 
-     * 对齐 OpenClaw src/memory/hybrid.ts
-     * 
-     * 同时执行:
-     * - Vector Search (通过 embedding + cosine similarity)
-     * - Keyword Search (FTS5 BM25)
-     * 
-     * 然后按权重合并结果。
      */
-    core::Result<std::vector<Memory>> hybrid_search(
+    std::vector<MemorySearchResult> hybrid_search(
         const std::string& query,
         const SearchOptions& options
     );
     
     /**
-     * MMR 重排 (Maximal Marginal Relevance)
-     * 
-     * 对齐 OpenClaw src/memory/mmr.ts
-     * 
-     * 去除相似结果,保持多样性。
-     */
-    std::vector<Memory> apply_mmr(
-        const std::vector<Memory>& memories,
-        double lambda = 0.7
-    );
-    
-    /**
      * MMR 重排 (MemorySearchResult 版本)
-     * 
-     * 严格对齐 OpenClaw mmr.ts 算法实现
-     * 
-     * @param results 搜索结果列表
-     * @param lambda 相关性vs多样性权重 (0.0-1.0, 默认0.7)
-     * @param max_results 最大结果数 (默认6)
-     * @return 重排后的结果
      */
     std::vector<MemorySearchResult> apply_mmr_to_search_results(
         const std::vector<MemorySearchResult>& results,
@@ -261,24 +213,7 @@ public:
     );
     
     /**
-     * 时间衰减 (Temporal Decay)
-     * 
-     * 对齐 OpenClaw src/memory/temporal-decay.ts
-     * 
-     * 降低旧记忆的权重。
-     */
-    void apply_temporal_decay(
-        std::vector<Memory>& memories,
-        int half_life_days = 30
-    );
-    
-    /**
      * 时间衰减 (MemorySearchResult 版本)
-     * 
-     * 严格对齐 OpenClaw temporal-decay.ts 指数衰减算法
-     * 
-     * @param results 搜索结果列表
-     * @param half_life_days 半衰期天数 (默认30天)
      */
     void apply_temporal_decay_to_search_results(
         std::vector<MemorySearchResult>& results,

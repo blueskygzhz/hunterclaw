@@ -13,8 +13,8 @@
 namespace hunterclaw {
 namespace memory {
 
-// Use MemoryChunk::EmbeddingInput as EmbeddingInput
-using EmbeddingInput = MemoryChunk::EmbeddingInput;
+// EmbeddingInput is defined in chunking.h
+// (no alias needed, use directly)
 
 // 严格对齐 OpenClaw src/memory/embeddings.ts
 
@@ -50,9 +50,7 @@ public:
         std::vector<std::string> texts;
         texts.reserve(inputs.size());
         for (const auto& input : inputs) {
-            if (input.text.has_value()) {
-                texts.push_back(input.text.value());
-            }
+            texts.push_back(input.text);
         }
         return embed_batch(texts);
     }

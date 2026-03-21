@@ -25,7 +25,7 @@ namespace {
 CompactionManager::CompactionManager(
     const CompactionConfig& config,
     std::shared_ptr<hunterclaw::llm::LLMClient> llm_client,
-    std::shared_ptr<MemoryProvider> memory_provider
+    std::shared_ptr<MemorySearchManager> memory_provider
 ) : config_(config),
     compactor_(config, llm_client),
     flusher_(MemoryFlusher::FlushConfig()),  // 使用默认配置

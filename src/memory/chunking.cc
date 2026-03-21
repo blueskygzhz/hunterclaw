@@ -890,9 +890,9 @@ std::vector<MemoryChunk> enforce_embedding_max_input_tokens(
 
     for (const auto& chunk : chunks) {
         // 对齐 openclaw: hasNonTextEmbeddingParts -> 直接保留（multimodal chunk）
-        if (!chunk.embedding_input.parts.empty()) {
+        if (chunk.embedding_input.has_value() && !chunk.embedding_input->parts.empty()) {
             bool has_non_text = false;
-            for (const auto& part : chunk.embedding_input.parts) {
+            for (const auto& part : chunk.embedding_input->parts) {
                 if (part.type != "text") {
                     has_non_text = true;
                     break;

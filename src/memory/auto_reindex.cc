@@ -22,9 +22,7 @@ namespace memory {
 // ============================================================================
 
 // 生成随机 UUID (简化版)
-static std::string gene
-
-rate_uuid() {
+static std::string generate_uuid() {
     static std::random_device rd;
     static std::mt19937 gen(rd());
     static std::uniform_int_distribution<> dis(0, 15);

@@ -565,8 +565,8 @@ void ManagerEmbeddingOps::reset_batch_failure_count() {
     }
     
     batch_failure_count_ = 0;
-    batch_failure_last_error_.clear();
-    batch_failure_last_provider_.clear();
+    batch_failure_last_error_.reset();
+    batch_failure_last_provider_.reset();
 }
 
 ManagerEmbeddingOps::BatchFailureResult

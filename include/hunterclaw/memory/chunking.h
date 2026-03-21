@@ -10,9 +10,45 @@
 #include <algorithm>
 #include <functional>
 #include <cmath>
+#include <regex>
 
 namespace hunterclaw {
 namespace memory {
+
+// ============================================================================
+// ChunkMode / ChunkOptions (basic chunking helpers)
+// ============================================================================
+enum class ChunkMode {
+    Paragraph,
+    Newline,
+    Length
+};
+
+struct ChunkOptions {
+    ChunkMode mode = ChunkMode::Paragraph;
+    int max_chunk_size = 2000;
+    bool split_long_paragraphs = true;
+    bool trim_lines = false;
+};
+
+// ============================================================================
+// FenceSpan (for Markdown code fence detection)
+// ============================================================================
+struct FenceSpan {
+    int start_line = 0;
+    int end_line = 0;
+    std::string fence_marker;  // "```" or "~~~"
+    std::string lang;          // language tag
+};
+
+// ============================================================================
+// FileEntry (for directory scanning)
+// ============================================================================
+struct FileEntry {
+    std::string path;
+    int64_t size = 0;
+    int64_t mtime = 0;
+};
 
 // ============================================================================
 // EmbeddingInput (对齐 openclaw embedding-inputs.ts)

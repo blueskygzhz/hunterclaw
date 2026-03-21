@@ -1,5 +1,7 @@
 #include <optional>
 #include "hunterclaw/memory/qmd_manager.h"
+#include "hunterclaw/memory/qmd_scope.h"
+#include "hunterclaw/memory/qmd_process.h"
 #include "hunterclaw/memory/json_parser.h"
 #include "hunterclaw/memory/qmd_query_parser.h"
 #include <stdexcept>
@@ -150,20 +152,16 @@ void QmdMemoryManager::bootstrap_collections() {
         
         collection_roots_[collection.name] = CollectionRoot{collection.path, kind};
         
-        // Add to sources set
+        // Add to sources set (using set semantics)
         bool found = false;
         for (auto s : sources_) {
-            if (s == kind) {
-                found = true;
-                break;
-            }
+            if (s == kind) { found = true; break; }
         }
-        if (!found) {
-            sources_.push_back(kind);
-        }
-        
-        managed_collection_names_.push_back(collection.name);
+        if (!found) sources_.push_back(kind);
     }
+    
+    // \u5bf9\u9f50 openclaw: computeManagedCollectionNames
+    managed_collection_names_ = compute_managed_collection_names();
 }
 
 void QmdMemoryManager::ensure_collections() {
@@ -174,10 +172,8 @@ void QmdMemoryManager::ensure_collections() {
     for (const auto& collection : qmd_config_.collections) {
         auto it = existing.find(collection.name);
         
-        // If exists and matches, skip
-        if (it != existing.end() && 
-            it->second.path == collection.path &&
-            it->second.pattern == collection.pattern) {
+        // 对齐 openclaw: shouldRebindCollection
+        if (it != existing.end() && !should_rebind_collection(collection, it->second)) {
             continue;
         }
         
@@ -185,8 +181,12 @@ void QmdMemoryManager::ensure_collections() {
         if (it != existing.end()) {
             try {
                 remove_collection(collection.name);
-            } catch (...) {
-                // Ignore errors
+            } catch (const std::exception& e) {
+                std::string msg = e.what();
+                std::transform(msg.begin(), msg.end(), msg.begin(), ::tolower);
+                if (!is_collection_missing_error(msg)) {
+                    // log warning
+                }
             }
         }
         
@@ -196,8 +196,15 @@ void QmdMemoryManager::ensure_collections() {
         // Add collection
         try {
             add_collection(collection.path, collection.name, collection.pattern);
+            existing[collection.name] = {collection.path, collection.pattern};
         } catch (const std::exception& e) {
-            // Log warning
+            std::string msg = e.what();
+            std::transform(msg.begin(), msg.end(), msg.begin(), ::tolower);
+            if (is_collection_already_exists_error(msg)) {
+                // log warning: already exists
+            } else {
+                // log warning
+            }
         }
     }
 }
@@ -206,14 +213,12 @@ std::map<std::string, ListedCollection> QmdMemoryManager::list_collections_best_
     std::map<std::string, ListedCollection> result;
     
     try {
-        QmdCommandOptions opts{qmd_config_.update.command_timeout_ms, {}};
+        QmdCommandOptions opts;
+        opts.timeout_ms = qmd_config_.update.command_timeout_ms;
         auto qmd_result = run_qmd({"collection", "list", "--json"}, &opts);
-        
-        // Parse JSON (simplified - real implementation would use JSON library)
-        // Format: [{"name": "...", "path": "...", "pattern": "..."}, ...]
-        
+        result = parse_listed_collections(qmd_result.stdout_data);
     } catch (...) {
-        // Ignore errors - older QMD versions might not support list --json
+        // ignore; older qmd versions might not support list --json.
     }
     
     return result;
@@ -247,13 +252,57 @@ void QmdMemoryManager::ensure_collection_path(const ManagedCollection& collectio
 }
 
 void QmdMemoryManager::run_update(const std::string& reason, bool force) {
-    std::vector<std::string> args = {"update"};
-    if (force) {
-        args.push_back("--force");
+    if (closed_) return;
+
+    // 对齐 openclaw: shouldSkipUpdate
+    if (should_skip_update(force)) {
+        return;
     }
-    
-    QmdCommandOptions opts{qmd_config_.update.command_timeout_ms, {}};
-    run_qmd(args, &opts);
+
+    // Export sessions if configured
+    if (session_exporter_.has_value()) {
+        try {
+            export_session_files();
+        } catch (...) {}
+    }
+
+    // Run qmd update
+    try {
+        QmdCommandOptions opts;
+        opts.timeout_ms = qmd_config_.update.update_timeout_ms;
+        opts.discard_output = true;
+        run_qmd({"update"}, &opts);
+    } catch (const std::exception& e) {
+        // Log warning but don't fail
+    }
+
+    // Run embed if needed (对齐 openclaw: shouldRunEmbed)
+    if (should_run_embed(force)) {
+        try {
+            QmdCommandOptions embed_opts;
+            embed_opts.timeout_ms = qmd_config_.update.embed_timeout_ms;
+            embed_opts.discard_output = true;
+            run_qmd({"embed"}, &embed_opts);
+            last_embed_at_ = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()
+            ).count();
+            embed_backoff_until_ = 0;
+            embed_failure_count_ = 0;
+        } catch (const std::exception& e) {
+            // note embed failure
+            embed_failure_count_++;
+            const int64_t base_ms = 60000;
+            const int64_t max_ms = 60LL * 60 * 1000;
+            int64_t delay_ms = std::min(max_ms, base_ms * (int64_t(1) << std::max(0, embed_failure_count_ - 1)));
+            embed_backoff_until_ = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()
+            ).count() + delay_ms;
+        }
+    }
+
+    last_update_at_ = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count();
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -267,40 +316,106 @@ std::vector<MemorySearchResult> QmdMemoryManager::search(
     if (closed_) {
         throw std::runtime_error("QmdMemoryManager is closed");
     }
-    
-    // Normalize query for Han script (Chinese)
-    std::string normalized_query = normalize_han_bm25_query(query);
-    
-    // Build QMD query args
-    std::vector<std::string> args = {"query", normalized_query};
-    
-    if (opts.max_results.has_value() && opts.max_results.value() > 0) {
-        args.push_back("--limit");
-        args.push_back(std::to_string(opts.max_results.value()));
+
+    // 对齐 openclaw: scope check
+    if (!is_scope_allowed(opts.session_key)) {
+        log_scope_denied(opts.session_key);
+        return {};
     }
-    
-    args.push_back("--json");
-    
-    // Run QMD query
-    QmdCommandOptions cmd_opts{30000, {}};
-    auto qmd_result = run_qmd(args, &cmd_opts);
-    
-    // Parse results
-    auto qmd_results = parse_qmd_query_json(qmd_result.stdout_data, qmd_result.stderr_data);
-    
-    // Convert to MemorySearchResult
-    std::vector<MemorySearchResult> results;
-    double min_score = opts.min_score.value_or(0.0);
-    for (const auto& qmd_res : qmd_results) {
-        auto mem_res = qmd_result_to_memory_result(qmd_res);
-        
-        // Filter by min_score
-        if (mem_res.score >= min_score) {
-            results.push_back(mem_res);
+
+    std::string trimmed = query;
+    trimmed.erase(0, trimmed.find_first_not_of(" \t\n\r"));
+    trimmed.erase(trimmed.find_last_not_of(" \t\n\r") + 1);
+    if (trimmed.empty()) {
+        return {};
+    }
+
+    // 对齐 openclaw: waitForPendingUpdateBeforeSearch
+    wait_for_pending_update();
+
+    // 对齐 openclaw: limit = min(qmd.limits.maxResults, opts.maxResults ?? qmd.limits.maxResults)
+    int limit = qmd_config_.limits.max_results;
+    if (opts.max_results.has_value() && opts.max_results.value() > 0) {
+        limit = std::min(limit, opts.max_results.value());
+    }
+
+    auto collection_names = list_managed_collection_names();
+    if (collection_names.empty()) {
+        // log.warn: qmd query skipped: no managed collections configured
+        return {};
+    }
+
+    const std::string& qmd_search_command = qmd_config_.search_mode;
+
+    // Run search attempt
+    auto run_search_attempt = [&](bool allow_missing_collection_repair) -> std::vector<QmdQueryResult> {
+        try {
+            if (collection_names.size() > 1) {
+                return run_query_across_collections(trimmed, limit, collection_names, qmd_search_command);
+            }
+            auto args = build_search_args(qmd_search_command, trimmed, limit);
+            auto filter_args = build_collection_filter_args(collection_names);
+            args.insert(args.end(), filter_args.begin(), filter_args.end());
+
+            QmdCommandOptions cmd_opts;
+            cmd_opts.timeout_ms = qmd_config_.limits.timeout_ms;
+            auto result = run_qmd(args, &cmd_opts);
+            return hunterclaw::memory::parse_qmd_query_json(result.stdout_data, result.stderr_data);
+        } catch (const std::exception& err) {
+            if (allow_missing_collection_repair && is_missing_collection_search_error(err)) {
+                throw;
+            }
+            // 对齐 openclaw: fallback to "query" if unsupported option
+            if (qmd_search_command != "query" && is_unsupported_qmd_option_error(err)) {
+                try {
+                    if (collection_names.size() > 1) {
+                        return run_query_across_collections(trimmed, limit, collection_names, "query");
+                    }
+                    auto fallback_args = build_search_args("query", trimmed, limit);
+                    auto filter_args = build_collection_filter_args(collection_names);
+                    fallback_args.insert(fallback_args.end(), filter_args.begin(), filter_args.end());
+                    QmdCommandOptions cmd_opts;
+                    cmd_opts.timeout_ms = qmd_config_.limits.timeout_ms;
+                    auto fallback = run_qmd(fallback_args, &cmd_opts);
+                    return hunterclaw::memory::parse_qmd_query_json(fallback.stdout_data, fallback.stderr_data);
+                } catch (const std::exception& fallback_err) {
+                    throw std::runtime_error(std::string(fallback_err.what()));
+                }
+            }
+            throw;
+        }
+    };
+
+    std::vector<QmdQueryResult> parsed;
+    try {
+        parsed = run_search_attempt(true);
+    } catch (const std::exception& err) {
+        if (is_missing_collection_search_error(err)) {
+            // repair: re-ensure collections then retry once
+            ensure_collections();
+            parsed = run_search_attempt(false);
+        } else {
+            throw;
         }
     }
-    
-    return results;
+
+    std::vector<MemorySearchResult> results;
+    double min_score = opts.min_score.value_or(0.0);
+    for (const auto& entry : parsed) {
+        auto mem_res = qmd_result_to_memory_result(entry);
+        // 对齐 openclaw: snippet clamped to maxSnippetChars
+        if (!mem_res.snippet.empty() && 
+            qmd_config_.limits.max_snippet_chars > 0 &&
+            (int)mem_res.snippet.size() > qmd_config_.limits.max_snippet_chars) {
+            mem_res.snippet = mem_res.snippet.substr(0, qmd_config_.limits.max_snippet_chars);
+        }
+        if (mem_res.score < min_score) {
+            continue;
+        }
+        results.push_back(mem_res);
+    }
+
+    return clamp_results_by_injected_chars(diversify_results_by_source(results, limit));
 }
 
 ReadFileResult QmdMemoryManager::read_file(const ReadFileParams& params) {
@@ -336,40 +451,43 @@ ReadFileResult QmdMemoryManager::read_file(const ReadFileParams& params) {
 }
 
 MemoryProviderStatus QmdMemoryManager::status() {
-    MemoryProviderStatus status;
-    status.backend = "qmd";
-    status.provider = "qmd";
-    status.workspace_dir = workspace_dir_;
-    status.db_path = index_path_;
-    status.sources = sources_;
+    // 对齐 openclaw: status() returns full provider status
+    MemoryProviderStatus s;
+    s.backend = "qmd";
+    s.provider = "qmd";
+    s.model = "qmd";
+    s.requested_provider = "qmd";
+    s.workspace_dir = workspace_dir_;
+    s.db_path = index_path_;
+    s.dirty = false;
     
-    // Query index stats (simplified)
-    try {
-        // Could use `qmd status --json` to get real stats
-        status.files = 0;
-        status.chunks = 0;
-    } catch (...) {
-        // Ignore
-    }
+    // Sources
+    std::vector<MemorySource> src_list(sources_.begin(), sources_.end());
+    s.sources = src_list;
     
-    return status;
+    // Stats (simplified - real impl would query SQLite)
+    s.files = 0;
+    s.chunks = 0;
+    
+    return s;
 }
 
 void QmdMemoryManager::sync(const SyncParams& params) {
+    // 对齐 openclaw: sync() with progress callback
+    if (params.progress) {
+        params.progress({0, 1, std::string("Updating QMD index\xe2\x80\xa6")});
+    }
     std::string reason = params.reason.value_or("manual");
     bool force = params.force.value_or(false);
     run_update(reason, force);
+    if (params.progress) {
+        params.progress({1, 1, std::string("QMD index updated")});
+    }
 }
 
 MemoryEmbeddingProbeResult QmdMemoryManager::probe_embedding_availability() {
-    try {
-        // Try to run a test query
-        QmdCommandOptions opts{5000, {}};
-        run_qmd({"query", "test", "--limit", "1"}, &opts);
-        return MemoryEmbeddingProbeResult{true, ""};
-    } catch (const std::exception& e) {
-        return MemoryEmbeddingProbeResult{false, e.what()};
-    }
+    // 对齐 openclaw: probeEmbeddingAvailability() { return { ok: true }; }
+    return MemoryEmbeddingProbeResult{true, std::nullopt};
 }
 
 bool QmdMemoryManager::probe_vector_availability() {
@@ -393,13 +511,6 @@ QmdMemoryManager::QmdCommandResult QmdMemoryManager::run_qmd(
     const std::vector<std::string>& args,
     const QmdCommandOptions* opts
 ) {
-    // Build command
-    std::ostringstream cmd;
-    cmd << qmd_config_.qmd_binary_path;
-    for (const auto& arg : args) {
-        cmd << " \"" << arg << "\"";
-    }
-    
     // Build environment
     auto env = build_xdg_env();
     if (opts && !opts->env.empty()) {
@@ -407,28 +518,32 @@ QmdMemoryManager::QmdCommandResult QmdMemoryManager::run_qmd(
             env[key] = value;
         }
     }
-    
-    // Run command (simplified - real implementation would use proper subprocess handling)
-    FILE* pipe = popen(cmd.str().c_str(), "r");
-    if (!pipe) {
-        throw std::runtime_error("Failed to run QMD command");
-    }
-    
-    std::ostringstream stdout_stream;
-    char buffer[1024];
-    while (fgets(buffer, sizeof(buffer), pipe)) {
-        stdout_stream << buffer;
-    }
-    
-    int exit_code = pclose(pipe);
-    
-    return QmdCommandResult{
-        stdout_stream.str(),
-        "",  // stderr not captured in this simplified version
-        exit_code
-    };
-}
 
+    int timeout_ms = opts ? opts->timeout_ms : 30000;
+    bool discard_output = opts ? opts->discard_output : false;
+
+    // \u5bf9\u9f50 openclaw: resolveCliSpawnInvocation + runCliCommand
+    CliSpawnInvocation invocation = resolve_cli_spawn_invocation(
+        qmd_config_.qmd_binary_path, args, env, "qmd"
+    );
+
+    std::string command_summary = "qmd";
+    for (const auto& arg : args) {
+        command_summary += " " + arg;
+    }
+
+    auto result = run_cli_command(
+        command_summary,
+        invocation,
+        env,
+        workspace_dir_,
+        timeout_ms,
+        200000,  // MAX_QMD_OUTPUT_CHARS
+        discard_output
+    );
+
+    return QmdCommandResult{result.stdout_text, result.stderr_text, result.exit_code};
+}
 std::map<std::string, std::string> QmdMemoryManager::build_xdg_env() {
     std::map<std::string, std::string> env;
     env["XDG_CONFIG_HOME"] = xdg_config_home_;
@@ -569,14 +684,345 @@ void QmdMemoryManager::export_session_files() {
     // For now, this is a placeholder for the full implementation
 }
 
-bool QmdMemoryManager::is_collection_missing_error(const std::string& error_msg) {
-    return error_msg.find("not found") != std::string::npos ||
-           error_msg.find("does not exist") != std::string::npos;
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Scope Helpers
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+bool QmdMemoryManager::is_scope_allowed(const std::optional<std::string>& session_key) const {
+    return is_qmd_scope_allowed(qmd_config_.scope_config, session_key);
 }
 
-bool QmdMemoryManager::is_collection_already_exists_error(const std::string& error_msg) {
-    return error_msg.find("already exists") != std::string::npos ||
-           error_msg.find("duplicate") != std::string::npos;
+void QmdMemoryManager::log_scope_denied(const std::optional<std::string>& session_key) const {
+    // log.warn: qmd search denied by scope
+    (void)session_key;
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Collection Name Management
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+std::vector<std::string> QmdMemoryManager::list_managed_collection_names() const {
+    return managed_collection_names_;
+}
+
+std::vector<std::string> QmdMemoryManager::compute_managed_collection_names() const {
+    std::set<std::string> seen;
+    std::vector<std::string> names;
+    for (const auto& collection : qmd_config_.collections) {
+        std::string name = collection.name;
+        // trim
+        name.erase(0, name.find_first_not_of(" \t"));
+        name.erase(name.find_last_not_of(" \t") + 1);
+        if (name.empty() || seen.count(name)) continue;
+        seen.insert(name);
+        names.push_back(name);
+    }
+    return names;
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Search Arg Builders
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+std::vector<std::string> QmdMemoryManager::build_search_args(
+    const std::string& command,
+    const std::string& query,
+    int limit
+) const {
+    // 对齐 openclaw: buildSearchArgs
+    // For "search" command, normalize Han BM25 query
+    std::string normalized_query = (command == "search") 
+        ? const_cast<QmdMemoryManager*>(this)->normalize_han_bm25_query(query)
+        : query;
+    if (command == "query") {
+        return {"query", normalized_query, "--json", "-n", std::to_string(limit)};
+    }
+    return {command, normalized_query, "--json", "-n", std::to_string(limit)};
+}
+
+std::vector<std::string> QmdMemoryManager::build_collection_filter_args(
+    const std::vector<std::string>& collection_names
+) const {
+    // 对齐 openclaw: buildCollectionFilterArgs -> flatMap([name] => ["-c", name])
+    std::vector<std::string> args;
+    for (const auto& name : collection_names) {
+        if (!name.empty()) {
+            args.push_back("-c");
+            args.push_back(name);
+        }
+    }
+    return args;
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Multi-Collection Query
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+std::vector<QmdQueryResult> QmdMemoryManager::run_query_across_collections(
+    const std::string& query,
+    int limit,
+    const std::vector<std::string>& collection_names,
+    const std::string& command
+) {
+    // 对齐 openclaw: runQueryAcrossCollections
+    // Deduplicate by result key, keep best score
+    std::map<std::string, QmdQueryResult> best_by_result_key;
+
+    for (const auto& collection_name : collection_names) {
+        auto args = build_search_args(command, query, limit);
+        args.push_back("-c");
+        args.push_back(collection_name);
+
+        QmdCommandOptions cmd_opts;
+        cmd_opts.timeout_ms = qmd_config_.limits.timeout_ms;
+        auto result = run_qmd(args, &cmd_opts);
+        auto parsed = hunterclaw::memory::parse_qmd_query_json(result.stdout_data, result.stderr_data);
+
+        for (auto& entry : parsed) {
+            // Assign collection if missing
+            if (!entry.collection.has_value() || entry.collection->empty()) {
+                entry.collection = collection_name;
+            }
+            // Build result key
+            std::string result_key;
+            const std::string docid = entry.docid.value_or("");
+            const std::string coll = entry.collection.value_or("");
+            const std::string file = entry.file.value_or("");
+            if (!docid.empty()) {
+                result_key = "docid:" + docid;
+            } else if (!coll.empty() && !file.empty()) {
+                result_key = "file:" + coll + ":" + file;
+            } else {
+                continue;
+            }
+
+            auto it = best_by_result_key.find(result_key);
+            double entry_score = entry.score.value_or(0.0);
+            if (it == best_by_result_key.end() || entry_score > it->second.score.value_or(0.0)) {
+                best_by_result_key[result_key] = entry;
+            }
+        }
+    }
+
+    // Collect and sort by score descending
+    std::vector<QmdQueryResult> results;
+    for (auto& [key, entry] : best_by_result_key) {
+        results.push_back(entry);
+    }
+    std::sort(results.begin(), results.end(),
+        [](const QmdQueryResult& a, const QmdQueryResult& b) {
+            return a.score.value_or(0.0) > b.score.value_or(0.0);
+        });
+    return results;
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Parse Listed Collections
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+std::map<std::string, ListedCollection> QmdMemoryManager::parse_listed_collections(
+    const std::string& output
+) {
+    std::map<std::string, ListedCollection> listed;
+    std::string trimmed = output;
+    trimmed.erase(0, trimmed.find_first_not_of(" \t\n\r"));
+    trimmed.erase(trimmed.find_last_not_of(" \t\n\r") + 1);
+    if (trimmed.empty()) return listed;
+
+    // Try JSON parse first
+    try {
+        auto j = nlohmann::json::parse(trimmed);
+        if (j.is_array()) {
+            for (const auto& entry : j) {
+                if (entry.is_string()) {
+                    listed[entry.get<std::string>()] = {};
+                    continue;
+                }
+                if (!entry.is_object()) continue;
+                std::string name;
+                if (entry.contains("name") && entry["name"].is_string()) {
+                    name = entry["name"].get<std::string>();
+                }
+                if (name.empty()) continue;
+                ListedCollection lc;
+                if (entry.contains("path") && entry["path"].is_string()) {
+                    lc.path = entry["path"].get<std::string>();
+                }
+                if (entry.contains("pattern") && entry["pattern"].is_string()) {
+                    lc.pattern = entry["pattern"].get<std::string>();
+                } else if (entry.contains("mask") && entry["mask"].is_string()) {
+                    lc.pattern = entry["mask"].get<std::string>();
+                }
+                listed[name] = lc;
+            }
+            return listed;
+        }
+    } catch (...) {}
+
+    // Fallback: parse table output line by line
+    std::istringstream iss(output);
+    std::string line;
+    std::string current_name;
+    std::regex collection_line_re(R"(^\s*([a-z0-9._-]+)\s+\(qmd://[^)]+\)\s*$)",
+        std::regex::icase);
+    std::regex bare_name_re(R"(^\s*([a-z0-9._-]+)\s*$)", std::regex::icase);
+    std::regex pattern_re(R"(^\s*(?:pattern|mask)\s*:\s*(.+?)\s*$)", std::regex::icase);
+    std::regex path_re(R"(^\s*path\s*:\s*(.+?)\s*$)", std::regex::icase);
+
+    while (std::getline(iss, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        std::string trimmed_line = line;
+        trimmed_line.erase(0, trimmed_line.find_first_not_of(" \t"));
+        trimmed_line.erase(trimmed_line.find_last_not_of(" \t") + 1);
+        if (trimmed_line.empty()) { current_name.clear(); continue; }
+
+        std::smatch m;
+        if (std::regex_match(line, m, collection_line_re)) {
+            current_name = m[1].str();
+            if (!listed.count(current_name)) listed[current_name] = {};
+            continue;
+        }
+        if (std::regex_search(trimmed_line, std::regex(R"(^collections\b)", std::regex::icase))) {
+            continue;
+        }
+        if (std::regex_match(trimmed_line, m, bare_name_re) && trimmed_line.find(':') == std::string::npos) {
+            current_name = m[1].str();
+            if (!listed.count(current_name)) listed[current_name] = {};
+            continue;
+        }
+        if (current_name.empty()) continue;
+        if (std::regex_match(line, m, pattern_re)) {
+            listed[current_name].pattern = m[1].str();
+            continue;
+        }
+        if (std::regex_match(line, m, path_re)) {
+            listed[current_name].path = m[1].str();
+        }
+    }
+    return listed;
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Collection Rebind Helpers
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+bool QmdMemoryManager::should_rebind_collection(
+    const ManagedCollection& collection,
+    const ListedCollection& listed
+) {
+    // 对齐 openclaw: shouldRebindCollection
+    if (listed.path.empty()) {
+        // Older qmd versions may only return names; do not rebind without metadata
+        return false;
+    }
+    if (!paths_match(listed.path, collection.path)) {
+        return true;
+    }
+    if (!listed.pattern.empty() && listed.pattern != collection.pattern) {
+        return true;
+    }
+    return false;
+}
+
+bool QmdMemoryManager::paths_match(const std::string& left, const std::string& right) {
+    // 对齐 openclaw: pathsMatch - resolve to absolute and normalize
+    auto normalize = [&](const std::string& value) -> std::string {
+        if (value.empty()) return value;
+        std::string resolved;
+        if (value[0] == '/') {
+            resolved = value;
+        } else {
+            resolved = workspace_dir_ + "/" + value;
+        }
+        // Normalize: remove trailing slash, resolve ..
+        return fs::path(resolved).lexically_normal().string();
+    };
+    return normalize(left) == normalize(right);
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Clamp Results by Injected Chars
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+std::vector<MemorySearchResult> QmdMemoryManager::clamp_results_by_injected_chars(
+    const std::vector<MemorySearchResult>& results
+) {
+    // 对齐 openclaw: clampResultsByInjectedChars
+    int budget = qmd_config_.limits.max_injected_chars;
+    if (budget <= 0) {
+        return results;
+    }
+    int remaining = budget;
+    std::vector<MemorySearchResult> clamped;
+    for (const auto& entry : results) {
+        if (remaining <= 0) break;
+        const std::string& snippet = entry.snippet;
+        if ((int)snippet.size() <= remaining) {
+            clamped.push_back(entry);
+            remaining -= (int)snippet.size();
+        } else {
+            MemorySearchResult trimmed_entry = entry;
+            trimmed_entry.snippet = snippet.substr(0, std::max(0, remaining));
+            clamped.push_back(trimmed_entry);
+            break;
+        }
+    }
+    return clamped;
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Update Helpers
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+bool QmdMemoryManager::should_skip_update(bool force) const {
+    // 对齐 openclaw: shouldSkipUpdate
+    if (force) return false;
+    int debounce_ms = qmd_config_.update.debounce_ms;
+    if (debounce_ms <= 0) return false;
+    if (last_update_at_ == 0) return false;
+    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count();
+    return (now - last_update_at_) < debounce_ms;
+}
+
+bool QmdMemoryManager::should_run_embed(bool force) const {
+    // 对齐 openclaw: shouldRunEmbed
+    if (qmd_config_.search_mode == "search") return false;
+    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count();
+    if (embed_backoff_until_ > 0 && now < embed_backoff_until_) return false;
+    int embed_interval_ms = qmd_config_.update.embed_interval_ms;
+    return force || last_embed_at_ == 0 ||
+           (embed_interval_ms > 0 && (now - last_embed_at_) > embed_interval_ms);
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Error Helpers
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+bool QmdMemoryManager::is_sqlite_busy_error(const std::exception& err) const {
+    std::string msg = err.what();
+    std::transform(msg.begin(), msg.end(), msg.begin(), ::tolower);
+    return msg.find("sqlite_busy") != std::string::npos ||
+           msg.find("database is locked") != std::string::npos;
+}
+
+bool QmdMemoryManager::is_unsupported_qmd_option_error(const std::exception& err) const {
+    std::string msg = err.what();
+    std::transform(msg.begin(), msg.end(), msg.begin(), ::tolower);
+    return msg.find("unknown flag") != std::string::npos ||
+           msg.find("unknown option") != std::string::npos ||
+           msg.find("unrecognized option") != std::string::npos ||
+           msg.find("flag provided but not defined") != std::string::npos ||
+           msg.find("unexpected argument") != std::string::npos;
+}
+
+bool QmdMemoryManager::is_missing_collection_search_error(const std::exception& err) const {
+    std::string msg = err.what();
+    std::transform(msg.begin(), msg.end(), msg.begin(), ::tolower);
+    return is_collection_missing_error(msg) && msg.find("collection") != std::string::npos;
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

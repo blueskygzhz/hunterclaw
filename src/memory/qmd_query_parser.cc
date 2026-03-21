@@ -44,23 +44,8 @@ static std::vector<std::string> split_lines(const std::string& str) {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 bool is_qmd_no_results_line(const std::string& line) {
-    // 对齐 openclaw: line.trim().toLowerCase().replace(/\s+/g, " ")
-    std::string lower = to_lower(trim(line));
-    // 压缩多个空白为单个空格
-    std::string collapsed;
-    bool prev_space = false;
-    for (char c : lower) {
-        if (std::isspace(static_cast<unsigned char>(c))) {
-            if (!prev_space) collapsed += ' ';
-            prev_space = true;
-        } else {
-            collapsed += c;
-            prev_space = false;
-        }
-    }
-    
-    // Direct match
-    if (collapsed == "no results found" || collapsed == "no results found.") {
+    // 对齐 openclaw: input is already trimmed/lowercased/collapsed
+    if (line == "no results found" || line == "no results found.") {
         return true;
     }
     
@@ -70,16 +55,29 @@ bool is_qmd_no_results_line(const std::string& line) {
         std::regex::icase
     );
     
-    return std::regex_search(collapsed, pattern);
+    return std::regex_search(line, pattern);
 }
 
 bool is_qmd_no_results_output(const std::string& raw) {
+    // 对齐 openclaw: split -> trim/lower/collapse -> filter empty -> some(isQmdNoResultsLine)
     auto lines = split_lines(raw);
     for (const auto& line : lines) {
-        std::string trimmed = trim(line);
-        if (trimmed.empty()) continue;
-        
-        if (is_qmd_no_results_line(trimmed)) {
+        // trim + lower
+        std::string lower = to_lower(trim(line));
+        if (lower.empty()) continue;
+        // collapse whitespace
+        std::string collapsed;
+        bool prev_space = false;
+        for (char c : lower) {
+            if (std::isspace(static_cast<unsigned char>(c))) {
+                if (!prev_space) collapsed += ' ';
+                prev_space = true;
+            } else {
+                collapsed += c;
+                prev_space = false;
+            }
+        }
+        if (is_qmd_no_results_line(collapsed)) {
             return true;
         }
     }
@@ -139,10 +137,11 @@ std::string extract_first_json_array(const std::string& raw) {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 std::vector<QmdQueryResult> parse_qmd_query_result_array(const std::string& raw) {
+    // 对齐 openclaw: parseQmdQueryResultArray returns null on failure (we throw to signal null)
     try {
         auto j = json::parse(raw);
         if (!j.is_array()) {
-            return {};
+            return {};  // signals null
         }
         
         std::vector<QmdQueryResult> results;
@@ -173,7 +172,18 @@ std::vector<QmdQueryResult> parse_qmd_query_result_array(const std::string& raw)
         
         return results;
     } catch (...) {
-        return {};
+        return {};  // signals null (parse failure)
+    }
+}
+
+// Returns true if the result is a valid non-null parse (array was found)
+static bool is_valid_parse_result(const std::vector<QmdQueryResult>& results, const std::string& raw) {
+    // We distinguish "null" (parse failure) from "empty array" by trying to parse again
+    try {
+        auto j = json::parse(raw);
+        return j.is_array();
+    } catch (...) {
+        return false;
     }
 }
 
@@ -215,18 +225,15 @@ std::vector<QmdQueryResult> parse_qmd_query_json(
             ? " (stderr: " + summarize_qmd_stderr(trimmed_stderr) + ")"
             : "";
         std::string message = "stdout empty" + context;
+        // log.warn equivalent
         throw std::runtime_error("qmd query returned invalid JSON: " + message);
     }
     
     try {
-        // Try direct parsing (对齐 openclaw: parseQmdQueryResultArray returns null on failure)
-        try {
-            auto j = json::parse(trimmed_stdout);
-            if (j.is_array()) {
-                return parse_qmd_query_result_array(trimmed_stdout);
-            }
-            // Not an array -> fall through to noisy extraction
-        } catch (...) {}
+        // Try direct parsing
+        if (is_valid_parse_result({}, trimmed_stdout)) {
+            return parse_qmd_query_result_array(trimmed_stdout);
+        }
         
         // Try extracting JSON array from noisy output
         std::string noisy_payload = extract_first_json_array(trimmed_stdout);
@@ -234,18 +241,22 @@ std::vector<QmdQueryResult> parse_qmd_query_json(
             throw std::runtime_error("qmd query JSON response was not an array");
         }
         
-        try {
-            auto j2 = json::parse(noisy_payload);
-            if (j2.is_array()) {
-                return parse_qmd_query_result_array(noisy_payload);
-            }
-        } catch (...) {}
+        if (is_valid_parse_result({}, noisy_payload)) {
+            return parse_qmd_query_result_array(noisy_payload);
+        }
         
         throw std::runtime_error("qmd query JSON response was not an array");
         
     } catch (const std::exception& e) {
-        // 对齐 openclaw: log.warn + re-throw with "qmd query returned invalid JSON: " prefix
+        // 对齐 openclaw: log.warn + re-throw
         std::string message = e.what();
+        // Avoid double-wrapping
+        if (message.find("qmd query returned invalid JSON: ") == 0) {
+            throw;
+        }
         throw std::runtime_error("qmd query returned invalid JSON: " + message);
     }
-}}  // namespace hunterclaw
+}
+
+}  // namespace memory
+}  // namespace hunterclaw
