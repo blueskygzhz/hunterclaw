@@ -6,11 +6,19 @@
 #include "hunterclaw/skills/skill.h"
 #include "hunterclaw/plugins/plugin.h"
 #include "hunterclaw/gateway/todo_types.h"
-#include "hunterclaw/gateway/auth_manager.h"  // ✅ AuthResult, AuthManager
+#include "hunterclaw/gateway/auth_manager.h"
 #include <websocketpp/config/asio_no_tls.hpp>
 #include <websocketpp/server.hpp>
+#include <nlohmann/json.hpp>
+#include <functional>
+#include <optional>
 #include <memory>
 #include <set>
+#include <map>
+#include <vector>
+#include <string>
+#include <mutex>
+#include <atomic>
 
 // Forward declarations
 namespace hunterclaw {
@@ -32,89 +40,281 @@ using WsMessagePtr = WsServer::message_ptr;
 using ConnectionHandle = websocketpp::connection_hdl;
 
 // ============================================================================
-// Gateway Client
+// Gateway Constants (对齐 OpenClaw server-constants.ts)
 // ============================================================================
 
-struct GatewayClient {
-    std::string conn_id;     // UUID
-    ConnectionHandle handle;
-    
-    // 🔐 鉴权信息 (对齐 OpenClaw ClientContext)
-    std::string session_id;  // 关联的 Session ID (用于资源隔离)
-    std::string device_id;
-    std::string account_id;
-    std::string channel_id;
-    std::string role;        // admin, user, guest
+// Keep server maxPayload aligned with gateway client maxPayload so high-res
+// canvas snapshots don't get disconnected mid-invoke.
+constexpr size_t MAX_PAYLOAD_BYTES = 25 * 1024 * 1024;
+// Per-connection send buffer limit (2x max payload)
+constexpr size_t MAX_BUFFERED_BYTES = 50 * 1024 * 1024;
+// Pre-auth payload limit (before connect handshake completes)
+constexpr size_t MAX_PREAUTH_PAYLOAD_BYTES = 64 * 1024;
+
+constexpr int64_t TICK_INTERVAL_MS = 30000;
+constexpr int64_t HEALTH_REFRESH_INTERVAL_MS = 60000;
+constexpr int64_t DEDUPE_TTL_MS = 5 * 60000;
+constexpr int DEDUPE_MAX = 1000;
+constexpr int64_t DEFAULT_HANDSHAKE_TIMEOUT_MS = 3000;
+
+// ============================================================================
+// ConnectParams (对齐 OpenClaw protocol/schema/frames.ts ConnectParams)
+// ============================================================================
+
+struct ConnectClientInfo {
+    std::string id;                          // client name/id
+    std::optional<std::string> display_name;
+    std::string version;
+    std::string platform;
+    std::optional<std::string> device_family;
+    std::string mode;                        // "interactive" | "headless" | "backend" | "probe"
+    std::optional<std::string> instance_id;
+};
+
+struct ConnectAuth {
+    std::optional<std::string> token;
+    std::optional<std::string> bootstrap_token;
+    std::optional<std::string> device_token;
+    std::optional<std::string> password;
+};
+
+struct ConnectDevice {
+    std::string id;
+    std::string public_key;
+    std::string signature;
+    int64_t signed_at;
+    std::string nonce;
+};
+
+struct ConnectParams {
+    int min_protocol = 1;
+    int max_protocol = 1;
+    ConnectClientInfo client;
+    std::vector<std::string> caps;
+    std::optional<std::vector<std::string>> commands;
+    std::optional<std::map<std::string, bool>> permissions;
+    std::optional<std::string> path_env;
+    std::optional<ConnectAuth> auth;
+    std::string role = "operator";           // "operator" | "node"
     std::vector<std::string> scopes;
-    bool authenticated = false;
-    
-    core::Timestamp connected_at;
-    core::Timestamp last_ping_at;
-    
-    std::map<std::string, core::JsonValue> metadata;
+    std::optional<ConnectDevice> device;
 };
 
 // ============================================================================
-// Gateway Runtime State
+// GatewayWsClient (严格对齐 OpenClaw server/ws-types.ts GatewayWsClient)
+// ============================================================================
+
+struct GatewayWsClient {
+    WsConnectionPtr socket;                  // WebSocket connection
+    ConnectParams connect;                   // Connect params (set after handshake)
+    std::string conn_id;                     // UUID
+    std::optional<std::string> presence_key;
+    std::optional<std::string> client_ip;
+    std::optional<std::string> canvas_host_url;
+    std::optional<std::string> canvas_capability;
+    std::optional<int64_t> canvas_capability_expires_at_ms;
+};
+
+// ============================================================================
+// ClientContext (对齐 OpenClaw server-methods/types.ts GatewayClient)
+// ============================================================================
+// 方法处理器使用的客户端上下文。
+// 定义在此处以避免 method_guard.h 与 gateway.h 的循环依赖。
+struct ClientContext {
+    ConnectParams connect;                           // Connect params (set after handshake)
+    std::string conn_id;                             // Connection UUID
+    std::optional<std::string> client_ip;            // Client IP address
+    std::optional<std::string> canvas_host_url;      // Canvas host URL
+    std::optional<std::string> canvas_capability;    // Canvas capability token
+    std::optional<int64_t> canvas_capability_expires_at_ms;
+
+    // ── Convenience accessors ──
+
+    // Role from connect params
+    const std::string& role() const {
+        return connect.role;
+    }
+
+    // Scopes from connect params
+    const std::vector<std::string>& scopes() const {
+        return connect.scopes;
+    }
+
+    // Client name from connect params
+    const std::string& client_name() const {
+        return connect.client.id;
+    }
+};
+
+// ============================================================================
+// Dedupe Entry (对齐 OpenClaw server-shared.ts)
+// ============================================================================
+
+struct DedupeEntry {
+    int64_t ts;
+    std::string method;
+};
+
+// ============================================================================
+// Chat Run State (对齐 OpenClaw server-chat.ts createChatRunState)
+// ============================================================================
+
+struct ChatRunEntry {
+    std::string session_key;
+    std::string client_run_id;
+};
+
+struct ChatAbortControllerEntry {
+    std::shared_ptr<std::atomic<bool>> aborted;
+    int64_t created_at;
+};
+
+// Chat run registry (对齐 OpenClaw createChatRunState)
+struct ChatRunRegistry {
+    // sessionId -> list<ChatRunEntry>
+    std::map<std::string, std::vector<ChatRunEntry>> runs;
+    mutable std::mutex mutex;
+
+    void add(const std::string& session_id, const ChatRunEntry& entry) {
+        std::lock_guard<std::mutex> lock(mutex);
+        runs[session_id].push_back(entry);
+    }
+
+    std::optional<ChatRunEntry> remove(
+        const std::string& session_id,
+        const std::string& client_run_id,
+        const std::optional<std::string>& session_key = std::nullopt
+    ) {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = runs.find(session_id);
+        if (it == runs.end()) return std::nullopt;
+        auto& list = it->second;
+        for (auto jt = list.begin(); jt != list.end(); ++jt) {
+            if (jt->client_run_id == client_run_id) {
+                if (session_key && jt->session_key != *session_key) continue;
+                ChatRunEntry entry = *jt;
+                list.erase(jt);
+                if (list.empty()) runs.erase(it);
+                return entry;
+            }
+        }
+        return std::nullopt;
+    }
+};
+
+struct ChatRunState {
+    ChatRunRegistry registry;
+    // sessionId -> buffer string (streaming delta buffer)
+    std::map<std::string, std::string> buffers;
+    // sessionId -> last delta sent timestamp
+    std::map<std::string, int64_t> delta_sent_at;
+    // runId -> abort timestamp
+    std::map<std::string, int64_t> aborted_runs;
+    mutable std::mutex buffers_mutex;
+};
+
+// ============================================================================
+// Broadcast Function Types (对齐 OpenClaw server-broadcast.ts)
+// ============================================================================
+
+struct GatewayBroadcastStateVersion {
+    std::optional<int> presence;
+    std::optional<int> health;
+};
+
+struct GatewayBroadcastOpts {
+    bool drop_if_slow = false;
+    std::optional<GatewayBroadcastStateVersion> state_version;
+};
+
+// broadcast(event, payload, opts?)
+using GatewayBroadcastFn = std::function<void(
+    const std::string& event,
+    const core::JsonValue& payload,
+    const GatewayBroadcastOpts& opts
+)>;
+
+// broadcastToConnIds(event, payload, connIds, opts?)
+using GatewayBroadcastToConnIdsFn = std::function<void(
+    const std::string& event,
+    const core::JsonValue& payload,
+    const std::set<std::string>& conn_ids,
+    const GatewayBroadcastOpts& opts
+)>;
+
+// ============================================================================
+// Gateway Runtime State (对齐 OpenClaw createGatewayRuntimeState 返回值)
 // ============================================================================
 
 struct GatewayRuntimeState {
     // Connected clients
-    std::map<std::string, std::shared_ptr<GatewayClient>> clients;
-    
-    // Device → Connections mapping (反向索引,对齐 OpenClaw)
-    std::map<std::string, std::set<std::string>> device_to_conns;
-    
-    // Tool Event Subscriptions (对齐 OpenClaw ToolEventRecipientRegistry)
-    // runId → set<connId>: 哪些连接订阅了该 runId 的工具事件
+    // 对齐 OpenClaw: Set<GatewayWsClient>
+    // C++ 实现: map<connId, GatewayWsClient> 支持按 conn_id 快速查找
+    std::map<std::string, std::shared_ptr<GatewayWsClient>> clients;
+
+    // Broadcast functions (对齐 OpenClaw)
+    GatewayBroadcastFn broadcast;
+    GatewayBroadcastToConnIdsFn broadcast_to_conn_ids;
+
+    // Agent run sequence (对齐 OpenClaw: Map<string, number>)
+    std::map<std::string, int64_t> agent_run_seq;
+
+    // Message deduplication (对齐 OpenClaw: Map<string, DedupeEntry>)
+    std::map<std::string, DedupeEntry> dedupe;
+
+    // Chat run state (对齐 OpenClaw: chatRunState)
+    std::shared_ptr<ChatRunState> chat_run_state;
+
+    // Chat abort controllers (对齐 OpenClaw: Map<string, ChatAbortControllerEntry>)
+    std::map<std::string, ChatAbortControllerEntry> chat_abort_controllers;
+
+    // Tool event recipients (对齐 OpenClaw: toolEventRecipients)
+    // runId -> set<connId>
     std::map<std::string, std::set<std::string>> tool_event_recipients;
-    
-    // Session state
-    std::map<std::string, core::SessionInfo> sessions;
-    
-    // Agent run state
-    std::map<std::string, uint64_t> agent_run_seq;
-    
-    // Message deduplication
-    std::map<std::string, core::Timestamp> dedupe;
-    
-    // Abort controllers (for cancelling long-running tasks)
-    std::map<std::string, std::shared_ptr<std::atomic<bool>>> abort_controllers;
-    
-    // 🔐 TODO 存储 (对齐 OpenClaw)
-    std::map<std::string, TodoItem> todos;
-    
-    // Method handler (RPC dispatcher) - for HTTP Gateway integration
-    std::function<core::Result<nlohmann::json>(const std::string&, const nlohmann::json&)> method_handler;
-    
-    // Thread safety
-    std::mutex mutex;
-    
-    // ========================================================================
-    // Tool Event Recipient Registry (对齐 OpenClaw)
-    // ========================================================================
-    
-    // 注册工具事件订阅
+
+    // Method handler (internal, injected by methods.cc)
+    // 对应 OpenClaw: handler({ req, params, client, state, ... })
+    std::function<core::Result<nlohmann::json>(
+        const std::string&,
+        const nlohmann::json&,
+        const ClientContext&
+    )> method_handler;
+
+    // ── Convenience helpers (对齐 OpenClaw addChatRun / removeChatRun) ──
+
+    void add_chat_run(const std::string& session_id, const ChatRunEntry& entry) {
+        if (chat_run_state) {
+            chat_run_state->registry.add(session_id, entry);
+        }
+    }
+
+    std::optional<ChatRunEntry> remove_chat_run(
+        const std::string& session_id,
+        const std::string& client_run_id,
+        const std::optional<std::string>& session_key = std::nullopt
+    ) {
+        if (!chat_run_state) return std::nullopt;
+        return chat_run_state->registry.remove(session_id, client_run_id, session_key);
+    }
+
+    // ── Tool Event Recipient Registry helpers ──
+
     void register_tool_event_recipient(const std::string& run_id, const std::string& conn_id) {
-        std::lock_guard<std::mutex> lock(mutex);
         tool_event_recipients[run_id].insert(conn_id);
     }
-    
-    // 获取订阅者列表
-    std::optional<std::set<std::string>> get_tool_event_recipients(const std::string& run_id) {
-        std::lock_guard<std::mutex> lock(mutex);
+
+    std::optional<std::set<std::string>> get_tool_event_recipients(const std::string& run_id) const {
         auto it = tool_event_recipients.find(run_id);
-        if (it == tool_event_recipients.end()) {
-            return std::nullopt;
-        }
+        if (it == tool_event_recipients.end()) return std::nullopt;
         return it->second;
     }
-    
-    // 清理订阅 (当 run 完成时)
+
     void cleanup_tool_event_recipients(const std::string& run_id) {
-        std::lock_guard<std::mutex> lock(mutex);
         tool_event_recipients.erase(run_id);
     }
+
+    // Thread safety
+    mutable std::mutex mutex;
 };
 
 // ============================================================================
@@ -125,36 +325,38 @@ class GatewayServer {
 public:
     // Factory method
     static std::shared_ptr<GatewayServer> create(const core::GatewayConfig& config);
-    
+
     explicit GatewayServer(std::shared_ptr<core::Config> config);
     ~GatewayServer();
-    
+
     // Lifecycle
     core::Result<bool> start();
     core::Result<bool> stop();
     bool is_running() const;
-    
-    // Broadcast
+
+    // Broadcast (对齐 OpenClaw server-broadcast.ts)
+    // 广播事件给所有已连接的客户端
     void broadcast(const core::EventFrame& event);
+    // 广播事件给指定 conn_id 列表的客户端
     void broadcast_to_conn_ids(
         const std::vector<std::string>& conn_ids,
         const core::EventFrame& event
     );
-    
+
     // Component access
     std::shared_ptr<channels::ChannelManager> channel_manager() const;
     std::shared_ptr<skills::SkillManager> skill_manager() const;
     std::shared_ptr<plugins::PluginManager> plugin_manager() const;
-    
+
     // Config access
     std::shared_ptr<core::Config> config() const;
-    
+
     // State access
     std::shared_ptr<GatewayRuntimeState> runtime_state() const;
-    
+
     // 🏢 Multi-tenant Agent Pool access (对齐 OpenClaw)
     std::shared_ptr<agents::AgentPool> agent_pool() const;
-    
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
@@ -168,27 +370,27 @@ class GatewayMethods {
 public:
     using MethodHandler = std::function<core::Result<core::JsonValue>(
         const core::JsonValue& params,
-        const GatewayClient& client,
+        const GatewayWsClient& client,
         GatewayRuntimeState& state
     )>;
-    
+
     explicit GatewayMethods(std::shared_ptr<GatewayServer> server);
-    
+
     // Method registration
     void register_method(const std::string& name, MethodHandler handler);
     void unregister_method(const std::string& name);
-    
+
     // Method invocation
     core::Result<core::JsonValue> invoke(
         const std::string& method,
         const core::JsonValue& params,
-        const GatewayClient& client,
+        const GatewayWsClient& client,
         GatewayRuntimeState& state
     );
-    
+
     // Built-in methods
     void register_builtin_methods();
-    
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
@@ -201,33 +403,27 @@ private:
 class ProtocolHandler {
 public:
     explicit ProtocolHandler(std::shared_ptr<GatewayServer> server);
-    
+
     // Frame parsing
     static core::Result<core::RequestFrame> parse_request(const std::string& json);
     static std::string serialize_response(const core::ResponseFrame& frame);
     static std::string serialize_event(const core::EventFrame& frame);
-    
+
     // Message handling
     void handle_message(
         const WsConnectionPtr& conn,
         const WsMessagePtr& msg,
-        std::shared_ptr<GatewayClient> client
+        std::shared_ptr<GatewayWsClient> client
     );
-    
+
     // Connection handling
     void handle_open(const ConnectionHandle& hdl);
     void handle_close(const ConnectionHandle& hdl);
-    
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
-
-// ============================================================================
-// Authentication (使用 auth_manager.h 中的定义)
-// ============================================================================
-
-// AuthResult 和 AuthManager 定义在 hunterclaw/gateway/auth_manager.h
 
 // ============================================================================
 // Session Manager
@@ -235,29 +431,25 @@ private:
 
 class SessionManager {
 public:
-    // Factory method
     static std::shared_ptr<SessionManager> create();
-    
+
     SessionManager() = default;
     virtual ~SessionManager() = default;
-    
-    // Session lifecycle
+
     virtual std::string create_session(const core::SessionKey& key) = 0;
     virtual std::optional<core::SessionInfo> get_session(const std::string& session_id) = 0;
     virtual bool update_last_active(const std::string& session_id) = 0;
     virtual bool delete_session(const std::string& session_id) = 0;
-    
-    // Session querying
+
     virtual std::vector<core::SessionInfo> list_sessions() = 0;
     virtual std::vector<core::SessionInfo> find_sessions_by_key(const core::SessionKey& key) = 0;
-    
-    // Session persistence
+
     virtual core::Result<bool> save_session(const core::SessionInfo& session) = 0;
     virtual core::Result<bool> load_sessions() = 0;
 };
 
 // ============================================================================
-// Rate Limiter
+// Rate Limiter (对齐 OpenClaw auth-rate-limit.ts)
 // ============================================================================
 
 class RateLimiter {
@@ -267,15 +459,12 @@ public:
         core::Duration window_ms{60000};  // 1 minute
         bool exempt_loopback = true;
     };
-    
+
     explicit RateLimiter(const Config& config);
-    
-    // Check rate limit
+
     bool check_limit(const std::string& identifier);
-    
-    // Reset counter
     void reset(const std::string& identifier);
-    
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

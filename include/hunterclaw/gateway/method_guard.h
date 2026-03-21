@@ -1,6 +1,7 @@
 #pragma once
 
 #include "hunterclaw/gateway/auth_manager.h"
+#include "hunterclaw/gateway/gateway.h"
 #include "hunterclaw/core/types.h"
 #include "hunterclaw/core/result.h"
 #include <nlohmann/json.hpp>
@@ -18,39 +19,6 @@ using json = nlohmann::json;
 // ============================================================================
 // 🔐 100% 对齐 OpenClaw: 方法权限守卫
 // ============================================================================
-
-/**
- * 客户端上下文
- * 
- * 包含客户端的认证信息、权限、Session 等。
- * 
- * OpenClaw 对齐:
- * ```typescript
- * interface ClientContext {
- *   clientId: string;
- *   sessionId?: string;
- *   deviceId?: string;
- *   scopes: string[];
- *   metadata: Record<string, any>;
- * }
- * ```
- */
-struct ClientContext {
-    std::string client_id;           // 客户端唯一标识
-    std::string session_id;          // 关联的 Session ID (可选)
-    std::string device_id;           // 设备 ID (可选)
-    std::vector<std::string> scopes; // 权限列表
-    core::Timestamp connected_at;    // 连接时间
-    
-    // 可选字段
-    std::string channel_id;          // Channel ID
-    std::string account_id;          // Account ID
-    std::map<std::string, std::string> metadata;  // 元数据
-    
-    // 鉴权结果缓存
-    bool authenticated = false;
-    std::string auth_reason;         // 未鉴权原因
-};
 
 /**
  * 权限检查结果

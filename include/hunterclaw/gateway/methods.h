@@ -551,7 +551,10 @@ core::Result<json> method_node_describe(std::shared_ptr<GatewayServer>, std::sha
 core::Result<json> method_node_canvas_capability_refresh(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
 core::Result<json> method_node_pending_pull(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
 core::Result<json> method_node_pending_ack(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
+core::Result<json> method_node_pending_drain(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
+core::Result<json> method_node_pending_enqueue(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
 core::Result<json> method_node_invoke(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
+core::Result<json> method_node_invoke_result(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
 core::Result<json> method_node_event(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
 
 // ============================================================================
@@ -682,10 +685,49 @@ core::Result<json> method_tools_catalog(std::shared_ptr<GatewayServer>, std::sha
 core::Result<json> method_update_run(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
 
 // ============================================================================
+// Wizard Methods (stubs.cc)
+// 🎯 OpenClaw 严格对齐: server-methods/wizard.ts wizardHandlers
+// ============================================================================
+core::Result<json> method_wizard_start(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
+core::Result<json> method_wizard_next(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
+core::Result<json> method_wizard_cancel(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
+core::Result<json> method_wizard_status(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
+
+// ============================================================================
+// VoiceWake Methods (stubs.cc)
+// 🎯 OpenClaw 严格对齐: server-methods/voicewake.ts voicewakeHandlers
+// ============================================================================
+core::Result<json> method_voicewake_get(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
+core::Result<json> method_voicewake_set(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
+
+// ============================================================================
 // Send Methods (stubs.cc)
 // 🎯 OpenClaw 严格对齐: server-methods/send.ts sendHandlers
 // ============================================================================
+// 🎯 OpenClaw 对齐: "send" (SendParams)
+core::Result<json> method_send(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
 core::Result<json> method_send_message(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
+
+// ============================================================================
+// Agent (top-level) Methods (stubs.cc)
+// 🎯 OpenClaw 严格对齐: server-methods/agent.ts agentHandlers["agent"]
+// ============================================================================
+// 🎯 OpenClaw 对齐: "agent" (AgentParams) - top-level agent method
+core::Result<json> method_agent(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
+
+// ============================================================================
+// Heartbeat Methods (stubs.cc)
+// 🎯 OpenClaw 严格对齐: server-methods/heartbeat.ts
+// ============================================================================
+core::Result<json> method_last_heartbeat(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
+core::Result<json> method_set_heartbeats(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
+
+// ============================================================================
+// System Presence / Event Methods (stubs.cc)
+// 🎯 OpenClaw 严格对齐: server-methods/system.ts systemHandlers
+// ============================================================================
+core::Result<json> method_system_presence(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
+core::Result<json> method_system_event(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
 
 // ============================================================================
 // Method Registration Helper

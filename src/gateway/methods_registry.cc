@@ -17,7 +17,7 @@ namespace gateway {
 // Called from gateway.cc to initialize the method handler
 // ============================================================================
 
-std::function<core::Result<json>(const std::string&, const json&)>
+std::function<core::Result<json>(const std::string&, const json&, const ClientContext&)>
 create_method_handler(std::shared_ptr<GatewayServer> server) {
     using MethodFn = std::function<core::Result<json>(
         std::shared_ptr<GatewayServer>,
@@ -70,18 +70,21 @@ create_method_handler(std::shared_ptr<GatewayServer> server) {
         {"channels.logs",           methods::method_channel_logs},
 
         // ── Agent (agent.ts) ────────────────────────────────────────────────
+        // HunterClaw 扩展 (OpenClaw 无对应)
         {"agent.cancel",            methods::method_agent_cancel},
         {"agent.status",            methods::method_agent_status},
 
         // ── Chat (chat.ts) ──────────────────────────────────────────────────
+        // 🎯 OpenClaw 对齐: chatHandlers
         {"chat.send",               methods::method_chat_send},
         {"chat.abort",              methods::method_chat_abort},
         {"chat.history",            methods::method_chat_history},
+        {"chat.inject",             methods::method_chat_inject},
+        // HunterClaw 扩展 (OpenClaw 无对应)
         {"chat.update_params",      methods::method_chat_update_params},
         {"chat.regenerate",         methods::method_chat_regenerate},
         {"chat.fork",               methods::method_chat_fork},
         {"chat.summarize",          methods::method_chat_summarize},
-        {"chat.inject",             methods::method_chat_inject},
         {"chat.edit",               methods::method_chat_edit},
         {"chat.delete",             methods::method_chat_delete},
         {"chat.transcript",         methods::method_chat_transcript},
@@ -131,7 +134,10 @@ create_method_handler(std::shared_ptr<GatewayServer> server) {
         {"node.canvas.capability.refresh",  methods::method_node_canvas_capability_refresh},
         {"node.pending.pull",               methods::method_node_pending_pull},
         {"node.pending.ack",                methods::method_node_pending_ack},
+        {"node.pending.drain",              methods::method_node_pending_drain},
+        {"node.pending.enqueue",            methods::method_node_pending_enqueue},
         {"node.invoke",                     methods::method_node_invoke},
+        {"node.invoke.result",              methods::method_node_invoke_result},
         {"node.event",                      methods::method_node_event},
 
         // ── Logs (logs.ts) ──────────────────────────────────────────────────
@@ -232,7 +238,35 @@ create_method_handler(std::shared_ptr<GatewayServer> server) {
 
         // ── Send (send.ts) ──────────────────────────────────────────────────
         // 🎯 OpenClaw 对齐: sendHandlers
+        // OpenClaw BASE_METHODS 中有 "send" (SendParams) 和 "send.message"
+        {"send",                            methods::method_send},
         {"send.message",                    methods::method_send_message},
+
+        // ── Agent top-level (agent.ts) ──────────────────────────────────────
+        // 🎯 OpenClaw 对齐: agentHandlers["agent"] (AgentParams)
+        {"agent",                           methods::method_agent},
+
+        // ── Wizard (wizard.ts) ──────────────────────────────────────────────
+        // 🎯 OpenClaw 对齐: wizardHandlers
+        {"wizard.start",                    methods::method_wizard_start},
+        {"wizard.next",                     methods::method_wizard_next},
+        {"wizard.cancel",                   methods::method_wizard_cancel},
+        {"wizard.status",                   methods::method_wizard_status},
+
+        // ── VoiceWake (voicewake.ts) ─────────────────────────────────────────
+        // 🎯 OpenClaw 对齐: voicewakeHandlers
+        {"voicewake.get",                   methods::method_voicewake_get},
+        {"voicewake.set",                   methods::method_voicewake_set},
+
+        // ── Heartbeat (heartbeat.ts) ─────────────────────────────────────────
+        // 🎯 OpenClaw 对齐: BASE_METHODS "last-heartbeat" / "set-heartbeats"
+        {"last-heartbeat",                  methods::method_last_heartbeat},
+        {"set-heartbeats",                  methods::method_set_heartbeats},
+
+        // ── System Presence / Event (system.ts) ─────────────────────────────
+        // 🎯 OpenClaw 对齐: systemHandlers "system-presence" / "system-event"
+        {"system-presence",                 methods::method_system_presence},
+        {"system-event",                    methods::method_system_event},
 
         // ── Cron (cron.ts) ──────────────────────────────────────────────────
         {"wake",                    methods::method_wake},
@@ -245,20 +279,18 @@ create_method_handler(std::shared_ptr<GatewayServer> server) {
         {"cron.runs",               methods::method_cron_runs},
     };
 
-    return [server](const std::string& method_name, const json& params) -> core::Result<json> {
+    return [server](const std::string& method_name, const json& params, const ClientContext& client_ctx) -> core::Result<json> {
         auto it = method_table.find(method_name);
         if (it == method_table.end()) {
             return core::Result<json>::Err("Unknown method: " + method_name);
         }
 
-        // Create a default method guard and client context
-        // MethodGuard requires AuthManager; pass nullptr for internal dispatch
+        // Create a method guard
+        // MethodGuard requires AuthManager; pass nullptr for now
         auto guard = std::make_shared<MethodGuard>(nullptr);
-        ClientContext ctx;
-        ctx.authenticated = true;  // Internal dispatch is always authenticated
 
         try {
-            return it->second(server, guard, ctx, params);
+            return it->second(server, guard, client_ctx, params);
         } catch (const std::exception& e) {
             return core::Result<json>::Err(
                 std::string("Method ") + method_name + " threw: " + e.what()

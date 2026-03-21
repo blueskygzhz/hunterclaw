@@ -6,7 +6,6 @@
 #include <websocketpp/config/asio_no_tls.hpp>
 #include <websocketpp/server.hpp>
 #include <nlohmann/json.hpp>
-using json = nlohmann::json;
 #include <map>
 #include <mutex>
 #include <set>
@@ -149,6 +148,13 @@ static std::string generate_uuid_v4() {
 // Internal implementation class (不继承 GatewayServer)
 class GatewayServerImpl {
 public:
+    // 🎯 OpenClaw 对齐: stateVersion 结构 (对应 GatewayBroadcastStateVersion)
+    // 定义在类开头，确保构造函数中可以使用
+    struct BroadcastStateVersion {
+        int64_t presence = -1;  // -1 表示不包含
+        int64_t health   = -1;
+    };
+
     explicit GatewayServerImpl(std::shared_ptr<core::Config> config)
         : config_(config), runtime_state_(std::make_shared<GatewayRuntimeState>()) {
         
@@ -160,6 +166,50 @@ public:
         ws_server_.set_open_handler(bind(&GatewayServerImpl::on_open, this, ::_1));
         ws_server_.set_close_handler(bind(&GatewayServerImpl::on_close, this, ::_1));
         ws_server_.set_message_handler(bind(&GatewayServerImpl::on_message, this, ::_1, ::_2));
+
+        // 🎯 OpenClaw 对齐: 初始化 runtime_state_->broadcast / broadcast_to_conn_ids
+        // 对应 OpenClaw server-runtime-state.ts:
+        //   const { broadcast, broadcastToConnIds } = createGatewayBroadcaster({ clients });
+        // 方法处理器通过 runtime_state_->broadcast(...) 广播事件
+        runtime_state_->broadcast = [this](
+            const std::string& event_name,
+            const core::JsonValue& payload,
+            const GatewayBroadcastOpts& opts
+        ) {
+            core::EventFrame ef;
+            ef.event = event_name;
+            ef.payload = payload;
+            BroadcastStateVersion sv;
+            if (opts.state_version.has_value()) {
+                sv.presence = opts.state_version->presence.value_or(-1);
+                sv.health   = opts.state_version->health.value_or(-1);
+            }
+            this->broadcast(ef, opts.drop_if_slow, nullptr,
+                            opts.state_version.has_value() ? &sv : nullptr);
+        };
+
+        runtime_state_->broadcast_to_conn_ids = [this](
+            const std::string& event_name,
+            const core::JsonValue& payload,
+            const std::set<std::string>& conn_ids,
+            const GatewayBroadcastOpts& opts
+        ) {
+            if (conn_ids.empty()) return;
+            core::EventFrame ef;
+            ef.event = event_name;
+            ef.payload = payload;
+            std::vector<std::string> conn_id_vec(conn_ids.begin(), conn_ids.end());
+            std::set<connection_hdl, std::owner_less<connection_hdl>> target_hdls;
+            this->get_handles_for_conn_ids(conn_id_vec, target_hdls);
+            if (target_hdls.empty()) return;
+            BroadcastStateVersion sv;
+            if (opts.state_version.has_value()) {
+                sv.presence = opts.state_version->presence.value_or(-1);
+                sv.health   = opts.state_version->health.value_or(-1);
+            }
+            this->broadcast(ef, opts.drop_if_slow, &target_hdls,
+                            opts.state_version.has_value() ? &sv : nullptr);
+        };
     }
     
     core::Result<bool> start() {
@@ -318,12 +368,6 @@ public:
         }
     }
     
-    // 🎯 OpenClaw 对齐: stateVersion 结构 (对应 GatewayBroadcastStateVersion)
-    struct BroadcastStateVersion {
-        int64_t presence = -1;  // -1 表示不包含
-        int64_t health   = -1;
-    };
-    
     void broadcast(const core::EventFrame& event,
                     bool drop_if_slow = false,
                     const std::set<connection_hdl, std::owner_less<connection_hdl>>* target_hdls = nullptr,
@@ -467,6 +511,23 @@ public:
             // Log error but don't throw
         }
     }
+
+    // 🎯 OpenClaw 对齐: 通过 conn_id 列表查找对应的 WebSocket handle 集合
+    // 供 GatewayServer::broadcast_to_conn_ids 使用
+    void get_handles_for_conn_ids(
+        const std::vector<std::string>& conn_ids,
+        std::set<connection_hdl, std::owner_less<connection_hdl>>& out_handles
+    ) {
+        std::lock_guard<std::mutex> lock(connections_mutex_);
+        for (const auto& conn_id : conn_ids) {
+            for (const auto& kv : handle_to_conn_id_) {
+                if (kv.second == conn_id) {
+                    out_handles.insert(kv.first);
+                    break;
+                }
+            }
+        }
+    }
     
 private:
     void on_open(connection_hdl hdl) {
@@ -571,24 +632,23 @@ private:
                 handle_to_conn_id_.erase(it);
             }
         }
-        
-        // 🎯 OpenClaw 严格对齐: node role unregister
+
+        // 🎯 OpenClaw 严格对齐: node role unregister + clients.delete
         // 对应 OpenClaw ws-connection.ts socket.once("close"):
-        //   if (client?.connect?.role === "node") {
-        //     const nodeId = context.nodeRegistry.unregister(connId);
-        //     if (nodeId) { removeRemoteNodeInfo(nodeId); context.nodeUnsubscribeAll(nodeId); }
-        //   }
+        //   if (client?.connect?.role === "node") { ... }
+        //   clients.delete(client)   ← 必须在读取 role 之后再删除
         if (was_connected && !conn_id_closed.empty()) {
             std::string closed_role;
             {
-                // role 已在 on_close 前从 handshake_states_ 中读取（已 erase），
-                // 从 runtime_state 中读取
+                // 先读取 role，再 erase（避免 use-after-erase）
                 if (runtime_state_) {
                     std::lock_guard<std::mutex> state_lock(runtime_state_->mutex);
                     auto client_it = runtime_state_->clients.find(conn_id_closed);
                     if (client_it != runtime_state_->clients.end()) {
-                        closed_role = client_it->second->role;
+                        closed_role = client_it->second->connect.role;
                     }
+                    // 对应 OpenClaw: clients.delete(client)
+                    runtime_state_->clients.erase(conn_id_closed);
                 }
             }
             if (closed_role == "node") {
@@ -935,23 +995,24 @@ private:
                         hs_it->second.role   = role_raw;
                         hs_it->second.scopes = client_scopes;
                     }
-                    // 🎯 OpenClaw 对齐: 更新 GatewayClient 的 role/scopes
+                    // 🎯 OpenClaw 对齐: 更新 GatewayWsClient 的 connect.role/scopes
                     auto conn_it = handle_to_conn_id_.find(hdl);
                     if (conn_it != handle_to_conn_id_.end()) {
                         std::lock_guard<std::mutex> state_lock(runtime_state_->mutex);
                         auto client_it = runtime_state_->clients.find(conn_it->second);
                         if (client_it != runtime_state_->clients.end()) {
-                            client_it->second->role   = role_raw;
-                            client_it->second->scopes = client_scopes;
+                            client_it->second->connect.role   = role_raw;
+                            client_it->second->connect.scopes = client_scopes;
                         } else {
-                            // 新建 GatewayClient
-                            auto gc = std::make_shared<GatewayClient>();
+                            // 新建 GatewayWsClient (对齐 OpenClaw GatewayWsClient)
+                            auto gc = std::make_shared<GatewayWsClient>();
                             gc->conn_id = conn_it->second;
-                            gc->handle  = hdl;
-                            gc->role    = role_raw;
-                            gc->scopes  = client_scopes;
-                            gc->authenticated = true;
-                            gc->connected_at  = core::utils::now();
+                            gc->connect.role   = role_raw;
+                            gc->connect.scopes = client_scopes;
+                            // 设置 socket (WebSocket connection ptr)
+                            try {
+                                gc->socket = ws_server_.get_con_from_hdl(hdl);
+                            } catch (...) {}
                             runtime_state_->clients[conn_it->second] = gc;
                         }
                     }
@@ -1401,11 +1462,28 @@ private:
         
         try {
             // 🎯 OpenClaw 对齐: 传递 req.params 给 method_handler_
-            // 对应 OpenClaw: handler({ req, params: req.params ?? {}, ... })
+            // 对应 OpenClaw: handler({ req, params: req.params ?? {}, client, ... })
             nlohmann::json params = req.params.is_null() ? nlohmann::json::object() : req.params.to_json();
-            
+
+            // 🎯 OpenClaw 对齐: 从 GatewayWsClient 构建 ClientContext
+            // 对应 OpenClaw: client (GatewayWsClient) 传递给 handler
+            ClientContext client_ctx;
+            if (!conn_id.empty() && runtime_state_) {
+                std::lock_guard<std::mutex> state_lock(runtime_state_->mutex);
+                auto client_it = runtime_state_->clients.find(conn_id);
+                if (client_it != runtime_state_->clients.end()) {
+                    const auto& wsc = *client_it->second;
+                    client_ctx.connect    = wsc.connect;
+                    client_ctx.conn_id    = wsc.conn_id;
+                    client_ctx.client_ip  = wsc.client_ip;
+                    client_ctx.canvas_host_url = wsc.canvas_host_url;
+                    client_ctx.canvas_capability = wsc.canvas_capability;
+                    client_ctx.canvas_capability_expires_at_ms = wsc.canvas_capability_expires_at_ms;
+                }
+            }
+
             // Invoke method
-            auto result = method_handler_(req.method, params);
+            auto result = method_handler_(req.method, params, client_ctx);
             
             if (result.is_ok()) {
                 core::ResponseFrame response;
@@ -1485,7 +1563,13 @@ private:
     std::mutex dedupe_mutex_;
     
     // 🎯 OpenClaw 对齐: 方法处理器 (由 methods.cc 注入)
-    std::function<core::Result<nlohmann::json>(const std::string&, const nlohmann::json&)> method_handler_;
+    // 对应 OpenClaw: handler({ req, params, client, state, ... })
+    // 添加 ClientContext 参数，使方法处理器能知道调用者信息
+    std::function<core::Result<nlohmann::json>(
+        const std::string&,
+        const nlohmann::json&,
+        const ClientContext&
+    )> method_handler_;
 };
 
 // Session Manager Implementation
@@ -1728,9 +1812,12 @@ GatewayServer::GatewayServer(std::shared_ptr<core::Config> config)
     );
     
     // Import create_method_handler from methods.cc
-    extern std::function<core::Result<nlohmann::json>(const std::string&, const nlohmann::json&)> 
-        create_method_handler(std::shared_ptr<GatewayServer> server);
-    
+    extern std::function<core::Result<nlohmann::json>(
+        const std::string&,
+        const nlohmann::json&,
+        const ClientContext&
+    )> create_method_handler(std::shared_ptr<GatewayServer> server);
+
     // Initialize method handler in runtime state
     auto self = std::shared_ptr<GatewayServer>(this, [](GatewayServer*){});  // Non-owning shared_ptr
     impl_->server_impl->runtime_state()->method_handler = create_method_handler(self);
@@ -1797,19 +1884,9 @@ void GatewayServer::broadcast_to_conn_ids(
     }
     
     // 构建目标 handle 集合
-    // 注意: 这里需要通过 conn_id 查找 handle
-    // 由于 GatewayServerImpl 的 handle_to_conn_id_ 是私有的，
-    // 我们通过 runtime_state 中的 clients 映射来查找
+    // 通过 GatewayServerImpl 内部的 conn_id -> handle 映射来查找
     std::set<websocketpp::connection_hdl, std::owner_less<websocketpp::connection_hdl>> target_hdls;
-    {
-        std::lock_guard<std::mutex> lock(state->mutex);
-        for (const auto& conn_id : conn_ids) {
-            auto it = state->clients.find(conn_id);
-            if (it != state->clients.end()) {
-                target_hdls.insert(it->second->handle);
-            }
-        }
-    }
+    impl_->server_impl->get_handles_for_conn_ids(conn_ids, target_hdls);
     
     if (!target_hdls.empty()) {
         impl_->server_impl->broadcast(event, false, &target_hdls);

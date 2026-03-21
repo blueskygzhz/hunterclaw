@@ -6,6 +6,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 namespace hunterclaw {
@@ -22,8 +23,7 @@ class PluginRegistry;
 
 enum class PluginKind {
   MEMORY,
-  CONTEXT_ENGINE,
-  GENERAL
+  CONTEXT_ENGINE
 };
 
 enum class PluginOrigin {
@@ -83,7 +83,7 @@ enum class HttpRouteMatch {
 class PluginLogger {
  public:
   virtual ~PluginLogger() = default;
-  
+
   virtual void debug(const std::string& message) = 0;
   virtual void info(const std::string& message) = 0;
   virtual void warn(const std::string& message) = 0;
@@ -121,7 +121,7 @@ struct PluginConfigValidation {
 class PluginConfigSchema {
  public:
   virtual ~PluginConfigSchema() = default;
-  
+
   virtual PluginConfigValidation validate(const std::string& value_json) const = 0;
   virtual std::unordered_map<std::string, PluginConfigUiHint> get_ui_hints() const = 0;
   virtual std::string get_json_schema() const = 0;  // Returns JSON string
@@ -155,7 +155,391 @@ struct PluginToolOptions {
 };
 
 // ============================================================================
-// Plugin Hook Handler
+// Plugin Hook — Agent Context (shared across agent hooks)
+// ============================================================================
+
+struct PluginHookAgentContext {
+  std::optional<std::string> agent_id;
+  std::optional<std::string> session_key;
+  std::optional<std::string> session_id;
+  std::optional<std::string> workspace_dir;
+  std::optional<std::string> message_provider;
+  /** What initiated this agent run: "user", "heartbeat", "cron", or "memory". */
+  std::optional<std::string> trigger;
+  /** Channel identifier (e.g. "telegram", "discord", "whatsapp"). */
+  std::optional<std::string> channel_id;
+};
+
+// ============================================================================
+// Plugin Hook — before_model_resolve
+// ============================================================================
+
+struct PluginHookBeforeModelResolveEvent {
+  /** User prompt for this run. No session messages are available yet in this phase. */
+  std::string prompt;
+};
+
+struct PluginHookBeforeModelResolveResult {
+  /** Override the model for this agent run. E.g. "llama3.3:8b" */
+  std::optional<std::string> model_override;
+  /** Override the provider for this agent run. E.g. "ollama" */
+  std::optional<std::string> provider_override;
+};
+
+// ============================================================================
+// Plugin Hook — before_prompt_build
+// ============================================================================
+
+struct PluginHookBeforePromptBuildEvent {
+  std::string prompt;
+  /** Session messages prepared for this run (JSON array string). */
+  std::string messages_json;
+};
+
+struct PluginHookBeforePromptBuildResult {
+  std::optional<std::string> system_prompt;
+  std::optional<std::string> prepend_context;
+  /**
+   * Prepended to the agent system prompt so providers can cache it.
+   * Use for static plugin guidance instead of prepend_context.
+   */
+  std::optional<std::string> prepend_system_context;
+  /**
+   * Appended to the agent system prompt so providers can cache it.
+   * Use for static plugin guidance instead of prepend_context.
+   */
+  std::optional<std::string> append_system_context;
+};
+
+// ============================================================================
+// Plugin Hook — before_agent_start (legacy: combines both phases)
+// ============================================================================
+
+struct PluginHookBeforeAgentStartEvent {
+  std::string prompt;
+  /** Optional because legacy hook can run in pre-session phase. */
+  std::optional<std::string> messages_json;
+};
+
+struct PluginHookBeforeAgentStartResult {
+  // From PluginHookBeforePromptBuildResult
+  std::optional<std::string> system_prompt;
+  std::optional<std::string> prepend_context;
+  std::optional<std::string> prepend_system_context;
+  std::optional<std::string> append_system_context;
+  // From PluginHookBeforeModelResolveResult
+  std::optional<std::string> model_override;
+  std::optional<std::string> provider_override;
+};
+
+// ============================================================================
+// Plugin Hook — llm_input
+// ============================================================================
+
+struct PluginHookLlmInputEvent {
+  std::string run_id;
+  std::string session_id;
+  std::string provider;
+  std::string model;
+  std::optional<std::string> system_prompt;
+  std::string prompt;
+  std::string history_messages_json;  // JSON array
+  int images_count = 0;
+};
+
+// ============================================================================
+// Plugin Hook — llm_output
+// ============================================================================
+
+struct PluginHookLlmOutputUsage {
+  std::optional<int> input;
+  std::optional<int> output;
+  std::optional<int> cache_read;
+  std::optional<int> cache_write;
+  std::optional<int> total;
+};
+
+struct PluginHookLlmOutputEvent {
+  std::string run_id;
+  std::string session_id;
+  std::string provider;
+  std::string model;
+  std::vector<std::string> assistant_texts;
+  std::optional<std::string> last_assistant_json;
+  std::optional<PluginHookLlmOutputUsage> usage;
+};
+
+// ============================================================================
+// Plugin Hook — agent_end
+// ============================================================================
+
+struct PluginHookAgentEndEvent {
+  std::string messages_json;  // JSON array
+  bool success = false;
+  std::optional<std::string> error;
+  std::optional<int> duration_ms;
+};
+
+// ============================================================================
+// Plugin Hook — before_compaction / after_compaction
+// ============================================================================
+
+struct PluginHookBeforeCompactionEvent {
+  /** Total messages in the session before any truncation or compaction */
+  int message_count = 0;
+  /** Messages being fed to the compaction LLM (after history-limit truncation) */
+  std::optional<int> compacting_count;
+  std::optional<int> token_count;
+  std::optional<std::string> messages_json;
+  /** Path to the session JSONL transcript. */
+  std::optional<std::string> session_file;
+};
+
+struct PluginHookAfterCompactionEvent {
+  int message_count = 0;
+  std::optional<int> token_count;
+  int compacted_count = 0;
+  /** Path to the session JSONL transcript. */
+  std::optional<std::string> session_file;
+};
+
+// ============================================================================
+// Plugin Hook — before_reset
+// ============================================================================
+
+struct PluginHookBeforeResetEvent {
+  std::optional<std::string> session_file;
+  std::optional<std::string> messages_json;
+  std::optional<std::string> reason;
+};
+
+// ============================================================================
+// Plugin Hook — message_received / message_sending / message_sent
+// ============================================================================
+
+struct PluginHookMessageContext {
+  std::string channel_id;
+  std::optional<std::string> account_id;
+  std::optional<std::string> conversation_id;
+};
+
+struct PluginHookMessageReceivedEvent {
+  std::string from;
+  std::string content;
+  std::optional<int64_t> timestamp;
+  std::optional<std::string> metadata_json;
+};
+
+struct PluginHookMessageSendingEvent {
+  std::string to;
+  std::string content;
+  std::optional<std::string> metadata_json;
+};
+
+struct PluginHookMessageSendingResult {
+  std::optional<std::string> content;
+  bool cancel = false;
+};
+
+struct PluginHookMessageSentEvent {
+  std::string to;
+  std::string content;
+  bool success = false;
+  std::optional<std::string> error;
+};
+
+// ============================================================================
+// Plugin Hook — before_tool_call / after_tool_call
+// ============================================================================
+
+struct PluginHookToolContext {
+  std::optional<std::string> agent_id;
+  std::optional<std::string> session_key;
+  /** Ephemeral session UUID — regenerated on /new and /reset. */
+  std::optional<std::string> session_id;
+  std::string tool_name;
+  /** Provider-specific tool call ID when available. */
+  std::optional<std::string> tool_call_id;
+};
+
+struct PluginHookBeforeToolCallEvent {
+  std::string tool_name;
+  std::string params_json;  // Record<string, unknown> as JSON
+  /** Stable run identifier for this agent invocation. */
+  std::optional<std::string> run_id;
+  /** Provider-specific tool call ID when available. */
+  std::optional<std::string> tool_call_id;
+};
+
+struct PluginHookBeforeToolCallResult {
+  std::optional<std::string> params_json;  // Modified params as JSON
+  bool block = false;
+  std::optional<std::string> block_reason;
+};
+
+struct PluginHookAfterToolCallEvent {
+  std::string tool_name;
+  std::string params_json;
+  /** Stable run identifier for this agent invocation. */
+  std::optional<std::string> run_id;
+  /** Provider-specific tool call ID when available. */
+  std::optional<std::string> tool_call_id;
+  std::optional<std::string> result_json;
+  std::optional<std::string> error;
+  std::optional<int> duration_ms;
+};
+
+// ============================================================================
+// Plugin Hook — tool_result_persist
+// ============================================================================
+
+struct PluginHookToolResultPersistContext {
+  std::optional<std::string> agent_id;
+  std::optional<std::string> session_key;
+  std::optional<std::string> tool_name;
+  std::optional<std::string> tool_call_id;
+};
+
+struct PluginHookToolResultPersistEvent {
+  std::optional<std::string> tool_name;
+  std::optional<std::string> tool_call_id;
+  /**
+   * The toolResult message about to be written to the session transcript (JSON).
+   * Handlers may return a modified message.
+   */
+  std::string message_json;
+  /** True when the tool result was synthesized by a guard/repair step. */
+  bool is_synthetic = false;
+};
+
+struct PluginHookToolResultPersistResult {
+  std::optional<std::string> message_json;
+};
+
+// ============================================================================
+// Plugin Hook — before_message_write
+// ============================================================================
+
+struct PluginHookBeforeMessageWriteEvent {
+  std::string message_json;
+  std::optional<std::string> session_key;
+  std::optional<std::string> agent_id;
+};
+
+struct PluginHookBeforeMessageWriteContext {
+  std::optional<std::string> agent_id;
+  std::optional<std::string> session_key;
+};
+
+struct PluginHookBeforeMessageWriteResult {
+  bool block = false;  // If true, message is NOT written to JSONL
+  std::optional<std::string> message_json;  // Optional: modified message to write instead
+};
+
+// ============================================================================
+// Plugin Hook — session_start / session_end
+// ============================================================================
+
+struct PluginHookSessionContext {
+  std::optional<std::string> agent_id;
+  std::string session_id;
+  std::optional<std::string> session_key;
+};
+
+struct PluginHookSessionStartEvent {
+  std::string session_id;
+  std::optional<std::string> session_key;
+  std::optional<std::string> resumed_from;
+};
+
+struct PluginHookSessionEndEvent {
+  std::string session_id;
+  std::optional<std::string> session_key;
+  int message_count = 0;
+  std::optional<int> duration_ms;
+};
+
+// ============================================================================
+// Plugin Hook — subagent_spawning / subagent_delivery_target / subagent_spawned / subagent_ended
+// ============================================================================
+
+struct PluginHookSubagentContext {
+  std::optional<std::string> run_id;
+  std::optional<std::string> child_session_key;
+  std::optional<std::string> requester_session_key;
+};
+
+struct PluginHookSubagentRequester {
+  std::optional<std::string> channel;
+  std::optional<std::string> account_id;
+  std::optional<std::string> to;
+  std::optional<std::string> thread_id;
+};
+
+struct PluginHookSubagentSpawnBase {
+  std::string child_session_key;
+  std::string agent_id;
+  std::optional<std::string> label;
+  std::string mode;  // "run" | "session"
+  std::optional<PluginHookSubagentRequester> requester;
+  bool thread_requested = false;
+};
+
+struct PluginHookSubagentSpawningEvent : PluginHookSubagentSpawnBase {};
+
+struct PluginHookSubagentSpawningResult {
+  bool ok = true;
+  bool thread_binding_ready = false;
+  std::optional<std::string> error;
+};
+
+struct PluginHookSubagentDeliveryTargetEvent {
+  std::string child_session_key;
+  std::string requester_session_key;
+  std::optional<PluginHookSubagentRequester> requester_origin;
+  std::optional<std::string> child_run_id;
+  std::optional<std::string> spawn_mode;  // "run" | "session"
+  bool expects_completion_message = false;
+};
+
+struct PluginHookSubagentDeliveryTargetResult {
+  std::optional<PluginHookSubagentRequester> origin;
+};
+
+struct PluginHookSubagentSpawnedEvent : PluginHookSubagentSpawnBase {
+  std::string run_id;
+};
+
+struct PluginHookSubagentEndedEvent {
+  std::string target_session_key;
+  std::string target_kind;  // "subagent" | "acp"
+  std::string reason;
+  bool send_farewell = false;
+  std::optional<std::string> account_id;
+  std::optional<std::string> run_id;
+  std::optional<int64_t> ended_at;
+  std::optional<std::string> outcome;  // "ok" | "error" | "timeout" | "killed" | "reset" | "deleted"
+  std::optional<std::string> error;
+};
+
+// ============================================================================
+// Plugin Hook — gateway_start / gateway_stop
+// ============================================================================
+
+struct PluginHookGatewayContext {
+  std::optional<int> port;
+};
+
+struct PluginHookGatewayStartEvent {
+  int port = 0;
+};
+
+struct PluginHookGatewayStopEvent {
+  std::optional<std::string> reason;
+};
+
+// ============================================================================
+// Plugin Hook Handler & Options
 // ============================================================================
 
 struct PluginHookEvent {
@@ -163,18 +547,14 @@ struct PluginHookEvent {
   std::string data_json;  // Event data as JSON
 };
 
-struct PluginHookContext {
-  std::string config_json;
-  std::optional<std::string> workspace_dir;
-  std::optional<std::string> agent_id;
-};
-
-using PluginHookHandler = std::function<void(const PluginHookEvent&, const PluginHookContext&)>;
+// Generic hook handler (used internally for registration)
+using PluginHookHandler = std::function<void(const PluginHookEvent&, const std::string& ctx_json)>;
 
 struct PluginHookOptions {
+  std::optional<std::string> entry;
   std::optional<std::string> name;
   std::optional<std::string> description;
-  bool register_immediately = true;
+  bool register_hook = true;
   int priority = 0;
 };
 
@@ -197,16 +577,27 @@ struct PluginHttpRouteParams {
 // ============================================================================
 
 struct PluginCommandContext {
+  /** The sender's identifier (e.g., Telegram user ID) */
   std::optional<std::string> sender_id;
+  /** The channel/surface (e.g., "telegram", "discord") */
   std::string channel;
+  /** Provider channel id (e.g., "telegram") */
   std::optional<std::string> channel_id;
+  /** Whether the sender is on the allowlist */
   bool is_authorized_sender = false;
+  /** Raw command arguments after the command name */
   std::optional<std::string> args;
+  /** The full normalized command body */
   std::string command_body;
+  /** Current config as JSON */
   std::string config_json;
+  /** Raw "From" value (channel-scoped id) */
   std::optional<std::string> from;
+  /** Raw "To" value (channel-scoped id) */
   std::optional<std::string> to;
+  /** Account id for multi-account channels */
   std::optional<std::string> account_id;
+  /** Thread/topic id if available */
   std::optional<int> message_thread_id;
 };
 
@@ -239,7 +630,7 @@ struct PluginServiceContext {
 class PluginService {
  public:
   virtual ~PluginService() = default;
-  
+
   std::string id;
   virtual void start(const PluginServiceContext& ctx) = 0;
   virtual void stop(const PluginServiceContext& ctx) = 0;
@@ -251,7 +642,7 @@ class PluginService {
 
 struct PluginDiagnostic {
   enum class Level { WARN, ERROR };
-  
+
   Level level;
   std::string message;
   std::optional<std::string> plugin_id;
@@ -265,7 +656,7 @@ struct PluginDiagnostic {
 class PluginApi {
  public:
   virtual ~PluginApi() = default;
-  
+
   std::string id;
   std::string name;
   std::optional<std::string> version;
@@ -275,7 +666,7 @@ class PluginApi {
   std::optional<std::string> plugin_config_json;  // Plugin-specific config
   std::shared_ptr<PluginRuntime> runtime;
   std::shared_ptr<PluginLogger> logger;
-  
+
   virtual void register_tool(PluginToolFactory factory, const PluginToolOptions& opts = {}) = 0;
   virtual void register_hook(const std::vector<PluginHookName>& events, PluginHookHandler handler, const PluginHookOptions& opts = {}) = 0;
   virtual void register_http_route(const PluginHttpRouteParams& params) = 0;
@@ -284,6 +675,9 @@ class PluginApi {
   virtual void register_command(const PluginCommandDefinition& command) = 0;
   virtual void register_context_engine(const std::string& id, std::function<void()> factory) = 0;
   virtual std::string resolve_path(const std::string& input) const = 0;
+
+  /** Register a lifecycle hook handler (typed, mirrors OpenClaw api.on()) */
+  virtual void on(PluginHookName hook_name, PluginHookHandler handler, int priority = 0) = 0;
 };
 
 // ============================================================================
@@ -361,7 +755,7 @@ struct PluginRecord {
   bool enabled;
   PluginStatus status;
   std::optional<std::string> error;
-  
+
   // Registration counts
   std::vector<std::string> tool_names;
   std::vector<PluginHookName> hook_names;
@@ -373,7 +767,7 @@ struct PluginRecord {
   std::vector<std::string> commands;
   int http_routes = 0;
   int hook_count = 0;
-  
+
   bool config_schema = false;
   std::unordered_map<std::string, PluginConfigUiHint> config_ui_hints;
   std::optional<std::string> config_json_schema;
@@ -387,7 +781,7 @@ class PluginRegistry {
  public:
   PluginRegistry();
   ~PluginRegistry();
-  
+
   // Registration methods
   void register_plugin(const PluginRecord& record);
   void register_tool(const PluginToolRegistration& reg);
@@ -396,7 +790,7 @@ class PluginRegistry {
   void register_service(const PluginServiceRegistration& reg);
   void register_command(const PluginCommandRegistration& reg);
   void add_diagnostic(const PluginDiagnostic& diag);
-  
+
   // Query methods
   std::vector<PluginRecord> list_plugins() const;
   std::optional<PluginRecord> get_plugin(const std::string& plugin_id) const;
@@ -407,10 +801,10 @@ class PluginRegistry {
   std::vector<PluginServiceRegistration> list_services() const;
   std::vector<PluginCommandRegistration> list_commands() const;
   std::vector<PluginDiagnostic> get_diagnostics() const;
-  
+
   // Clear
   void clear();
-  
+
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
@@ -432,23 +826,23 @@ class PluginLoader {
  public:
   PluginLoader();
   ~PluginLoader();
-  
+
   // Load plugins
   std::shared_ptr<PluginRegistry> load_plugins(const PluginLoadOptions& options = {});
-  
+
   // Discovery
   std::vector<std::string> discover_bundled_plugins() const;
   std::vector<std::string> discover_workspace_plugins(const std::string& workspace_dir) const;
   std::vector<std::string> discover_global_plugins() const;
-  
+
   // Cache management
   void clear_cache();
   void invalidate_cache(const std::string& cache_key);
-  
+
   // Plugin loading
   bool load_plugin_from_path(const std::string& path, PluginRegistry& registry);
   bool load_plugin_definition(const PluginDefinition& def, PluginRegistry& registry, const std::string& source);
-  
+
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
