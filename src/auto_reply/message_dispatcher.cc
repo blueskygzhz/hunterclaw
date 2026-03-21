@@ -4,6 +4,10 @@
 //   src/auto-reply/reply/inbound-dedupe.ts
 //   src/auto-reply/reply/abort.ts
 //   src/auto-reply/inbound-debounce.ts
+//   src/auto-reply/reply/agent-runner.ts          (runReplyAgent)
+//   src/auto-reply/reply/queue-policy.ts          (resolveActiveRunQueueAction)
+//   src/auto-reply/reply/queue/enqueue.ts         (enqueueFollowupRun)
+//   src/auto-reply/reply/queue/drain.ts           (scheduleFollowupDrain)
 
 #include "hunterclaw/auto_reply/message_dispatcher.h"
 #include "hunterclaw/auto_reply/command_detection.h"
@@ -473,181 +477,337 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
     log()->debug("dispatch_reply_from_config: suppress_typing={} session={}",
                  suppress_typing, session_key);
 
-    // ── Step 10: Generate reply ──────────────────────────────────────────────
-    // Aligned with openclaw: getReplyFromConfig
+    // ── Step 10: Generate reply via run_reply_agent ──────────────────────────
+    // Aligned with openclaw: runReplyAgent (agent-runner.ts)
     //
-    // Track accumulated block text for TTS generation after streaming completes.
-    // When block streaming succeeds, there's no final reply, so we need to generate
-    // TTS audio separately from the accumulated block content.
-    // (aligned with openclaw: accumulatedBlockText + blockCount)
-    std::string accumulated_block_text;
-    int block_count = 0;
+    // runReplyAgent 决策逻辑:
+    //   - isActive=false → "run-now": 通过双层 Lane 队列立即执行
+    //     enqueueSession(() => enqueueGlobal(() => runEmbeddedPiAgent(...)))
+    //   - isActive=true  → "enqueue-followup": 入 FollowupQueue 等待
+    //     drain 时串行消费（while + await runFollowup()）
+    //
+    // 两层串行保证:
+    //   1. session Lane (maxConcurrent=1): 同一 session 请求严格串行
+    //   2. FollowupQueue: 当 session 正在运行时，新请求入队等待
 
-    ReplyGenerator::GenerateConfig gen_config;
-    gen_config.agent_id = config.agent_id;
-    gen_config.workspace_path = config.workspace_path;
-    gen_config.user_input = message.text;
-    gen_config.session_key = session_key;
+    // 捕获所有需要在 run_fn 中使用的变量（避免悬空引用）
+    auto captured_message = message;
+    auto captured_config  = config;
+    auto captured_delivery_to = delivery_to;
+    auto captured_tts_channel = tts_channel;
 
-    // Aligned with openclaw: onBlockReply callback
-    // - shouldSuppressReasoningPayload filter
-    // - accumulate block text for TTS
-    // - maybeApplyTtsToPayload (kind="block")
-    // - deliver block reply via dispatcher
-    gen_config.on_block_reply = [&](const std::string& block_text) {
-        // Aligned with openclaw: shouldSuppressReasoningPayload(payload)
-        // Suppress reasoning payloads — channels using this generic dispatch path
-        // do not have a dedicated reasoning lane.
-        // (HunterClaw: reasoning payloads are tagged with a special prefix)
-        static const std::string REASONING_PREFIX = "<reasoning>";
-        if (block_text.find(REASONING_PREFIX) != std::string::npos) {
-            log()->debug("dispatch_reply_from_config: suppressed reasoning block");
-            return;
+    RunReplyAgentParams agent_params;
+    agent_params.session_key = session_key;
+    agent_params.label = "auto_reply:" + session_key;
+    agent_params.run_fn = [this,
+                           captured_message,
+                           captured_config,
+                           captured_delivery_to,
+                           captured_tts_channel]() -> DispatchResult {
+        DispatchResult inner_result;
+
+        // ── Track accumulated block text for TTS ──────────────────────────
+        std::string accumulated_block_text;
+        int block_count = 0;
+
+        ReplyGenerator::GenerateConfig gen_config;
+        gen_config.agent_id        = captured_config.agent_id;
+        gen_config.workspace_path  = captured_config.workspace_path;
+        gen_config.user_input      = captured_message.text;
+        gen_config.session_key     = captured_message.session_key;
+
+        // Aligned with openclaw: onBlockReply callback
+        gen_config.on_block_reply = [&](const std::string& block_text) {
+            static const std::string REASONING_PREFIX = "<reasoning>";
+            if (block_text.find(REASONING_PREFIX) != std::string::npos) {
+                log()->debug("dispatch_reply_from_config: suppressed reasoning block");
+                return;
+            }
+            if (!block_text.empty()) {
+                if (!accumulated_block_text.empty()) accumulated_block_text += "\n";
+                accumulated_block_text += block_text;
+                block_count++;
+            }
+            log()->debug("dispatch_reply_from_config: [block_reply] len={} tts_channel={}",
+                         block_text.size(), captured_tts_channel);
+        };
+
+        // Aligned with openclaw: onToolResult callback
+        gen_config.on_tool_result = [&](const std::string& tool_text) {
+            log()->debug("dispatch_reply_from_config: [tool_result] len={} tts_channel={}",
+                         tool_text.size(), captured_tts_channel);
+        };
+
+        auto gen_result = ReplyGenerator::get_reply_from_config(
+            gen_config, llm_client_, tool_manager_, session_manager_
+        );
+
+        if (!gen_result.success) {
+            inner_result.success = false;
+            inner_result.error = gen_result.error;
+            log()->error("dispatch_reply_from_config: reply generation failed: {}",
+                         gen_result.error);
+            log()->debug("dispatch_reply_from_config: markIdle session={} reason=message_error",
+                         captured_message.session_key);
+            return inner_result;
         }
-        // Aligned with openclaw: accumulate block text for TTS
-        if (!block_text.empty()) {
-            if (!accumulated_block_text.empty()) accumulated_block_text += "\n";
-            accumulated_block_text += block_text;
-            block_count++;
-        }
-        // Aligned with openclaw: maybeApplyTtsToPayload({ kind: "block", ... })
-        // TTS for block replies is applied here when tts is enabled.
-        // For now, deliver block reply as-is (TTS integration is a future step).
-        log()->debug("dispatch_reply_from_config: [block_reply] len={} tts_channel={}",
-                     block_text.size(), tts_channel);
-    };
 
-    // Aligned with openclaw: onToolResult callback
-    // - maybeApplyTtsToPayload (kind="tool")
-    // - resolveToolDeliveryPayload (suppress in group/native flows)
-    // - deliver tool result via dispatcher
-    gen_config.on_tool_result = [&](const std::string& tool_text) {
-        // Aligned with openclaw: maybeApplyTtsToPayload({ kind: "tool", ... })
-        // TTS for tool results is applied here when tts is enabled.
-        log()->debug("dispatch_reply_from_config: [tool_result] len={} tts_channel={}",
-                     tool_text.size(), tts_channel);
-    };
+        inner_result.react_result = gen_result.react_result;
+        inner_result.total_tokens = gen_result.react_result.usage.total_tokens;
 
-    auto gen_result = ReplyGenerator::get_reply_from_config(
-        gen_config, llm_client_, tool_manager_, session_manager_
-    );
-
-    if (!gen_result.success) {
-        result.success = false;
-        result.error = gen_result.error;
-        log()->error("dispatch_reply_from_config: reply generation failed: {}",
-                     gen_result.error);
-        log()->debug("dispatch_reply_from_config: markIdle session={} reason=message_error",
-                     session_key);
-        return result;
-    }
-
-    result.react_result = gen_result.react_result;
-    result.total_tokens = gen_result.react_result.usage.total_tokens;
-
-    // ── Step 11: AcpDispatchTailAfterReset ───────────────────────────────────
-    // Aligned with openclaw: ctx.AcpDispatchTailAfterReset === true
-    // Command handling may prepare a trailing prompt after ACP in-place reset.
-    // Route that tail through ACP now (same turn) instead of embedded dispatch.
-    if (gen_result.acp_dispatch_tail_after_reset && config.dispatch.enable_acp) {
-        log()->info("dispatch_reply_from_config: AcpDispatchTailAfterReset — routing tail to ACP");
-        auto acp_tail_result = try_dispatch_acp_reply(message);
-        if (acp_tail_result.handled) {
-            result.success = true;
-            log()->debug("dispatch_reply_from_config: markIdle session={} reason=message_completed",
-                         session_key);
-            return result;
-        }
-    }
-
-    // ── Step 12: Build final reply payloads ──────────────────────────────────
-    std::vector<::hunterclaw::queue::MessagePayload> payloads;
-    ::hunterclaw::queue::MessagePayload payload;
-    payload.text = gen_result.response;
-    payloads.push_back(payload);
-
-    // ── Step 13: Final reply loop ─────────────────────────────────────────────
-    // Aligned with openclaw: for (const reply of replies) loop
-    //   - shouldSuppressReasoningPayload filter
-    //   - maybeApplyTtsToPayload (kind="final")
-    std::vector<::hunterclaw::queue::MessagePayload> final_payloads;
-    for (auto& p : payloads) {
-        // Aligned with openclaw: shouldSuppressReasoningPayload(reply)
-        static const std::string REASONING_PREFIX = "<reasoning>";
-        if (!p.text.empty() && p.text.find(REASONING_PREFIX) != std::string::npos) {
-            log()->debug("dispatch_reply_from_config: suppressed reasoning final payload");
-            continue;
-        }
-        // Aligned with openclaw: maybeApplyTtsToPayload({ kind: "final", inboundAudio, ttsAuto })
-        if (config.dispatch.enable_tts) {
-            std::vector<::hunterclaw::queue::MessagePayload> tts_single = {p};
-            maybe_apply_tts_to_payload(tts_single, config);
-            p = tts_single[0];
-        }
-        final_payloads.push_back(p);
-    }
-
-    // ── Step 14: Block TTS accumulation (aligned with openclaw) ──────────────
-    // Generate TTS-only reply after block streaming completes (when there's no final reply).
-    // This handles the case where block streaming succeeds and drops final payloads,
-    // but we still want TTS audio to be generated from the accumulated block content.
-    // Aligned with openclaw: ttsMode === "final" && replies.length === 0 && blockCount > 0
-    if (config.dispatch.enable_tts &&
-        final_payloads.empty() &&
-        block_count > 0 &&
-        !accumulated_block_text.empty()) {
-        // Trim check
-        const bool has_content = accumulated_block_text.find_first_not_of(" \t\n\r")
-                                 != std::string::npos;
-        if (has_content) {
-            log()->debug("dispatch_reply_from_config: generating TTS-only payload from "
-                         "accumulated block text len={}", accumulated_block_text.size());
-            // Aligned with openclaw: maybeApplyTtsToPayload({ payload: { text: accumulatedBlockText }, kind: "final" })
-            // Only send if TTS was actually applied (mediaUrl exists).
-            // For now, create a synthetic payload with the accumulated text.
-            // TODO: integrate actual TTS call and check mediaUrl before sending.
-            ::hunterclaw::queue::MessagePayload tts_synthetic;
-            tts_synthetic.text = accumulated_block_text;
-            std::vector<::hunterclaw::queue::MessagePayload> tts_vec = {tts_synthetic};
-            maybe_apply_tts_to_payload(tts_vec, config);
-            // Only add if TTS produced a media URL (aligned with openclaw: if (ttsSyntheticReply.mediaUrl))
-            if (!tts_vec.empty() && !tts_vec[0].media_urls.empty()) {
-                // Send TTS-only payload (no text, just audio)
-                ::hunterclaw::queue::MessagePayload tts_only;
-                tts_only.media_urls = tts_vec[0].media_urls;
-                tts_only.audio_as_voice = tts_vec[0].audio_as_voice;
-                final_payloads.push_back(tts_only);
+        // ── Step 11: AcpDispatchTailAfterReset ───────────────────────────
+        if (gen_result.acp_dispatch_tail_after_reset && captured_config.dispatch.enable_acp) {
+            log()->info("dispatch_reply_from_config: AcpDispatchTailAfterReset — routing tail to ACP");
+            auto acp_tail_result = try_dispatch_acp_reply(captured_message);
+            if (acp_tail_result.handled) {
+                inner_result.success = true;
+                log()->debug("dispatch_reply_from_config: markIdle session={} reason=message_completed",
+                             captured_message.session_key);
+                return inner_result;
             }
         }
-    }
 
-    // ── Step 15: Deliver (aligned with openclaw: deliverOutboundPayloads) ────
-    outbound::DeliverOutboundPayloadsParams deliver_params;
-    deliver_params.channel = message.channel;
-    deliver_params.to = delivery_to;
-    deliver_params.payloads = final_payloads;
-    deliver_params.delivery_queue = delivery_queue_;
-    deliver_params.skip_queue = false;
-    deliver_params.best_effort = false;
-    deliver_params.silent = false;
-    deliver_params.gif_playback = false;
-    deliver_params.reply_to_id = message.reply_to_id;
-    deliver_params.thread_id = message.thread_id;
-    deliver_params.account_id = message.account_id;
+        // ── Step 12: Build final reply payloads ──────────────────────────
+        std::vector<::hunterclaw::queue::MessagePayload> payloads;
+        ::hunterclaw::queue::MessagePayload payload;
+        payload.text = gen_result.response;
+        payloads.push_back(payload);
 
-    auto deliver_result = outbound::deliver_outbound_payloads(deliver_params);
-    if (deliver_result.is_ok()) {
-        result.success = true;
-        log()->info("dispatch_reply_from_config: delivered via channel={}", message.channel);
-    } else {
-        result.success = false;
-        result.error = std::string("Delivery failed: ") + deliver_result.error;
-        log()->error("dispatch_reply_from_config: delivery failed: {}", deliver_result.error);
-    }
+        // ── Step 13: Final reply loop ─────────────────────────────────────
+        std::vector<::hunterclaw::queue::MessagePayload> final_payloads;
+        for (auto& p : payloads) {
+            static const std::string REASONING_PREFIX = "<reasoning>";
+            if (!p.text.empty() && p.text.find(REASONING_PREFIX) != std::string::npos) {
+                log()->debug("dispatch_reply_from_config: suppressed reasoning final payload");
+                continue;
+            }
+            if (captured_config.dispatch.enable_tts) {
+                std::vector<::hunterclaw::queue::MessagePayload> tts_single = {p};
+                maybe_apply_tts_to_payload(tts_single, captured_config);
+                p = tts_single[0];
+            }
+            final_payloads.push_back(p);
+        }
 
-    log()->debug("dispatch_reply_from_config: markIdle session={} reason=message_completed",
-                 session_key);
+        // ── Step 14: Block TTS accumulation ──────────────────────────────
+        if (captured_config.dispatch.enable_tts &&
+            final_payloads.empty() &&
+            block_count > 0 &&
+            !accumulated_block_text.empty()) {
+            const bool has_content = accumulated_block_text.find_first_not_of(" \t\n\r")
+                                     != std::string::npos;
+            if (has_content) {
+                log()->debug("dispatch_reply_from_config: generating TTS-only payload from "
+                             "accumulated block text len={}", accumulated_block_text.size());
+                ::hunterclaw::queue::MessagePayload tts_synthetic;
+                tts_synthetic.text = accumulated_block_text;
+                std::vector<::hunterclaw::queue::MessagePayload> tts_vec = {tts_synthetic};
+                maybe_apply_tts_to_payload(tts_vec, captured_config);
+                if (!tts_vec.empty() && !tts_vec[0].media_urls.empty()) {
+                    ::hunterclaw::queue::MessagePayload tts_only;
+                    tts_only.media_urls = tts_vec[0].media_urls;
+                    tts_only.audio_as_voice = tts_vec[0].audio_as_voice;
+                    final_payloads.push_back(tts_only);
+                }
+            }
+        }
+
+        // ── Step 15: Deliver ──────────────────────────────────────────────
+        outbound::DeliverOutboundPayloadsParams deliver_params;
+        deliver_params.channel      = captured_message.channel;
+        deliver_params.to           = captured_delivery_to;
+        deliver_params.payloads     = final_payloads;
+        deliver_params.delivery_queue = delivery_queue_;
+        deliver_params.skip_queue   = false;
+        deliver_params.best_effort  = false;
+        deliver_params.silent       = false;
+        deliver_params.gif_playback = false;
+        deliver_params.reply_to_id  = captured_message.reply_to_id;
+        deliver_params.thread_id    = captured_message.thread_id;
+        deliver_params.account_id   = captured_message.account_id;
+
+        auto deliver_result = outbound::deliver_outbound_payloads(deliver_params);
+        if (deliver_result.is_ok()) {
+            inner_result.success = true;
+            log()->info("dispatch_reply_from_config: delivered via channel={}",
+                        captured_message.channel);
+        } else {
+            inner_result.success = false;
+            inner_result.error = std::string("Delivery failed: ") + deliver_result.error;
+            log()->error("dispatch_reply_from_config: delivery failed: {}",
+                         deliver_result.error);
+        }
+
+        log()->debug("dispatch_reply_from_config: markIdle session={} reason=message_completed",
+                     captured_message.session_key);
+        return inner_result;
+    };
+
+    // 通过 run_reply_agent 执行（isActive 检查 + FollowupQueue 串行保证）
+    // Aligned with openclaw: runReplyAgent → resolveActiveRunQueueAction → run-now / enqueue-followup
+    result = run_reply_agent(agent_params);
     return result;
+}
+
+// ============================================================================
+// run_reply_agent
+// Aligned with openclaw: runReplyAgent (auto-reply/reply/agent-runner.ts)
+//                        + resolveActiveRunQueueAction (queue-policy.ts)
+//
+// Decision logic (aligned with openclaw: resolveActiveRunQueueAction):
+//   - isActive=false → "run-now":
+//       直接执行 run_fn()（对齐 openclaw: await runAgentTurnWithFallback(...)）
+//       执行完成后异步 drain followup queue
+//   - isActive=true  → "enqueue-followup":
+//       push to followup_queues_[session_key]，立即返回
+//       drain 在当前 run 完成后自动触发
+//
+// Serial guarantee (aligned with openclaw):
+//   isActive flag + FollowupQueue drain loop 保证同一 session 请求串行执行
+//   （OpenClaw 不使用 Lane 队列，直接通过 isEmbeddedPiRunActive 跟踪状态）
+// ============================================================================
+
+MessageDispatcher::DispatchResult MessageDispatcher::run_reply_agent(
+    const RunReplyAgentParams& params
+) {
+    const std::string& session_key = params.session_key;
+
+    // ── Check isActive (aligned with openclaw: isEmbeddedPiRunActive(sessionId)) ──
+    bool is_active = false;
+    {
+        std::lock_guard<std::mutex> lock(session_state_mutex_);
+        is_active = (active_sessions_.count(session_key) > 0);
+    }
+
+    if (is_active) {
+        // ── "enqueue-followup" path ──────────────────────────────────────────
+        // Aligned with openclaw: enqueueFollowupRun (queue/enqueue.ts)
+        // Session is busy → push to followup queue; drain will pick it up.
+        log()->debug("run_reply_agent: session={} is active → enqueue-followup", session_key);
+
+        FollowupTask task;
+        task.run_fn = [fn = params.run_fn]() { fn(); };
+        task.label  = params.label;
+
+        {
+            std::lock_guard<std::mutex> lock(session_state_mutex_);
+            followup_queues_[session_key].push_back(std::move(task));
+        }
+
+        // Return immediately — result will be delivered asynchronously via drain
+        // Aligned with openclaw: enqueueFollowupRun returns immediately after push
+        DispatchResult queued_result;
+        queued_result.success = true;  // queued successfully
+        return queued_result;
+    }
+
+    // ── "run-now" path ───────────────────────────────────────────────────────
+    // Aligned with openclaw: directly await runAgentTurnWithFallback(...)
+    // OpenClaw does NOT use Lane queues here — serial guarantee comes from
+    // isActive flag + FollowupQueue drain loop.
+    log()->debug("run_reply_agent: session={} is idle → run-now", session_key);
+
+    // Mark session as active (aligned with openclaw: isEmbeddedPiRunActive → true)
+    {
+        std::lock_guard<std::mutex> lock(session_state_mutex_);
+        active_sessions_.insert(session_key);
+    }
+
+    DispatchResult run_result;
+    try {
+        run_result = params.run_fn();
+    } catch (const std::exception& e) {
+        log()->error("run_reply_agent: run_fn failed session={}: {}", session_key, e.what());
+        run_result.success = false;
+        run_result.error   = e.what();
+    }
+
+    // Mark session as idle (aligned with openclaw: isEmbeddedPiRunActive → false)
+    {
+        std::lock_guard<std::mutex> lock(session_state_mutex_);
+        active_sessions_.erase(session_key);
+    }
+
+    // Async drain followup queue (aligned with openclaw: scheduleFollowupDrain)
+    // Launch in detached thread so caller is not blocked.
+    // Aligned with openclaw: void (async () => { while (queue.items.length > 0) {...} })()
+    drain_followup_queue(session_key);
+
+    return run_result;
+}
+
+// ============================================================================
+// drain_followup_queue
+// Aligned with openclaw: scheduleFollowupDrain (auto-reply/reply/queue/drain.ts)
+//
+// Asynchronously drains the followup queue for a session in a detached thread:
+//   while (queue not empty) {
+//     task = dequeue()
+//     mark session active
+//     run task directly (no Lane queue)
+//     mark session idle
+//   }
+//
+// Aligned with openclaw:
+//   void (async () => {
+//     while (queue.items.length > 0) {
+//       await drainNextQueueItem(queue.items, runFollowup);
+//     }
+//   })()
+//
+// Key: drain runs in a detached thread so the caller is not blocked.
+// ============================================================================
+
+void MessageDispatcher::drain_followup_queue(const std::string& session_key) {
+    // Check if there's anything to drain before spawning a thread
+    {
+        std::lock_guard<std::mutex> lock(session_state_mutex_);
+        auto it = followup_queues_.find(session_key);
+        if (it == followup_queues_.end() || it->second.empty()) {
+            return;  // Nothing to drain
+        }
+    }
+
+    // Launch async drain in detached thread
+    // Aligned with openclaw: void (async () => {...})()
+    std::thread([this, session_key]() {
+        while (true) {
+            // Dequeue next followup task
+            FollowupTask next_task;
+            {
+                std::lock_guard<std::mutex> lock(session_state_mutex_);
+                auto it = followup_queues_.find(session_key);
+                if (it == followup_queues_.end() || it->second.empty()) {
+                    break;  // Queue empty → done
+                }
+                next_task = std::move(it->second.front());
+                it->second.erase(it->second.begin());
+
+                // Mark session active for this followup run
+                // Aligned with openclaw: isEmbeddedPiRunActive → true
+                active_sessions_.insert(session_key);
+            }
+
+            log()->debug("drain_followup_queue: session={} running followup label={}",
+                         session_key, next_task.label);
+
+            // Execute followup task directly (no Lane queue)
+            // Aligned with openclaw: await runFollowup(item)
+            try {
+                next_task.run_fn();
+            } catch (const std::exception& e) {
+                log()->error("drain_followup_queue: followup failed session={}: {}",
+                             session_key, e.what());
+            }
+
+            // Mark session idle before checking for more followups
+            // Aligned with openclaw: isEmbeddedPiRunActive → false
+            {
+                std::lock_guard<std::mutex> lock(session_state_mutex_);
+                active_sessions_.erase(session_key);
+            }
+        }
+    }).detach();
 }
 
 // ============================================================================

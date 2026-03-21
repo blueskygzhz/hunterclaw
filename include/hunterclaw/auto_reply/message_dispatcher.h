@@ -8,6 +8,10 @@
 #include <memory>
 #include <optional>
 #include <map>
+#include <unordered_map>
+#include <unordered_set>
+#include <mutex>
+#include <functional>
 
 namespace hunterclaw {
 namespace auto_reply {
@@ -159,7 +163,35 @@ private:
         int64_t timestamp_ms;
     };
     std::vector<DedupRecord> dedup_cache_;
-    
+
+    // ✅ Session active 状态跟踪 (aligned with openclaw: runReplyAgent isActive check)
+    // 记录哪些 session 当前正在运行 LLM 推理，用于 run-now vs enqueue-followup 决策
+    mutable std::mutex session_state_mutex_;
+    std::unordered_set<std::string> active_sessions_;
+
+    // ✅ FollowupQueue (aligned with openclaw: queue/enqueue.ts enqueueFollowupRun)
+    // 当 session 正在运行时，新请求入队等待；drain 时串行消费
+    // Key: session_key → queue of pending followup tasks
+    struct FollowupTask {
+        std::function<void()> run_fn;  // 实际执行函数
+        std::string label;
+    };
+    std::unordered_map<std::string, std::vector<FollowupTask>> followup_queues_;
+
+    // ✅ run_reply_agent (aligned with openclaw: runReplyAgent agent-runner.ts)
+    // 决策: run-now (session 空闲) 或 enqueue-followup (session 忙碌)
+    // 然后通过双层 Lane 队列执行: session lane → global main lane
+    struct RunReplyAgentParams {
+        std::string session_key;
+        std::function<DispatchResult()> run_fn;  // 实际执行函数
+        std::string label;
+    };
+    DispatchResult run_reply_agent(const RunReplyAgentParams& params);
+
+    // ✅ drain_followup_queue (aligned with openclaw: queue/drain.ts drainFollowupQueue)
+    // 串行消费 followup 队列，直到队列为空
+    void drain_followup_queue(const std::string& session_key);
+
     // 组件依赖
     std::shared_ptr<::hunterclaw::routing::MessageRouter> router_;
     std::shared_ptr<sessions::SessionManager> session_manager_;
