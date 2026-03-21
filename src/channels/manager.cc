@@ -172,7 +172,18 @@ public:
                 // 构建 ChannelGatewayContext (对齐 OpenClaw ChannelGatewayContext)
                 ChannelGatewayContext ctx;
                 ctx.account_id    = effective_account_id;
-                ctx.account       = nlohmann::json::object();  // TODO: resolve from config
+
+                // Aligned with openclaw: resolveAccount(cfg, accountId) → inject into ctx.account
+                // Manager loads config and resolves the account object for the gateway.
+                {
+                    core::Config cfg = options_.load_config ? options_.load_config() : core::Config();
+                    ctx.cfg = cfg;
+                    if (plugin_copy.config && plugin_copy.config->resolve_account) {
+                        ctx.account = plugin_copy.config->resolve_account(cfg, effective_account_id);
+                    } else {
+                        ctx.account = nlohmann::json::object();
+                    }
+                }
                 ctx.abort_signal  = abort;
 
                 // 设置日志回调
@@ -277,12 +288,20 @@ public:
 
         for (const auto& channel_id : to_start) {
             // Aligned with openclaw: await startChannel(plugin.id)
-            // listAccountIds from config — for now use "default" account
-            // TODO: resolve account IDs from config (plugin.config.listAccountIds(cfg))
-            auto result = start_channel(channel_id, "default", {});
-            if (result.is_err()) {
-                log()->warn("Failed to start channel {}: {}", channel_id, result.error);
-                // Aligned with openclaw: continue on per-channel failure (don't abort all)
+            // Resolve account IDs from plugin.config.listAccountIds(cfg)
+            auto plugin_opt = ChannelPluginRegistry::instance().get_plugin(std::string(channel_id));
+            std::vector<std::string> account_ids = {"default"};
+            if (plugin_opt.has_value() && plugin_opt->config && plugin_opt->config->list_account_ids) {
+                core::Config cfg = options_.load_config ? options_.load_config() : core::Config();
+                auto ids = plugin_opt->config->list_account_ids(cfg);
+                if (!ids.empty()) account_ids = ids;
+            }
+            for (const auto& account_id : account_ids) {
+                auto result = start_channel(channel_id, account_id, {});
+                if (result.is_err()) {
+                    log()->warn("Failed to start channel {} account {}: {}", channel_id, account_id, result.error);
+                    // Aligned with openclaw: continue on per-channel failure (don't abort all)
+                }
             }
         }
 
