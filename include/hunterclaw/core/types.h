@@ -556,6 +556,10 @@ struct ResponseFrame {
     bool ok;
     JsonValue payload;
     std::string error;
+    // 🎯 OpenClaw 对齐: errorShape 字段 (对应 ErrorCodes / retryable / retryAfterMs)
+    std::string error_code;       // "INVALID_REQUEST" | "UNAVAILABLE" | "NOT_PAIRED" | ...
+    bool retryable = false;       // 对应 errorShape options.retryable
+    int64_t retry_after_ms = 0;   // 对应 errorShape options.retryAfterMs
 };
 
 struct EventFrame {

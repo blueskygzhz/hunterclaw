@@ -1,150 +1,146 @@
 #pragma once
 
-#include "hunterclaw/memory/types.h"  // MemorySearchManager (openclaw types.ts)
-#include "hunterclaw/plugins/plugin.h"
+// ============================================================================
+// Memory Plugin Interface
+//
+// Alignment with OpenClaw src/plugins/types.ts:
+//
+//   export type PluginKind = "memory" | "context-engine";
+//
+//   export type OpenClawPluginDefinition = {
+//     id?: string;
+//     name?: string;
+//     description?: string;
+//     version?: string;
+//     kind?: PluginKind;
+//     configSchema?: OpenClawPluginConfigSchema;
+//     register?: (api: OpenClawPluginApi) => void | Promise<void>;
+//     activate?: (api: OpenClawPluginApi) => void | Promise<void>;
+//   };
+//
+// In OpenClaw, a "memory" plugin is simply an OpenClawPluginDefinition with
+// kind="memory". It registers a MemorySearchManager via the plugin API.
+// There is NO separate MemoryPlugin base class in OpenClaw.
+//
+// The MemorySearchManager interface (types.ts) is the actual contract:
+//   interface MemorySearchManager {
+//     search(query, opts?): Promise<MemorySearchResult[]>
+//     readFile(params): Promise<{text, path}>
+//     status(): MemoryProviderStatus
+//     sync?(params?): Promise<void>
+//     probeEmbeddingAvailability(): Promise<MemoryEmbeddingProbeResult>
+//     probeVectorAvailability(): Promise<boolean>
+//     close?(): Promise<void>
+//   }
+//
+// HunterClaw C++ mapping:
+//   - MemorySearchManager (types.h) = MemorySearchManager interface
+//   - MemoryPluginDefinition (below) = OpenClawPluginDefinition with kind="memory"
+//   - Memory plugins register their MemorySearchManager via the plugin API
+// ============================================================================
+
+#include "hunterclaw/memory/types.h"
 #include "hunterclaw/core/result.h"
+#include <memory>
+#include <string>
+#include <functional>
+#include <map>
 
 namespace hunterclaw {
+
+// Forward declaration
+namespace plugins {
+struct PluginContext;
+}
+
 namespace memory {
 
-/**
- * 🎯 100% 对齐 OpenClaw: Memory Plugin 接口
- * 
- * Memory Plugin 是提供 MemoryProvider 实现的插件。
- * 插件系统允许第三方扩展为 Agent 提供长期记忆能力。
- * 
- * OpenClaw 官方 Memory Plugin 示例:
- * - MemOS Cloud Plugin (https://github.com/MemTensor/MemOS-Cloud-OpenClaw-Plugin)
- * - SQLite Memory Plugin (内置)
- * - Supabase Memory Plugin (社区)
- * 
- * 插件清单示例 (.plugin.json):
- * {
- *   "id": "sqlite-memory",
- *   "name": "SQLite Memory",
- *   "version": "1.0.0",
- *   "type": "memory",
- *   "author": "HunterClaw Team",
- *   "description": "Local SQLite-based memory storage",
- *   "main": "libsqlite_memory_plugin.so",
- *   "config": {
- *     "db_path": {"type": "string", "default": "./memory.db"},
- *     "embedding_provider": {"type": "string", "default": "openai"}
- *   }
- * }
- * 
- * 使用示例:
- * 
- * // 1. 实现 MemoryPlugin
- * class SQLiteMemoryPlugin : public MemoryPlugin {
- * public:
- *     Result<bool> init(const PluginContext& ctx) override {
- *         // 从配置创建 provider
- *         std::string db_path = ctx.config["db_path"];
- *         provider_ = std::make_shared<SQLiteMemoryProvider>(db_path);
- *         
- *         // 注册到 Registry
- *         MemoryProviderRegistry::instance().register_provider(id(), provider_);
- *         return Ok(true);
- *     }
- *     
- *     std::shared_ptr<MemoryProvider> get_provider() override {
- *         return provider_;
- *     }
- *     
- *     std::string id() const override { return "sqlite-memory"; }
- *     std::string name() const override { return "SQLite Memory"; }
- *     std::string version() const override { return "1.0.0"; }
- *     
- * private:
- *     std::shared_ptr<MemoryProvider> provider_;
- * };
- * 
- * // 2. Agent 自动使用
- * // Agent 配置 (config.yaml):
- * // agents:
- * //   default:
- * //     memory:
- * //       enabled: true
- * //       provider: "sqlite-memory"  # 插件 ID
- * //       config:
- * //         contextWindow: 10
- * //         minScore: 0.7
- * 
- * // Agent 运行时:
- * auto agent = Agent::create(config);
- * agent->process_message("记住我最喜欢的颜色是蓝色");
- * // → 自动存储到 memory provider
- * 
- * agent->process_message("我喜欢什么颜色?");
- * // → 自动召回: "你最喜欢的颜色是蓝色"
- */
-class MemoryPlugin : public plugins::Plugin {
-public:
-    virtual ~MemoryPlugin() = default;
-    
-    /**
-     * 🎯 OpenClaw 核心 API: 获取 Memory Provider 实例
-     * 
-     * Plugin 必须在 init() 后返回可用的 Provider。
-     * 
-     * @return MemoryProvider 实例 (非空)
-     */
-    virtual std::shared_ptr<MemorySearchManager> get_manager() = 0;
-    
-    /**
-     * Plugin 类型 (固定为 "memory")
-     */
-    std::string type() const { return "memory"; }
-    
-    /**
-     * 🎯 OpenClaw 扩展: 支持热重载
-     * 
-     * Memory Plugin 可以选择性支持热重载。
-     * 如果支持，Plugin Manager 可以在运行时更新插件。
-     */
-    bool supports_hot_reload() const override { 
-        return false;  // 默认不支持
-    }
+// ============================================================================
+// PluginKind (对齐 plugins/types.ts: PluginKind = "memory" | "context-engine")
+// ============================================================================
+enum class PluginKind {
+    Memory,         // "memory"
+    ContextEngine,  // "context-engine"
 };
 
-// ========================================
-// 🎯 对齐 OpenClaw: Plugin 辅助工厂
-// ========================================
+// ============================================================================
+// MemoryPluginConfigSchema
+// 对齐 OpenClawPluginConfigSchema (plugins/types.ts:47-57)
+// ============================================================================
+struct MemoryPluginConfigSchema {
+    // Optional: validate config values
+    std::function<bool(const std::map<std::string, std::string>&, std::vector<std::string>&)>
+        validate;
+    // Optional: JSON schema for UI hints
+    std::map<std::string, std::string> json_schema;
+};
 
-/**
- * Memory Plugin 工厂接口
- * 
- * 用于动态创建 Memory Plugin 实例。
- * 
- * 示例:
- * 
- * class SQLiteMemoryPluginFactory : public MemoryPluginFactory {
- * public:
- *     Result<std::shared_ptr<MemoryPlugin>> create(
- *         const std::map<std::string, std::string>& config
- *     ) override {
- *         auto plugin = std::make_shared<SQLiteMemoryPlugin>();
- *         
- *         PluginContext ctx;
- *         ctx.config = config;
- *         
- *         auto result = plugin->init(ctx);
- *         if (!result) {
- *             return Err(result.error());
- *         }
- *         
- *         return Ok(plugin);
- *     }
- * };
- */
-class MemoryPluginFactory {
+// ============================================================================
+// MemoryPluginDefinition
+// 对齐 OpenClawPluginDefinition (plugins/types.ts:248-257) with kind="memory"
+//
+// OpenClaw:
+//   export type OpenClawPluginDefinition = {
+//     id?: string;
+//     name?: string;
+//     description?: string;
+//     version?: string;
+//     kind?: PluginKind;
+//     configSchema?: OpenClawPluginConfigSchema;
+//     register?: (api: OpenClawPluginApi) => void | Promise<void>;
+//     activate?: (api: OpenClawPluginApi) => void | Promise<void>;
+//   };
+//
+// A memory plugin provides a MemorySearchManager implementation.
+// It does NOT inherit from any base class — it's a plain struct/definition.
+// ============================================================================
+struct MemoryPluginDefinition {
+    // Plugin identity
+    std::string id;
+    std::string name;
+    std::string description;
+    std::string version;
+
+    // kind is always "memory" for memory plugins
+    PluginKind kind = PluginKind::Memory;
+
+    // Optional config schema
+    MemoryPluginConfigSchema config_schema;
+
+    // Factory: create the MemorySearchManager for a given agent/workspace
+    // Called during plugin activation (对齐 activate callback in OpenClaw)
+    std::function<std::shared_ptr<MemorySearchManager>(
+        const std::string& agent_id,
+        const std::string& workspace_dir,
+        const std::map<std::string, std::string>& plugin_config
+    )> create_manager;
+};
+
+// ============================================================================
+// Memory Plugin Registry
+// 对齐 OpenClaw: plugins register their memory manager via the plugin API.
+// In HunterClaw, memory plugins register a MemoryPluginDefinition.
+// The search-manager.h (getMemorySearchManager) resolves the active manager.
+// ============================================================================
+class MemoryPluginRegistry {
 public:
-    virtual ~MemoryPluginFactory() = default;
-    
-    virtual core::Result<std::shared_ptr<MemoryPlugin>> create(
-        const std::map<std::string, std::string>& config
-    ) = 0;
+    static MemoryPluginRegistry& instance();
+
+    // Register a memory plugin definition
+    void register_plugin(const MemoryPluginDefinition& def);
+
+    // Get a registered plugin by ID
+    const MemoryPluginDefinition* get_plugin(const std::string& id) const;
+
+    // List all registered plugin IDs
+    std::vector<std::string> list_plugin_ids() const;
+
+    // Check if a plugin is registered
+    bool has_plugin(const std::string& id) const;
+
+private:
+    MemoryPluginRegistry() = default;
+    std::map<std::string, MemoryPluginDefinition> plugins_;
 };
 
 } // namespace memory

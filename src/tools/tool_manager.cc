@@ -212,14 +212,31 @@ ToolResult ToolManager::execute_tool(
     }
     
     // 3. Before Hooks (参数修改和验证)
+    // Aligned with OpenClaw runBeforeToolCall() in plugins/hooks.ts
     core::JsonValue effective_params = params;
     if (hook_manager_) {
-        auto hook_outcome = hook_manager_->run_before_hooks(name, params, context_);
-        if (hook_outcome.blocked) {
-            log()->warn("Tool '{}' blocked by before hook: {}", name, hook_outcome.reason);
-            return tool_result::error(hook_outcome.reason);
+        PluginHookBeforeToolCallEvent before_event;
+        before_event.tool_name = name;
+        before_event.params = params;
+
+        PluginHookToolContext tool_ctx;
+        tool_ctx.tool_name = name;
+        tool_ctx.agent_id = context_.agent_id.empty()
+            ? std::nullopt : std::make_optional(context_.agent_id);
+        tool_ctx.session_key = context_.session_key.empty()
+            ? std::nullopt : std::make_optional(context_.session_key);
+
+        auto before_result = hook_manager_->run_before_tool_call(before_event, tool_ctx);
+        if (before_result.has_value()) {
+            if (before_result->block.value_or(false)) {
+                std::string reason = before_result->block_reason.value_or("blocked by plugin hook");
+                log()->warn("Tool '{}' blocked by before_tool_call hook: {}", name, reason);
+                return tool_result::error(reason);
+            }
+            if (before_result->params.has_value()) {
+                effective_params = before_result->params.value();
+            }
         }
-        effective_params = hook_outcome.params;  // 使用可能被修改的参数
     }
     
     // 4. 执行工具
@@ -239,11 +256,32 @@ ToolResult ToolManager::execute_tool(
     // }
     
     // 6. After Hooks (日志记录、审计等)
+    // Aligned with OpenClaw runAfterToolCall() in plugins/hooks.ts
     auto end = std::chrono::steady_clock::now();
     double duration_ms = std::chrono::duration<double, std::milli>(end - start).count();
-    
+
     if (hook_manager_) {
-        hook_manager_->run_after_hooks(name, effective_params, result, duration_ms, error_msg);
+        PluginHookAfterToolCallEvent after_event;
+        after_event.tool_name = name;
+        after_event.params = effective_params;
+        after_event.duration_ms = duration_ms;
+        if (!error_msg.empty()) {
+            after_event.error = error_msg;
+        } else {
+            core::JsonValue result_json = core::JsonValue::object();
+            result_json["success"] = result.success;
+            if (!result.error.empty()) result_json["error"] = result.error;
+            after_event.result = result_json;
+        }
+
+        PluginHookToolContext tool_ctx;
+        tool_ctx.tool_name = name;
+        tool_ctx.agent_id = context_.agent_id.empty()
+            ? std::nullopt : std::make_optional(context_.agent_id);
+        tool_ctx.session_key = context_.session_key.empty()
+            ? std::nullopt : std::make_optional(context_.session_key);
+
+        hook_manager_->run_after_tool_call(after_event, tool_ctx);
     }
     
     // 7. 循环检测 (100% 对齐 OpenClaw)

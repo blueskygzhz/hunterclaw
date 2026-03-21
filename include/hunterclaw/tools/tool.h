@@ -117,11 +117,40 @@ struct ToolContext {
     std::string workspace_dir;
     std::string agent_id;
     std::string session_key;
+    /// Stable run identifier for this agent invocation
+    /// Aligned with OpenClaw PluginHookToolContext.runId
+    std::string run_id;
+    /// Ephemeral session UUID — regenerated on /new and /reset
+    std::string session_id;
     std::map<std::string, std::string> metadata;
-    
+
     // ===== Sandbox 集成 (100% 对齐 OpenClaw) =====
     std::shared_ptr<hunterclaw::sandbox::SandboxManager> sandbox_manager;
     std::string sandbox_id;  // 当前 Sandbox ID (如果启用)
+
+    // ===== Exec 配置 (对齐 OpenClaw ExecToolDefaults) =====
+    // tools.exec.host: "sandbox" | "gateway" | "node"
+    std::string exec_host = "sandbox";
+    // tools.exec.security: "deny" | "allowlist" | "full"
+    std::string exec_security = "allowlist";
+    // tools.exec.ask: "off" | "on-miss" | "always"
+    std::string exec_ask = "on-miss";
+    // tools.elevated.defaultLevel: "off" | "ask" | "full"
+    std::string exec_elevated_level = "off";
+    // tools.exec.notifyOnExit
+    bool exec_notify_on_exit = true;
+    // tools.exec.notifyOnExitEmptySuccess
+    bool exec_notify_on_exit_empty_success = false;
+    // tools.exec.backgroundMs (default 10000)
+    int64_t exec_background_ms = 10000;
+    // tools.exec.timeoutSec (default 1800)
+    int64_t exec_timeout_sec = 1800;
+    // Channel/provider context for exec approval turn-source
+    std::string message_provider;
+    std::string current_channel_id;
+    std::string account_id;
+    std::string current_thread_ts;
+    std::string scope_key;
 };
 
 // Forward declarations

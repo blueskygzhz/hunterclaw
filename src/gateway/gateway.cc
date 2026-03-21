@@ -39,6 +39,9 @@ struct ConnectionHandshakeState {
     std::chrono::steady_clock::time_point opened_at;
     std::string conn_id;                // 连接唯一 ID
     std::string close_cause;            // 关闭原因 (用于日志)
+    // 🎯 OpenClaw 对齐: role/scopes (对应 GatewayWsClient.connect.role/scopes)
+    std::string role = "operator";      // 连接角色: operator | node
+    std::vector<std::string> scopes;    // 授权 scopes
 };
 
 // 握手超时常量 (对齐 OpenClaw DEFAULT_HANDSHAKE_TIMEOUT_MS = 3000)
@@ -53,6 +56,9 @@ static constexpr size_t MAX_PREAUTH_PAYLOAD_BYTES = 64 * 1024;
 static constexpr size_t MAX_PAYLOAD_BYTES = 25 * 1024 * 1024;
 // 最大缓冲字节 (对齐 OpenClaw MAX_BUFFERED_BYTES = 50MB)
 static constexpr size_t MAX_BUFFERED_BYTES = 50 * 1024 * 1024;
+// 🎯 OpenClaw 对齐: 请求去重 (对应 server-constants.ts: DEDUPE_TTL_MS / DEDUPE_MAX)
+static constexpr int64_t DEDUPE_TTL_MS = 5 * 60000;  // 5 分钟
+static constexpr size_t  DEDUPE_MAX    = 1000;
 
 // 🎯 OpenClaw 对齐: GATEWAY_EVENTS 列表 (对应 server-methods-list.ts:GATEWAY_EVENTS)
 static const std::vector<std::string> GATEWAY_EVENTS = {
@@ -183,23 +189,90 @@ public:
                         json tick_payload;
                         tick_payload["ts"] = ts_ms;
                         
+                        // 🎯 OpenClaw 对齐: tick 带 stateVersion (dropIfSlow: true)
                         json tick_frame;
-                        tick_frame["type"] = "event";
-                        tick_frame["event"] = "tick";
+                        tick_frame["type"]    = "event";
+                        tick_frame["event"]   = "tick";
                         tick_frame["payload"] = tick_payload;
-                        // dropIfSlow: true (对齐 OpenClaw)
+                        tick_frame["seq"]     = ++broadcast_seq_;
+                        tick_frame["stateVersion"] = json{
+                            {"presence", presence_version_.load()},
+                            {"health",   health_version_.load()}
+                        };
                         std::string tick_msg = tick_frame.dump();
                         
                         std::lock_guard<std::mutex> lock(connections_mutex_);
                         for (auto hdl : connections_) {
-                            // 只向已完成握手的连接发送 tick
                             auto hs_it = handshake_states_.find(hdl);
-                            if (hs_it != handshake_states_.end() &&
-                                hs_it->second.phase == ConnectionHandshakeState::Phase::Connected) {
-                                try {
-                                    ws_server_.send(hdl, tick_msg, websocketpp::frame::opcode::text);
-                                } catch (...) {}
+                            if (hs_it == handshake_states_.end() ||
+                                hs_it->second.phase != ConnectionHandshakeState::Phase::Connected) {
+                                continue;
                             }
+                            // dropIfSlow: true
+                            try {
+                                auto conn = ws_server_.get_con_from_hdl(hdl);
+                                if (conn && conn->get_buffered_amount() > MAX_BUFFERED_BYTES) {
+                                    continue;  // 跳过慢消费者
+                                }
+                            } catch (...) {}
+                            try {
+                                ws_server_.send(hdl, tick_msg, websocketpp::frame::opcode::text);
+                            } catch (...) {}
+                        }
+                    } catch (...) {}
+                }
+            });
+            
+            // 🎯 OpenClaw 严格对齐: 启动健康刷新定时器
+            // 对应 OpenClaw server-maintenance.ts:
+            //   const healthRefreshInterval = setInterval(() => {
+            //     refreshGatewayHealthSnapshot().then(snap => broadcast("health", snap, { dropIfSlow: true, stateVersion: ... }));
+            //   }, HEALTH_REFRESH_INTERVAL_MS);
+            health_refresh_running_ = true;
+            health_refresh_thread_ = std::thread([this]() {
+                while (health_refresh_running_) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(HEALTH_REFRESH_INTERVAL_MS));
+                    if (!health_refresh_running_) break;
+                    try {
+                        // 递增 health 版本号
+                        int64_t new_health_ver = ++health_version_;
+                        int64_t cur_presence_ver = presence_version_.load();
+                        
+                        // 🎯 OpenClaw 对齐: 更新 health 缓存 (healthCache)
+                        // 对应 OpenClaw health-state.ts:refreshGatewayHealthSnapshot:
+                        //   healthCache = snap; healthVersion += 1; broadcastHealthUpdate(snap);
+                        json health_payload = json::object();  // TODO: getHealthSnapshot()
+                        {
+                            std::lock_guard<std::mutex> hc_lock(health_cache_mutex_);
+                            health_cache_ = health_payload;
+                        }
+                        
+                        json j;
+                        j["type"]    = "event";
+                        j["event"]   = "health";
+                        j["payload"] = health_payload;
+                        j["seq"]     = ++broadcast_seq_;
+                        j["stateVersion"] = json{
+                            {"presence", cur_presence_ver},
+                            {"health",   new_health_ver}
+                        };
+                        std::string msg = j.dump();
+                        
+                        std::lock_guard<std::mutex> lock(connections_mutex_);
+                        for (auto hdl : connections_) {
+                            auto hs_it = handshake_states_.find(hdl);
+                            if (hs_it == handshake_states_.end() ||
+                                hs_it->second.phase != ConnectionHandshakeState::Phase::Connected) {
+                                continue;
+                            }
+                            // dropIfSlow: true
+                            try {
+                                auto conn = ws_server_.get_con_from_hdl(hdl);
+                                if (conn && conn->get_buffered_amount() > MAX_BUFFERED_BYTES) {
+                                    continue;
+                                }
+                            } catch (...) {}
+                            try { ws_server_.send(hdl, msg, websocketpp::frame::opcode::text); } catch (...) {}
                         }
                     } catch (...) {}
                 }
@@ -213,10 +286,14 @@ public:
     
     core::Result<bool> stop() {
         try {
-            // 🎯 OpenClaw 对齐: 先停止 tick 心跳
+            // 🎯 OpenClaw 对齐: 先停止 tick 心跳和健康刷新
             tick_running_ = false;
             if (tick_thread_.joinable()) {
                 tick_thread_.join();
+            }
+            health_refresh_running_ = false;
+            if (health_refresh_thread_.joinable()) {
+                health_refresh_thread_.join();
             }
             
             ws_server_.stop_listening();
@@ -241,9 +318,16 @@ public:
         }
     }
     
+    // 🎯 OpenClaw 对齐: stateVersion 结构 (对应 GatewayBroadcastStateVersion)
+    struct BroadcastStateVersion {
+        int64_t presence = -1;  // -1 表示不包含
+        int64_t health   = -1;
+    };
+    
     void broadcast(const core::EventFrame& event,
                     bool drop_if_slow = false,
-                    const std::set<connection_hdl, std::owner_less<connection_hdl>>* target_hdls = nullptr) {
+                    const std::set<connection_hdl, std::owner_less<connection_hdl>>* target_hdls = nullptr,
+                    const BroadcastStateVersion* state_version = nullptr) {
         try {
             // 🎯 OpenClaw 严格对齐: broadcast 实现
             // 对应 OpenClaw server-broadcast.ts:broadcastInternal
@@ -265,6 +349,19 @@ public:
             if (event_seq >= 0) {
                 j["seq"] = event_seq;
             }
+            
+            // 🎯 OpenClaw 严格对齐: stateVersion 字段
+            // 对应 OpenClaw server-broadcast.ts:
+            //   const frame = JSON.stringify({ type:"event", event, payload, seq: eventSeq, stateVersion: opts?.stateVersion });
+            // 即: stateVersion 只在 opts?.stateVersion 存在时才包含该字段
+            if (state_version) {
+                json sv = json::object();
+                if (state_version->presence >= 0) sv["presence"] = state_version->presence;
+                if (state_version->health   >= 0) sv["health"]   = state_version->health;
+                if (!sv.empty()) j["stateVersion"] = sv;
+                // 如果 sv 为空，不包含 stateVersion 字段 (对应 opts?.stateVersion = undefined)
+            }
+            // 注意: 不传 state_version 时，帧中不包含 stateVersion 字段 (对应 opts = undefined)
             
             // Serialize event.payload
             if (event.payload.is_null()) {
@@ -298,33 +395,32 @@ public:
                     continue;
                 }
                 
-                // 🎯 OpenClaw 对齐: scope 过滤
-                // 对应 OpenClaw: if (!hasEventScope(c, event)) continue;
+                // 🎯 OpenClaw 对齐: scope 过滤 (hasEventScope)
+                // 对应 OpenClaw server-broadcast.ts:hasEventScope:
+                //   if (!required) return true;
+                //   if (role !== "operator") return false;  // node role 不收 scope-guarded 事件
+                //   if (scopes.includes(ADMIN_SCOPE)) return true;
+                //   return required.some(scope => scopes.includes(scope));
                 if (required_scopes) {
-                    // 敏感事件: 检查客户端是否有对应 scope
-                    auto conn_it = handle_to_conn_id_.find(hdl);
-                    if (conn_it != handle_to_conn_id_.end()) {
-                        auto state = runtime_state_;
-                        if (state) {
-                            std::lock_guard<std::mutex> state_lock(state->mutex);
-                            auto client_it = state->clients.find(conn_it->second);
-                            if (client_it != state->clients.end()) {
-                                const auto& client_scopes = client_it->second->scopes;
-                                bool has_admin = std::find(client_scopes.begin(), client_scopes.end(),
-                                                           "operator.admin") != client_scopes.end();
-                                if (!has_admin) {
-                                    bool has_required = false;
-                                    for (const auto& req_scope : *required_scopes) {
-                                        if (std::find(client_scopes.begin(), client_scopes.end(),
-                                                      req_scope) != client_scopes.end()) {
-                                            has_required = true;
-                                            break;
-                                        }
-                                    }
-                                    if (!has_required) continue;
-                                }
+                    // 敏感事件: 先检查 role，再检查 scope
+                    const std::string& client_role_for_scope = hs_it->second.role;
+                    // node role 不收 scope-guarded 事件
+                    if (client_role_for_scope != "operator") {
+                        continue;
+                    }
+                    const auto& client_scopes_for_scope = hs_it->second.scopes;
+                    bool has_admin = std::find(client_scopes_for_scope.begin(), client_scopes_for_scope.end(),
+                                               "operator.admin") != client_scopes_for_scope.end();
+                    if (!has_admin) {
+                        bool has_required = false;
+                        for (const auto& req_scope : *required_scopes) {
+                            if (std::find(client_scopes_for_scope.begin(), client_scopes_for_scope.end(),
+                                          req_scope) != client_scopes_for_scope.end()) {
+                                has_required = true;
+                                break;
                             }
                         }
+                        if (!has_required) continue;
                     }
                 }
                 
@@ -444,30 +540,135 @@ private:
     }
     
     void on_close(connection_hdl hdl) {
-        std::lock_guard<std::mutex> lock(connections_mutex_);
-        connections_.erase(hdl);
+        std::string conn_id_closed;
+        std::string presence_key_closed;
+        bool was_connected = false;
         
-        // 🎯 OpenClaw 对齐: 取消握手超时定时器
-        auto timer_it = handshake_timers_.find(hdl);
-        if (timer_it != handshake_timers_.end()) {
-            timer_it->second->cancel();
-            handshake_timers_.erase(timer_it);
+        {
+            std::lock_guard<std::mutex> lock(connections_mutex_);
+            connections_.erase(hdl);
+            
+            // 🎯 OpenClaw 对齐: 取消握手超时定时器
+            auto timer_it = handshake_timers_.find(hdl);
+            if (timer_it != handshake_timers_.end()) {
+                timer_it->second->cancel();
+                handshake_timers_.erase(timer_it);
+            }
+            
+            // 记录握手状态
+            auto hs_it = handshake_states_.find(hdl);
+            if (hs_it != handshake_states_.end()) {
+                was_connected = (hs_it->second.phase == ConnectionHandshakeState::Phase::Connected);
+            }
+            handshake_states_.erase(hdl);
+            
+            // 🎯 OpenClaw 对齐: 从 ConnectionPool 注销连接
+            auto it = handle_to_conn_id_.find(hdl);
+            if (it != handle_to_conn_id_.end()) {
+                conn_id_closed = it->second;
+                auto& pool = ConnectionPool::instance();
+                pool.remove_client(it->second);
+                handle_to_conn_id_.erase(it);
+            }
         }
         
-        // 清理握手状态
-        handshake_states_.erase(hdl);
+        // 🎯 OpenClaw 严格对齐: node role unregister
+        // 对应 OpenClaw ws-connection.ts socket.once("close"):
+        //   if (client?.connect?.role === "node") {
+        //     const nodeId = context.nodeRegistry.unregister(connId);
+        //     if (nodeId) { removeRemoteNodeInfo(nodeId); context.nodeUnsubscribeAll(nodeId); }
+        //   }
+        if (was_connected && !conn_id_closed.empty()) {
+            std::string closed_role;
+            {
+                // role 已在 on_close 前从 handshake_states_ 中读取（已 erase），
+                // 从 runtime_state 中读取
+                if (runtime_state_) {
+                    std::lock_guard<std::mutex> state_lock(runtime_state_->mutex);
+                    auto client_it = runtime_state_->clients.find(conn_id_closed);
+                    if (client_it != runtime_state_->clients.end()) {
+                        closed_role = client_it->second->role;
+                    }
+                }
+            }
+            if (closed_role == "node") {
+                // node 断连: 清理 node 相关订阅
+                if (runtime_state_) {
+                    std::lock_guard<std::mutex> state_lock(runtime_state_->mutex);
+                    // 清理 tool_event_recipients 中该 node 的订阅
+                    for (auto it = runtime_state_->tool_event_recipients.begin();
+                         it != runtime_state_->tool_event_recipients.end(); ) {
+                        it->second.erase(conn_id_closed);
+                        if (it->second.empty()) {
+                            it = runtime_state_->tool_event_recipients.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                }
+            }
+        }
         
-        // 🎯 OpenClaw 对齐: 从 ConnectionPool 注销连接
-        auto it = handle_to_conn_id_.find(hdl);
-        if (it != handle_to_conn_id_.end()) {
-            auto& pool = ConnectionPool::instance();
-            pool.remove_client(it->second);
-            handle_to_conn_id_.erase(it);
+        // 🎯 OpenClaw 严格对齐: presence 断连广播
+        // 对应 OpenClaw ws-connection.ts socket.once("close"):
+        //   if (client?.presenceKey) {
+        //     upsertPresence(client.presenceKey, { reason: "disconnect" });  // 先 upsert
+        //     broadcastPresenceSnapshot({ broadcast, incrementPresenceVersion, getHealthVersion });
+        //   }
+        if (was_connected && !conn_id_closed.empty()) {
+            // 获取 presenceKey (对应 OpenClaw: device?.id ?? instanceId ?? connId)
+            presence_key_closed = conn_id_closed;  // 简化: 使用 connId 作为 presenceKey
+            
+            // 🎯 OpenClaw 对齐: upsertPresence(presenceKey, { reason: "disconnect" })
+            // TODO: upsertPresence(presence_key_closed, { reason: "disconnect" })
+            
+            // 递增 presence 版本号 (对应 incrementPresenceVersion())
+            int64_t new_presence_ver = ++presence_version_;
+            int64_t cur_health_ver   = health_version_.load();
+            
+            // 广播 presence 快照 (dropIfSlow: true)
+            // 🎯 OpenClaw 严格对齐: broadcastPresenceSnapshot
+            // 对应 OpenClaw presence-events.ts:
+            //   const presenceVersion = params.incrementPresenceVersion();
+            //   params.broadcast("presence", { presence: listSystemPresence() }, {
+            //     dropIfSlow: true,
+            //     stateVersion: { presence: presenceVersion, health: params.getHealthVersion() }
+            //   });
+            try {
+                // payload 格式: { presence: [...] } (对应 listSystemPresence())
+                json presence_payload;
+                presence_payload["presence"] = json::array();  // TODO: listSystemPresence()
+                
+                json j;
+                j["type"]    = "event";
+                j["event"]   = "presence";
+                j["payload"] = presence_payload;
+                // seq 不递增 (targeted=false, 但 dropIfSlow=true)
+                j["seq"]     = ++broadcast_seq_;
+                j["stateVersion"] = json{{"presence", new_presence_ver}, {"health", cur_health_ver}};
+                std::string msg = j.dump();
+                
+                std::lock_guard<std::mutex> lock(connections_mutex_);
+                for (auto& c_hdl : connections_) {
+                    auto hs_it = handshake_states_.find(c_hdl);
+                    if (hs_it == handshake_states_.end() ||
+                        hs_it->second.phase != ConnectionHandshakeState::Phase::Connected) {
+                        continue;
+                    }
+                    // dropIfSlow: true
+                    try {
+                        auto conn = ws_server_.get_con_from_hdl(c_hdl);
+                        if (conn && conn->get_buffered_amount() > MAX_BUFFERED_BYTES) {
+                            continue;  // 跳过慢消费者
+                        }
+                    } catch (...) {}
+                    try { ws_server_.send(c_hdl, msg, websocketpp::frame::opcode::text); } catch (...) {}
+                }
+            } catch (...) {}
         }
     }
     
     void on_message(connection_hdl hdl, message_ptr msg) {
-        auto start_time = std::chrono::steady_clock::now();
         std::string conn_id;
         std::string method_name;
         
@@ -509,16 +710,50 @@ private:
                 }
             }
             
-            // 验证是 req 帧
+            // 🎯 OpenClaw 严格对齐: 帧类型验证
+            // 对应 OpenClaw message-handler.ts:
+            //   if (!client) {
+            //     const isRequestFrame = validateRequestFrame(parsed);
+            //     if (!isRequestFrame || parsed.method !== "connect" || !validateConnectParams(parsed.params)) {
+            //       if (isRequestFrame) { send error; queueMicrotask(() => close(1008, ...)); }
+            //       else { close(1008, ...); }  // 非 req 帧: 直接关闭，不发响应
+            //     }
+            //   } else {
+            //     if (!validateRequestFrame(parsed)) { send error; return; }  // 不关闭连接
+            //   }
             std::string msg_type = j.contains("type") && j["type"].is_string()
                 ? j["type"].get<std::string>() : "";
-            if (msg_type != "req") {
-                // 非 req 帧: 握手前直接关闭，握手后忽略
+            bool is_currently_pending = false;
+            {
                 std::lock_guard<std::mutex> lock(connections_mutex_);
                 auto hs_it = handshake_states_.find(hdl);
-                if (hs_it == handshake_states_.end() ||
-                    hs_it->second.phase == ConnectionHandshakeState::Phase::Pending) {
-                    try { ws_server_.close(hdl, 1008, "invalid handshake"); } catch (...) {}
+                is_currently_pending = (hs_it == handshake_states_.end() ||
+                    hs_it->second.phase == ConnectionHandshakeState::Phase::Pending);
+            }
+            if (msg_type != "req") {
+                if (is_currently_pending) {
+                    // 握手阶段: 非 req 帧 → 直接关闭，不发响应
+                    // 对应 OpenClaw: else { close(1008, closeReason); } (no send)
+                    {
+                        std::lock_guard<std::mutex> lock(connections_mutex_);
+                        auto hs_it = handshake_states_.find(hdl);
+                        if (hs_it != handshake_states_.end()) {
+                            hs_it->second.phase = ConnectionHandshakeState::Phase::Failed;
+                            hs_it->second.close_cause = "invalid-handshake";
+                        }
+                    }
+                    try { ws_server_.close(hdl, 1008, "invalid request frame"); } catch (...) {}
+                } else {
+                    // 握手后: 发送错误响应，不关闭连接
+                    // 对应 OpenClaw: send({ type:"res", id: parsed?.id ?? "invalid", ok: false, error: ... })
+                    std::string frame_id = j.contains("id") && j["id"].is_string()
+                        ? j["id"].get<std::string>() : "invalid";
+                    json err_res;
+                    err_res["type"] = "res";
+                    err_res["id"] = frame_id;
+                    err_res["ok"] = false;
+                    err_res["error"] = json{{"code", "INVALID_REQUEST"}, {"message", "invalid request frame"}};
+                    try { ws_server_.send(hdl, err_res.dump(), websocketpp::frame::opcode::text); } catch (...) {}
                 }
                 return;
             }
@@ -557,13 +792,14 @@ private:
                 //   if (!isRequestFrame || parsed.method !== "connect" || !validateConnectParams(...))
                 // --------------------------------------------------------
                 if (req_method != "connect") {
-                    // 握手阶段收到非 connect 请求 → 拒绝并关闭
+                    // 握手阶段收到非 connect 请求 → 先发响应，再 queueMicrotask close
+                    // 对应 OpenClaw: if (isRequestFrame) { send error; queueMicrotask(() => close(1008, ...)); }
+                    std::string handshake_error = "invalid handshake: first request must be connect";
                     json err_res;
                     err_res["type"] = "res";
                     err_res["id"] = req_id;
                     err_res["ok"] = false;
-                    err_res["error"] = json{{"code", "INVALID_REQUEST"},
-                                           {"message", "invalid handshake: first request must be connect"}};
+                    err_res["error"] = json{{"code", "INVALID_REQUEST"}, {"message", handshake_error}};
                     try { ws_server_.send(hdl, err_res.dump(), websocketpp::frame::opcode::text); } catch (...) {}
                     {
                         std::lock_guard<std::mutex> lock(connections_mutex_);
@@ -573,22 +809,93 @@ private:
                             hs_it->second.close_cause = "invalid-handshake";
                         }
                     }
-                    try { ws_server_.close(hdl, 1008, "invalid handshake"); } catch (...) {}
+                    // 对应 OpenClaw: queueMicrotask(() => close(1008, closeReason))
+                    // 使用异步关闭，确保响应先发出
+                    try {
+                        auto& asio_io = ws_server_.get_io_service();
+                        asio_io.post([this, hdl, handshake_error]() {
+                            try { ws_server_.close(hdl, 1008, handshake_error.substr(0, 123)); } catch (...) {}
+                        });
+                    } catch (...) {
+                        try { ws_server_.close(hdl, 1008, "invalid handshake"); } catch (...) {}
+                    }
                     return;
                 }
                 
                 // 处理 connect 请求
                 // 对应 OpenClaw: 验证 auth、protocol、device nonce 等
-                // HunterClaw 简化版: 验证 nonce (如果客户端提供了 device)
                 bool auth_ok = true;
                 std::string auth_error;
                 
-                // 验证 device nonce (对齐 OpenClaw nonce 校验)
+                // 🎯 OpenClaw 对齐: protocol 版本协商
+                // 对应 OpenClaw: if (maxProtocol < PROTOCOL_VERSION || minProtocol > PROTOCOL_VERSION)
+                static constexpr int PROTOCOL_VERSION = 1;
+                int min_protocol = req_params.value("minProtocol", 0);
+                int max_protocol = req_params.value("maxProtocol", PROTOCOL_VERSION);
+                if (max_protocol < PROTOCOL_VERSION || min_protocol > PROTOCOL_VERSION) {
+                    json err_res;
+                    err_res["type"] = "res";
+                    err_res["id"] = req_id;
+                    err_res["ok"] = false;
+                    err_res["error"] = json{{"code", "INVALID_REQUEST"}, {"message", "protocol mismatch"},
+                                           {"details", json{{"expectedProtocol", PROTOCOL_VERSION}}}};
+                    try { ws_server_.send(hdl, err_res.dump(), websocketpp::frame::opcode::text); } catch (...) {}
+                    {
+                        std::lock_guard<std::mutex> lock(connections_mutex_);
+                        auto hs_it = handshake_states_.find(hdl);
+                        if (hs_it != handshake_states_.end()) {
+                            hs_it->second.phase = ConnectionHandshakeState::Phase::Failed;
+                            hs_it->second.close_cause = "protocol-mismatch";
+                        }
+                    }
+                    try { ws_server_.close(hdl, 1002, "protocol mismatch"); } catch (...) {}
+                    return;
+                }
+                
+                // 🎯 OpenClaw 对齐: role 解析和验证
+                // 对应 OpenClaw: const role = parseGatewayRole(roleRaw);
+                std::string role_raw = "operator";
+                if (req_params.contains("role") && req_params["role"].is_string()) {
+                    role_raw = req_params["role"].get<std::string>();
+                }
+                static const std::set<std::string> VALID_ROLES = {"operator", "node"};
+                if (!VALID_ROLES.count(role_raw)) {
+                    json err_res;
+                    err_res["type"] = "res";
+                    err_res["id"] = req_id;
+                    err_res["ok"] = false;
+                    err_res["error"] = json{{"code", "INVALID_REQUEST"}, {"message", "invalid role"}};
+                    try { ws_server_.send(hdl, err_res.dump(), websocketpp::frame::opcode::text); } catch (...) {}
+                    {
+                        std::lock_guard<std::mutex> lock(connections_mutex_);
+                        auto hs_it = handshake_states_.find(hdl);
+                        if (hs_it != handshake_states_.end()) {
+                            hs_it->second.phase = ConnectionHandshakeState::Phase::Failed;
+                            hs_it->second.close_cause = "invalid-role";
+                        }
+                    }
+                    try { ws_server_.close(hdl, 1008, "invalid role"); } catch (...) {}
+                    return;
+                }
+                
+                // 🎯 OpenClaw 对齐: scopes 解析
+                std::vector<std::string> client_scopes;
+                if (req_params.contains("scopes") && req_params["scopes"].is_array()) {
+                    for (const auto& s : req_params["scopes"]) {
+                        if (s.is_string()) client_scopes.push_back(s.get<std::string>());
+                    }
+                }
+                
+                // 🎯 OpenClaw 对齐: 验证 device nonce
+                // 对应 OpenClaw: if (providedNonce !== connectNonce) rejectDeviceAuthInvalid(...)
                 if (req_params.contains("device") && req_params["device"].is_object()) {
                     auto& device = req_params["device"];
                     std::string provided_nonce = device.contains("nonce") && device["nonce"].is_string()
                         ? device["nonce"].get<std::string>() : "";
-                    if (!provided_nonce.empty() && provided_nonce != connect_nonce) {
+                    if (provided_nonce.empty()) {
+                        auth_ok = false;
+                        auth_error = "device nonce required";
+                    } else if (provided_nonce != connect_nonce) {
                         auth_ok = false;
                         auth_error = "device nonce mismatch";
                     }
@@ -621,11 +928,46 @@ private:
                         timer_it->second->cancel();
                         handshake_timers_.erase(timer_it);
                     }
-                    // 更新握手状态为 Connected
+                    // 更新握手状态为 Connected，保存 role/scopes
                     auto hs_it = handshake_states_.find(hdl);
                     if (hs_it != handshake_states_.end()) {
                         hs_it->second.phase = ConnectionHandshakeState::Phase::Connected;
+                        hs_it->second.role   = role_raw;
+                        hs_it->second.scopes = client_scopes;
                     }
+                    // 🎯 OpenClaw 对齐: 更新 GatewayClient 的 role/scopes
+                    auto conn_it = handle_to_conn_id_.find(hdl);
+                    if (conn_it != handle_to_conn_id_.end()) {
+                        std::lock_guard<std::mutex> state_lock(runtime_state_->mutex);
+                        auto client_it = runtime_state_->clients.find(conn_it->second);
+                        if (client_it != runtime_state_->clients.end()) {
+                            client_it->second->role   = role_raw;
+                            client_it->second->scopes = client_scopes;
+                        } else {
+                            // 新建 GatewayClient
+                            auto gc = std::make_shared<GatewayClient>();
+                            gc->conn_id = conn_it->second;
+                            gc->handle  = hdl;
+                            gc->role    = role_raw;
+                            gc->scopes  = client_scopes;
+                            gc->authenticated = true;
+                            gc->connected_at  = core::utils::now();
+                            runtime_state_->clients[conn_it->second] = gc;
+                        }
+                    }
+                }
+                
+                // 🎯 OpenClaw 对齐: presence upsert (对应 upsertPresence + incrementPresenceVersion)
+                // 对应 OpenClaw message-handler.ts:
+                //   if (presenceKey) {
+                //     upsertPresence(presenceKey, { host, ip, version, platform, mode, roles, scopes, reason: "connect" });
+                //     incrementPresenceVersion();
+                //   }
+                // HunterClaw: 使用 conn_id 作为 presenceKey，递增 presence 版本号
+                {
+                    int64_t new_presence_ver = ++presence_version_;
+                    (void)new_presence_ver;  // 版本号已更新，hello-ok 中的 snapshot 会使用
+                    // TODO: upsertPresence(conn_id, { host, role, scopes, reason: "connect" })
                 }
                 
                 // 🎯 OpenClaw 严格对齐: 发送 hello-ok 响应
@@ -651,25 +993,64 @@ private:
                 
                 // 🎯 OpenClaw 对齐: snapshot (对应 buildGatewaySnapshot())
                 // 包含: presence, health, stateVersion, uptimeMs, configPath,
-                //        stateDir, sessionDefaults, authMode
+                //        stateDir, sessionDefaults, authMode, updateAvailable
+                // 对应 OpenClaw health-state.ts:buildGatewaySnapshot()
                 int64_t uptime_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now().time_since_epoch()
                 ).count();
                 json snapshot;
                 snapshot["presence"] = json::array();  // TODO: listSystemPresence()
-                snapshot["health"] = json::object();   // async, filled after connect
-                snapshot["stateVersion"] = json{{"presence", 1}, {"health", 1}};
+                // 🎯 OpenClaw 严格对齐: 填充缓存的健康数据
+                // 对应 OpenClaw message-handler.ts:
+                //   const snapshot = buildGatewaySnapshot();
+                //   const cachedHealth = getHealthCache();
+                //   if (cachedHealth) {
+                //     snapshot.health = cachedHealth;
+                //     snapshot.stateVersion.health = getHealthVersion();
+                //   }
+                // HunterClaw: health_cache_ 存储最近一次健康快照
+                {
+                    std::lock_guard<std::mutex> hc_lock(health_cache_mutex_);
+                    if (!health_cache_.empty()) {
+                        snapshot["health"] = health_cache_;
+                        // 同步更新 stateVersion.health
+                        snapshot["stateVersion"]["health"] = health_version_.load();
+                    } else {
+                        snapshot["health"] = json::object();  // async, filled after connect
+                    }
+                }
+                snapshot["stateVersion"] = json{
+                    {"presence", presence_version_.load()},
+                    {"health",   health_version_.load()}
+                };
                 snapshot["uptimeMs"] = uptime_ms;
                 snapshot["configPath"] = config_ ? config_->config_dir + "/config.yaml" : "";
                 snapshot["stateDir"] = config_ ? config_->workspace_dir : "";
+                // 🎯 OpenClaw 对齐: sessionDefaults (对应 buildGatewaySnapshot)
+                // 对应 OpenClaw health-state.ts:
+                //   sessionDefaults: { defaultAgentId, mainKey, mainSessionKey, scope }
+                std::string default_agent_id = "";
+                std::string main_key = "";
+                std::string main_session_key = "";
+                std::string session_scope = "per-sender";
+                // TODO: resolveDefaultAgentId(cfg) / normalizeMainKey / resolveMainSessionKey
                 snapshot["sessionDefaults"] = json{
-                    {"defaultAgentId", nullptr},
-                    {"mainKey", nullptr},
-                    {"mainSessionKey", nullptr},
-                    {"scope", "per-sender"}
+                    {"defaultAgentId", default_agent_id.empty() ? json(nullptr) : json(default_agent_id)},
+                    {"mainKey", main_key.empty() ? json(nullptr) : json(main_key)},
+                    {"mainSessionKey", main_session_key.empty() ? json(nullptr) : json(main_session_key)},
+                    {"scope", session_scope}
                 };
                 snapshot["authMode"] = config_ ? config_->gateway.auth.mode : "none";
+                // 🎯 OpenClaw 对齐: updateAvailable (对应 getUpdateAvailable())
+                snapshot["updateAvailable"] = nullptr;
                 hello_ok["snapshot"] = snapshot;
+                
+                // 🎯 OpenClaw 对齐: canvasHostUrl (对应 scopedCanvasHostUrl)
+                hello_ok["canvasHostUrl"] = nullptr;  // TODO: canvas host URL
+                
+                // 🎯 OpenClaw 对齐: auth 字段 (对应 deviceToken)
+                // 对应 OpenClaw: auth: deviceToken ? { deviceToken, role, scopes, issuedAtMs } : undefined
+                hello_ok["auth"] = nullptr;  // TODO: device token auth
                 
                 // 🎯 OpenClaw 对齐: policy (对应 server-constants.ts)
                 hello_ok["policy"] = json{
@@ -684,6 +1065,45 @@ private:
                 res_j["ok"] = true;
                 res_j["payload"] = hello_ok;
                 try { ws_server_.send(hdl, res_j.dump(), websocketpp::frame::opcode::text); } catch (...) {}
+                
+                // 🎯 OpenClaw 对齐: 握手成功后异步刷新健康状态
+                // 对应 OpenClaw: void refreshGatewayHealthSnapshot({ probe: true })
+                // 在后台线程中触发一次健康刷新
+                std::thread([this]() {
+                    try {
+                        // 触发健康刷新并广播
+                        int64_t new_health_ver = ++health_version_;
+                        int64_t cur_presence_ver = presence_version_.load();
+                        json health_payload = json::object();  // TODO: getHealthSnapshot()
+                        // 🎯 OpenClaw 对齐: 更新 health 缓存
+                        {
+                            std::lock_guard<std::mutex> hc_lock(health_cache_mutex_);
+                            health_cache_ = health_payload;
+                        }
+                        json j;
+                        j["type"]    = "event";
+                        j["event"]   = "health";
+                        j["payload"] = health_payload;
+                        j["seq"]     = ++broadcast_seq_;
+                        j["stateVersion"] = json{
+                            {"presence", cur_presence_ver},
+                            {"health",   new_health_ver}
+                        };
+                        std::string msg = j.dump();
+                        std::lock_guard<std::mutex> lock(connections_mutex_);
+                        for (auto h : connections_) {
+                            auto hs_it = handshake_states_.find(h);
+                            if (hs_it == handshake_states_.end() ||
+                                hs_it->second.phase != ConnectionHandshakeState::Phase::Connected) continue;
+                            try {
+                                auto conn = ws_server_.get_con_from_hdl(h);
+                                if (conn && conn->get_buffered_amount() > MAX_BUFFERED_BYTES) continue;
+                            } catch (...) {}
+                            try { ws_server_.send(h, msg, websocketpp::frame::opcode::text); } catch (...) {}
+                        }
+                    } catch (...) {}
+                }).detach();
+                
                 return;
             }
             
@@ -691,14 +1111,55 @@ private:
             // 已连接阶段: 处理普通请求
             // 对应 OpenClaw: handleGatewayRequest({ req, respond, client, ... })
             // --------------------------------------------------------
+            
+            // 🎯 OpenClaw 对齐: 请求去重 (对应 DEDUPE_TTL_MS / DEDUPE_MAX)
+            // 对应 OpenClaw server-methods.ts: dedupeMap
+            if (!req_id.empty()) {
+                int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()
+                ).count();
+                std::lock_guard<std::mutex> dedupe_lock(dedupe_mutex_);
+                // 清理过期条目
+                if (dedupe_map_.size() > DEDUPE_MAX) {
+                    for (auto it = dedupe_map_.begin(); it != dedupe_map_.end(); ) {
+                        if (now_ms - it->second > DEDUPE_TTL_MS) {
+                            it = dedupe_map_.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                }
+                // 检查是否重复
+                auto dedupe_it = dedupe_map_.find(req_id);
+                if (dedupe_it != dedupe_map_.end() &&
+                    now_ms - dedupe_it->second < DEDUPE_TTL_MS) {
+                    // 重复请求: 忽略 (对应 OpenClaw: return without processing)
+                    return;
+                }
+                dedupe_map_[req_id] = now_ms;
+            }
+            
+            // 获取当前连接的 role/scopes
+            std::string client_role = "operator";
+            std::vector<std::string> client_scopes_for_req;
+            {
+                std::lock_guard<std::mutex> lock(connections_mutex_);
+                auto hs_it = handshake_states_.find(hdl);
+                if (hs_it != handshake_states_.end()) {
+                    client_role = hs_it->second.role;
+                    client_scopes_for_req = hs_it->second.scopes;
+                }
+            }
+            
             core::RequestFrame req;
             req.id = req_id;
             req.method = req_method;
             req.params = req_params;
             
-            auto response = handle_request(req);
+            auto response = handle_request(req, conn_id, client_role, client_scopes_for_req);
             
             // 发送响应帧
+            // 🎯 OpenClaw 对齐: 错误码使用 response.error_code (INVALID_REQUEST / UNAVAILABLE)
             json res_j;
             res_j["type"] = "res";
             res_j["id"] = req.id;
@@ -708,11 +1169,17 @@ private:
                     res_j["payload"] = response.payload.to_json();
                 }
             } else {
-                if (!response.error.empty()) {
-                    res_j["error"] = json{{"code", "UNAVAILABLE"}, {"message", response.error}};
-                } else {
-                    res_j["error"] = json{{"code", "UNAVAILABLE"}, {"message", "method failed"}};
+                std::string err_code = response.error_code.empty() ? "UNAVAILABLE" : response.error_code;
+                std::string err_msg  = response.error.empty() ? "method failed" : response.error;
+                json err_obj = json{{"code", err_code}, {"message", err_msg}};
+                // 🎯 OpenClaw 对齐: retryable + retryAfterMs (对应 rate limit 错误)
+                if (response.retryable) {
+                    err_obj["retryable"] = true;
+                    if (response.retry_after_ms > 0) {
+                        err_obj["retryAfterMs"] = response.retry_after_ms;
+                    }
                 }
+                res_j["error"] = err_obj;
             }
             ws_server_.send(hdl, res_j.dump(), websocketpp::frame::opcode::text);
             
@@ -729,7 +1196,200 @@ private:
         }
     }
     
-    core::ResponseFrame handle_request(const core::RequestFrame& req) {
+    // 🎯 OpenClaw 对齐: Control Plane 写操作速率限制
+    // 对应 OpenClaw server-methods.ts: CONTROL_PLANE_WRITE_METHODS + consumeControlPlaneWriteBudget
+    // 3次/60s per client
+    static const std::set<std::string> CONTROL_PLANE_WRITE_METHODS;
+    struct ControlPlaneBudget {
+        int64_t window_start_ms = 0;
+        int count = 0;
+    };
+    std::map<std::string, ControlPlaneBudget> cp_budgets_;  // key: conn_id
+    std::mutex cp_budget_mutex_;
+    static constexpr int CP_WRITE_LIMIT = 3;
+    static constexpr int64_t CP_WRITE_WINDOW_MS = 60000;
+    
+    bool consume_control_plane_budget(const std::string& conn_id) {
+        std::lock_guard<std::mutex> lock(cp_budget_mutex_);
+        int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count();
+        auto& budget = cp_budgets_[conn_id];
+        if (now_ms - budget.window_start_ms > CP_WRITE_WINDOW_MS) {
+            budget.window_start_ms = now_ms;
+            budget.count = 0;
+        }
+        if (budget.count >= CP_WRITE_LIMIT) {
+            return false;  // rate limited
+        }
+        budget.count++;
+        return true;
+    }
+    
+    core::ResponseFrame handle_request(const core::RequestFrame& req,
+                                        const std::string& conn_id = "",
+                                        const std::string& role = "operator",
+                                        const std::vector<std::string>& scopes = {}) {
+        // 🎯 OpenClaw 严格对齐: authorizeGatewayMethod
+        // 对应 OpenClaw server-methods.ts:authorizeGatewayMethod
+        // 对应 OpenClaw role-policy.ts:isRoleAuthorizedForMethod
+        // 对应 OpenClaw method-scopes.ts:authorizeOperatorScopesForMethod
+        if (req.method != "health") {
+            // 1. isRoleAuthorizedForMethod(role, method)
+            // 对应 OpenClaw role-policy.ts:
+            //   if (isNodeRoleMethod(method)) return role === "node";
+            //   return role === "operator";
+            // 即: node 专属方法只有 node 能调用，其他方法只有 operator 能调用
+            static const std::set<std::string> NODE_ROLE_METHODS = {
+                "node.invoke.result", "node.event", "node.pending.drain",
+                "node.canvas.capability.refresh", "node.pending.pull", "node.pending.ack",
+                "skills.bins",
+            };
+            bool is_node_method = NODE_ROLE_METHODS.count(req.method) > 0;
+            if (is_node_method) {
+                // node 专属方法: 只有 node role 能调用
+                if (role != "node") {
+                    core::ResponseFrame response;
+                    response.id = req.id;
+                    response.ok = false;
+                    response.error = "unauthorized role: " + role;
+                    response.error_code = "INVALID_REQUEST";
+                    return response;
+                }
+            } else {
+                // 非 node 专属方法: 只有 operator role 能调用
+                if (role != "operator") {
+                    core::ResponseFrame response;
+                    response.id = req.id;
+                    response.ok = false;
+                    response.error = "unauthorized role: " + role;
+                    response.error_code = "INVALID_REQUEST";
+                    return response;
+                }
+            }
+            
+            // 2. authorizeOperatorScopesForMethod(method, scopes)
+            // 对应 OpenClaw method-scopes.ts:authorizeOperatorScopesForMethod
+            // 对应 OpenClaw: if (role === "node") return null; (node 不需要 scope 鉴权)
+            // 对应 OpenClaw: if (scopes.includes(ADMIN_SCOPE)) return null;
+            // 完整 scope 分组 (对应 METHOD_SCOPE_GROUPS):
+            //   APPROVALS_SCOPE: exec.approval.*
+            //   PAIRING_SCOPE: node.pair.*, device.pair.*, device.token.*, node.rename
+            //   READ_SCOPE: health, config.get, sessions.list, ...
+            //   WRITE_SCOPE: agent, chat.send, node.invoke, ...
+            //   ADMIN_SCOPE: config.*, exec.approvals.*, wizard.*, update.*, agents.create, ...
+            if (role == "operator") {
+                bool has_admin = std::find(scopes.begin(), scopes.end(), "operator.admin") != scopes.end();
+                if (!has_admin) {
+                    // 解析方法所需的 scope (对应 resolveScopedMethod)
+                    std::string required_scope;
+                    // APPROVALS_SCOPE 方法
+                    static const std::set<std::string> APPROVALS_METHODS = {
+                        "exec.approval.request", "exec.approval.waitDecision", "exec.approval.resolve",
+                    };
+                    // PAIRING_SCOPE 方法
+                    static const std::set<std::string> PAIRING_METHODS = {
+                        "node.pair.request", "node.pair.list", "node.pair.approve",
+                        "node.pair.reject", "node.pair.verify",
+                        "device.pair.list", "device.pair.approve", "device.pair.reject",
+                        "device.pair.remove", "device.token.rotate", "device.token.revoke",
+                        "node.rename",
+                    };
+                    // READ_SCOPE 方法
+                    static const std::set<std::string> READ_METHODS = {
+                        "health", "doctor.memory.status", "logs.tail", "channels.status",
+                        "status", "usage.status", "usage.cost", "tts.status", "tts.providers",
+                        "models.list", "tools.catalog", "agents.list", "agent.identity.get",
+                        "skills.status", "voicewake.get", "sessions.list", "sessions.get",
+                        "sessions.preview", "sessions.resolve", "sessions.usage",
+                        "sessions.usage.timeseries", "sessions.usage.logs",
+                        "cron.list", "cron.status", "cron.runs", "gateway.identity.get",
+                        "system-presence", "last-heartbeat", "node.list", "node.describe",
+                        "chat.history", "config.get", "config.schema.lookup", "talk.config",
+                        "agents.files.list", "agents.files.get",
+                    };
+                    // WRITE_SCOPE 方法
+                    static const std::set<std::string> WRITE_METHODS = {
+                        "send", "poll", "agent", "agent.wait", "wake", "talk.mode",
+                        "tts.enable", "tts.disable", "tts.convert", "tts.setProvider",
+                        "voicewake.set", "node.invoke", "chat.send", "chat.abort",
+                        "browser.request", "push.test", "node.pending.enqueue",
+                    };
+                    // ADMIN_SCOPE 方法 (显式列表)
+                    static const std::set<std::string> ADMIN_METHODS = {
+                        "channels.logout", "agents.create", "agents.update", "agents.delete",
+                        "skills.install", "skills.update", "secrets.reload", "secrets.resolve",
+                        "cron.add", "cron.update", "cron.remove", "cron.run",
+                        "sessions.patch", "sessions.reset", "sessions.delete", "sessions.compact",
+                        "connect", "chat.inject", "web.login.start", "web.login.wait",
+                        "set-heartbeats", "system-event", "agents.files.set",
+                    };
+                    // ADMIN_METHOD_PREFIXES: exec.approvals.*, config.*, wizard.*, update.*
+                    static const std::vector<std::string> ADMIN_PREFIXES = {
+                        "exec.approvals.", "config.", "wizard.", "update.",
+                    };
+                    
+                    if (APPROVALS_METHODS.count(req.method)) {
+                        required_scope = "operator.approvals";
+                    } else if (PAIRING_METHODS.count(req.method)) {
+                        required_scope = "operator.pairing";
+                    } else if (READ_METHODS.count(req.method)) {
+                        required_scope = "operator.read";
+                    } else if (WRITE_METHODS.count(req.method)) {
+                        required_scope = "operator.write";
+                    } else if (ADMIN_METHODS.count(req.method)) {
+                        required_scope = "operator.admin";
+                    } else {
+                        // 检查 ADMIN_METHOD_PREFIXES
+                        for (const auto& prefix : ADMIN_PREFIXES) {
+                            if (req.method.substr(0, prefix.size()) == prefix) {
+                                required_scope = "operator.admin";
+                                break;
+                            }
+                        }
+                        // 未分类方法: 默认需要 admin scope (default-deny)
+                        if (required_scope.empty()) {
+                            required_scope = "operator.admin";
+                        }
+                    }
+                    
+                    // 对应 OpenClaw: if (requiredScope === READ_SCOPE) { if (scopes.includes(READ_SCOPE) || scopes.includes(WRITE_SCOPE)) return allowed; }
+                    bool scope_ok = false;
+                    if (required_scope == "operator.read") {
+                        scope_ok = std::find(scopes.begin(), scopes.end(), "operator.read") != scopes.end() ||
+                                   std::find(scopes.begin(), scopes.end(), "operator.write") != scopes.end();
+                    } else {
+                        scope_ok = std::find(scopes.begin(), scopes.end(), required_scope) != scopes.end();
+                    }
+                    if (!scope_ok) {
+                        core::ResponseFrame response;
+                        response.id = req.id;
+                        response.ok = false;
+                        response.error = "missing scope: " + required_scope;
+                        response.error_code = "INVALID_REQUEST";
+                        return response;
+                    }
+                }
+            }
+        }
+        
+        // 🎯 OpenClaw 对齐: Control Plane 写操作速率限制
+        // 对应 OpenClaw server-methods.ts: consumeControlPlaneWriteBudget({ client })
+        // 错误格式: ErrorCodes.UNAVAILABLE + retryable: true + retryAfterMs
+        if (CONTROL_PLANE_WRITE_METHODS.count(req.method) && !conn_id.empty()) {
+            if (!consume_control_plane_budget(conn_id)) {
+                core::ResponseFrame response;
+                response.id = req.id;
+                response.ok = false;
+                // 对应 OpenClaw: errorShape(ErrorCodes.UNAVAILABLE, `rate limit exceeded...`, { retryable: true, retryAfterMs, details: { method, limit } })
+                response.error = "rate limit exceeded for " + req.method + "; retry after 60s";
+                response.error_code = "UNAVAILABLE";
+                response.retryable = true;
+                response.retry_after_ms = CP_WRITE_WINDOW_MS;
+                return response;
+            }
+        }
+        
         // Use new method handler (对齐 OpenClaw server-methods/)
         if (!method_handler_) {
             core::ResponseFrame response;
@@ -751,12 +1411,25 @@ private:
                 core::ResponseFrame response;
                 response.id = req.id;
                 response.ok = true;
+                // 🎯 OpenClaw 对齐: 返回 payload
+                // 对应 OpenClaw: respond(true, payload)
+                if (result.value.has_value()) {
+                    response.payload = core::JsonValue(result.value.value());
+                }
                 return response;
             } else {
                 core::ResponseFrame response;
                 response.id = req.id;
                 response.ok = false;
-                response.error = result.error;
+                // 🎯 OpenClaw 对齐: unknown method 错误
+                // 对应 OpenClaw: errorShape(ErrorCodes.INVALID_REQUEST, `unknown method: ${req.method}`)
+                if (result.error.find("unknown") != std::string::npos ||
+                    result.error.find("not found") != std::string::npos) {
+                    response.error = "unknown method: " + req.method;
+                    response.error_code = "INVALID_REQUEST";
+                } else {
+                    response.error = result.error;
+                }
                 return response;
             }
         } catch (const std::exception& e) {
@@ -774,10 +1447,19 @@ private:
     std::set<connection_hdl, std::owner_less<connection_hdl>> connections_;
     std::mutex connections_mutex_;
     std::shared_ptr<GatewayRuntimeState> runtime_state_;
-    std::function<core::Result<nlohmann::json>(const std::string&, const nlohmann::json&)> method_handler_;
     
     // 🎯 OpenClaw 对齐: 全局广播 seq 计数器 (对应 server-broadcast.ts: let seq = 0)
     std::atomic<int64_t> broadcast_seq_{0};
+    
+    // 🎯 OpenClaw 对齐: presence/health 版本号 (对应 health-state.ts: presenceVersion / healthVersion)
+    std::atomic<int64_t> presence_version_{1};
+    std::atomic<int64_t> health_version_{1};
+    
+    // 🎯 OpenClaw 对齐: health 缓存 (对应 health-state.ts: healthCache)
+    // 对应 OpenClaw: let healthCache: HealthSummary | null = null;
+    // 对应 OpenClaw: if (cachedHealth) { snapshot.health = cachedHealth; snapshot.stateVersion.health = getHealthVersion(); }
+    json health_cache_ = json::object();  // 空 object 表示无缓存
+    std::mutex health_cache_mutex_;
     
     // handle → conn_id mapping (用于 on_close 时查找)
     std::map<connection_hdl, std::string, std::owner_less<connection_hdl>> handle_to_conn_id_;
@@ -786,12 +1468,24 @@ private:
     std::thread tick_thread_;
     std::atomic<bool> tick_running_{false};
     
+    // 🎯 OpenClaw 对齐: 健康刷新线程 (对应 HEALTH_REFRESH_INTERVAL_MS)
+    std::thread health_refresh_thread_;
+    std::atomic<bool> health_refresh_running_{false};
+    
     // 🎯 OpenClaw 对齐: 每连接握手状态 (对应 handshakeState / connectNonce)
     std::map<connection_hdl, ConnectionHandshakeState, std::owner_less<connection_hdl>> handshake_states_;
     
     // 🎯 OpenClaw 对齐: 每连接握手超时定时器 (对应 handshakeTimer)
     using AsioTimer = websocketpp::lib::asio::steady_timer;
     std::map<connection_hdl, std::shared_ptr<AsioTimer>, std::owner_less<connection_hdl>> handshake_timers_;
+    
+    // 🎯 OpenClaw 对齐: 请求去重表 (对应 DEDUPE_TTL_MS / DEDUPE_MAX)
+    // key: req_id, value: timestamp_ms
+    std::map<std::string, int64_t> dedupe_map_;
+    std::mutex dedupe_mutex_;
+    
+    // 🎯 OpenClaw 对齐: 方法处理器 (由 methods.cc 注入)
+    std::function<core::Result<nlohmann::json>(const std::string&, const nlohmann::json&)> method_handler_;
 };
 
 // Session Manager Implementation
@@ -1151,3 +1845,9 @@ std::shared_ptr<core::Config> GatewayServer::config() const {
 
 } // namespace gateway
 } // namespace hunterclaw
+
+// 🎯 OpenClaw 对齐: Control Plane 写操作方法集合
+// 对应 OpenClaw server-methods.ts: CONTROL_PLANE_WRITE_METHODS
+const std::set<std::string> hunterclaw::gateway::GatewayServerImpl::CONTROL_PLANE_WRITE_METHODS = {
+    "config.apply", "config.patch", "update.run"
+};

@@ -4,9 +4,10 @@
 #include <filesystem>
 #include <fstream>
 #include <dlfcn.h>
-#include <json/json.h>
+#include <nlohmann/json.hpp>
 
 namespace fs = std::filesystem;
+using json = nlohmann::json;
 
 namespace hunterclaw {
 namespace memory {
@@ -21,478 +22,313 @@ namespace {
     }
 }
 
-// ========================================
-// 单例模式
-// ========================================
+// ============================================================================
+// MemoryPluginRegistry
+// ============================================================================
 
-MemoryPluginManager& MemoryPluginManager::instance() {
-    static MemoryPluginManager instance;
-    return instance;
+MemoryPluginRegistry& MemoryPluginRegistry::instance() {
+    static MemoryPluginRegistry inst;
+    return inst;
 }
 
-// ========================================
-// 设置插件目录
-// ========================================
-
-void MemoryPluginManager::set_plugins_directory(const std::string& dir) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    plugin_directories_.clear();
-    plugin_directories_.push_back(dir);
-    log()->info("MemoryPluginManager: set plugins directory to {}", dir);
+void MemoryPluginRegistry::register_plugin(const MemoryPluginDefinition& def) {
+    plugins_[def.id] = def;
+    log()->info("MemoryPluginRegistry: registered plugin '{}'", def.id);
 }
 
-void MemoryPluginManager::add_plugins_directory(const std::string& dir) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    plugin_directories_.push_back(dir);
-    log()->info("MemoryPluginManager: added plugins directory {}", dir);
+const MemoryPluginDefinition* MemoryPluginRegistry::get_plugin(const std::string& id) const {
+    auto it = plugins_.find(id);
+    return it != plugins_.end() ? &it->second : nullptr;
 }
 
-// ========================================
-// 发现插件
-// ========================================
+std::vector<std::string> MemoryPluginRegistry::list_plugin_ids() const {
+    std::vector<std::string> ids;
+    ids.reserve(plugins_.size());
+    for (const auto& [id, _] : plugins_) {
+        ids.push_back(id);
+    }
+    return ids;
+}
 
-core::Result<std::vector<std::string>> MemoryPluginManager::discover_plugins() {
+bool MemoryPluginRegistry::has_plugin(const std::string& id) const {
+    return plugins_.find(id) != plugins_.end();
+}
+
+// ============================================================================
+// MemoryPluginLoader
+// ============================================================================
+
+MemoryPluginLoader& MemoryPluginLoader::instance() {
+    static MemoryPluginLoader inst;
+    return inst;
+}
+
+MemoryPluginLoader::~MemoryPluginLoader() {
+    // Close all loaded .so handles
     std::lock_guard<std::mutex> lock(mutex_);
-    
-    discovered_manifests_.clear();
-    std::vector<std::string> plugin_ids;
-    
-    // 默认插件目录 (如果未设置)
-    if (plugin_directories_.empty()) {
-        // HunterClaw 默认路径
+    for (auto& [id, handle] : handles_) {
+        if (handle) {
+            dlclose(handle);
+        }
+    }
+    handles_.clear();
+}
+
+void MemoryPluginLoader::add_plugins_directory(const std::string& dir) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    plugin_dirs_.push_back(dir);
+}
+
+void MemoryPluginLoader::set_plugins_directories(const std::vector<std::string>& dirs) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    plugin_dirs_ = dirs;
+}
+
+std::vector<std::string> MemoryPluginLoader::get_plugins_directories() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return plugin_dirs_;
+}
+
+core::Result<std::vector<PluginManifest>> MemoryPluginLoader::discover_plugins() {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    // Default directories if none configured
+    if (plugin_dirs_.empty()) {
         const char* home = std::getenv("HOME");
         if (home) {
-            plugin_directories_.push_back(std::string(home) + "/.hunterclaw/plugins");
+            plugin_dirs_.push_back(std::string(home) + "/.hunterclaw/plugins");
         }
-        plugin_directories_.push_back("/usr/lib/hunterclaw/plugins");
-        plugin_directories_.push_back("/usr/local/lib/hunterclaw/plugins");
+        plugin_dirs_.push_back("/usr/lib/hunterclaw/plugins");
+        plugin_dirs_.push_back("/usr/local/lib/hunterclaw/plugins");
     }
-    
-    // 扫描所有插件目录
-    for (const auto& dir : plugin_directories_) {
+
+    std::vector<PluginManifest> manifests;
+
+    for (const auto& dir : plugin_dirs_) {
         if (!fs::exists(dir)) {
-            log()->debug("MemoryPluginManager: directory {} does not exist, skipping", dir);
+            log()->debug("MemoryPluginLoader: directory {} does not exist, skipping", dir);
             continue;
         }
-        
-        log()->info("MemoryPluginManager: scanning directory {} for plugins", dir);
-        
-        // 查找所有 .plugin.json 文件
+
         for (const auto& entry : fs::directory_iterator(dir)) {
             if (!entry.is_regular_file()) continue;
-            
-            std::string filename = entry.path().filename().string();
-            std::string suffix = ".plugin.json";
-            if (filename.size() < suffix.size() || 
-                filename.compare(filename.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
-            
-            // 解析 manifest
-            auto manifest_result = parse_manifest(entry.path().string());
-            if (manifest_result.is_err()) {
-                log()->warn("MemoryPluginManager: failed to parse manifest {}: {}",
-                    entry.path().string(), manifest_result.error);
+
+            const std::string filename = entry.path().filename().string();
+            if (filename.size() < 12 ||
+                filename.compare(filename.size() - 12, 12, ".plugin.json") != 0) {
                 continue;
             }
-            
-            auto manifest = manifest_result.get();
-            
-            // 验证 manifest
-            auto validate_result = validate_manifest(manifest);
-            if (validate_result.is_err()) {
-                log()->warn("MemoryPluginManager: invalid manifest {}: {}",
-                    entry.path().string(), validate_result.error);
+
+            auto result = parse_manifest(entry.path().string());
+            if (!result.ok()) {
+                log()->warn("MemoryPluginLoader: failed to parse {}: {}",
+                    entry.path().string(), result.error());
                 continue;
             }
-            
-            // 检查 type 是否为 "memory"
-            if (manifest.type != "memory") {
-                log()->debug("MemoryPluginManager: skipping non-memory plugin {} (type: {})",
-                    manifest.id, manifest.type);
+
+            auto manifest = result.value();
+            if (manifest.kind != "memory") {
+                log()->debug("MemoryPluginLoader: skipping non-memory plugin {} (kind: {})",
+                    manifest.id, manifest.kind);
                 continue;
             }
-            
-            // 保存 manifest
-            discovered_manifests_[manifest.id] = manifest;
-            plugin_ids.push_back(manifest.id);
-            
-            log()->info("MemoryPluginManager: discovered plugin {} ({}) at {}",
-                manifest.id, manifest.name, entry.path().string());
+
+            log()->info("MemoryPluginLoader: discovered plugin '{}' at {}",
+                manifest.id, entry.path().string());
+            manifests.push_back(std::move(manifest));
         }
     }
-    
-    log()->info("MemoryPluginManager: discovered {} memory plugin(s)", plugin_ids.size());
-    return core::Result<std::vector<std::string>>::Ok(plugin_ids);
+
+    return core::Result<std::vector<PluginManifest>>::ok(std::move(manifests));
 }
 
-// ========================================
-// 加载插件 (from manifest)
-// ========================================
-
-core::Result<std::shared_ptr<MemoryPlugin>> MemoryPluginManager::load_plugin(
-    const std::string& manifest_path
-) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    // 1. 解析 manifest
+core::Result<void> MemoryPluginLoader::load_plugin(const std::string& manifest_path) {
     auto manifest_result = parse_manifest(manifest_path);
-    if (manifest_result.is_err()) {
-        return core::Result<std::shared_ptr<MemoryPlugin>>::Err(manifest_result.error);
+    if (!manifest_result.ok()) {
+        return core::Result<void>::err(manifest_result.error());
     }
-    
-    auto manifest = manifest_result.get();
-    
-    // 2. 验证 manifest
+
+    const auto& manifest = manifest_result.value();
+
     auto validate_result = validate_manifest(manifest);
-    if (validate_result.is_err()) {
-        return core::Result<std::shared_ptr<MemoryPlugin>>::Err(validate_result.error);
+    if (!validate_result.ok()) {
+        return core::Result<void>::err(validate_result.error());
     }
-    
-    // 3. 检查是否已加载
-    if (plugins_.find(manifest.id) != plugins_.end()) {
-        log()->warn("MemoryPluginManager: plugin {} is already loaded", manifest.id);
-        return core::Result<std::shared_ptr<MemoryPlugin>>::Ok(plugins_[manifest.id]);
+
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    if (handles_.count(manifest.id)) {
+        log()->debug("MemoryPluginLoader: plugin '{}' already loaded", manifest.id);
+        return core::Result<void>::ok();
     }
-    
-    // 4. 找到 .so 文件
-    fs::path manifest_dir = fs::path(manifest_path).parent_path();
-    fs::path so_path = manifest_dir / manifest.main;
-    
+
+    // Locate .so file
+    const fs::path manifest_dir = fs::path(manifest_path).parent_path();
+    const fs::path so_path = manifest_dir / manifest.main;
+
     if (!fs::exists(so_path)) {
-        return core::Result<std::shared_ptr<MemoryPlugin>>::Err("Plugin library not found: " + so_path.string());
+        return core::Result<void>::err("Plugin library not found: " + so_path.string());
     }
-    
-    // 5. dlopen 加载 .so
+
+    // dlopen
     void* handle = dlopen(so_path.c_str(), RTLD_LAZY);
     if (!handle) {
-        std::string error = dlerror();
-        return core::Result<std::shared_ptr<MemoryPlugin>>::Err("Failed to load plugin library: " + error);
+        return core::Result<void>::err(
+            std::string("dlopen failed: ") + dlerror());
     }
-    
-    // 6. 查找 create_plugin 函数
-    dlerror();  // 清空错误
-    CreatePluginFn create_fn = (CreatePluginFn)dlsym(handle, "create_plugin");
-    const char* dlsym_error = dlerror();
-    if (dlsym_error) {
+
+    // Locate register_memory_plugin symbol
+    // Convention: each memory plugin .so exports:
+    //   extern "C" void register_memory_plugin(MemoryPluginRegistry&);
+    using RegisterFn = void (*)(MemoryPluginRegistry&);
+    dlerror();
+    auto register_fn = reinterpret_cast<RegisterFn>(dlsym(handle, "register_memory_plugin"));
+    const char* sym_err = dlerror();
+    if (sym_err) {
         dlclose(handle);
-        return core::Result<std::shared_ptr<MemoryPlugin>>::Err("Failed to find create_plugin: " + std::string(dlsym_error));
+        return core::Result<void>::err(
+            std::string("register_memory_plugin not found: ") + sym_err);
     }
-    
-    // 7. 创建插件实例
-    MemoryPlugin* raw_plugin = create_fn();
-    if (!raw_plugin) {
-        dlclose(handle);
-        return core::Result<std::shared_ptr<MemoryPlugin>>::Err("create_plugin returned null");
-    }
-    
-    auto plugin = std::shared_ptr<MemoryPlugin>(raw_plugin);
-    
-    // 8. 初始化插件
-    // TODO: 目前 MemoryPlugin 的 init 函数需要适配标准的 plugins::PluginContext
-    // 暂时使用简化方案，直接创建一个包含 config map 的 context
-    plugins::PluginContext ctx;
-    ctx.plugin_dir = manifest_dir.string();
-    // config 暂时留空，实际的配置通过 manifest.config 传递给 provider
-    
-    auto init_result = plugin->init(ctx);
-    if (init_result.is_err()) {
-        dlclose(handle);
-        return core::Result<std::shared_ptr<MemoryPlugin>>::Err("Failed to initialize plugin: " + init_result.error);
-    }
-    
-    // 9. 获取 Manager 并注册
-    auto provider = plugin->get_manager();
-    if (!provider) {
-        dlclose(handle);
-        return core::Result<std::shared_ptr<MemoryPlugin>>::Err("Plugin returned null provider");
-    }
-    
-    auto& registry = MemoryProviderRegistry::instance();
-    auto register_result = registry.register_provider(manifest.id, provider);
-    if (register_result.is_err()) {
-        dlclose(handle);
-        return core::Result<std::shared_ptr<MemoryPlugin>>::Err("Failed to register provider: " + register_result.error);
-    }
-    
-    // 10. 保存插件和句柄
-    plugins_[manifest.id] = plugin;
-    plugin_handles_[manifest.id] = handle;
-    
-    log()->info("MemoryPluginManager: loaded plugin {} ({}) from {}",
-        manifest.id, manifest.name, so_path.string());
-    
-    return core::Result<std::shared_ptr<MemoryPlugin>>::Ok(plugin);
+
+    // Call register function — plugin registers its MemoryPluginDefinition
+    register_fn(MemoryPluginRegistry::instance());
+
+    handles_[manifest.id] = handle;
+    log()->info("MemoryPluginLoader: loaded plugin '{}' from {}", manifest.id, so_path.string());
+
+    return core::Result<void>::ok();
 }
 
-// ========================================
-// 加载插件 (by ID)
-// ========================================
-
-core::Result<std::shared_ptr<MemoryPlugin>> MemoryPluginManager::load_plugin_by_id(
-    const std::string& plugin_id
-) {
-    // 检查是否已发现
-    if (discovered_manifests_.find(plugin_id) == discovered_manifests_.end()) {
-        return core::Result<std::shared_ptr<MemoryPlugin>>::Err("Plugin not found in discovered manifests: " + plugin_id);
+core::Result<int> MemoryPluginLoader::load_all_plugins() {
+    auto discover_result = discover_plugins();
+    if (!discover_result.ok()) {
+        return core::Result<int>::err(discover_result.error());
     }
-    
-    // 找到 manifest 文件路径
-    // (需要从 discovered_manifests_ 中恢复路径)
-    // 简化实现: 重新扫描目录查找 manifest
-    for (const auto& dir : plugin_directories_) {
-        for (const auto& entry : fs::directory_iterator(dir)) {
-            std::string filename = entry.path().filename().string();
-            if (filename.find(".plugin.json") == std::string::npos) continue;
-            
-            auto manifest_result = parse_manifest(entry.path().string());
-            if (manifest_result.is_err()) continue;
-            
-            if (manifest_result.get().id == plugin_id) {
-                return load_plugin(entry.path().string());
+
+    int loaded = 0;
+    for (const auto& manifest : discover_result.value()) {
+        // Re-derive manifest path from directories
+        for (const auto& dir : plugin_dirs_) {
+            const fs::path candidate = fs::path(dir) / (manifest.id + ".plugin.json");
+            if (fs::exists(candidate)) {
+                auto r = load_plugin(candidate.string());
+                if (r.ok()) {
+                    ++loaded;
+                } else {
+                    log()->warn("MemoryPluginLoader: failed to load '{}': {}",
+                        manifest.id, r.error());
+                }
+                break;
             }
         }
     }
-    
-    return core::Result<std::shared_ptr<MemoryPlugin>>::Err("Plugin manifest not found: " + plugin_id);
+
+    log()->info("MemoryPluginLoader: loaded {} plugin(s)", loaded);
+    return core::Result<int>::ok(loaded);
 }
 
-// ========================================
-// 卸载插件
-// ========================================
-
-core::Result<bool> MemoryPluginManager::unload_plugin(const std::string& plugin_id) {
+core::Result<void> MemoryPluginLoader::unload_plugin(const std::string& plugin_id) {
     std::lock_guard<std::mutex> lock(mutex_);
-    
-    // 1. 检查插件是否已加载
-    if (plugins_.find(plugin_id) == plugins_.end()) {
-        return core::Result<bool>::Err("Plugin not loaded: " + plugin_id);
+
+    auto it = handles_.find(plugin_id);
+    if (it == handles_.end()) {
+        return core::Result<void>::err("Plugin not loaded: " + plugin_id);
     }
-    
-    auto plugin = plugins_[plugin_id];
-    
-    // 2. 调用 shutdown
-    auto shutdown_result = plugin->shutdown();
-    if (shutdown_result.is_err()) {
-        log()->warn("MemoryPluginManager: plugin {} shutdown failed: {}",
-            plugin_id, shutdown_result.error);
-    }
-    
-    // 3. 从 Provider Registry 移除
-    auto& registry = MemoryProviderRegistry::instance();
-    registry.unregister_provider(plugin_id);
-    
-    // 4. dlclose 卸载 .so
-    if (plugin_handles_.find(plugin_id) != plugin_handles_.end()) {
-        void* handle = plugin_handles_[plugin_id];
-        dlclose(handle);
-        plugin_handles_.erase(plugin_id);
-    }
-    
-    // 5. 移除插件
-    plugins_.erase(plugin_id);
-    
-    log()->info("MemoryPluginManager: unloaded plugin {}", plugin_id);
-    return core::Result<bool>::Ok(true);
+
+    dlclose(it->second);
+    handles_.erase(it);
+
+    log()->info("MemoryPluginLoader: unloaded plugin '{}'", plugin_id);
+    return core::Result<void>::ok();
 }
 
-// ========================================
-// 重载插件
-// ========================================
+// ============================================================================
+// Manifest parsing
+// ============================================================================
 
-core::Result<bool> MemoryPluginManager::reload_plugin(const std::string& plugin_id) {
-    // 1. 卸载插件
-    auto unload_result = unload_plugin(plugin_id);
-    if (unload_result.is_err()) {
-        return core::Result<bool>::Err("Failed to unload plugin: " + unload_result.error);
-    }
-    
-    // 2. 重新加载插件
-    auto load_result = load_plugin_by_id(plugin_id);
-    if (load_result.is_err()) {
-        return core::Result<bool>::Err("Failed to reload plugin: " + load_result.error);
-    }
-    
-    log()->info("MemoryPluginManager: reloaded plugin {}", plugin_id);
-    return core::Result<bool>::Ok(true);
-}
-
-// ========================================
-// 发现并加载所有插件
-// ========================================
-
-core::Result<int> MemoryPluginManager::discover_and_load_all() {
-    // 1. 发现插件
-    auto discover_result = discover_plugins();
-    if (discover_result.is_err()) {
-        return core::Result<int>::Err(discover_result.error);
-    }
-    
-    auto plugin_ids = discover_result.get();
-    
-    // 2. 加载所有插件
-    int loaded_count = 0;
-    for (const auto& plugin_id : plugin_ids) {
-        auto load_result = load_plugin_by_id(plugin_id);
-        if (load_result.is_ok()) {
-            loaded_count++;
-        } else {
-            log()->warn("MemoryPluginManager: failed to load plugin {}: {}",
-                plugin_id, load_result.error);
-        }
-    }
-    
-    log()->info("MemoryPluginManager: loaded {}/{} plugin(s)", loaded_count, plugin_ids.size());
-    return core::Result<int>::Ok(loaded_count);
-}
-
-// ========================================
-// 查询和管理
-// ========================================
-
-std::shared_ptr<MemoryPlugin> MemoryPluginManager::get_plugin(const std::string& plugin_id) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = plugins_.find(plugin_id);
-    if (it != plugins_.end()) {
-        return it->second;
-    }
-    return nullptr;
-}
-
-std::vector<std::shared_ptr<MemoryPlugin>> MemoryPluginManager::list_plugins() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    std::vector<std::shared_ptr<MemoryPlugin>> result;
-    for (const auto& [id, plugin] : plugins_) {
-        result.push_back(plugin);
-    }
-    return result;
-}
-
-bool MemoryPluginManager::is_loaded(const std::string& plugin_id) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return plugins_.find(plugin_id) != plugins_.end();
-}
-
-size_t MemoryPluginManager::plugin_count() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return plugins_.size();
-}
-
-core::Result<bool> MemoryPluginManager::unload_all() {
-    std::vector<std::string> plugin_ids;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (const auto& [id, _] : plugins_) {
-            plugin_ids.push_back(id);
-        }
-    }
-    
-    for (const auto& id : plugin_ids) {
-        auto result = unload_plugin(id);
-        if (result.is_err()) {
-            log()->warn("MemoryPluginManager: failed to unload plugin {}: {}", id, result.error);
-        }
-    }
-    
-    return core::Result<bool>::Ok(true);
-}
-
-// ========================================
-// Manifest 解析
-// ========================================
-
-core::Result<MemoryPluginManager::PluginManifest> MemoryPluginManager::parse_manifest(
-    const std::string& manifest_path
-) {
+core::Result<PluginManifest> MemoryPluginLoader::parse_manifest(
+    const std::string& manifest_path)
+{
     std::ifstream file(manifest_path);
     if (!file.is_open()) {
-        return core::Result<PluginManifest>::Err("Failed to open manifest file: " + manifest_path);
+        return core::Result<PluginManifest>::err("Cannot open: " + manifest_path);
     }
-    
-    Json::Value root;
-    Json::CharReaderBuilder builder;
-    std::string errs;
-    
-    if (!Json::parseFromStream(builder, file, &root, &errs)) {
-        return core::Result<PluginManifest>::Err("Failed to parse manifest JSON: " + errs);
+
+    json root;
+    try {
+        file >> root;
+    } catch (const json::exception& e) {
+        return core::Result<PluginManifest>::err(
+            std::string("JSON parse error: ") + e.what());
     }
-    
-    PluginManifest manifest;
-    
-    // 必填字段
-    if (!root.isMember("id") || !root["id"].isString()) {
-        return core::Result<PluginManifest>::Err("Missing or invalid field: id");
+
+    PluginManifest m;
+
+    auto require_string = [&](const char* field) -> core::Result<std::string> {
+        if (!root.contains(field) || !root[field].is_string()) {
+            return core::Result<std::string>::err(
+                std::string("Missing or invalid field: ") + field);
+        }
+        return core::Result<std::string>::ok(root[field].get<std::string>());
+    };
+
+    auto id_r = require_string("id");
+    if (!id_r.ok()) return core::Result<PluginManifest>::err(id_r.error());
+    m.id = id_r.value();
+
+    auto name_r = require_string("name");
+    if (!name_r.ok()) return core::Result<PluginManifest>::err(name_r.error());
+    m.name = name_r.value();
+
+    auto version_r = require_string("version");
+    if (!version_r.ok()) return core::Result<PluginManifest>::err(version_r.error());
+    m.version = version_r.value();
+
+    // "kind" (preferred) or legacy "type"
+    if (root.contains("kind") && root["kind"].is_string()) {
+        m.kind = root["kind"].get<std::string>();
+    } else if (root.contains("type") && root["type"].is_string()) {
+        m.kind = root["type"].get<std::string>();
+    } else {
+        return core::Result<PluginManifest>::err("Missing field: kind (or type)");
     }
-    manifest.id = root["id"].asString();
-    
-    if (!root.isMember("name") || !root["name"].isString()) {
-        return core::Result<PluginManifest>::Err("Missing or invalid field: name");
-    }
-    manifest.name = root["name"].asString();
-    
-    if (!root.isMember("version") || !root["version"].isString()) {
-        return core::Result<PluginManifest>::Err("Missing or invalid field: version");
-    }
-    manifest.version = root["version"].asString();
-    
-    if (!root.isMember("type") || !root["type"].isString()) {
-        return core::Result<PluginManifest>::Err("Missing or invalid field: type");
-    }
-    manifest.type = root["type"].asString();
-    
-    if (!root.isMember("main") || !root["main"].isString()) {
-        return core::Result<PluginManifest>::Err("Missing or invalid field: main");
-    }
-    manifest.main = root["main"].asString();
-    
-    // 可选字段
-    if (root.isMember("author") && root["author"].isString()) {
-        manifest.author = root["author"].asString();
-    }
-    
-    if (root.isMember("description") && root["description"].isString()) {
-        manifest.description = root["description"].asString();
-    }
-    
-    if (root.isMember("license") && root["license"].isString()) {
-        manifest.license = root["license"].asString();
-    }
-    
-    if (root.isMember("homepage") && root["homepage"].isString()) {
-        manifest.homepage = root["homepage"].asString();
-    }
-    
-    // config (对象转 map)
-    if (root.isMember("config") && root["config"].isObject()) {
-        const Json::Value& config = root["config"];
-        for (const auto& key : config.getMemberNames()) {
-            if (config[key].isObject() && config[key].isMember("default")) {
-                manifest.config[key] = config[key]["default"].asString();
-            } else if (config[key].isString()) {
-                manifest.config[key] = config[key].asString();
+
+    auto main_r = require_string("main");
+    if (!main_r.ok()) return core::Result<PluginManifest>::err(main_r.error());
+    m.main = main_r.value();
+
+    // Optional fields
+    if (root.contains("description") && root["description"].is_string())
+        m.description = root["description"].get<std::string>();
+    if (root.contains("author") && root["author"].is_string())
+        m.author = root["author"].get<std::string>();
+    if (root.contains("license") && root["license"].is_string())
+        m.license = root["license"].get<std::string>();
+    if (root.contains("homepage") && root["homepage"].is_string())
+        m.homepage = root["homepage"].get<std::string>();
+
+    // config defaults
+    if (root.contains("config") && root["config"].is_object()) {
+        for (auto& [key, val] : root["config"].items()) {
+            if (val.is_object() && val.contains("default")) {
+                m.config[key] = val["default"].dump();
+            } else if (val.is_string()) {
+                m.config[key] = val.get<std::string>();
             }
         }
     }
-    
-    return core::Result<PluginManifest>::Ok(manifest);
+
+    return core::Result<PluginManifest>::ok(std::move(m));
 }
 
-// ========================================
-// Manifest 验证
-// ========================================
-
-core::Result<bool> MemoryPluginManager::validate_manifest(const PluginManifest& manifest) {
-    if (manifest.id.empty()) {
-        return core::Result<bool>::Err("Manifest id is empty");
-    }
-    
-    if (manifest.type != "memory") {
-        return core::Result<bool>::Err("Manifest type is not 'memory': " + manifest.type);
-    }
-    
-    if (manifest.main.empty()) {
-        return core::Result<bool>::Err("Manifest main is empty");
-    }
-    
-    return core::Result<bool>::Ok(true);
+core::Result<void> MemoryPluginLoader::validate_manifest(const PluginManifest& m) {
+    if (m.id.empty())
+        return core::Result<void>::err("Manifest id is empty");
+    if (m.kind != "memory")
+        return core::Result<void>::err("Manifest kind is not 'memory': " + m.kind);
+    if (m.main.empty())
+        return core::Result<void>::err("Manifest main is empty");
+    return core::Result<void>::ok();
 }
 
 } // namespace memory
