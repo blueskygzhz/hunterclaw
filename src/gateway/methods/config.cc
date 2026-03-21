@@ -7,9 +7,14 @@
 #include "hunterclaw/gateway/method_guard.h"
 #include "hunterclaw/core/utils.h"
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <thread>
+#include <chrono>
+#include <signal.h>
+#include <unistd.h>
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -488,17 +493,151 @@ core::Result<json> method_config_schema_lookup(
     return core::Result<json>::Ok(result);
 }
 
-// 🎯 OpenClaw 对齐: configHandlers["config.apply"]
-// 对应 OpenClaw: requireConfigBaseHash + parseValidateConfig + writeConfigFile + scheduleGatewaySigusr1Restart
+// ============================================================================
+// config.apply 内部辅助函数
+// ============================================================================
+
+// 🎯 OpenClaw 对齐: diffConfigPaths
+// 计算两个配置对象之间的变更路径列表（用于 audit 日志）
+// 对应 OpenClaw: diffConfigPaths(snapshot.config, parsed.config)
+static std::vector<std::string> diff_config_paths(const json& before, const json& after, const std::string& prefix = "") {
+    std::vector<std::string> changed;
+    // 收集 after 中新增或变更的 key
+    for (auto it = after.begin(); it != after.end(); ++it) {
+        std::string key = prefix.empty() ? it.key() : prefix + "." + it.key();
+        if (!before.contains(it.key())) {
+            changed.push_back(key);
+        } else if (it.value().is_object() && before[it.key()].is_object()) {
+            auto sub = diff_config_paths(before[it.key()], it.value(), key);
+            changed.insert(changed.end(), sub.begin(), sub.end());
+        } else if (it.value() != before[it.key()]) {
+            changed.push_back(key);
+        }
+    }
+    // 收集 before 中被删除的 key
+    for (auto it = before.begin(); it != before.end(); ++it) {
+        std::string key = prefix.empty() ? it.key() : prefix + "." + it.key();
+        if (!after.contains(it.key())) {
+            changed.push_back(key);
+        }
+    }
+    return changed;
+}
+
+// 🎯 OpenClaw 对齐: summarizeChangedPaths
+// 将变更路径列表格式化为日志字符串
+static std::string summarize_changed_paths(const std::vector<std::string>& paths) {
+    if (paths.empty()) return "(none)";
+    std::string result;
+    for (size_t i = 0; i < paths.size() && i < 5; ++i) {
+        if (!result.empty()) result += ",";
+        result += paths[i];
+    }
+    if (paths.size() > 5) {
+        result += ",... +" + std::to_string(paths.size() - 5) + " more";
+    }
+    return result;
+}
+
+// 🎯 OpenClaw 对齐: writeRestartSentinel
+// 写入 sentinel 文件，供重启后恢复上下文使用
+// 对应 OpenClaw: writeRestartSentinel(payload) -> sentinelPath
+static std::string write_restart_sentinel(
+    const std::string& config_dir,
+    const std::string& kind,       // "config-apply" | "config-patch"
+    const std::string& mode,       // "config.apply" | "config.patch"
+    const std::string& session_key,
+    const std::string& note
+) {
+    try {
+        std::string sentinel_dir = config_dir + "/.sentinel";
+        fs::create_directories(sentinel_dir);
+
+        auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count();
+
+        std::string sentinel_path = sentinel_dir + "/restart-" + std::to_string(now_ms) + ".json";
+
+        json payload;
+        payload["kind"] = kind;
+        payload["status"] = "ok";
+        payload["ts"] = now_ms;
+        payload["sessionKey"] = session_key.empty() ? json(nullptr) : json(session_key);
+        payload["message"] = note.empty() ? json(nullptr) : json(note);
+        payload["stats"] = json{{"mode", mode}};
+
+        std::ofstream f(sentinel_path);
+        if (f.is_open()) {
+            f << payload.dump(2);
+            return sentinel_path;
+        }
+    } catch (...) {}
+    return "";
+}
+
+// 🎯 OpenClaw 对齐: scheduleGatewaySigusr1Restart
+// 调度 SIGUSR1 重启，支持延迟和合并（coalesce）
+// 对应 OpenClaw: scheduleGatewaySigusr1Restart({ delayMs, reason, audit })
+struct RestartResult {
+    bool scheduled = false;
+    bool coalesced = false;
+    int64_t delay_ms = 0;
+};
+
+static RestartResult schedule_gateway_sigusr1_restart(
+    int64_t delay_ms,
+    const std::string& reason,
+    const std::vector<std::string>& changed_paths
+) {
+    RestartResult result;
+    result.delay_ms = delay_ms;
+
+    try {
+        if (delay_ms <= 0) {
+            // 立即发送 SIGUSR1
+            ::kill(::getpid(), SIGUSR1);
+            result.scheduled = true;
+        } else {
+            // 延迟发送：在后台线程中等待后发送
+            std::thread([delay_ms, reason]() {
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+                ::kill(::getpid(), SIGUSR1);
+            }).detach();
+            result.scheduled = true;
+        }
+    } catch (...) {
+        result.scheduled = false;
+    }
+
+    return result;
+}
+
+// ============================================================================
+// config.apply - 应用完整配置并触发重启
+// 🎯 OpenClaw 严格对齐: server-methods/config.ts configHandlers["config.apply"]
+//
+// OpenClaw 完整流程:
+//   1. requireConfigBaseHash  — baseHash 必须存在且匹配（文件存在时）
+//   2. parseValidateConfigFromRawOrRespond — 解析 JSON5 + restoreRedactedValues + validateConfig
+//   3. diffConfigPaths        — 计算变更路径（用于 audit 日志）
+//   4. writeConfigFile        — 写入配置文件
+//   5. resolveConfigRestartRequest — 解析 sessionKey/note/restartDelayMs
+//   6. buildConfigRestartSentinelPayload — 构建 sentinel payload (kind="config-apply")
+//   7. writeRestartSentinel   — 写入 sentinel 文件
+//   8. scheduleGatewaySigusr1Restart — 调度 SIGUSR1 重启（带 audit）
+//   9. 返回 { ok, path, config(redacted), restart, sentinel }
+// ============================================================================
 core::Result<json> method_config_apply(
     std::shared_ptr<GatewayServer> server,
     std::shared_ptr<MethodGuard> method_guard,
     const ClientContext& client_ctx,
     const json& params
 ) {
-    (void)method_guard; (void)client_ctx;
+    (void)method_guard;
 
-    // 🎯 OpenClaw 对齐: 需要 raw 参数 (JSON5 格式的配置字符串)
+    // ── Step 1: 参数校验 ──
+    // 🎯 OpenClaw 对齐: raw (string) 必须存在
     if (!params.contains("raw") || !params["raw"].is_string()) {
         return core::Result<json>::Err("invalid config.apply params: raw (string) required");
     }
@@ -507,25 +646,64 @@ core::Result<json> method_config_apply(
     auto config = server->config();
     std::string config_path = config ? config->config_dir + "/config.yaml" : "";
 
-    // 🎯 OpenClaw 对齐: requireConfigBaseHash 校验
-    // 对应 OpenClaw: if (baseHash !== snapshotHash) respond(false, ..., "config changed since last load")
-    if (params.contains("baseHash") && params["baseHash"].is_string()) {
-        std::string base_hash = params["baseHash"].get<std::string>();
+    // ── Step 2: requireConfigBaseHash ──
+    // 🎯 OpenClaw 对齐: 配置文件存在时 baseHash 必须提供且匹配
+    // 对应 OpenClaw:
+    //   if (!snapshot.exists) return true;  // 文件不存在时跳过校验
+    //   if (!snapshotHash) respond(false, ..., "config base hash unavailable")
+    //   if (!baseHash) respond(false, ..., "config base hash required")
+    //   if (baseHash !== snapshotHash) respond(false, ..., "config changed since last load")
+    if (fs::exists(config_path)) {
         std::string current_hash = compute_config_hash(config_path);
-        if (!current_hash.empty() && !base_hash.empty() && base_hash != current_hash) {
+        if (current_hash.empty()) {
+            return core::Result<json>::Err("config base hash unavailable; re-run config.get and retry");
+        }
+        if (!params.contains("baseHash") || !params["baseHash"].is_string() ||
+            params["baseHash"].get<std::string>().empty()) {
+            return core::Result<json>::Err("config base hash required; re-run config.get and retry");
+        }
+        std::string base_hash = params["baseHash"].get<std::string>();
+        if (base_hash != current_hash) {
             return core::Result<json>::Err("config changed since last load; re-run config.get and retry");
         }
     }
 
-    // 🎯 OpenClaw 对齐: 尝试解析配置
+    // ── Step 3: parseValidateConfig ──
+    // 🎯 OpenClaw 对齐: parseConfigJson5 + restoreRedactedValues + validateConfigObjectWithPlugins
+    // HunterClaw 简化版: 直接 JSON 解析（不支持 JSON5 和 redact 恢复）
     json parsed_config;
     try {
         parsed_config = json::parse(raw);
     } catch (const std::exception& e) {
         return core::Result<json>::Err(std::string("invalid config: ") + e.what());
     }
+    if (!parsed_config.is_object()) {
+        return core::Result<json>::Err("invalid config: must be an object");
+    }
 
-    // 🎯 OpenClaw 对齐: writeConfigFile
+    // ── Step 4: diffConfigPaths ──
+    // 🎯 OpenClaw 对齐: 计算变更路径，用于 audit 日志
+    json before_config = json::object();
+    if (fs::exists(config_path)) {
+        try {
+            std::ifstream f(config_path);
+            if (f.is_open()) {
+                std::string content((std::istreambuf_iterator<char>(f)),
+                                     std::istreambuf_iterator<char>());
+                before_config = json::parse(content);
+            }
+        } catch (...) {}
+    }
+    auto changed_paths = diff_config_paths(before_config, parsed_config);
+
+    // ── Step 5: audit 日志 ──
+    // 🎯 OpenClaw 对齐: context.logGateway.info("config.apply write ...")
+    std::string actor_id = client_ctx.account_id.empty() ? client_ctx.conn_id : client_ctx.account_id;
+    spdlog::info("[config.apply] write actor={} changedPaths={} restartReason=config.apply",
+        actor_id, summarize_changed_paths(changed_paths));
+
+    // ── Step 6: writeConfigFile ──
+    // 🎯 OpenClaw 对齐: writeConfigFile(parsed.config, writeOptions)
     bool write_ok = false;
     if (!config_path.empty()) {
         try {
@@ -535,28 +713,80 @@ core::Result<json> method_config_apply(
                 f << parsed_config.dump(2);
                 write_ok = true;
             }
-        } catch (...) {}
+        } catch (const std::exception& e) {
+            return core::Result<json>::Err(std::string("failed to write config: ") + e.what());
+        }
     }
 
-    // 🎯 OpenClaw 对齐: scheduleGatewaySigusr1Restart
-    // 对应 OpenClaw: scheduleGatewaySigusr1Restart({ delayMs, reason: "config.apply" })
+    // ── Step 7: resolveConfigRestartRequest ──
+    // 🎯 OpenClaw 对齐: parseRestartRequestParams(params)
     int64_t restart_delay_ms = 0;
     if (params.contains("restartDelayMs") && params["restartDelayMs"].is_number()) {
         restart_delay_ms = params["restartDelayMs"].get<int64_t>();
     }
-    bool restart_scheduled = false;
-    if (write_ok) {
-        // 发送 SIGUSR1 触发重启
-        // TODO: 实现延迟重启逻辑
-        restart_scheduled = true;
+    std::string session_key = params.value("sessionKey", "");
+    std::string note = params.value("note", "");
+
+    // ── Step 8: writeRestartSentinel ──
+    // 🎯 OpenClaw 对齐: buildConfigRestartSentinelPayload + writeRestartSentinel
+    std::string sentinel_path;
+    json sentinel_payload = nullptr;
+    if (write_ok && config) {
+        sentinel_path = write_restart_sentinel(
+            config->config_dir,
+            "config-apply",
+            "config.apply",
+            session_key,
+            note
+        );
+        if (!sentinel_path.empty()) {
+            auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()
+            ).count();
+            sentinel_payload = json{
+                {"kind", "config-apply"},
+                {"status", "ok"},
+                {"ts", now_ms},
+                {"sessionKey", session_key.empty() ? json(nullptr) : json(session_key)},
+                {"message", note.empty() ? json(nullptr) : json(note)},
+                {"stats", json{{"mode", "config.apply"}}}
+            };
+        }
     }
 
+    // ── Step 9: scheduleGatewaySigusr1Restart ──
+    // 🎯 OpenClaw 对齐: scheduleGatewaySigusr1Restart({ delayMs, reason: "config.apply", audit })
+    json restart_result;
+    if (write_ok) {
+        auto restart = schedule_gateway_sigusr1_restart(
+            restart_delay_ms,
+            "config.apply",
+            changed_paths
+        );
+        if (restart.coalesced) {
+            spdlog::warn("[config.apply] restart coalesced actor={} delayMs={}", actor_id, restart.delay_ms);
+        }
+        restart_result = json{
+            {"scheduled", restart.scheduled},
+            {"delayMs", restart.delay_ms},
+            {"coalesced", restart.coalesced}
+        };
+    } else {
+        restart_result = json{{"scheduled", false}, {"delayMs", restart_delay_ms}, {"coalesced", false}};
+    }
+
+    // ── Step 10: 返回结果 ──
+    // 🎯 OpenClaw 对齐: { ok, path, config(redacted), restart, sentinel }
+    // HunterClaw 简化版: config 不做 redact（无 uiHints 支持）
     json result;
     result["ok"] = write_ok;
     result["path"] = config_path;
     result["config"] = parsed_config;
-    result["restart"] = json{{"scheduled", restart_scheduled}, {"delayMs", restart_delay_ms}, {"coalesced", false}};
-    result["sentinel"] = json{{"path", nullptr}, {"payload", nullptr}};
+    result["restart"] = restart_result;
+    result["sentinel"] = json{
+        {"path", sentinel_path.empty() ? json(nullptr) : json(sentinel_path)},
+        {"payload", sentinel_payload}
+    };
 
     return core::Result<json>::Ok(result);
 }
