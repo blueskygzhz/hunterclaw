@@ -284,6 +284,33 @@ bool is_query_stop_word_token(const std::string& token) {
            STOP_WORDS_JA.count(token) > 0;
 }
 
+// Strip Korean trailing particle from a UTF-32 token
+// (对齐 query-expansion.ts:stripKoreanTrailingParticle)
+std::optional<std::u32string> strip_korean_trailing_particle(const std::u32string& token) {
+    if (token.empty()) return std::nullopt;
+    // Try longest match first (particles are sorted by descending length)
+    for (const auto& particle : KO_TRAILING_PARTICLES) {
+        if (token.size() > particle.size() &&
+            token.compare(token.size() - particle.size(), particle.size(), particle) == 0) {
+            return token.substr(0, token.size() - particle.size());
+        }
+    }
+    return std::nullopt;
+}
+
+// Check if a Korean stem is a useful keyword
+// (对齐 query-expansion.ts:isUsefulKoreanStem)
+bool is_useful_korean_stem(const std::u32string& stem) {
+    if (stem.empty()) return false;
+    // Must be at least 2 characters to be useful
+    if (stem.size() < 2) return false;
+    // Must contain at least one Hangul character
+    for (char32_t c : stem) {
+        if (is_hangul(c)) return true;
+    }
+    return false;
+}
+
 // Check if a UTF-32 codepoint is whitespace or ASCII punctuation
 // (对齐 openclaw: split(/[\s\p{P}]+/u))
 static bool is_segment_separator(char32_t c) {

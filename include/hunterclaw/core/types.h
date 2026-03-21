@@ -471,6 +471,10 @@ struct Config {
     
     std::string workspace_dir;
     std::string config_dir;  // ~/.hunterclaw
+
+    // Raw JSON config data — used by channel plugins to access arbitrary config keys
+    // (e.g. cfg.data["channels"]["telegram"]["token"])
+    nlohmann::json data;
 };
 
 // ============================================================================

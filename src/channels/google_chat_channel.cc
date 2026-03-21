@@ -460,7 +460,10 @@ ChannelPlugin make_google_chat_plugin() {
             if (to.empty()) return core::Result<nlohmann::json>::Err("'to' is required for send action");
             auto result = send_google_chat_message(ctx.cfg, to, message, std::nullopt, ctx.account_id.value_or("default"));
             if (!result.is_ok()) return core::Result<nlohmann::json>::Err(result.error);
-            return core::Result<nlohmann::json>::Ok(nlohmann::json{{"ok", true}, {"messageId", result.value.message_id}});
+            nlohmann::json resp = nlohmann::json::object();
+            resp["ok"] = true;
+            resp["messageId"] = result.get().message_id;
+            return core::Result<nlohmann::json>::Ok(resp);
         }
         return core::Result<nlohmann::json>::Err("Action '" + ctx.action + "' not yet implemented for Google Chat");
     };
@@ -471,8 +474,6 @@ ChannelPlugin make_google_chat_plugin() {
 
 // Static registration — aligned with discord/telegram/slack pattern
 static const ChannelPlugin GOOGLE_CHAT_PLUGIN = make_google_chat_plugin();
-
-} // namespace
 
 static struct GoogleChatPluginRegistrar {
     GoogleChatPluginRegistrar() {

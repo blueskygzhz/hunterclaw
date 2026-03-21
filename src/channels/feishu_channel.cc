@@ -516,8 +516,6 @@ ChannelPlugin make_feishu_plugin() {
 // Static registration — aligned with discord/telegram/slack pattern
 static const ChannelPlugin FEISHU_PLUGIN = make_feishu_plugin();
 
-} // namespace
-
 static struct FeishuPluginRegistrar {
     FeishuPluginRegistrar() {
         ChannelPluginRegistry::instance().register_plugin(FEISHU_PLUGIN, 0);

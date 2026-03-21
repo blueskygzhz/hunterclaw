@@ -676,20 +676,6 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
             spdlog::get("default")->warn("[AgentInstance] Exception warming memory: {}", e.what());
         }
     }
-                        }
-                        
-                        msg.content = entry.snippet;  // MemorySearchResult uses snippet
-                        history.push_back(msg);
-                    }
-                } else {
-                    spdlog::get("default")->warn("[AgentInstance] Failed to load history: {}",
-                                 search_result.error);
-                }
-            }
-        } catch (const std::exception& e) {
-            spdlog::get("default")->warn("[AgentInstance] Exception loading history: {}", e.what());
-        }
-    }
     
     if (history.empty()) {
         spdlog::get("default")->debug("[AgentInstance] Starting fresh conversation (no history)");

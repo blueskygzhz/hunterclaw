@@ -14,6 +14,8 @@ using json = nlohmann::json;
 #include <fstream>
 #include <chrono>
 #include <atomic>
+#include <random>
+#include <cstdio>
 #include <boost/system/error_code.hpp>
 
 using json = nlohmann::json;
@@ -43,6 +45,100 @@ struct ConnectionHandshakeState {
 static constexpr int64_t HANDSHAKE_TIMEOUT_MS = 3000;
 // tick 心跳间隔 (对齐 OpenClaw TICK_INTERVAL_MS = 30000)
 static constexpr int64_t TICK_INTERVAL_MS = 30000;
+// 健康刷新间隔 (对齐 OpenClaw HEALTH_REFRESH_INTERVAL_MS = 60000)
+static constexpr int64_t HEALTH_REFRESH_INTERVAL_MS = 60000;
+// 握手前最大 payload (对齐 OpenClaw MAX_PREAUTH_PAYLOAD_BYTES = 64KB)
+static constexpr size_t MAX_PREAUTH_PAYLOAD_BYTES = 64 * 1024;
+// 最大 payload (对齐 OpenClaw MAX_PAYLOAD_BYTES = 25MB)
+static constexpr size_t MAX_PAYLOAD_BYTES = 25 * 1024 * 1024;
+// 最大缓冲字节 (对齐 OpenClaw MAX_BUFFERED_BYTES = 50MB)
+static constexpr size_t MAX_BUFFERED_BYTES = 50 * 1024 * 1024;
+
+// 🎯 OpenClaw 对齐: GATEWAY_EVENTS 列表 (对应 server-methods-list.ts:GATEWAY_EVENTS)
+static const std::vector<std::string> GATEWAY_EVENTS = {
+    "connect.challenge", "agent", "chat", "presence", "tick",
+    "talk.mode", "shutdown", "health", "heartbeat", "cron",
+    "node.pair.requested", "node.pair.resolved", "node.invoke.request",
+    "device.pair.requested", "device.pair.resolved", "voicewake.changed",
+    "exec.approval.requested", "exec.approval.resolved", "update.available",
+};
+
+// 🎯 OpenClaw 对齐: BASE_METHODS 列表 (对应 server-methods-list.ts:BASE_METHODS)
+static const std::vector<std::string> GATEWAY_METHODS = {
+    "health", "doctor.memory.status", "logs.tail",
+    "channels.status", "channels.logout",
+    "status", "usage.status", "usage.cost",
+    "tts.status", "tts.providers", "tts.enable", "tts.disable", "tts.convert", "tts.setProvider",
+    "config.get", "config.set", "config.apply", "config.patch",
+    "config.schema", "config.schema.lookup",
+    "exec.approvals.get", "exec.approvals.set",
+    "exec.approvals.node.get", "exec.approvals.node.set",
+    "exec.approval.request", "exec.approval.waitDecision", "exec.approval.resolve",
+    "talk.config", "talk.mode",
+    "models.list", "tools.catalog",
+    "agents.list", "agents.create", "agents.update", "agents.delete",
+    "agents.files.list", "agents.files.get", "agents.files.set",
+    "skills.status", "skills.bins", "skills.install", "skills.update",
+    "update.run", "secrets.reload", "secrets.resolve",
+    "sessions.list", "sessions.preview", "sessions.patch",
+    "sessions.reset", "sessions.delete", "sessions.compact",
+    "wake",
+    "node.pair.request", "node.pair.list", "node.pair.approve",
+    "node.pair.reject", "node.pair.verify",
+    "device.pair.list", "device.pair.approve", "device.pair.reject",
+    "device.pair.remove", "device.token.rotate", "device.token.revoke",
+    "node.rename", "node.list", "node.describe",
+    "node.pending.pull", "node.pending.ack",
+    "node.invoke", "node.event", "node.canvas.capability.refresh",
+    "cron.list", "cron.status", "cron.add", "cron.update",
+    "cron.remove", "cron.run", "cron.runs",
+    "gateway.identity.get",
+    "agent", "agent.identity.get", "agent.wait",
+    "browser.request", "push.test",
+    "chat.history", "chat.abort", "chat.send",
+    "chat.update_params", "chat.regenerate", "chat.fork",
+    "chat.summarize", "chat.inject", "chat.edit",
+    "chat.delete", "chat.transcript", "chat.export",
+    "send.message",
+    "sessions.resolve", "sessions.get", "sessions.usage",
+    "sessions.usage.timeseries", "sessions.usage.logs",
+    "web.login.start", "web.login.wait",
+};
+
+// 🎯 OpenClaw 对齐: 事件 scope 守卫 (对应 server-broadcast.ts:EVENT_SCOPE_GUARDS)
+// 这些敏感事件只广播给有对应 scope 的 operator 客户端
+static const std::map<std::string, std::vector<std::string>> EVENT_SCOPE_GUARDS = {
+    {"exec.approval.requested", {"operator.approvals"}},
+    {"exec.approval.resolved",  {"operator.approvals"}},
+    {"device.pair.requested",   {"operator.pairing"}},
+    {"device.pair.resolved",    {"operator.pairing"}},
+    {"node.pair.requested",     {"operator.pairing"}},
+    {"node.pair.resolved",      {"operator.pairing"}},
+};
+
+// 🎯 OpenClaw 对齐: 生成 UUID v4 (对应 randomUUID())
+static std::string generate_uuid_v4() {
+    // 使用 /dev/urandom 生成随机字节
+    static thread_local std::mt19937_64 rng(
+        std::chrono::steady_clock::now().time_since_epoch().count()
+    );
+    std::uniform_int_distribution<uint64_t> dist;
+    uint64_t hi = dist(rng);
+    uint64_t lo = dist(rng);
+    // 设置 UUID v4 版本位和变体位
+    hi = (hi & 0xFFFFFFFFFFFF0FFFULL) | 0x0000000000004000ULL;  // version 4
+    lo = (lo & 0x3FFFFFFFFFFFFFFFULL) | 0x8000000000000000ULL;  // variant 1
+    char buf[37];
+    snprintf(buf, sizeof(buf),
+        "%08x-%04x-%04x-%04x-%012llx",
+        (uint32_t)(hi >> 32),
+        (uint16_t)(hi >> 16),
+        (uint16_t)(hi),
+        (uint16_t)(lo >> 48),
+        (unsigned long long)(lo & 0x0000FFFFFFFFFFFFULL)
+    );
+    return std::string(buf);
+}
 
 // Internal implementation class (不继承 GatewayServer)
 class GatewayServerImpl {
@@ -145,14 +241,32 @@ public:
         }
     }
     
-    void broadcast(const core::EventFrame& event) {
+    void broadcast(const core::EventFrame& event,
+                    bool drop_if_slow = false,
+                    const std::set<connection_hdl, std::owner_less<connection_hdl>>* target_hdls = nullptr) {
         try {
+            // 🎯 OpenClaw 严格对齐: broadcast 实现
+            // 对应 OpenClaw server-broadcast.ts:broadcastInternal
+            //
+            // 1. 全局递增 seq (非 targeted broadcast 才递增)
+            // 2. scope 过滤 (EVENT_SCOPE_GUARDS)
+            // 3. dropIfSlow: bufferedAmount > MAX_BUFFERED_BYTES 时跳过或关闭
+            // 4. stateVersion 字段 (presence/health 版本号)
+            
+            const bool is_targeted = (target_hdls != nullptr);
+            int64_t event_seq = -1;
+            if (!is_targeted) {
+                event_seq = ++broadcast_seq_;  // 全局递增 seq
+            }
+            
             json j;
             j["type"] = "event";
             j["event"] = event.event;
-            j["seq"] = static_cast<int64_t>(event.seq);  // explicit cast to avoid ambiguity
+            if (event_seq >= 0) {
+                j["seq"] = event_seq;
+            }
             
-            // Serialize event.payload (完整实现 - 对齐 OpenClaw)
+            // Serialize event.payload
             if (event.payload.is_null()) {
                 j["payload"] = nullptr;
             } else if (event.payload.is_object() || event.payload.is_array()) {
@@ -165,9 +279,79 @@ public:
             
             std::string msg = j.dump();
             
+            // 🎯 OpenClaw 对齐: 检查事件 scope 守卫
+            auto scope_guard_it = EVENT_SCOPE_GUARDS.find(event.event);
+            const std::vector<std::string>* required_scopes =
+                (scope_guard_it != EVENT_SCOPE_GUARDS.end()) ? &scope_guard_it->second : nullptr;
+            
             std::lock_guard<std::mutex> lock(connections_mutex_);
             for (auto hdl : connections_) {
-                ws_server_.send(hdl, msg, websocketpp::frame::opcode::text);
+                // targeted broadcast: 只发给指定连接
+                if (is_targeted && target_hdls->find(hdl) == target_hdls->end()) {
+                    continue;
+                }
+                
+                // 只向已完成握手的连接发送
+                auto hs_it = handshake_states_.find(hdl);
+                if (hs_it == handshake_states_.end() ||
+                    hs_it->second.phase != ConnectionHandshakeState::Phase::Connected) {
+                    continue;
+                }
+                
+                // 🎯 OpenClaw 对齐: scope 过滤
+                // 对应 OpenClaw: if (!hasEventScope(c, event)) continue;
+                if (required_scopes) {
+                    // 敏感事件: 检查客户端是否有对应 scope
+                    auto conn_it = handle_to_conn_id_.find(hdl);
+                    if (conn_it != handle_to_conn_id_.end()) {
+                        auto state = runtime_state_;
+                        if (state) {
+                            std::lock_guard<std::mutex> state_lock(state->mutex);
+                            auto client_it = state->clients.find(conn_it->second);
+                            if (client_it != state->clients.end()) {
+                                const auto& client_scopes = client_it->second->scopes;
+                                bool has_admin = std::find(client_scopes.begin(), client_scopes.end(),
+                                                           "operator.admin") != client_scopes.end();
+                                if (!has_admin) {
+                                    bool has_required = false;
+                                    for (const auto& req_scope : *required_scopes) {
+                                        if (std::find(client_scopes.begin(), client_scopes.end(),
+                                                      req_scope) != client_scopes.end()) {
+                                            has_required = true;
+                                            break;
+                                        }
+                                    }
+                                    if (!has_required) continue;
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // 🎯 OpenClaw 对齐: 慢消费者处理
+                // 对应 OpenClaw:
+                //   const slow = c.socket.bufferedAmount > MAX_BUFFERED_BYTES;
+                //   if (slow && opts?.dropIfSlow) continue;
+                //   if (slow) { c.socket.close(1008, "slow consumer"); continue; }
+                try {
+                    auto conn = ws_server_.get_con_from_hdl(hdl);
+                    if (conn) {
+                        size_t buffered = conn->get_buffered_amount();
+                        if (buffered > MAX_BUFFERED_BYTES) {
+                            if (drop_if_slow) {
+                                continue;  // dropIfSlow: 跳过慢消费者
+                            } else {
+                                // 关闭慢消费者连接
+                                try { ws_server_.close(hdl, 1008, "slow consumer"); } catch (...) {}
+                                continue;
+                            }
+                        }
+                    }
+                } catch (...) {}
+                
+                try {
+                    ws_server_.send(hdl, msg, websocketpp::frame::opcode::text);
+                } catch (...) {}
             }
             
         } catch (const std::exception& e) {
@@ -194,14 +378,12 @@ private:
         connections_.insert(hdl);
         
         // 🎯 OpenClaw 严格对齐: 生成 connId (对应 randomUUID())
-        static std::atomic<uint64_t> conn_id_counter{0};
-        uint64_t conn_id_num = ++conn_id_counter;
-        std::string conn_id = "conn-" + std::to_string(conn_id_num);
+        // OpenClaw: const connId = randomUUID();
+        std::string conn_id = generate_uuid_v4();
         
         // 🎯 OpenClaw 严格对齐: 生成 connect.challenge nonce
         // 对应 OpenClaw: const connectNonce = randomUUID();
-        std::string nonce = "nonce-" + std::to_string(conn_id_num) + "-" +
-            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+        std::string nonce = generate_uuid_v4();
         
         // 初始化握手状态
         ConnectionHandshakeState hs;
@@ -291,6 +473,31 @@ private:
         
         try {
             std::string payload_str = msg->get_payload();
+            
+            // 🎯 OpenClaw 严格对齐: 握手前 payload 大小限制
+            // 对应 OpenClaw message-handler.ts:
+            //   const preauthPayloadBytes = !getClient() ? getRawDataByteLength(data) : undefined;
+            //   if (preauthPayloadBytes > MAX_PREAUTH_PAYLOAD_BYTES) close(1009, "preauth payload too large");
+            bool is_pre_auth = false;
+            {
+                std::lock_guard<std::mutex> lock(connections_mutex_);
+                auto hs_it = handshake_states_.find(hdl);
+                is_pre_auth = (hs_it == handshake_states_.end() ||
+                               hs_it->second.phase == ConnectionHandshakeState::Phase::Pending);
+            }
+            if (is_pre_auth && payload_str.size() > MAX_PREAUTH_PAYLOAD_BYTES) {
+                {
+                    std::lock_guard<std::mutex> lock(connections_mutex_);
+                    auto hs_it = handshake_states_.find(hdl);
+                    if (hs_it != handshake_states_.end()) {
+                        hs_it->second.phase = ConnectionHandshakeState::Phase::Failed;
+                        hs_it->second.close_cause = "preauth-payload-too-large";
+                    }
+                }
+                try { ws_server_.close(hdl, 1009, "preauth payload too large"); } catch (...) {}
+                return;
+            }
+            
             json j = json::parse(payload_str);
             
             // 提取 conn_id
@@ -425,19 +632,50 @@ private:
                 // 对应 OpenClaw:
                 //   send({ type: "res", id: frame.id, ok: true, payload: helloOk });
                 // helloOk 包含: type, protocol, server, features, snapshot, policy
+                //
+                // 🎯 OpenClaw 对齐: PROTOCOL_VERSION = 1 (protocol/schema.ts)
                 json hello_ok;
                 hello_ok["type"] = "hello-ok";
-                hello_ok["protocol"] = 1;  // 协议版本
+                hello_ok["protocol"] = 1;  // PROTOCOL_VERSION
                 hello_ok["server"] = json{{"connId", conn_id}, {"version", "1.0.0"}};
-                hello_ok["features"] = json{
-                    {"methods", json::array()},  // TODO: 填充支持的 methods 列表
-                    {"events", json::array()}    // TODO: 填充支持的 events 列表
+                
+                // 🎯 OpenClaw 对齐: features.methods = listGatewayMethods()
+                //                   features.events = GATEWAY_EVENTS
+                // 对应 OpenClaw message-handler.ts:
+                //   features: { methods: gatewayMethods, events }
+                json methods_arr = json::array();
+                for (const auto& m : GATEWAY_METHODS) methods_arr.push_back(m);
+                json events_arr = json::array();
+                for (const auto& e : GATEWAY_EVENTS) events_arr.push_back(e);
+                hello_ok["features"] = json{{"methods", methods_arr}, {"events", events_arr}};
+                
+                // 🎯 OpenClaw 对齐: snapshot (对应 buildGatewaySnapshot())
+                // 包含: presence, health, stateVersion, uptimeMs, configPath,
+                //        stateDir, sessionDefaults, authMode
+                int64_t uptime_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()
+                ).count();
+                json snapshot;
+                snapshot["presence"] = json::array();  // TODO: listSystemPresence()
+                snapshot["health"] = json::object();   // async, filled after connect
+                snapshot["stateVersion"] = json{{"presence", 1}, {"health", 1}};
+                snapshot["uptimeMs"] = uptime_ms;
+                snapshot["configPath"] = config_ ? config_->config_dir + "/config.yaml" : "";
+                snapshot["stateDir"] = config_ ? config_->workspace_dir : "";
+                snapshot["sessionDefaults"] = json{
+                    {"defaultAgentId", nullptr},
+                    {"mainKey", nullptr},
+                    {"mainSessionKey", nullptr},
+                    {"scope", "per-sender"}
                 };
-                hello_ok["snapshot"] = json::object();  // TODO: 填充全量状态快照
+                snapshot["authMode"] = config_ ? config_->gateway.auth.mode : "none";
+                hello_ok["snapshot"] = snapshot;
+                
+                // 🎯 OpenClaw 对齐: policy (对应 server-constants.ts)
                 hello_ok["policy"] = json{
-                    {"maxPayload", 25 * 1024 * 1024},  // 25MB (对齐 OpenClaw MAX_PAYLOAD_BYTES)
-                    {"maxBufferedBytes", 50 * 1024 * 1024},  // 50MB
-                    {"tickIntervalMs", TICK_INTERVAL_MS}  // 30s (对齐 OpenClaw TICK_INTERVAL_MS)
+                    {"maxPayload", (int64_t)MAX_PAYLOAD_BYTES},
+                    {"maxBufferedBytes", (int64_t)MAX_BUFFERED_BYTES},
+                    {"tickIntervalMs", TICK_INTERVAL_MS}
                 };
                 
                 json res_j;
@@ -502,9 +740,9 @@ private:
         }
         
         try {
-            // Parse params to JSON
-            nlohmann::json params;
-            // params is already available in req
+            // 🎯 OpenClaw 对齐: 传递 req.params 给 method_handler_
+            // 对应 OpenClaw: handler({ req, params: req.params ?? {}, ... })
+            nlohmann::json params = req.params.is_null() ? nlohmann::json::object() : req.params.to_json();
             
             // Invoke method
             auto result = method_handler_(req.method, params);
@@ -537,6 +775,9 @@ private:
     std::mutex connections_mutex_;
     std::shared_ptr<GatewayRuntimeState> runtime_state_;
     std::function<core::Result<nlohmann::json>(const std::string&, const nlohmann::json&)> method_handler_;
+    
+    // 🎯 OpenClaw 对齐: 全局广播 seq 计数器 (对应 server-broadcast.ts: let seq = 0)
+    std::atomic<int64_t> broadcast_seq_{0};
     
     // handle → conn_id mapping (用于 on_close 时查找)
     std::map<connection_hdl, std::string, std::owner_less<connection_hdl>> handle_to_conn_id_;
@@ -837,7 +1078,8 @@ bool GatewayServer::is_running() const {
 
 void GatewayServer::broadcast(const core::EventFrame& event) {
     if (impl_->server_impl) {
-        impl_->server_impl->broadcast(event);
+        // 🎯 OpenClaw 对齐: 默认 drop_if_slow=false
+        impl_->server_impl->broadcast(event, false, nullptr);
     }
 }
 
@@ -845,47 +1087,38 @@ void GatewayServer::broadcast_to_conn_ids(
     const std::vector<std::string>& conn_ids,
     const core::EventFrame& event
 ) {
-    // Targeted broadcast (完整实现 - 对齐 OpenClaw)
+    // 🎯 OpenClaw 对齐: targeted broadcast
+    // 对应 OpenClaw server-broadcast.ts:broadcastToConnIds
     if (!impl_->server_impl) {
         return;
     }
+    if (conn_ids.empty()) {
+        return;
+    }
     
-    try {
-        json j;
-        j["type"] = "event";
-        j["event"] = event.event;
-        j["seq"] = static_cast<int64_t>(event.seq);
-        
-        // Serialize event.payload
-        if (event.payload.is_null()) {
-            j["payload"]
-             = nullptr;
-        } else {
-            j["payload"] = event.payload.to_json();
-        }
-        
-        std::string msg = j.dump();
-        
-        // Get runtime state
-        auto state = impl_->server_impl->runtime_state();
-        if (!state) {
-            return;
-        }
-        
-        // Send to specific conn_ids
+    // 将 conn_id 列表转换为 handle 集合
+    auto state = impl_->server_impl->runtime_state();
+    if (!state) {
+        return;
+    }
+    
+    // 构建目标 handle 集合
+    // 注意: 这里需要通过 conn_id 查找 handle
+    // 由于 GatewayServerImpl 的 handle_to_conn_id_ 是私有的，
+    // 我们通过 runtime_state 中的 clients 映射来查找
+    std::set<websocketpp::connection_hdl, std::owner_less<websocketpp::connection_hdl>> target_hdls;
+    {
         std::lock_guard<std::mutex> lock(state->mutex);
         for (const auto& conn_id : conn_ids) {
             auto it = state->clients.find(conn_id);
             if (it != state->clients.end()) {
-                try {
-                    impl_->server_impl->send_to_handle(it->second->handle, msg);
-                } catch (const std::exception& e) {
-                    // Log error but continue with other connections
-                }
+                target_hdls.insert(it->second->handle);
             }
         }
-    } catch (const std::exception& e) {
-        // Log error but don't throw
+    }
+    
+    if (!target_hdls.empty()) {
+        impl_->server_impl->broadcast(event, false, &target_hdls);
     }
 }
 

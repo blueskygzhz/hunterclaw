@@ -1,15 +1,22 @@
 #include "hunterclaw/auto_reply/delta_trigger.h"
 #include "hunterclaw/memory/session_memory_provider.h"
+#include "hunterclaw/memory/session_files.h"
 #include "hunterclaw/core/logging.h"
 #include <chrono>
+#include <fstream>
+#include <filesystem>
 
 namespace hunterclaw {
 namespace auto_reply {
 
 // ========================================
 // DeltaTrigger Implementation
-// 严格对齐 OpenClaw 的 delta 触发机制
-// 参考: src/memory/manager-sync-ops.ts::updateSessionDelta
+// Aligns with OpenClaw session delta mechanism
+// Reference: src/memory/manager-sync-ops.ts::updateSessionDelta
+//
+// OpenClaw writes session messages as JSONL entries to session files.
+// There is no separate trigger_delta_update API — session state is tracked
+// via sessionsDirty / sessionDeltas in MemoryIndexManager (manager.ts).
 // ========================================
 
 DeltaTrigger::DeltaTrigger(
@@ -22,34 +29,49 @@ core::Result<void> DeltaTrigger::trigger_on_message_batch(
     const std::vector<Message>& messages
 ) {
     if (!session_provider_ || !session_provider_->config().enabled) {
-        // Session memory 未启用,静默跳过
+        // Session memory not enabled, silently skip
         return core::Result<void>::Ok();
     }
-    
+
     logger_->debug("Delta trigger: processing {} messages for session {}",
                    messages.size(), session_key);
-    
-    // 转换为 SessionMessage 格式
-    std::vector<memory::SessionMessage> session_messages;
-    session_messages.reserve(messages.size());
-    
+
+    // Align with OpenClaw: session messages are appended as JSONL entries
+    // to the session file. MemoryIndexManager picks them up on next sync.
+    const auto& cfg = session_provider_->config();
+    if (!cfg.export_dir.has_value()) {
+        return core::Result<void>::Ok();
+    }
+
+    std::string session_file = cfg.export_dir.value() + "/" + session_key + ".jsonl";
+
+    // Ensure directory exists
+    std::filesystem::create_directories(cfg.export_dir.value());
+
     auto now = std::chrono::system_clock::now();
-    auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+    auto timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         now.time_since_epoch()
     ).count();
-    
-    for (const auto& msg : messages) {
-        memory::SessionMessage session_msg;
-        session_msg.timestamp = timestamp;
-        session_msg.role = msg.role;
-        session_msg.content = msg.content;  // Can be string or json
-        session_msg.agent_id = msg.agent_id.value_or("");
-        
-        session_messages.push_back(session_msg);
+
+    std::ofstream ofs(session_file, std::ios::app);
+    if (!ofs.is_open()) {
+        return core::Result<void>::Err("Failed to open session file: " + session_file);
     }
-    
-    // 触发 delta 更新 (对齐 OpenClaw)
-    return session_provider_->trigger_delta_update(session_key, session_messages);
+
+    for (const auto& msg : messages) {
+        // Serialize each message as a JSONL entry (aligns with OpenClaw session format)
+        nlohmann::json entry;
+        entry["type"] = "message";
+        entry["role"] = msg.role;
+        entry["content"] = msg.content;
+        entry["timestamp"] = timestamp_ms;
+        if (msg.agent_id.has_value()) {
+            entry["agentId"] = msg.agent_id.value();
+        }
+        ofs << entry.dump() << "\n";
+    }
+
+    return core::Result<void>::Ok();
 }
 
 core::Result<void> DeltaTrigger::trigger_on_single_message(
@@ -62,12 +84,12 @@ core::Result<void> DeltaTrigger::trigger_on_single_message(
     msg.role = role;
     msg.content = content;
     msg.agent_id = agent_id;
-    
+
     return trigger_on_message_batch(session_key, {msg});
 }
 
 // ========================================
-// Integration Hook: 在 auto-reply 流程中调用
+// Integration Hook: called in auto-reply flow
 // ========================================
 
 core::Result<void> trigger_delta_after_reply(
@@ -79,22 +101,22 @@ core::Result<void> trigger_delta_after_reply(
     if (!session_provider) {
         return core::Result<void>::Ok();
     }
-    
+
     DeltaTrigger trigger(session_provider);
-    
-    // 对齐 OpenClaw: 批量触发 user + assistant 消息
+
+    // Align with OpenClaw: batch trigger user + assistant messages
     std::vector<Message> messages;
-    
+
     Message user_msg;
     user_msg.role = "user";
     user_msg.content = user_message;
     messages.push_back(user_msg);
-    
+
     Message assistant_msg;
     assistant_msg.role = "assistant";
     assistant_msg.content = assistant_message;
     messages.push_back(assistant_msg);
-    
+
     return trigger.trigger_on_message_batch(session_key, messages);
 }
 

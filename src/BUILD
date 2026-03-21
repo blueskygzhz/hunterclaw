@@ -94,11 +94,38 @@ cc_library(
 # ============================================================================
 # Memory Library - 严格对齐 OpenClaw Memory 实现
 # ============================================================================
+# ============================================================================
+# Logging Library - Subsystem Logger (对齐 OpenClaw logging/subsystem.ts)
+# ============================================================================
+cc_library(
+    name = "hunterclaw_logging",
+    srcs = glob(["logging/*.cc"]),
+    deps = [
+        "//:hunterclaw_headers",
+        "@nlohmann_json//:json",
+    ],
+    copts = [
+        "-std=c++17",
+        "-Wall",
+        "-Wextra",
+        "-I/usr/include/spdlog",
+    ],
+    linkopts = [
+        "-lpthread",
+    ],
+    linkstatic = False,
+    visibility = ["//visibility:public"],
+)
+
+# ============================================================================
+# Memory Library - 严格对齐 OpenClaw Memory 实现
+# ============================================================================
 cc_library(
     name = "hunterclaw_memory",
     srcs = glob(["memory/*.cc"]),
     deps = [
         "//:hunterclaw_headers",
+        ":hunterclaw_logging",  # ✅ 添加 logging 依赖 (create_subsystem_logger)
         "@nlohmann_json//:json",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -499,7 +526,6 @@ cc_library(
         "auto_reply/*.cc",
         # ✅ 移除 observability/*.cc - 已移至独立的 hunterclaw_observability 库
         "infra/*.cc",
-        "logging/*.cc",
         "markdown/*.cc",
         "shared/*.cc",
         "nodes/*.cc",
@@ -509,6 +535,7 @@ cc_library(
     ]),
     deps = [
         ":hunterclaw_core_base",  # ✅ 依赖 core_base (core/*.cc)
+        ":hunterclaw_logging",   # ✅ 添加 logging 依赖 (create_subsystem_logger)
         ":hunterclaw_agents",    # ✅ 添加 agents 依赖
         ":hunterclaw_cron",      # ✅ 添加 cron 依赖
         ":hunterclaw_gateway",   # ✅ 添加 gateway 依赖
