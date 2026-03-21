@@ -433,11 +433,6 @@ ChannelPlugin make_slack_plugin() {
 
     p.outbound = outbound;
 
-    // ── streaming (对齐 OpenClaw DEFAULT_BLOCK_STREAMING_COALESCE) ────────────
-    ChannelStreamingAdapter streaming;
-    streaming.block_streaming_coalesce_defaults = {1500, 1000};
-    p.streaming = streaming;
-
     // ── config adapter (严格对齐 OpenClaw dock.ts slack.config) ──────────────
     auto config = std::make_shared<ChannelConfigAdapter>();
 
@@ -706,6 +701,431 @@ ChannelPlugin make_slack_plugin() {
     };
 
     p.gateway = gateway;
+
+    // ── streaming (对齐 OpenClaw dock.ts slack.streaming) ────────────────────
+    // Aligned with openclaw: streaming = DEFAULT_BLOCK_STREAMING_COALESCE
+    // { blockStreamingCoalesceDefaults: { minChars: 1500, idleMs: 1000 } }
+    ChannelStreamingAdapter streaming;
+    streaming.block_streaming_coalesce_defaults = ChannelStreamingAdapter::CoalesceDefaults{1500, 1000};
+    p.streaming = streaming;
+
+    // ── security (对齐 OpenClaw ChannelSecurityAdapter) ───────────────────────
+    // Aligned with openclaw: security.resolveDmPolicy
+    // Slack DM policy: check cfg.channels.slack.dm.policy / allowFrom
+    ChannelSecurityAdapter security;
+    security.resolve_dm_policy = [](const core::Config& cfg, const std::string& account_id, const nlohmann::json& /*account*/) -> std::optional<ChannelSecurityDmPolicy> {
+        const auto& j = cfg.data;
+        if (!j.contains("channels") || !j["channels"].contains("slack")) return std::nullopt;
+        const auto account = resolve_slack_account(cfg, account_id);
+        std::string policy;
+        if (account.contains("dm") && account["dm"].contains("policy") && account["dm"]["policy"].is_string()) {
+            policy = account["dm"]["policy"].get<std::string>();
+        }
+        if (policy.empty()) return std::nullopt;
+        ChannelSecurityDmPolicy dm_policy;
+        dm_policy.policy = policy;
+        dm_policy.policy_path = "channels.slack.dm.policy";
+        dm_policy.allow_from_path = "channels.slack.dm.allowFrom";
+        dm_policy.approve_hint = "Add the Slack user ID to channels.slack.dm.allowFrom";
+        // Aligned with openclaw: normalizeEntry → lowercase, no prefix stripping for Slack
+        dm_policy.normalize_entry = [](const std::string& raw) -> std::string {
+            std::string s = raw;
+            while (!s.empty() && std::isspace((unsigned char)s.front())) s.erase(s.begin());
+            while (!s.empty() && std::isspace((unsigned char)s.back()))  s.pop_back();
+            std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+            return s;
+        };
+        return dm_policy;
+    };
+    security.collect_warnings = [](const core::Config& /*cfg*/, const std::string& /*account_id*/, const nlohmann::json& /*account*/) -> std::vector<std::string> {
+        return {};
+    };
+    p.security = security;
+
+    // ── heartbeat (对齐 OpenClaw ChannelHeartbeatAdapter) ─────────────────────
+    // Aligned with openclaw: heartbeat.checkReady → validate bot token via auth.test
+    // heartbeat.resolveRecipients → resolve defaultTo or allowFrom
+    ChannelHeartbeatAdapter heartbeat;
+    heartbeat.check_ready = [](const core::Config& cfg, const std::string& account_id) -> core::Result<ChannelHeartbeatAdapter::ReadyResult> {
+        const auto account = resolve_slack_account(cfg, account_id);
+        const std::string bot_token = resolve_slack_bot_token(account, cfg, account_id);
+        if (bot_token.empty()) {
+            return core::Result<ChannelHeartbeatAdapter::ReadyResult>::Ok({false, "no bot token configured"});
+        }
+        httplib::Client cli("https://slack.com");
+        cli.set_connection_timeout(8);
+        cli.set_read_timeout(8);
+        httplib::Headers headers = {{"Authorization", "Bearer " + bot_token}};
+        auto res = cli.Post("/api/auth.test", headers, "", "application/json");
+        if (!res || res->status != 200) {
+            return core::Result<ChannelHeartbeatAdapter::ReadyResult>::Ok({false, "Slack auth.test failed"});
+        }
+        try {
+            auto resp = nlohmann::json::parse(res->body);
+            if (!resp.value("ok", false)) {
+                return core::Result<ChannelHeartbeatAdapter::ReadyResult>::Ok({false, "Slack auth.test error: " + resp.value("error", "unknown")});
+            }
+        } catch (...) {}
+        return core::Result<ChannelHeartbeatAdapter::ReadyResult>::Ok({true, "ok"});
+    };
+    heartbeat.resolve_recipients = [](const core::Config& cfg, const std::string& account_id, bool /*all*/) -> ChannelHeartbeatAdapter::RecipientsResult {
+        const auto account = resolve_slack_account(cfg, account_id);
+        if (account.contains("defaultTo") && account["defaultTo"].is_string()) {
+            std::string v = account["defaultTo"].get<std::string>();
+            while (!v.empty() && std::isspace((unsigned char)v.front())) v.erase(v.begin());
+            while (!v.empty() && std::isspace((unsigned char)v.back()))  v.pop_back();
+            if (!v.empty()) return {{v}, "config.defaultTo"};
+        }
+        return {{}, "none"};
+    };
+    p.heartbeat = heartbeat;
+
+    // ── directory (对齐 OpenClaw ChannelDirectoryAdapter) ─────────────────────
+    // Aligned with openclaw: directory.self → auth.test → bot user info
+    // directory.listPeers → users.list
+    // directory.listGroups → conversations.list (channels/groups)
+    ChannelDirectoryAdapter directory;
+    directory.self = [](const core::Config& cfg, const std::string& account_id) -> core::Result<std::optional<ChannelDirectoryEntry>> {
+        const auto account = resolve_slack_account(cfg, account_id);
+        const std::string bot_token = resolve_slack_bot_token(account, cfg, account_id);
+        if (bot_token.empty()) return core::Result<std::optional<ChannelDirectoryEntry>>::Ok(std::nullopt);
+        httplib::Client cli("https://slack.com");
+        cli.set_connection_timeout(8);
+        cli.set_read_timeout(8);
+        httplib::Headers headers = {{"Authorization", "Bearer " + bot_token}};
+        auto res = cli.Post("/api/auth.test", headers, "", "application/json");
+        if (!res || res->status != 200) return core::Result<std::optional<ChannelDirectoryEntry>>::Ok(std::nullopt);
+        try {
+            auto j = nlohmann::json::parse(res->body);
+            if (!j.value("ok", false)) return core::Result<std::optional<ChannelDirectoryEntry>>::Ok(std::nullopt);
+            ChannelDirectoryEntry entry;
+            entry.kind = "user";
+            entry.id = j.value("user_id", std::string{});
+            entry.name = j.value("user", std::string{});
+            entry.handle = j.value("user", std::string{});
+            return core::Result<std::optional<ChannelDirectoryEntry>>::Ok(entry);
+        } catch (...) {}
+        return core::Result<std::optional<ChannelDirectoryEntry>>::Ok(std::nullopt);
+    };
+    directory.list_groups = [](const core::Config& cfg, const std::string& account_id, const std::string& query, int limit) -> core::Result<std::vector<ChannelDirectoryEntry>> {
+        // Aligned with openclaw: listSlackDirectoryGroupsFromConfig
+        // Returns configured channels from config
+        const auto& j = cfg.data;
+        std::vector<ChannelDirectoryEntry> entries;
+        if (!j.contains("channels") || !j["channels"].contains("slack")) return core::Result<std::vector<ChannelDirectoryEntry>>::Ok(entries);
+        const auto account = resolve_slack_account(cfg, account_id);
+        if (account.contains("channels") && account["channels"].is_object()) {
+            for (auto it = account["channels"].begin(); it != account["channels"].end(); ++it) {
+                ChannelDirectoryEntry entry;
+                entry.kind = "channel";
+                entry.id = it.key();
+                if (it.value().is_object() && it.value().contains("name")) {
+                    entry.name = it.value()["name"].get<std::string>();
+                }
+                if (!query.empty() && entry.name.has_value() && entry.name->find(query) == std::string::npos) continue;
+                entries.push_back(entry);
+                if (limit > 0 && (int)entries.size() >= limit) break;
+            }
+        }
+        return core::Result<std::vector<ChannelDirectoryEntry>>::Ok(entries);
+    };
+    p.directory = directory;
+
+    // ── actions (对齐 OpenClaw: createSlackActions) ───────────────────────────
+    // Aligned with openclaw: slack.actions.ts → createSlackActions("slack")
+    // listActions → listSlackMessageActions(cfg)
+    // extractToolSend → extractSlackToolSend(args)
+    // handleAction → handleSlackMessageAction(...)
+    ChannelMessageActionAdapter actions;
+
+    // Aligned with openclaw: listSlackMessageActions(cfg)
+    // Returns actions based on configured bot token
+    actions.list_actions = [](const core::Config& cfg) -> std::vector<std::string> {
+        const auto& j = cfg.data;
+        bool has_token = false;
+        if (j.contains("channels") && j["channels"].contains("slack")) {
+            const auto& sl = j["channels"]["slack"];
+            if (sl.contains("botToken") && sl["botToken"].is_string() && !sl["botToken"].get<std::string>().empty()) {
+                has_token = true;
+            }
+            if (!has_token && sl.contains("accounts") && sl["accounts"].is_object()) {
+                for (auto it = sl["accounts"].begin(); it != sl["accounts"].end(); ++it) {
+                    if (it.value().contains("botToken") && it.value()["botToken"].is_string() &&
+                        !it.value()["botToken"].get<std::string>().empty()) {
+                        has_token = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!has_token) {
+            const char* env_token = std::getenv("SLACK_BOT_TOKEN");
+            if (env_token && *env_token) has_token = true;
+        }
+        if (!has_token) return {};
+
+        // Aligned with openclaw: listSlackMessageActions
+        // Slack supports: send, react, read, edit, delete, pin, unpin, list-pins,
+        //                 thread-reply, thread-list, search, member-info, channel-info, channel-list
+        auto read_action_gate = [&](const std::string& key, bool default_val = true) -> bool {
+            if (!j.contains("channels") || !j["channels"].contains("slack")) return default_val;
+            const auto& sl = j["channels"]["slack"];
+            if (sl.contains("actions") && sl["actions"].is_object()) {
+                const auto& acts = sl["actions"];
+                if (acts.contains(key) && acts[key].is_boolean()) return acts[key].get<bool>();
+            }
+            return default_val;
+        };
+
+        std::vector<std::string> actions_list;
+        actions_list.push_back("send");
+
+        if (read_action_gate("reactions")) {
+            actions_list.push_back("react");
+            actions_list.push_back("reactions");
+        }
+        if (read_action_gate("messages")) {
+            actions_list.push_back("read");
+            actions_list.push_back("edit");
+            actions_list.push_back("delete");
+        }
+        if (read_action_gate("pins")) {
+            actions_list.push_back("pin");
+            actions_list.push_back("unpin");
+            actions_list.push_back("list-pins");
+        }
+        if (read_action_gate("threads")) {
+            actions_list.push_back("thread-reply");
+            actions_list.push_back("thread-list");
+        }
+        if (read_action_gate("search")) {
+            actions_list.push_back("search");
+        }
+        if (read_action_gate("memberInfo")) {
+            actions_list.push_back("member-info");
+        }
+        if (read_action_gate("channelInfo")) {
+            actions_list.push_back("channel-info");
+            actions_list.push_back("channel-list");
+        }
+        return actions_list;
+    };
+
+    // Aligned with openclaw: extractSlackToolSend(args)
+    // Slack: action === "sendMessage" → { to, accountId, threadId }
+    actions.extract_tool_send = [](const nlohmann::json& args) -> std::optional<nlohmann::json> {
+        if (!args.contains("action") || !args["action"].is_string()) return std::nullopt;
+        const std::string action = args["action"].get<std::string>();
+        if (action == "sendMessage") {
+            if (args.contains("to") && args["to"].is_string()) {
+                nlohmann::json result = {{"to", args["to"].get<std::string>()}};
+                if (args.contains("accountId") && args["accountId"].is_string()) {
+                    result["accountId"] = args["accountId"].get<std::string>();
+                }
+                if (args.contains("threadId") && args["threadId"].is_string()) {
+                    result["threadId"] = args["threadId"].get<std::string>();
+                }
+                return result;
+            }
+        }
+        return std::nullopt;
+    };
+
+    // Aligned with openclaw: handleSlackMessageAction
+    // Dispatch to Slack Web API based on action type
+    actions.handle_action = [](const ChannelMessageActionContext& ctx) -> core::Result<nlohmann::json> {
+        const auto account = resolve_slack_account(ctx.cfg, ctx.account_id.value_or("default"));
+        const std::string bot_token = resolve_slack_bot_token(account, ctx.cfg, ctx.account_id.value_or("default"));
+        if (bot_token.empty()) {
+            return core::Result<nlohmann::json>::Err("no slack bot token configured");
+        }
+
+        if (ctx.action == "send") {
+            // Aligned with openclaw: sendMessage → POST /chat.postMessage
+            const std::string to = ctx.params.value("to", std::string{});
+            const std::string message = ctx.params.value("message", ctx.params.value("content", std::string{}));
+            if (to.empty()) return core::Result<nlohmann::json>::Err("'to' is required for send action");
+            nlohmann::json body = {
+                {"channel", to},
+                {"text", message}
+            };
+            if (ctx.params.contains("threadId") && ctx.params["threadId"].is_string()) {
+                body["thread_ts"] = ctx.params["threadId"].get<std::string>();
+            }
+            if (ctx.params.contains("replyTo") && ctx.params["replyTo"].is_string()) {
+                body["thread_ts"] = ctx.params["replyTo"].get<std::string>();
+            }
+            httplib::Client cli("https://slack.com");
+            cli.set_connection_timeout(10);
+            cli.set_read_timeout(30);
+            httplib::Headers headers = {{"Authorization", "Bearer " + bot_token}};
+            auto res = cli.Post("/api/chat.postMessage", headers, body.dump(), "application/json");
+            if (!res || res->status != 200) {
+                std::string err = res ? ("chat.postMessage failed: " + res->body) : "connection failed";
+                return core::Result<nlohmann::json>::Err(err);
+            }
+            nlohmann::json result_json = {{"ok", true}};
+            try {
+                auto resp = nlohmann::json::parse(res->body);
+                if (!resp.value("ok", false)) {
+                    return core::Result<nlohmann::json>::Err("chat.postMessage error: " + resp.value("error", "unknown"));
+                }
+                if (resp.contains("ts")) result_json["messageId"] = resp["ts"].get<std::string>();
+                if (resp.contains("channel")) result_json["channelId"] = resp["channel"].get<std::string>();
+            } catch (...) {}
+            return core::Result<nlohmann::json>::Ok(result_json);
+        }
+
+        if (ctx.action == "react") {
+            // Aligned with openclaw: react → POST /reactions.add
+            const std::string channel = ctx.params.value("to", ctx.params.value("channelId", std::string{}));
+            const std::string timestamp = ctx.params.value("messageId", ctx.params.value("ts", std::string{}));
+            const std::string emoji = ctx.params.value("emoji", std::string{});
+            if (channel.empty() || timestamp.empty() || emoji.empty()) {
+                return core::Result<nlohmann::json>::Err("channel, messageId (ts), and emoji are required for react action");
+            }
+            // Strip colons from emoji name
+            std::string emoji_name = emoji;
+            if (!emoji_name.empty() && emoji_name.front() == ':') emoji_name = emoji_name.substr(1);
+            if (!emoji_name.empty() && emoji_name.back() == ':') emoji_name.pop_back();
+            nlohmann::json body = {{"channel", channel}, {"timestamp", timestamp}, {"name", emoji_name}};
+            httplib::Client cli("https://slack.com");
+            cli.set_connection_timeout(10);
+            cli.set_read_timeout(10);
+            httplib::Headers headers = {{"Authorization", "Bearer " + bot_token}};
+            auto res = cli.Post("/api/reactions.add", headers, body.dump(), "application/json");
+            if (!res || res->status != 200) {
+                return core::Result<nlohmann::json>::Err(res ? ("reactions.add failed: " + res->body) : "connection failed");
+            }
+            return core::Result<nlohmann::json>::Ok(nlohmann::json{{"ok", true}});
+        }
+
+        if (ctx.action == "delete") {
+            // Aligned with openclaw: delete → POST /chat.delete
+            const std::string channel = ctx.params.value("channelId", ctx.params.value("to", std::string{}));
+            const std::string ts = ctx.params.value("messageId", ctx.params.value("ts", std::string{}));
+            if (channel.empty() || ts.empty()) {
+                return core::Result<nlohmann::json>::Err("channelId and messageId (ts) are required for delete action");
+            }
+            nlohmann::json body = {{"channel", channel}, {"ts", ts}};
+            httplib::Client cli("https://slack.com");
+            cli.set_connection_timeout(10);
+            cli.set_read_timeout(10);
+            httplib::Headers headers = {{"Authorization", "Bearer " + bot_token}};
+            auto res = cli.Post("/api/chat.delete", headers, body.dump(), "application/json");
+            if (!res || res->status != 200) {
+                return core::Result<nlohmann::json>::Err(res ? ("chat.delete failed: " + res->body) : "connection failed");
+            }
+            return core::Result<nlohmann::json>::Ok(nlohmann::json{{"ok", true}});
+        }
+
+        if (ctx.action == "edit") {
+            // Aligned with openclaw: edit → POST /chat.update
+            const std::string channel = ctx.params.value("channelId", ctx.params.value("to", std::string{}));
+            const std::string ts = ctx.params.value("messageId", ctx.params.value("ts", std::string{}));
+            const std::string message = ctx.params.value("message", ctx.params.value("content", std::string{}));
+            if (channel.empty() || ts.empty()) {
+                return core::Result<nlohmann::json>::Err("channelId and messageId (ts) are required for edit action");
+            }
+            nlohmann::json body = {{"channel", channel}, {"ts", ts}, {"text", message}};
+            httplib::Client cli("https://slack.com");
+            cli.set_connection_timeout(10);
+            cli.set_read_timeout(10);
+            httplib::Headers headers = {{"Authorization", "Bearer " + bot_token}};
+            auto res = cli.Post("/api/chat.update", headers, body.dump(), "application/json");
+            if (!res || res->status != 200) {
+                return core::Result<nlohmann::json>::Err(res ? ("chat.update failed: " + res->body) : "connection failed");
+            }
+            return core::Result<nlohmann::json>::Ok(nlohmann::json{{"ok", true}});
+        }
+
+        return core::Result<nlohmann::json>::Err("Action '" + ctx.action + "' not yet implemented for Slack");
+    };
+
+    p.actions = actions;
+
+    // ── reload (对齐 OpenClaw: reload.configPrefixes) ─────────────────────────
+    // Aligned with openclaw: reload = { configPrefixes: ["channels.slack"] }
+    ChannelPlugin::ReloadConfig reload;
+    reload.config_prefixes = {"channels.slack"};
+    p.reload = reload;
+
+    // ── defaults.queue (对齐 OpenClaw: defaults.queue.debounceMs) ─────────────
+    // Aligned with openclaw: defaults = { queue: { debounceMs: 500 } }
+    ChannelPlugin::Defaults defaults;
+    defaults.queue = ChannelPlugin::Defaults::Queue{500};
+    p.defaults = defaults;
+
+    // ── commands (对齐 OpenClaw: dock.ts slack.commands) ─────────────────────
+    // Aligned with openclaw: commands = { skipWhenConfigEmpty: true }
+    // (Slack: skip command processing when config is empty — no guilds/channels configured)
+    ChannelCommandAdapter commands;
+    commands.skip_when_config_empty = true;
+    p.commands = commands;
+
+    // ── setup (对齐 OpenClaw: ChannelSetupAdapter) ────────────────────────────
+    // Aligned with openclaw: setup.applyAccountConfig → patchScopedAccountConfig
+    // setup.resolveAccountId → normalizeAccountId(input.name ?? accountId)
+    ChannelSetupAdapter setup;
+
+    // Aligned with openclaw: resolveAccountId
+    setup.resolve_account_id = [](const core::Config& /*cfg*/, const std::string& account_id, const ChannelSetupInput& input) -> std::string {
+        if (input.name.has_value() && !input.name->empty()) {
+            std::string name = *input.name;
+            while (!name.empty() && std::isspace((unsigned char)name.front())) name.erase(name.begin());
+            while (!name.empty() && std::isspace((unsigned char)name.back()))  name.pop_back();
+            std::transform(name.begin(), name.end(), name.begin(), ::tolower);
+            if (!name.empty()) return name;
+        }
+        return normalize_account_id(account_id);
+    };
+
+    // Aligned with openclaw: applyAccountConfig → patch channels.slack.accounts[accountId].botToken + appToken
+    setup.apply_account_config = [](const core::Config& cfg, const std::string& account_id, const ChannelSetupInput& input) -> core::Config {
+        core::Config next = cfg;
+        const std::string norm_id = normalize_account_id(account_id);
+        auto& j = next.data;
+        if (!j.contains("channels")) j["channels"] = nlohmann::json::object();
+        if (!j["channels"].contains("slack")) j["channels"]["slack"] = nlohmann::json::object();
+        auto& sl = j["channels"]["slack"];
+
+        // Aligned with openclaw: patchScopedAccountConfig
+        if (norm_id == "default") {
+            sl["enabled"] = true;
+            if (input.bot_token.has_value() && !input.bot_token->empty()) sl["botToken"] = *input.bot_token;
+            if (input.app_token.has_value() && !input.app_token->empty()) sl["appToken"] = *input.app_token;
+        } else {
+            if (!sl.contains("accounts")) sl["accounts"] = nlohmann::json::object();
+            if (!sl["accounts"].contains(norm_id)) sl["accounts"][norm_id] = nlohmann::json::object();
+            auto& acc = sl["accounts"][norm_id];
+            acc["enabled"] = true;
+            if (input.bot_token.has_value() && !input.bot_token->empty()) acc["botToken"] = *input.bot_token;
+            if (input.app_token.has_value() && !input.app_token->empty()) acc["appToken"] = *input.app_token;
+        }
+        return next;
+    };
+
+    // Aligned with openclaw: validateInput → botToken must be non-empty
+    setup.validate_input = [](const core::Config& /*cfg*/, const std::string& /*account_id*/, const ChannelSetupInput& input) -> std::optional<std::string> {
+        if (!input.bot_token.has_value() || input.bot_token->empty()) {
+            return std::string("Slack bot token (xoxb-...) is required");
+        }
+        return std::nullopt;
+    };
+
+    p.setup = setup;
+
+    // ── status (对齐 OpenClaw: ChannelStatusAdapter) ──────────────────────────
+    // Aligned with openclaw: status.collectStatusIssues
+    // Slack: no specific status issues defined in openclaw (no status-issues/slack.ts)
+    // → return empty issues list (placeholder for future implementation)
+    ChannelStatusAdapter status;
+    status.collect_status_issues = [](const std::vector<ChannelAccountSnapshot>& /*accounts*/) -> std::vector<nlohmann::json> {
+        // Aligned with openclaw: Slack has no collectStatusIssues defined
+        // (no status-issues/slack.ts in openclaw)
+        return {};
+    };
+    p.status = status;
 
     return p;
 }

@@ -175,6 +175,50 @@ public:
         const std::string& account_id
     ) const;
 
+    // ── Status Issues (对齐 OpenClaw: getStatusIssues) ────────────────────────
+    // Aligned with openclaw: getStatusIssues() → collect issues from all plugins
+    std::vector<nlohmann::json> get_status_issues() const;
+
+    // ── Reload Config (对齐 OpenClaw: reloadConfig) ───────────────────────────
+    // Aligned with openclaw: reloadConfig(changedPrefixes) → restart affected channels
+    void reload_config(const std::vector<std::string>& changed_prefixes);
+
+    // ── Execute Action (对齐 OpenClaw: executeChannelAction) ──────────────────
+    // Aligned with openclaw: executeChannelAction(channel, action, params, cfg, accountId, ...)
+    core::Result<nlohmann::json> execute_action(
+        const ChannelId& channel_id,
+        const std::string& action,
+        const nlohmann::json& params,
+        const core::Config& cfg,
+        const std::optional<std::string>& account_id = std::nullopt,
+        const std::optional<std::string>& requester_sender_id = std::nullopt,
+        const std::optional<nlohmann::json>& tool_context = std::nullopt,
+        const std::optional<std::vector<std::string>>& media_local_roots = std::nullopt
+    );
+
+    // ── List Actions (对齐 OpenClaw: listChannelActions) ──────────────────────
+    // Aligned with openclaw: listChannelActions(channel, cfg)
+    std::vector<std::string> list_actions(
+        const ChannelId& channel_id,
+        const core::Config& cfg
+    ) const;
+
+    // ── Setup Account (对齐 OpenClaw: setupChannelAccount) ────────────────────
+    // Aligned with openclaw: setupChannelAccount(channel, accountId, input, cfg)
+    core::Result<core::Config> setup_account(
+        const ChannelId& channel_id,
+        const std::string& account_id,
+        const ChannelSetupInput& input,
+        const core::Config& cfg
+    );
+
+    // ── Extract Tool Send (对齐 OpenClaw: extractChannelToolSend) ─────────────
+    // Aligned with openclaw: extractChannelToolSend(channel, args)
+    std::optional<nlohmann::json> extract_tool_send(
+        const ChannelId& channel_id,
+        const nlohmann::json& args
+    ) const;
+
 private:
     std::unique_ptr<ChannelManagerImpl> impl_;
 };

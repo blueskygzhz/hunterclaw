@@ -513,6 +513,205 @@ public:
         log()->info("MessageDispatcher wired into ChannelManager");
     }
 
+    // ========== Status Issues (对齐 OpenClaw: getStatusIssues) ==========
+
+    // Aligned with openclaw: getStatusIssues()
+    // Iterates all plugins, collects account snapshots, calls status.collectStatusIssues
+    std::vector<nlohmann::json> get_status_issues() const {
+        std::vector<nlohmann::json> all_issues;
+        const auto& all_plugins = ChannelPluginRegistry::instance().list_plugins();
+        for (const auto& plugin : all_plugins) {
+            if (!plugin.status.has_value()) continue;
+            if (!plugin.status->collect_status_issues) continue;
+
+            // Collect account snapshots for this plugin
+            std::vector<ChannelAccountSnapshot> snapshots;
+            {
+                std::lock_guard<std::mutex> lock(stores_mutex_);
+                auto store_it = channel_stores_.find(std::string(plugin.id));
+                if (store_it != channel_stores_.end()) {
+                    for (const auto& [acc_id, snap] : store_it->second.runtimes) {
+                        snapshots.push_back(snap);
+                    }
+                }
+            }
+            if (snapshots.empty()) {
+                // Provide a default snapshot for unconfigured/unstarted accounts
+                ChannelAccountSnapshot default_snap;
+                default_snap.account_id = "default";
+                default_snap.enabled = false;
+                default_snap.configured = false;
+                snapshots.push_back(default_snap);
+            }
+
+            // Aligned with openclaw: plugin.status.collectStatusIssues(snapshots)
+            auto issues = plugin.status->collect_status_issues(snapshots);
+            all_issues.insert(all_issues.end(), issues.begin(), issues.end());
+        }
+        return all_issues;
+    }
+
+    // ========== Reload Config (对齐 OpenClaw: reloadConfig) ==========
+
+    // Aligned with openclaw: reloadConfig(changedPrefixes)
+    // For each plugin with reload.configPrefixes, check if any changed prefix matches.
+    // If so, restart the affected accounts.
+    void reload_config(const std::vector<std::string>& changed_prefixes) {
+        const auto& all_plugins = ChannelPluginRegistry::instance().list_plugins();
+        for (const auto& plugin : all_plugins) {
+            if (!plugin.reload.has_value()) continue;
+            const auto& prefixes = plugin.reload->config_prefixes;
+            // Aligned with openclaw: check if any changedPrefix starts with a configPrefix
+            bool needs_reload = false;
+            for (const auto& changed : changed_prefixes) {
+                for (const auto& prefix : prefixes) {
+                    if (changed.rfind(prefix, 0) == 0 || prefix.rfind(changed, 0) == 0) {
+                        needs_reload = true;
+                        break;
+                    }
+                }
+                if (needs_reload) break;
+            }
+            if (!needs_reload) continue;
+
+            // Aligned with openclaw: noop_prefixes — skip if only noop prefixes changed
+            if (!plugin.reload->noop_prefixes.empty()) {
+                bool only_noop = true;
+                for (const auto& changed : changed_prefixes) {
+                    bool is_noop = false;
+                    for (const auto& noop : plugin.reload->noop_prefixes) {
+                        if (changed.rfind(noop, 0) == 0) { is_noop = true; break; }
+                    }
+                    if (!is_noop) { only_noop = false; break; }
+                }
+                if (only_noop) continue;
+            }
+
+            // Restart all accounts for this plugin
+            std::vector<std::string> account_ids;
+            {
+                std::lock_guard<std::mutex> lock(stores_mutex_);
+                auto store_it = channel_stores_.find(std::string(plugin.id));
+                if (store_it != channel_stores_.end()) {
+                    for (const auto& [acc_id, _] : store_it->second.runtimes) {
+                        account_ids.push_back(acc_id);
+                    }
+                }
+            }
+            if (account_ids.empty()) account_ids.push_back("default");
+
+            for (const auto& acc_id : account_ids) {
+                log()->info("Reloading config for channel {} account {} (changed: {})",
+                            plugin.id, acc_id, changed_prefixes.empty() ? "" : changed_prefixes[0]);
+                stop_channel(plugin.id, acc_id);
+                StartChannelOptions opts;
+                opts.force = true;
+                start_channel(plugin.id, acc_id, opts);
+            }
+        }
+    }
+
+    // ========== Execute Action (对齐 OpenClaw: executeChannelAction) ==========
+
+    // Aligned with openclaw: executeChannelAction(channel, action, params, cfg, accountId, ...)
+    core::Result<nlohmann::json> execute_action(
+        const ChannelId& channel_id,
+        const std::string& action,
+        const nlohmann::json& params,
+        const core::Config& cfg,
+        const std::optional<std::string>& account_id,
+        const std::optional<std::string>& requester_sender_id,
+        const std::optional<nlohmann::json>& tool_context,
+        const std::optional<std::vector<std::string>>& media_local_roots
+    ) {
+        auto plugin_opt = ChannelPluginRegistry::instance().get_plugin(channel_id);
+        if (!plugin_opt.has_value()) {
+            return core::Result<nlohmann::json>::Err("Channel plugin not found: " + std::string(channel_id));
+        }
+        const auto& plugin = *plugin_opt;
+        if (!plugin.actions.has_value() || !plugin.actions->handle_action) {
+            return core::Result<nlohmann::json>::Err("Channel " + std::string(channel_id) + " does not support actions");
+        }
+
+        ChannelMessageActionContext ctx;
+        ctx.channel = std::string(channel_id);
+        ctx.action = action;
+        ctx.cfg = cfg;
+        ctx.params = params;
+        ctx.account_id = account_id;
+        ctx.requester_sender_id = requester_sender_id;
+        ctx.tool_context = tool_context;
+        ctx.media_local_roots = media_local_roots;
+
+        return plugin.actions->handle_action(ctx);
+    }
+
+    // ========== List Actions (对齐 OpenClaw: listChannelActions) ==========
+
+    // Aligned with openclaw: listChannelActions(channel, cfg)
+    std::vector<std::string> list_actions(const ChannelId& channel_id, const core::Config& cfg) const {
+        auto plugin_opt = ChannelPluginRegistry::instance().get_plugin(channel_id);
+        if (!plugin_opt.has_value()) return {};
+        const auto& plugin = *plugin_opt;
+        if (!plugin.actions.has_value() || !plugin.actions->list_actions) return {};
+        return plugin.actions->list_actions(cfg);
+    }
+
+    // ========== Setup Account (对齐 OpenClaw: setupChannelAccount) ==========
+
+    // Aligned with openclaw: setupChannelAccount(channel, accountId, input, cfg)
+    // Returns updated config after applying account setup
+    core::Result<core::Config> setup_account(
+        const ChannelId& channel_id,
+        const std::string& account_id,
+        const ChannelSetupInput& input,
+        const core::Config& cfg
+    ) {
+        auto plugin_opt = ChannelPluginRegistry::instance().get_plugin(channel_id);
+        if (!plugin_opt.has_value()) {
+            return core::Result<core::Config>::Err("Channel plugin not found: " + std::string(channel_id));
+        }
+        const auto& plugin = *plugin_opt;
+        if (!plugin.setup.has_value()) {
+            return core::Result<core::Config>::Err("Channel " + std::string(channel_id) + " does not support setup");
+        }
+
+        // Aligned with openclaw: validateInput first
+        if (plugin.setup->validate_input) {
+            auto err = plugin.setup->validate_input(cfg, account_id, input);
+            if (err.has_value()) {
+                return core::Result<core::Config>::Err(*err);
+            }
+        }
+
+        // Aligned with openclaw: resolveAccountId
+        std::string resolved_account_id = account_id;
+        if (plugin.setup->resolve_account_id) {
+            resolved_account_id = plugin.setup->resolve_account_id(cfg, account_id, input);
+        }
+
+        // Aligned with openclaw: applyAccountConfig
+        if (!plugin.setup->apply_account_config) {
+            return core::Result<core::Config>::Err("Channel " + std::string(channel_id) + " setup.applyAccountConfig not implemented");
+        }
+        core::Config updated_cfg = plugin.setup->apply_account_config(cfg, resolved_account_id, input);
+        return core::Result<core::Config>::Ok(updated_cfg);
+    }
+
+    // ========== Extract Tool Send (对齐 OpenClaw: extractChannelToolSend) ==========
+
+    // Aligned with openclaw: extractChannelToolSend(channel, args)
+    std::optional<nlohmann::json> extract_tool_send(
+        const ChannelId& channel_id,
+        const nlohmann::json& args
+    ) const {
+        auto plugin_opt = ChannelPluginRegistry::instance().get_plugin(channel_id);
+        if (!plugin_opt.has_value()) return std::nullopt;
+        const auto& plugin = *plugin_opt;
+        if (!plugin.actions.has_value() || !plugin.actions->extract_tool_send) return std::nullopt;
+        return plugin.actions->extract_tool_send(args);
+    }
+
     // ========== Channel Activity (对齐 OpenClaw: channel-activity.ts) ==========
 
     void record_channel_activity(
@@ -899,6 +1098,63 @@ ChannelActivityEntry ChannelManager::get_channel_activity(
     const std::string& account_id
 ) const {
     return impl_->get_channel_activity(channel_id, account_id);
+}
+
+// ── Status Issues (对齐 OpenClaw: getStatusIssues) ────────────────────────
+// Aligned with openclaw: getStatusIssues() → collect issues from all plugins
+std::vector<nlohmann::json> ChannelManager::get_status_issues() const {
+    return impl_->get_status_issues();
+}
+
+// ── Reload Config (对齐 OpenClaw: reloadConfig) ───────────────────────────
+// Aligned with openclaw: reloadConfig(changedPrefixes) → restart affected channels
+void ChannelManager::reload_config(const std::vector<std::string>& changed_prefixes) {
+    impl_->reload_config(changed_prefixes);
+}
+
+// ── Execute Action (对齐 OpenClaw: executeChannelAction) ──────────────────
+// Aligned with openclaw: executeChannelAction(channel, action, params, ...)
+core::Result<nlohmann::json> ChannelManager::execute_action(
+    const ChannelId& channel_id,
+    const std::string& action,
+    const nlohmann::json& params,
+    const core::Config& cfg,
+    const std::optional<std::string>& account_id,
+    const std::optional<std::string>& requester_sender_id,
+    const std::optional<nlohmann::json>& tool_context,
+    const std::optional<std::vector<std::string>>& media_local_roots
+) {
+    return impl_->execute_action(channel_id, action, params, cfg, account_id,
+                                  requester_sender_id, tool_context, media_local_roots);
+}
+
+// ── List Actions (对齐 OpenClaw: listChannelActions) ──────────────────────
+// Aligned with openclaw: listChannelActions(channel, cfg)
+std::vector<std::string> ChannelManager::list_actions(
+    const ChannelId& channel_id,
+    const core::Config& cfg
+) const {
+    return impl_->list_actions(channel_id, cfg);
+}
+
+// ── Setup Account (对齐 OpenClaw: setupChannelAccount) ────────────────────
+// Aligned with openclaw: setupChannelAccount(channel, accountId, input, cfg)
+core::Result<core::Config> ChannelManager::setup_account(
+    const ChannelId& channel_id,
+    const std::string& account_id,
+    const ChannelSetupInput& input,
+    const core::Config& cfg
+) {
+    return impl_->setup_account(channel_id, account_id, input, cfg);
+}
+
+// ── Extract Tool Send (对齐 OpenClaw: extractChannelToolSend) ─────────────
+// Aligned with openclaw: extractChannelToolSend(channel, args)
+std::optional<nlohmann::json> ChannelManager::extract_tool_send(
+    const ChannelId& channel_id,
+    const nlohmann::json& args
+) const {
+    return impl_->extract_tool_send(channel_id, args);
 }
 
 // ============================================================================

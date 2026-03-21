@@ -425,36 +425,6 @@ ChannelPlugin make_discord_plugin() {
 
     p.outbound = outbound;
 
-    // ── streaming (对齐 OpenClaw DEFAULT_BLOCK_STREAMING_COALESCE) ────────────
-    ChannelStreamingAdapter streaming;
-    streaming.block_streaming_coalesce_defaults = {1500, 1000};
-    p.streaming = streaming;
-
-    // ── elevated (严格对齐 OpenClaw dock.ts discord.elevated) ────────────────
-    // Aligned with openclaw: allowFromFallback → cfg.channels?.discord?.allowFrom ?? cfg.channels?.discord?.dm?.allowFrom
-    ChannelElevatedAdapter elevated;
-    elevated.allow_from_fallback = [](const core::Config& cfg, const std::string& /*account_id*/) -> std::optional<std::vector<std::string>> {
-        const auto& j = cfg.data;
-        if (!j.contains("channels") || !j["channels"].contains("discord")) return std::nullopt;
-        const auto& dc = j["channels"]["discord"];
-
-        auto extract_allow_from = [](const nlohmann::json& obj) -> std::optional<std::vector<std::string>> {
-            if (!obj.contains("allowFrom") || !obj["allowFrom"].is_array()) return std::nullopt;
-            std::vector<std::string> result;
-            for (const auto& e : obj["allowFrom"]) {
-                if (e.is_string()) result.push_back(e.get<std::string>());
-                else if (e.is_number()) result.push_back(std::to_string(e.get<int64_t>()));
-            }
-            return result.empty() ? std::nullopt : std::optional<std::vector<std::string>>(result);
-        };
-
-        auto v = extract_allow_from(dc);
-        if (v.has_value()) return v;
-        if (dc.contains("dm")) return extract_allow_from(dc["dm"]);
-        return std::nullopt;
-    };
-    p.elevated = elevated;
-
     // ── config adapter (严格对齐 OpenClaw dock.ts discord.config) ────────────
     auto config = std::make_shared<ChannelConfigAdapter>();
 
@@ -731,6 +701,549 @@ ChannelPlugin make_discord_plugin() {
     };
 
     p.gateway = gateway;
+
+    // ── elevated (对齐 OpenClaw dock.ts discord.elevated) ────────────────────
+    // Aligned with openclaw: elevated.allowFromFallback
+    // → cfg.channels?.discord?.allowFrom ?? cfg.channels?.discord?.dm?.allowFrom
+    ChannelElevatedAdapter elevated;
+    elevated.allow_from_fallback = [](const core::Config& cfg, const std::string& /*account_id*/) -> std::optional<std::vector<std::string>> {
+        const auto& j = cfg.data;
+        if (!j.contains("channels") || !j["channels"].contains("discord")) return std::nullopt;
+        const auto& dc = j["channels"]["discord"];
+        auto extract = [](const nlohmann::json& src) -> std::optional<std::vector<std::string>> {
+            if (!src.contains("allowFrom") || !src["allowFrom"].is_array()) return std::nullopt;
+            std::vector<std::string> result;
+            for (const auto& e : src["allowFrom"]) {
+                if (e.is_string()) result.push_back(e.get<std::string>());
+                else if (e.is_number()) result.push_back(std::to_string(e.get<int64_t>()));
+            }
+            return result.empty() ? std::nullopt : std::optional<std::vector<std::string>>(result);
+        };
+        auto v = extract(dc);
+        if (v.has_value()) return v;
+        if (dc.contains("dm")) return extract(dc["dm"]);
+        return std::nullopt;
+    };
+    p.elevated = elevated;
+
+    // ── streaming (对齐 OpenClaw dock.ts discord.streaming) ──────────────────
+    // Aligned with openclaw: streaming = DEFAULT_BLOCK_STREAMING_COALESCE
+    // { blockStreamingCoalesceDefaults: { minChars: 1500, idleMs: 1000 } }
+    ChannelStreamingAdapter streaming;
+    streaming.block_streaming_coalesce_defaults = ChannelStreamingAdapter::CoalesceDefaults{1500, 1000};
+    p.streaming = streaming;
+
+    // ── security (对齐 OpenClaw ChannelSecurityAdapter) ───────────────────────
+    // Aligned with openclaw: security.resolveDmPolicy
+    // Discord DM policy: check cfg.channels.discord.dm.policy / allowFrom
+    ChannelSecurityAdapter security;
+    security.resolve_dm_policy = [](const core::Config& cfg, const std::string& account_id, const nlohmann::json& /*account*/) -> std::optional<ChannelSecurityDmPolicy> {
+        const auto& j = cfg.data;
+        if (!j.contains("channels") || !j["channels"].contains("discord")) return std::nullopt;
+        const auto& dc = j["channels"]["discord"];
+        // Aligned with openclaw: resolveDmPolicy → check dm.policy
+        std::string policy;
+        if (dc.contains("dm") && dc["dm"].contains("policy") && dc["dm"]["policy"].is_string()) {
+            policy = dc["dm"]["policy"].get<std::string>();
+        }
+        if (policy.empty()) return std::nullopt;
+        ChannelSecurityDmPolicy dm_policy;
+        dm_policy.policy = policy;
+        dm_policy.policy_path = "channels.discord.dm.policy";
+        dm_policy.allow_from_path = "channels.discord.dm.allowFrom";
+        dm_policy.approve_hint = "Add the Discord user ID to channels.discord.dm.allowFrom";
+        // Aligned with openclaw: normalizeEntry → strip discord:/user:/pk: prefix, lowercase
+        dm_policy.normalize_entry = [](const std::string& raw) -> std::string {
+            std::string s = raw;
+            std::string s_lower = s;
+            std::transform(s_lower.begin(), s_lower.end(), s_lower.begin(), ::tolower);
+            for (const auto& prefix : std::vector<std::string>{"discord:", "user:", "pk:"}) {
+                if (s_lower.rfind(prefix, 0) == 0) { s = s.substr(prefix.size()); break; }
+            }
+            while (!s.empty() && std::isspace((unsigned char)s.front())) s.erase(s.begin());
+            while (!s.empty() && std::isspace((unsigned char)s.back()))  s.pop_back();
+            std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+            return s;
+        };
+        return dm_policy;
+    };
+    security.collect_warnings = [](const core::Config& /*cfg*/, const std::string& /*account_id*/, const nlohmann::json& /*account*/) -> std::vector<std::string> {
+        return {};
+    };
+    p.security = security;
+
+    // ── heartbeat (对齐 OpenClaw ChannelHeartbeatAdapter) ─────────────────────
+    // Aligned with openclaw: heartbeat.checkReady → validate token via /users/@me
+    // heartbeat.resolveRecipients → resolve defaultTo or allowFrom
+    ChannelHeartbeatAdapter heartbeat;
+    heartbeat.check_ready = [](const core::Config& cfg, const std::string& account_id) -> core::Result<ChannelHeartbeatAdapter::ReadyResult> {
+        const auto account = resolve_discord_account(cfg, account_id);
+        const std::string token = resolve_discord_token(account, cfg, account_id);
+        if (token.empty()) {
+            return core::Result<ChannelHeartbeatAdapter::ReadyResult>::Ok({false, "no bot token configured"});
+        }
+        httplib::Client cli("https://discord.com");
+        cli.set_connection_timeout(8);
+        cli.set_read_timeout(8);
+        httplib::Headers headers = {{"Authorization", "Bot " + token}};
+        auto res = cli.Get("/api/v10/users/@me", headers);
+        if (!res || res->status != 200) {
+            std::string err = res ? ("Discord /users/@me failed: HTTP " + std::to_string(res->status)) : "connection failed";
+            return core::Result<ChannelHeartbeatAdapter::ReadyResult>::Ok({false, err});
+        }
+        return core::Result<ChannelHeartbeatAdapter::ReadyResult>::Ok({true, "ok"});
+    };
+    heartbeat.resolve_recipients = [](const core::Config& cfg, const std::string& account_id, bool /*all*/) -> ChannelHeartbeatAdapter::RecipientsResult {
+        const auto account = resolve_discord_account(cfg, account_id);
+        // Aligned with openclaw: resolveRecipients → defaultTo or first allowFrom entry
+        if (account.contains("defaultTo") && account["defaultTo"].is_string()) {
+            std::string v = account["defaultTo"].get<std::string>();
+            while (!v.empty() && std::isspace((unsigned char)v.front())) v.erase(v.begin());
+            while (!v.empty() && std::isspace((unsigned char)v.back()))  v.pop_back();
+            if (!v.empty()) return {{v}, "config.defaultTo"};
+        }
+        return {{}, "none"};
+    };
+    p.heartbeat = heartbeat;
+
+    // ── directory (对齐 OpenClaw ChannelDirectoryAdapter) ─────────────────────
+    // Aligned with openclaw: directory.listPeers → GET /guilds/{guildId}/members
+    // directory.listGroups → list configured guilds/channels
+    ChannelDirectoryAdapter directory;
+    directory.self = [](const core::Config& cfg, const std::string& account_id) -> core::Result<std::optional<ChannelDirectoryEntry>> {
+        const auto account = resolve_discord_account(cfg, account_id);
+        const std::string token = resolve_discord_token(account, cfg, account_id);
+        if (token.empty()) return core::Result<std::optional<ChannelDirectoryEntry>>::Ok(std::nullopt);
+        httplib::Client cli("https://discord.com");
+        cli.set_connection_timeout(8);
+        cli.set_read_timeout(8);
+        httplib::Headers headers = {{"Authorization", "Bot " + token}};
+        auto res = cli.Get("/api/v10/users/@me", headers);
+        if (!res || res->status != 200) return core::Result<std::optional<ChannelDirectoryEntry>>::Ok(std::nullopt);
+        try {
+            auto j = nlohmann::json::parse(res->body);
+            ChannelDirectoryEntry entry;
+            entry.kind = "user";
+            entry.id = j.value("id", std::string{});
+            entry.name = j.value("username", std::string{});
+            entry.handle = j.value("username", std::string{});
+            return core::Result<std::optional<ChannelDirectoryEntry>>::Ok(entry);
+        } catch (...) {}
+        return core::Result<std::optional<ChannelDirectoryEntry>>::Ok(std::nullopt);
+    };
+    directory.list_groups = [](const core::Config& cfg, const std::string& account_id, const std::string& /*query*/, int /*limit*/) -> core::Result<std::vector<ChannelDirectoryEntry>> {
+        // Aligned with openclaw: listDiscordDirectoryGroupsFromConfig
+        // Returns configured guilds/channels from config
+        const auto& j = cfg.data;
+        std::vector<ChannelDirectoryEntry> entries;
+        if (!j.contains("channels") || !j["channels"].contains("discord")) return core::Result<std::vector<ChannelDirectoryEntry>>::Ok(entries);
+        const auto account = resolve_discord_account(cfg, account_id);
+        if (account.contains("guilds") && account["guilds"].is_object()) {
+            for (auto it = account["guilds"].begin(); it != account["guilds"].end(); ++it) {
+                ChannelDirectoryEntry entry;
+                entry.kind = "group";
+                entry.id = it.key();
+                if (it.value().is_object() && it.value().contains("name")) {
+                    entry.name = it.value()["name"].get<std::string>();
+                }
+                entries.push_back(entry);
+            }
+        }
+        return core::Result<std::vector<ChannelDirectoryEntry>>::Ok(entries);
+    };
+    p.directory = directory;
+
+    // ── reload (对齐 OpenClaw: reload.configPrefixes) ─────────────────────────
+    // Aligned with openclaw: reload = { configPrefixes: ["channels.discord"] }
+    ChannelPlugin::ReloadConfig reload;
+    reload.config_prefixes = {"channels.discord"};
+    p.reload = reload;
+
+    // ── defaults.queue (对齐 OpenClaw: defaults.queue.debounceMs) ─────────────
+    // Aligned with openclaw: defaults = { queue: { debounceMs: 500 } }
+    ChannelPlugin::Defaults defaults;
+    defaults.queue = ChannelPlugin::Defaults::Queue{500};
+    p.defaults = defaults;
+
+    // ── commands (对齐 OpenClaw: commands adapter) ────────────────────────────
+    // Aligned with openclaw: commands = { enforceOwnerForCommands: false }
+    ChannelCommandAdapter commands;
+    commands.enforce_owner_for_commands = false;
+    p.commands = commands;
+
+    // ── setup (对齐 OpenClaw: ChannelSetupAdapter) ────────────────────────────
+    // Aligned with openclaw: setup.applyAccountConfig → patchScopedAccountConfig
+    // setup.resolveAccountId → normalizeAccountId(input.name ?? accountId)
+    ChannelSetupAdapter setup;
+
+    // Aligned with openclaw: resolveAccountId
+    setup.resolve_account_id = [](const core::Config& /*cfg*/, const std::string& account_id, const ChannelSetupInput& input) -> std::string {
+        if (input.name.has_value() && !input.name->empty()) {
+            std::string name = *input.name;
+            while (!name.empty() && std::isspace((unsigned char)name.front())) name.erase(name.begin());
+            while (!name.empty() && std::isspace((unsigned char)name.back()))  name.pop_back();
+            std::transform(name.begin(), name.end(), name.begin(), ::tolower);
+            if (!name.empty()) return name;
+        }
+        return normalize_account_id(account_id);
+    };
+
+    // Aligned with openclaw: applyAccountConfig → patch channels.discord.accounts[accountId].token
+    setup.apply_account_config = [](const core::Config& cfg, const std::string& account_id, const ChannelSetupInput& input) -> core::Config {
+        core::Config next = cfg;
+        const std::string norm_id = normalize_account_id(account_id);
+        auto& j = next.data;
+        if (!j.contains("channels")) j["channels"] = nlohmann::json::object();
+        if (!j["channels"].contains("discord")) j["channels"]["discord"] = nlohmann::json::object();
+        auto& dc = j["channels"]["discord"];
+
+        // Aligned with openclaw: patchScopedAccountConfig
+        // For default account: patch top-level; for named accounts: patch accounts[id]
+        if (norm_id == "default") {
+            dc["enabled"] = true;
+            if (input.token.has_value() && !input.token->empty()) dc["token"] = *input.token;
+        } else {
+            if (!dc.contains("accounts")) dc["accounts"] = nlohmann::json::object();
+            if (!dc["accounts"].contains(norm_id)) dc["accounts"][norm_id] = nlohmann::json::object();
+            auto& acc = dc["accounts"][norm_id];
+            acc["enabled"] = true;
+            if (input.token.has_value() && !input.token->empty()) acc["token"] = *input.token;
+        }
+        return next;
+    };
+
+    // Aligned with openclaw: validateInput → token must be non-empty
+    setup.validate_input = [](const core::Config& /*cfg*/, const std::string& /*account_id*/, const ChannelSetupInput& input) -> std::optional<std::string> {
+        if (!input.token.has_value() || input.token->empty()) {
+            return std::string("Discord bot token is required");
+        }
+        return std::nullopt;
+    };
+
+    p.setup = setup;
+
+    // ── status (对齐 OpenClaw: ChannelStatusAdapter + collectDiscordStatusIssues) ──
+    // Aligned with openclaw: status.collectStatusIssues → collectDiscordStatusIssues
+    ChannelStatusAdapter status;
+
+    // Aligned with openclaw: collectDiscordStatusIssues (status-issues/discord.ts)
+    // Checks: application.intents.messageContent === "disabled" → intent issue
+    //         audit.unresolvedChannels > 0 → config issue
+    //         audit.channels[].ok === false → permissions issue
+    status.collect_status_issues = [](const std::vector<ChannelAccountSnapshot>& accounts) -> std::vector<nlohmann::json> {
+        std::vector<nlohmann::json> issues;
+        for (const auto& entry : accounts) {
+            // Aligned with openclaw: resolveEnabledConfiguredAccountId
+            if (!entry.enabled.value_or(true) || !entry.configured.value_or(true)) continue;
+            const std::string account_id = entry.account_id;
+            if (account_id.empty()) continue;
+
+            // Check application.intents.messageContent
+            if (entry.application.has_value() && entry.application->is_object()) {
+                const auto& app = *entry.application;
+                if (app.contains("intents") && app["intents"].is_object()) {
+                    const auto& intents = app["intents"];
+                    if (intents.contains("messageContent") && intents["messageContent"].is_string()) {
+                        const std::string mc = intents["messageContent"].get<std::string>();
+                        if (mc == "disabled") {
+                            issues.push_back({
+                                {"channel", "discord"},
+                                {"accountId", account_id},
+                                {"kind", "intent"},
+                                {"message", "Message Content Intent is disabled. Bot may not see normal channel messages."},
+                                {"fix", "Enable Message Content Intent in Discord Dev Portal → Bot → Privileged Gateway Intents, or require mention-only operation."}
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Check audit.unresolvedChannels and audit.channels
+            if (entry.audit.has_value() && entry.audit->is_object()) {
+                const auto& audit = *entry.audit;
+                if (audit.contains("unresolvedChannels") && audit["unresolvedChannels"].is_number()) {
+                    int unresolved = audit["unresolvedChannels"].get<int>();
+                    if (unresolved > 0) {
+                        issues.push_back({
+                            {"channel", "discord"},
+                            {"accountId", account_id},
+                            {"kind", "config"},
+                            {"message", "Some configured guild channels are not numeric IDs (unresolvedChannels=" + std::to_string(unresolved) + "). Permission audit can only check numeric channel IDs."},
+                            {"fix", "Use numeric channel IDs as keys in channels.discord.guilds.*.channels (then rerun channels status --probe)."}
+                        });
+                    }
+                }
+                if (audit.contains("channels") && audit["channels"].is_array()) {
+                    for (const auto& ch : audit["channels"]) {
+                        if (!ch.is_object()) continue;
+                        if (ch.contains("ok") && ch["ok"].is_boolean() && ch["ok"].get<bool>()) continue;
+                        const std::string channel_id = ch.value("channelId", std::string{});
+                        if (channel_id.empty()) continue;
+                        std::string missing_str;
+                        if (ch.contains("missing") && ch["missing"].is_array()) {
+                            for (const auto& m : ch["missing"]) {
+                                if (!missing_str.empty()) missing_str += ", ";
+                                missing_str += m.is_string() ? m.get<std::string>() : "";
+                            }
+                        }
+                        std::string err_str = ch.contains("error") && ch["error"].is_string() ? ch["error"].get<std::string>() : "";
+                        std::string msg = "Channel " + channel_id + " permission check failed.";
+                        if (!missing_str.empty()) msg += " missing " + missing_str;
+                        if (!err_str.empty()) msg += ": " + err_str;
+                        issues.push_back({
+                            {"channel", "discord"},
+                            {"accountId", account_id},
+                            {"kind", "permissions"},
+                            {"message", msg},
+                            {"fix", "Ensure the bot role can view + send in this channel (and that channel overrides don't deny it)."}
+                        });
+                    }
+                }
+            }
+        }
+        return issues;
+    };
+
+    p.status = status;
+
+    // ── actions (对齐 OpenClaw: discordMessageActions) ────────────────────────
+    // Aligned with openclaw: actions.listActions → discordMessageActions.listActions
+    // actions.extractToolSend → discordMessageActions.extractToolSend
+    // actions.handleAction → discordMessageActions.handleAction
+    ChannelMessageActionAdapter actions;
+
+    // Aligned with openclaw: listActions → union of all accounts' action gates
+    // HunterClaw: simplified — return base set of actions when token is configured
+    actions.list_actions = [](const core::Config& cfg) -> std::vector<std::string> {
+        // Check if any discord account is configured
+        const auto& j = cfg.data;
+        bool has_token = false;
+        if (j.contains("channels") && j["channels"].contains("discord")) {
+            const auto& dc = j["channels"]["discord"];
+            if (dc.contains("token") && dc["token"].is_string() && !dc["token"].get<std::string>().empty()) {
+                has_token = true;
+            }
+            if (!has_token && dc.contains("accounts") && dc["accounts"].is_object()) {
+                for (auto it = dc["accounts"].begin(); it != dc["accounts"].end(); ++it) {
+                    if (it.value().contains("token") && it.value()["token"].is_string() &&
+                        !it.value()["token"].get<std::string>().empty()) {
+                        has_token = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!has_token) {
+            const char* env_token = std::getenv("DISCORD_BOT_TOKEN");
+            if (env_token && *env_token) has_token = true;
+        }
+        if (!has_token) return {};
+
+        // Aligned with openclaw: discordMessageActions.listActions gate logic
+        // Read per-account action config from cfg.channels.discord.actions
+        auto read_action_gate = [&](const std::string& key, bool default_val = true) -> bool {
+            if (!j.contains("channels") || !j["channels"].contains("discord")) return default_val;
+            const auto& dc = j["channels"]["discord"];
+            if (dc.contains("actions") && dc["actions"].is_object()) {
+                const auto& acts = dc["actions"];
+                if (acts.contains(key) && acts[key].is_boolean()) return acts[key].get<bool>();
+            }
+            return default_val;
+        };
+
+        std::vector<std::string> actions_list;
+        actions_list.push_back("send");
+
+        // Aligned with openclaw: polls (default: true)
+        if (read_action_gate("polls")) {
+            actions_list.push_back("poll");
+        }
+        // Aligned with openclaw: reactions (default: true)
+        if (read_action_gate("reactions")) {
+            actions_list.push_back("react");
+            actions_list.push_back("reactions");
+            actions_list.push_back("emoji-list");
+        }
+        // Aligned with openclaw: messages (default: true)
+        if (read_action_gate("messages")) {
+            actions_list.push_back("read");
+            actions_list.push_back("edit");
+            actions_list.push_back("delete");
+        }
+        // Aligned with openclaw: pins (default: true)
+        if (read_action_gate("pins")) {
+            actions_list.push_back("pin");
+            actions_list.push_back("unpin");
+            actions_list.push_back("list-pins");
+        }
+        // Aligned with openclaw: permissions (default: true)
+        if (read_action_gate("permissions")) {
+            actions_list.push_back("permissions");
+        }
+        // Aligned with openclaw: threads (default: true)
+        if (read_action_gate("threads")) {
+            actions_list.push_back("thread-create");
+            actions_list.push_back("thread-list");
+            actions_list.push_back("thread-reply");
+        }
+        // Aligned with openclaw: search (default: true)
+        if (read_action_gate("search")) {
+            actions_list.push_back("search");
+        }
+        // Aligned with openclaw: stickers (default: true)
+        if (read_action_gate("stickers")) {
+            actions_list.push_back("sticker");
+        }
+        // Aligned with openclaw: memberInfo (default: true)
+        if (read_action_gate("memberInfo")) {
+            actions_list.push_back("member-info");
+        }
+        // Aligned with openclaw: roleInfo (default: true)
+        if (read_action_gate("roleInfo")) {
+            actions_list.push_back("role-info");
+        }
+        // Aligned with openclaw: emojiUploads (default: true)
+        if (read_action_gate("emojiUploads")) {
+            actions_list.push_back("emoji-upload");
+        }
+        // Aligned with openclaw: stickerUploads (default: true)
+        if (read_action_gate("stickerUploads")) {
+            actions_list.push_back("sticker-upload");
+        }
+        // Aligned with openclaw: roles (default: false)
+        if (read_action_gate("roles", false)) {
+            actions_list.push_back("role-add");
+            actions_list.push_back("role-remove");
+        }
+        // Aligned with openclaw: channelInfo (default: true)
+        if (read_action_gate("channelInfo")) {
+            actions_list.push_back("channel-info");
+            actions_list.push_back("channel-list");
+        }
+        // Aligned with openclaw: channels (default: true)
+        if (read_action_gate("channels")) {
+            actions_list.push_back("channel-create");
+            actions_list.push_back("channel-edit");
+            actions_list.push_back("channel-delete");
+            actions_list.push_back("channel-move");
+            actions_list.push_back("category-create");
+            actions_list.push_back("category-edit");
+            actions_list.push_back("category-delete");
+        }
+        // Aligned with openclaw: voiceStatus (default: true)
+        if (read_action_gate("voiceStatus")) {
+            actions_list.push_back("voice-status");
+        }
+        // Aligned with openclaw: events (default: true)
+        if (read_action_gate("events")) {
+            actions_list.push_back("event-list");
+            actions_list.push_back("event-create");
+        }
+        // Aligned with openclaw: moderation (default: false)
+        if (read_action_gate("moderation", false)) {
+            actions_list.push_back("timeout");
+            actions_list.push_back("kick");
+            actions_list.push_back("ban");
+        }
+        // Aligned with openclaw: presence (default: false)
+        if (read_action_gate("presence", false)) {
+            actions_list.push_back("set-presence");
+        }
+        return actions_list;
+    };
+
+    // Aligned with openclaw: supportsButtons → Discord supports buttons (inline components)
+    actions.supports_buttons = [](const core::Config& /*cfg*/) -> bool {
+        return true;
+    };
+
+    // Aligned with openclaw: supportsCards → Discord does not support cards
+    actions.supports_cards = [](const core::Config& /*cfg*/) -> bool {
+        return false;
+    };
+
+    // Aligned with openclaw: extractToolSend → discordMessageActions.extractToolSend
+    actions.extract_tool_send = [](const nlohmann::json& args) -> std::optional<nlohmann::json> {
+        // Aligned with openclaw: action === "sendMessage" → { to }
+        //                        action === "threadReply" → { to: "channel:{channelId}" }
+        if (!args.contains("action") || !args["action"].is_string()) return std::nullopt;
+        const std::string action = args["action"].get<std::string>();
+        if (action == "sendMessage") {
+            if (args.contains("to") && args["to"].is_string()) {
+                return nlohmann::json{{"to", args["to"].get<std::string>()}};
+            }
+            return std::nullopt;
+        }
+        if (action == "threadReply") {
+            if (args.contains("channelId") && args["channelId"].is_string()) {
+                std::string channel_id = args["channelId"].get<std::string>();
+                while (!channel_id.empty() && std::isspace((unsigned char)channel_id.front())) channel_id.erase(channel_id.begin());
+                while (!channel_id.empty() && std::isspace((unsigned char)channel_id.back()))  channel_id.pop_back();
+                if (!channel_id.empty()) {
+                    return nlohmann::json{{"to", "channel:" + channel_id}};
+                }
+            }
+            return std::nullopt;
+        }
+        return std::nullopt;
+    };
+
+    // Aligned with openclaw: handleAction → handleDiscordMessageAction
+    // HunterClaw: dispatch to Discord REST API based on action type
+    actions.handle_action = [](const ChannelMessageActionContext& ctx) -> core::Result<nlohmann::json> {
+        const std::string token = resolve_discord_token(
+            resolve_discord_account(ctx.cfg, ctx.account_id.value_or("default")),
+            ctx.cfg, ctx.account_id.value_or("default")
+        );
+        if (token.empty()) {
+            return core::Result<nlohmann::json>::Err("no discord bot token configured");
+        }
+
+        if (ctx.action == "send") {
+            // Aligned with openclaw: sendMessage action
+            const std::string to = ctx.params.value("to", std::string{});
+            const std::string message = ctx.params.value("message", std::string{});
+            if (to.empty()) return core::Result<nlohmann::json>::Err("'to' is required for send action");
+            std::optional<std::string> reply_to;
+            if (ctx.params.contains("replyTo") && ctx.params["replyTo"].is_string()) {
+                reply_to = ctx.params["replyTo"].get<std::string>();
+            }
+            auto result = send_discord_message(token, to, message, reply_to, std::nullopt, false);
+            if (result.is_err()) return core::Result<nlohmann::json>::Err(result.error);
+            return core::Result<nlohmann::json>::Ok(nlohmann::json{
+                {"ok", true},
+                {"messageId", result.value->message_id},
+                {"channelId", result.value->channel_id.value_or("")}
+            });
+        }
+
+        if (ctx.action == "poll") {
+            // Aligned with openclaw: poll action → sendPollDiscord
+            const std::string to = ctx.params.value("to", std::string{});
+            if (to.empty()) return core::Result<nlohmann::json>::Err("'to' is required for poll action");
+            ChannelPollContext poll_ctx;
+            poll_ctx.cfg = ctx.cfg;
+            poll_ctx.to = to;
+            poll_ctx.account_id = ctx.account_id;
+            poll_ctx.poll.question = ctx.params.value("pollQuestion", std::string{});
+            if (ctx.params.contains("pollOption") && ctx.params["pollOption"].is_array()) {
+                for (const auto& opt : ctx.params["pollOption"]) {
+                    if (opt.is_string()) poll_ctx.poll.options.push_back(opt.get<std::string>());
+                }
+            }
+            auto result = send_discord_poll(token, to, poll_ctx);
+            if (result.is_err()) return core::Result<nlohmann::json>::Err(result.error);
+            return core::Result<nlohmann::json>::Ok(nlohmann::json{
+                {"ok", true},
+                {"messageId", result.value->message_id}
+            });
+        }
+
+        // Aligned with openclaw: other actions → forward to Discord REST API
+        return core::Result<nlohmann::json>::Err("Action '" + ctx.action + "' not yet implemented for Discord");
+    };
+
+    p.actions = actions;
 
     return p;
 }
