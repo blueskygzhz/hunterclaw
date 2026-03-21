@@ -1,7 +1,7 @@
 #include <optional>
 #include "hunterclaw/memory/embedding_provider.h"
 #include "hunterclaw/memory/chunking.h"
-#include "hunterclaw/memory/http_client.h"
+#include "hunterclaw/infra/http_client.h"
 #include <nlohmann/json.hpp>
 #include <sstream>
 #include <cmath>
@@ -176,15 +176,24 @@ core::Result<std::vector<float>> OpenAIEmbeddingProvider::embed_query(const std:
     
     // 发送HTTP请求
     std::string url = config_.base_url + "/embeddings";
-    auto result = HttpClient::post_json(url, request_body, headers, 30000);
-    
-    if (!result.is_ok()) {
-        return core::Result<std::vector<float>>::Err("OpenAI API error: " + result.error);
+    infra::HttpRequestOptions opts;
+    opts.headers = headers;
+    opts.body = request_body.dump();
+    opts.timeout_ms = 30000;
+    auto http_result = infra::HttpClient::create()->post(url, opts);
+    if (!http_result.is_ok()) {
+        return core::Result<std::vector<float>>::Err("OpenAI API error: " + http_result.error);
     }
+    if (!http_result.get().ok) {
+        return core::Result<std::vector<float>>::Err(
+            "OpenAI API error " + std::to_string(http_result.get().status_code) + ": " + http_result.get().body
+        );
+    }
+    auto result = nlohmann::json::parse(http_result.get().body);
     
     // 解析响应 (对齐 OpenClaw格式)
     try {
-        const nlohmann::json& resp_json = result.get();
+        const nlohmann::json& resp_json = result;
         
         
         if (!resp_json.contains("data") || !resp_json["data"].is_array()) {
@@ -233,17 +242,26 @@ core::Result<std::vector<std::vector<float>>> OpenAIEmbeddingProvider::embed_bat
     
     // 发送HTTP请求
     std::string url = config_.base_url + "/embeddings";
-    auto result = HttpClient::post_json(url, request_body, headers, 60000);
-    
-    if (!result.is_ok()) {
+    infra::HttpRequestOptions opts;
+    opts.headers = headers;
+    opts.body = request_body.dump();
+    opts.timeout_ms = 60000;
+    auto http_result = infra::HttpClient::create()->post(url, opts);
+    if (!http_result.is_ok()) {
         return core::Result<std::vector<std::vector<float>>>::Err(
-            "OpenAI batch API error: " + result.error
+            "OpenAI batch API error: " + http_result.error
         );
     }
+    if (!http_result.get().ok) {
+        return core::Result<std::vector<std::vector<float>>>::Err(
+            "OpenAI batch API error " + std::to_string(http_result.get().status_code) + ": " + http_result.get().body
+        );
+    }
+    auto result = nlohmann::json::parse(http_result.get().body);
     
     // 解析响应
     try {
-        const auto& resp_json = result.get();
+        const auto& resp_json = result;
         
         if (!resp_json.contains("data") || !resp_json["data"].is_array()) {
             return core::Result<std::vector<std::vector<float>>>::Err(
@@ -307,15 +325,24 @@ core::Result<std::vector<float>> OllamaEmbeddingProvider::embed_query(const std:
     
     // Ollama API endpoint
     std::string url = config_.base_url + "/api/embeddings";
-    auto result = HttpClient::post_json(url, request_body, headers, 30000);
-    
-    if (!result.is_ok()) {
-        return core::Result<std::vector<float>>::Err("Ollama API error: " + result.error);
+    infra::HttpRequestOptions opts;
+    opts.headers = headers;
+    opts.body = request_body.dump();
+    opts.timeout_ms = 30000;
+    auto http_result = infra::HttpClient::create()->post(url, opts);
+    if (!http_result.is_ok()) {
+        return core::Result<std::vector<float>>::Err("Ollama API error: " + http_result.error);
     }
+    if (!http_result.get().ok) {
+        return core::Result<std::vector<float>>::Err(
+            "Ollama API error " + std::to_string(http_result.get().status_code) + ": " + http_result.get().body
+        );
+    }
+    auto result = nlohmann::json::parse(http_result.get().body);
     
     // 解析响应: {"embedding": [0.1, 0.2, ...]}
     try {
-        const auto& resp_json = result.get();
+        const auto& resp_json = result;
         
         if (!resp_json.contains("embedding")) {
             return core::Result<std::vector<float>>::Err("No embedding field in Ollama response");
@@ -419,17 +446,26 @@ core::Result<std::vector<float>> GeminiEmbeddingProvider::embed_query(const std:
         url += "?key=" + config_.api_key;
     }
     
-    auto result = HttpClient::post_json(url, request_body, headers, 30000);
-    
-    if (!result.is_ok()) {
+    infra::HttpRequestOptions opts;
+    opts.headers = headers;
+    opts.body = request_body.dump();
+    opts.timeout_ms = 30000;
+    auto http_result = infra::HttpClient::create()->post(url, opts);
+    if (!http_result.is_ok()) {
         return core::Result<std::vector<float>>::Err(
-            "gemini embeddings failed: " + result.error
+            "gemini embeddings failed: " + http_result.error
         );
     }
+    if (!http_result.get().ok) {
+        return core::Result<std::vector<float>>::Err(
+            "gemini embeddings failed " + std::to_string(http_result.get().status_code) + ": " + http_result.get().body
+        );
+    }
+    auto result = nlohmann::json::parse(http_result.get().body);
     
     // 解析响应: {"embedding": {"values": [0.1, 0.2, ...]}}
     try {
-        const auto& resp_json = result.get();
+        const auto& resp_json = result;
         
         if (!resp_json.contains("embedding") || !resp_json["embedding"].contains("values")) {
             return core::Result<std::vector<float>>::Err(
@@ -507,17 +543,26 @@ core::Result<std::vector<std::vector<float>>> GeminiEmbeddingProvider::embed_bat
         url += "?key=" + config_.api_key;
     }
     
-    auto result = HttpClient::post_json(url, request_body, headers, 30000);
-    
-    if (!result.is_ok()) {
+    infra::HttpRequestOptions opts;
+    opts.headers = headers;
+    opts.body = request_body.dump();
+    opts.timeout_ms = 30000;
+    auto http_result = infra::HttpClient::create()->post(url, opts);
+    if (!http_result.is_ok()) {
         return core::Result<std::vector<std::vector<float>>>::Err(
-            "gemini batch embeddings failed: " + result.error
+            "gemini batch embeddings failed: " + http_result.error
         );
     }
+    if (!http_result.get().ok) {
+        return core::Result<std::vector<std::vector<float>>>::Err(
+            "gemini batch embeddings failed " + std::to_string(http_result.get().status_code) + ": " + http_result.get().body
+        );
+    }
+    auto result = nlohmann::json::parse(http_result.get().body);
     
     // 解析响应: {"embeddings": [{"values": [...]}, ...]}
     try {
-        const auto& resp_json = result.get();
+        const auto& resp_json = result;
         
         if (!resp_json.contains("embeddings") || !resp_json["embeddings"].is_array()) {
             return core::Result<std::vector<std::vector<float>>>::Err(
@@ -585,15 +630,24 @@ core::Result<std::vector<float>> VoyageEmbeddingProvider::embed_query(const std:
     
     // Voyage API endpoint
     std::string url = config_.base_url + "/embeddings";
-    auto result = HttpClient::post_json(url, request_body, headers, 30000);
-    
-    if (!result.is_ok()) {
-        return core::Result<std::vector<float>>::Err("Voyage API error: " + result.error);
+    infra::HttpRequestOptions opts;
+    opts.headers = headers;
+    opts.body = request_body.dump();
+    opts.timeout_ms = 30000;
+    auto http_result = infra::HttpClient::create()->post(url, opts);
+    if (!http_result.is_ok()) {
+        return core::Result<std::vector<float>>::Err("Voyage API error: " + http_result.error);
     }
+    if (!http_result.get().ok) {
+        return core::Result<std::vector<float>>::Err(
+            "Voyage API error " + std::to_string(http_result.get().status_code) + ": " + http_result.get().body
+        );
+    }
+    auto result = nlohmann::json::parse(http_result.get().body);
     
     // 解析响应: {data: [{embedding: [0.1, 0.2, ...]}]}
     try {
-        const auto& resp_json = result.get();
+        const auto& resp_json = result;
         
         if (!resp_json.contains("data") || !resp_json["data"].is_array()) {
             return core::Result<std::vector<float>>::Err("Invalid Voyage response format");
@@ -658,15 +712,24 @@ core::Result<std::vector<float>> MistralEmbeddingProvider::embed_query(const std
     
     // Mistral API endpoint
     std::string url = config_.base_url + "/embeddings";
-    auto result = HttpClient::post_json(url, request_body, headers, 30000);
-    
-    if (!result.is_ok()) {
-        return core::Result<std::vector<float>>::Err("Mistral API error: " + result.error);
+    infra::HttpRequestOptions opts;
+    opts.headers = headers;
+    opts.body = request_body.dump();
+    opts.timeout_ms = 30000;
+    auto http_result = infra::HttpClient::create()->post(url, opts);
+    if (!http_result.is_ok()) {
+        return core::Result<std::vector<float>>::Err("Mistral API error: " + http_result.error);
     }
+    if (!http_result.get().ok) {
+        return core::Result<std::vector<float>>::Err(
+            "Mistral API error " + std::to_string(http_result.get().status_code) + ": " + http_result.get().body
+        );
+    }
+    auto result = nlohmann::json::parse(http_result.get().body);
     
     // 解析响应 (OpenAI格式兼容): {data: [{embedding: [...]}]}
     try {
-        const auto& resp_json = result.get();
+        const auto& resp_json = result;
         
         if (!resp_json.contains("data") || !resp_json["data"].is_array()) {
             return core::Result<std::vector<float>>::Err("Invalid Mistral response format");
@@ -707,17 +770,26 @@ core::Result<std::vector<std::vector<float>>> MistralEmbeddingProvider::embed_ba
     headers["Content-Type"] = "application/json";
     
     std::string url = config_.base_url + "/embeddings";
-    auto result = HttpClient::post_json(url, request_body, headers, 60000);
-    
-    if (!result.is_ok()) {
+    infra::HttpRequestOptions opts;
+    opts.headers = headers;
+    opts.body = request_body.dump();
+    opts.timeout_ms = 60000;
+    auto http_result = infra::HttpClient::create()->post(url, opts);
+    if (!http_result.is_ok()) {
         return core::Result<std::vector<std::vector<float>>>::Err(
-            "Mistral batch API error: " + result.error
+            "Mistral batch API error: " + http_result.error
         );
     }
+    if (!http_result.get().ok) {
+        return core::Result<std::vector<std::vector<float>>>::Err(
+            "Mistral batch API error " + std::to_string(http_result.get().status_code) + ": " + http_result.get().body
+        );
+    }
+    auto result = nlohmann::json::parse(http_result.get().body);
     
     // 解析响应
     try {
-        const auto& resp_json = result.get();
+        const auto& resp_json = result;
         
         if (!resp_json.contains("data") || !resp_json["data"].is_array()) {
             return core::Result<std::vector<std::vector<float>>>::Err(
@@ -995,18 +1067,27 @@ public:
             headers["Authorization"] = "Bearer " + config_.api_key;
         }
 
-        // Make HTTP request using post_json
+        // Make HTTP request using infra::HttpClient
         std::string url = config_.base_url + "/embeddings";
-        auto http_result = HttpClient::post_json(url, request_body, headers);
+        infra::HttpRequestOptions req_opts;
+        req_opts.headers = headers;
+        req_opts.body = request_body.dump();
+        req_opts.timeout_ms = 30000;
+        auto http_result = infra::HttpClient::create()->post(url, req_opts);
         if (!http_result.is_ok()) {
             return core::Result<std::vector<std::vector<float>>>::Err(
                 "HTTP request failed: " + http_result.error
             );
         }
+        if (!http_result.get().ok) {
+            return core::Result<std::vector<std::vector<float>>>::Err(
+                "HTTP error " + std::to_string(http_result.get().status_code) + ": " + http_result.get().body
+            );
+        }
 
         // Parse response
         try {
-            const json& response = http_result.get();
+            const json response = json::parse(http_result.get().body);
             if (!response.contains("data") || !response["data"].is_array()) {
                 std::string err_msg = "Invalid response format";
                 if (response.contains("error")) {
