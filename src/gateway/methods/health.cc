@@ -143,7 +143,7 @@ core::Result<json> method_status(
     result["ts"] = ts_ms;
     result["server"] = "HunterClaw";
     result["version"] = "1.0.0";
-    result["sessionsCount"] = (int)runtime->sessions.size();
+    result["sessionsCount"] = (int)runtime->clients.size();
 
     // channels 摘要
     json channels_summary = json::object();

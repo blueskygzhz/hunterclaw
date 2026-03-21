@@ -88,7 +88,7 @@ core::Result<json> method_todo_create(
     // 仅发送给当前 Session 的客户端
     std::vector<std::string> target_conns;
     for (const auto& [conn_id, client] : state->clients) {
-        if (client->session_id == client_ctx.session_id) {
+        if (client->session_id.value_or("") == client_ctx.session_id) {
             target_conns.push_back(conn_id);
         }
     }
@@ -290,7 +290,7 @@ core::Result<json> method_todo_update(
     
     std::vector<std::string> target_conns;
     for (const auto& [conn_id, client] : state->clients) {
-        if (client->session_id == client_ctx.session_id) {
+        if (client->session_id.value_or("") == client_ctx.session_id) {
             target_conns.push_back(conn_id);
         }
     }
@@ -376,7 +376,7 @@ core::Result<json> method_todo_delete(
     
     std::vector<std::string> target_conns;
     for (const auto& [conn_id, client] : state->clients) {
-        if (client->session_id == client_ctx.session_id) {
+        if (client->session_id.value_or("") == client_ctx.session_id) {
             target_conns.push_back(conn_id);
         }
     }

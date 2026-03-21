@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <atomic>
 #include <map>
+#include <unordered_map>
 #include <chrono>
 #include <iostream>
 
@@ -32,7 +33,7 @@ struct TaskWrapper {
 // 通道状态
 struct LaneState {
     std::priority_queue<TaskWrapper> queue;
-    size_t max_concurrent = 1;  // 默认串行
+    size_t max_concurrent = 1;  // 默认串行（对齐 OpenClaw: session lane 默认 maxConcurrent=1）
     size_t active_tasks = 0;
     size_t completed_tasks = 0;
     size_t failed_tasks = 0;
@@ -40,25 +41,33 @@ struct LaneState {
     uint64_t max_wait_ms = 0;
     uint64_t generation = 0;  // 代际计数（用于重启恢复）
     bool cleared = false;
+    bool is_dynamic = false;  // 是否为动态字符串 lane（如 session:xxx）
 };
 
 // CommandQueue实现类
 class CommandQueue::Impl {
 public:
     Impl() : gateway_draining_(false), shutdown_(false) {
-        // 初始化通道
-        lanes_[CommandLane::Main].max_concurrent = 1;  // 主通道串行
-        lanes_[CommandLane::Cron].max_concurrent = 2;  // Cron通道2并发
-        lanes_[CommandLane::Subagent].max_concurrent = 4;  // 子代理4并发
-        lanes_[CommandLane::Nested].max_concurrent = 2;  // 嵌套2并发
+        // 初始化固定枚举通道
+        // 对齐 OpenClaw server-lanes.ts: applyGatewayLaneConcurrency
+        lanes_[CommandLane::Main].max_concurrent = 1;      // 主通道串行（由配置覆盖）
+        lanes_[CommandLane::Cron].max_concurrent = 1;      // Cron通道（由配置覆盖）
+        lanes_[CommandLane::Subagent].max_concurrent = 4;  // 子代理通道（由配置覆盖）
+        lanes_[CommandLane::Nested].max_concurrent = 2;    // 嵌套通道
         
-        // 启动工作线程（每个通道一个）
+        // 启动工作线程（每个固定通道一个）
         for (auto& pair : lanes_) {
             CommandLane lane = pair.first;
             worker_threads_.emplace_back([this, lane]() {
                 WorkerThread(lane);
             });
         }
+        
+        // 启动动态 lane 调度线程（处理 session:xxx 等动态 lane）
+        // 对齐 OpenClaw: 每个动态 lane 独立串行，通过单一调度线程轮询
+        dynamic_worker_thread_ = std::thread([this]() {
+            DynamicLaneWorkerThread();
+        });
     }
     
     ~Impl() {
@@ -71,12 +80,16 @@ public:
             shutdown_ = true;
         }
         cv_.notify_all();
+        dynamic_cv_.notify_all();
         
         // 等待所有工作线程退出
         for (auto& thread : worker_threads_) {
             if (thread.joinable()) {
                 thread.join();
             }
+        }
+        if (dynamic_worker_thread_.joinable()) {
+            dynamic_worker_thread_.join();
         }
     }
     
@@ -138,11 +151,70 @@ public:
         cv_.notify_one();
         return future;
     }
+
+    // ── 动态字符串 Lane 入队（对齐 OpenClaw enqueueCommandInLane(lane: string, ...)）──
+    // session:xxx Lane 默认 maxConcurrent=1（串行），保证同一 session 请求串行执行
+    template<typename Func>
+    auto EnqueueInDynamicLane(
+        const std::string& lane_name,
+        Func&& task,
+        const EnqueueOptions& opts
+    ) -> std::future<typename std::invoke_result<Func>::type> {
+        using ReturnType = typename std::invoke_result<Func>::type;
+
+        // 检查排空状态
+        {
+            std::lock_guard<std::mutex> lock(dynamic_mutex_);
+            if (gateway_draining_) {
+                throw GatewayDrainingError();
+            }
+        }
+
+        auto promise_ptr = std::make_shared<std::promise<ReturnType>>();
+        auto future = promise_ptr->get_future();
+
+        auto wrapped_task = [task = std::forward<Func>(task), promise_ptr]() mutable {
+            try {
+                if constexpr (std::is_void_v<ReturnType>) {
+                    task();
+                    promise_ptr->set_value();
+                } else {
+                    promise_ptr->set_value(task());
+                }
+            } catch (...) {
+                promise_ptr->set_exception(std::current_exception());
+            }
+        };
+
+        {
+            std::lock_guard<std::mutex> lock(dynamic_mutex_);
+            auto& state = GetOrCreateDynamicLane(lane_name);
+
+            TaskWrapper wrapper;
+            wrapper.task = std::move(wrapped_task);
+            wrapper.label = opts.label;
+            wrapper.urgent = opts.urgent;
+            wrapper.enqueue_time_ms = GetCurrentTimeMs();
+            wrapper.generation = state.generation;
+
+            state.queue.push(std::move(wrapper));
+        }
+
+        dynamic_cv_.notify_one();
+        return future;
+    }
     
     void SetConcurrency(CommandLane lane, size_t max_concurrent) {
         std::lock_guard<std::mutex> lock(mutex_);
         lanes_[lane].max_concurrent = max_concurrent;
         cv_.notify_all();  // 唤醒工作线程重新检查
+    }
+
+    void SetDynamicLaneConcurrency(const std::string& lane_name, size_t max_concurrent) {
+        std::lock_guard<std::mutex> lock(dynamic_mutex_);
+        auto& state = GetOrCreateDynamicLane(lane_name);
+        state.max_concurrent = std::max<size_t>(1, max_concurrent);
+        dynamic_cv_.notify_all();
     }
     
     void ClearLane(CommandLane lane) {
@@ -156,24 +228,46 @@ public:
         
         state.cleared = true;
     }
+
+    void ClearDynamicLane(const std::string& lane_name) {
+        std::lock_guard<std::mutex> lock(dynamic_mutex_);
+        auto it = dynamic_lanes_.find(lane_name);
+        if (it != dynamic_lanes_.end()) {
+            while (!it->second.queue.empty()) {
+                it->second.queue.pop();
+            }
+            it->second.cleared = true;
+        }
+    }
     
     void ResetAllLanes() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        
-        for (auto& pair : lanes_) {
-            auto& state = pair.second;
-            
-            // 清空队列
-            while (!state.queue.empty()) {
-                state.queue.pop();
+        // 重置固定枚举 lane
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (auto& pair : lanes_) {
+                auto& state = pair.second;
+                while (!state.queue.empty()) {
+                    state.queue.pop();
+                }
+                state.generation++;
+                state.cleared = false;
             }
-            
-            // 递增generation
-            state.generation++;
-            state.cleared = false;
+            cv_.notify_all();
         }
-        
-        cv_.notify_all();
+        // 重置动态 lane（对齐 OpenClaw resetAllLanes）
+        {
+            std::lock_guard<std::mutex> lock(dynamic_mutex_);
+            for (auto& pair : dynamic_lanes_) {
+                auto& state = pair.second;
+                while (!state.queue.empty()) {
+                    state.queue.pop();
+                }
+                state.generation++;
+                state.active_tasks = 0;
+                state.cleared = false;
+            }
+            dynamic_cv_.notify_all();
+        }
     }
     
     void MarkGatewayDraining() {
@@ -191,12 +285,26 @@ public:
         auto it = lanes_.find(lane);
         return (it != lanes_.end()) ? it->second.queue.size() : 0;
     }
+
+    size_t GetDynamicQueueSize(const std::string& lane_name) const {
+        std::lock_guard<std::mutex> lock(dynamic_mutex_);
+        auto it = dynamic_lanes_.find(lane_name);
+        return (it != dynamic_lanes_.end()) ? it->second.queue.size() + it->second.active_tasks : 0;
+    }
     
     size_t GetTotalQueueSize() const {
-        std::lock_guard<std::mutex> lock(mutex_);
         size_t total = 0;
-        for (const auto& pair : lanes_) {
-            total += pair.second.queue.size();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (const auto& pair : lanes_) {
+                total += pair.second.queue.size() + pair.second.active_tasks;
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(dynamic_mutex_);
+            for (const auto& pair : dynamic_lanes_) {
+                total += pair.second.queue.size() + pair.second.active_tasks;
+            }
         }
         return total;
     }
@@ -259,6 +367,86 @@ public:
     }
     
 private:
+    // 获取或创建动态 lane（调用方需持有 dynamic_mutex_）
+    LaneState& GetOrCreateDynamicLane(const std::string& lane_name) {
+        auto it = dynamic_lanes_.find(lane_name);
+        if (it != dynamic_lanes_.end()) {
+            return it->second;
+        }
+        LaneState& state = dynamic_lanes_[lane_name];
+        state.max_concurrent = 1;  // 默认串行（对齐 OpenClaw session lane）
+        state.is_dynamic = true;
+        return state;
+    }
+
+    // 动态 Lane 调度线程（对齐 OpenClaw drainLane 的 pump 逻辑）
+    // 单线程轮询所有动态 lane，按 maxConcurrent 控制并发
+    void DynamicLaneWorkerThread() {
+        while (true) {
+            std::vector<std::pair<std::string, TaskWrapper>> to_run;
+
+            {
+                std::unique_lock<std::mutex> lock(dynamic_mutex_);
+                dynamic_cv_.wait(lock, [&]() {
+                    if (shutdown_) return true;
+                    for (auto& pair : dynamic_lanes_) {
+                        auto& state = pair.second;
+                        if (!state.queue.empty() && state.active_tasks < state.max_concurrent) {
+                            return true;
+                        }
+                    }
+                    return false;
+                });
+
+                if (shutdown_) break;
+
+                // 收集可执行任务（每个 lane 按 maxConcurrent 限制）
+                for (auto& pair : dynamic_lanes_) {
+                    auto& state = pair.second;
+                    while (!state.queue.empty() && state.active_tasks < state.max_concurrent) {
+                        TaskWrapper wrapper = std::move(
+                            const_cast<TaskWrapper&>(state.queue.top())
+                        );
+                        state.queue.pop();
+                        state.active_tasks++;
+                        to_run.emplace_back(pair.first, std::move(wrapper));
+                    }
+                }
+            }
+
+            // 执行任务（无锁，每个任务在独立线程中执行）
+            for (auto& [lane_name, wrapper] : to_run) {
+                std::thread([this, lane_name, wrapper = std::move(wrapper)]() mutable {
+                    uint64_t start_time = GetCurrentTimeMs();
+                    uint64_t wait_ms = start_time - wrapper.enqueue_time_ms;
+
+                    try {
+                        wrapper.task();
+                    } catch (const std::exception& e) {
+                        std::cerr << "[DynamicLane] Task failed in lane " << lane_name
+                                  << ": " << e.what() << std::endl;
+                    } catch (...) {
+                        std::cerr << "[DynamicLane] Task failed in lane " << lane_name
+                                  << ": unknown exception" << std::endl;
+                    }
+
+                    {
+                        std::lock_guard<std::mutex> lock(dynamic_mutex_);
+                        auto it = dynamic_lanes_.find(lane_name);
+                        if (it != dynamic_lanes_.end()) {
+                            it->second.active_tasks--;
+                            it->second.completed_tasks++;
+                            it->second.total_wait_ms += wait_ms;
+                            it->second.max_wait_ms = std::max(it->second.max_wait_ms, wait_ms);
+                        }
+                    }
+                    // 通知调度线程有新的槽位可用
+                    dynamic_cv_.notify_one();
+                }).detach();
+            }
+        }
+    }
+
     void WorkerThread(CommandLane lane) {
         while (true) {
             TaskWrapper wrapper;
@@ -329,6 +517,13 @@ private:
     std::condition_variable cv_;
     std::map<CommandLane, LaneState> lanes_;
     std::vector<std::thread> worker_threads_;
+
+    // 动态字符串 Lane（对齐 OpenClaw: Map<string, LaneState>）
+    mutable std::mutex dynamic_mutex_;
+    std::condition_variable dynamic_cv_;
+    std::unordered_map<std::string, LaneState> dynamic_lanes_;
+    std::thread dynamic_worker_thread_;
+
     std::atomic<bool> gateway_draining_;
     std::atomic<bool> shutdown_;
 };
@@ -355,12 +550,30 @@ auto CommandQueue::enqueue_command_in_lane(
     return impl_->EnqueueInLane(lane, std::forward<Func>(task), opts);
 }
 
+// 动态字符串 Lane 入队（对齐 OpenClaw enqueueCommandInLane(lane: string, ...)）
+template<typename Func>
+auto CommandQueue::enqueue_command_in_lane(
+    const std::string& lane_name,
+    Func&& task,
+    const EnqueueOptions& opts
+) -> std::future<typename std::invoke_result<Func>::type> {
+    return impl_->EnqueueInDynamicLane(lane_name, std::forward<Func>(task), opts);
+}
+
 void CommandQueue::set_command_lane_concurrency(CommandLane lane, size_t max_concurrent) {
     impl_->SetConcurrency(lane, max_concurrent);
 }
 
+void CommandQueue::set_command_lane_concurrency(const std::string& lane_name, size_t max_concurrent) {
+    impl_->SetDynamicLaneConcurrency(lane_name, max_concurrent);
+}
+
 void CommandQueue::clear_command_lane(CommandLane lane) {
     impl_->ClearLane(lane);
+}
+
+void CommandQueue::clear_command_lane(const std::string& lane_name) {
+    impl_->ClearDynamicLane(lane_name);
 }
 
 void CommandQueue::reset_all_lanes() {
@@ -377,6 +590,10 @@ void CommandQueue::unmark_gateway_draining() {
 
 size_t CommandQueue::get_queue_size(CommandLane lane) const {
     return impl_->GetQueueSize(lane);
+}
+
+size_t CommandQueue::get_queue_size(const std::string& lane_name) const {
+    return impl_->GetDynamicQueueSize(lane_name);
 }
 
 size_t CommandQueue::get_total_queue_size() const {
@@ -418,7 +635,7 @@ Result<void> CommandQueue::wait_for_lane_tasks(CommandLane lane, uint32_t timeou
     }
 }
 
-// 显式实例化常用模板
+// 显式实例化常用模板（枚举 Lane）
 template auto CommandQueue::enqueue_command_in_lane<std::function<void()>>(
     CommandLane, std::function<void()>&&, const EnqueueOptions&
 ) -> std::future<void>;
@@ -429,6 +646,19 @@ template auto CommandQueue::enqueue_command_in_lane<std::function<int()>>(
 
 template auto CommandQueue::enqueue_command_in_lane<std::function<std::string()>>(
     CommandLane, std::function<std::string()>&&, const EnqueueOptions&
+) -> std::future<std::string>;
+
+// 显式实例化常用模板（字符串 Lane）
+template auto CommandQueue::enqueue_command_in_lane<std::function<void()>>(
+    const std::string&, std::function<void()>&&, const EnqueueOptions&
+) -> std::future<void>;
+
+template auto CommandQueue::enqueue_command_in_lane<std::function<int()>>(
+    const std::string&, std::function<int()>&&, const EnqueueOptions&
+) -> std::future<int>;
+
+template auto CommandQueue::enqueue_command_in_lane<std::function<std::string()>>(
+    const std::string&, std::function<std::string()>&&, const EnqueueOptions&
 ) -> std::future<std::string>;
 
 }  // namespace queue

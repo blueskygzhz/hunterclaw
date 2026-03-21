@@ -1210,7 +1210,11 @@ core::Result<json> HttpGateway::invoke_rpc(
     }
     
     // Invoke the method through the handler
-    return state->method_handler(method, params);
+    // HTTP gateway uses a default ClientContext (no WebSocket session)
+    ClientContext http_ctx;
+    http_ctx.conn_id = "http";
+    http_ctx.authenticated = true;  // HTTP gateway is pre-authenticated
+    return state->method_handler(method, params, http_ctx);
 }
 
 // ============================================================================

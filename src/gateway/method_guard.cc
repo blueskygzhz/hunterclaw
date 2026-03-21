@@ -100,7 +100,7 @@ PermissionCheckResult MethodGuard::check_scope(
     const ClientContext& client_ctx,
     const std::string& required_scope
 ) const {
-    if (AuthManager::has_scope(client_ctx.scopes, required_scope)) {
+    if (AuthManager::has_scope(client_ctx.scopes(), required_scope)) {
         return { true, "", "" };
     }
     
@@ -142,7 +142,7 @@ PermissionCheckResult MethodGuard::check_resource_access(
             if (client_ctx.session_id != ownership.owner_session_id) {
                 auto logger = get_logger();
                 logger->warn("[MethodGuard] Access denied: client {} tried to access resource {}:{} owned by {}",
-                    client_ctx.client_id, resource_type, resource_id,
+                    client_ctx.conn_id, resource_type, resource_id,
                     ownership.owner_session_id);
                 return {
                     false,
@@ -272,13 +272,13 @@ void MethodGuard::log_audit(
     
     json log_entry;
     log_entry["timestamp"] = core::utils::now().time_since_epoch().count();
-    log_entry["client_id"] = client_ctx.client_id;
+    log_entry["client_id"] = client_ctx.conn_id;
     log_entry["session_id"] = client_ctx.session_id;
     log_entry["device_id"] = client_ctx.device_id;
     log_entry["method"] = method;
     log_entry["params"] = params;
     log_entry["result"] = result;
-    log_entry["scopes"] = client_ctx.scopes;
+    log_entry["scopes"] = client_ctx.scopes();
     
     impl_->audit_logs.push_back(log_entry);
     
@@ -293,7 +293,7 @@ void MethodGuard::log_audit(
     
     auto logger = get_logger();
     logger->info("[Audit] {} by client {} (session={})",
-        method, client_ctx.client_id, client_ctx.session_id);
+        method, client_ctx.conn_id, client_ctx.session_id);
 }
 
 std::vector<json> MethodGuard::get_audit_logs(int limit) const {

@@ -108,6 +108,7 @@ struct GatewayWsClient {
     WsConnectionPtr socket;                  // WebSocket connection
     ConnectParams connect;                   // Connect params (set after handshake)
     std::string conn_id;                     // UUID
+    std::optional<std::string> session_id;   // Session ID (set after auth)
     std::optional<std::string> presence_key;
     std::optional<std::string> client_ip;
     std::optional<std::string> canvas_host_url;
@@ -123,6 +124,10 @@ struct GatewayWsClient {
 struct ClientContext {
     ConnectParams connect;                           // Connect params (set after handshake)
     std::string conn_id;                             // Connection UUID
+    std::string session_id;                          // Session ID (bound after auth)
+    std::string device_id;                           // Device ID (from connect.device)
+    std::string account_id;                          // Account ID (from auth token)
+    bool authenticated = false;                      // Whether client has completed auth
     std::optional<std::string> client_ip;            // Client IP address
     std::optional<std::string> canvas_host_url;      // Canvas host URL
     std::optional<std::string> canvas_capability;    // Canvas capability token
@@ -271,6 +276,13 @@ struct GatewayRuntimeState {
     // Tool event recipients (对齐 OpenClaw: toolEventRecipients)
     // runId -> set<connId>
     std::map<std::string, std::set<std::string>> tool_event_recipients;
+
+    // TODO items (Session-scoped, todoId -> TodoItem)
+    std::map<std::string, TodoItem> todos;
+
+    // Agent abort controllers (runId -> abort flag)
+    // 对齐 OpenClaw: Map<string, AbortController>
+    std::map<std::string, std::shared_ptr<std::atomic<bool>>> abort_controllers;
 
     // Method handler (internal, injected by methods.cc)
     // 对应 OpenClaw: handler({ req, params, client, state, ... })

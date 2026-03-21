@@ -7,6 +7,8 @@
 #include "hunterclaw/react/react_engine.h"
 #include "hunterclaw/tools/tool.h"
 #include "hunterclaw/sessions/transcript_io.h"
+#include "hunterclaw/queue/command_queue.h"
+#include "hunterclaw/queue/lanes.h"
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 #include <algorithm>
@@ -349,34 +351,81 @@ core::Result<json> method_chat_send(
             session_id, run_id, error);
     };
     
-    // 异步启动 (不阻塞当前线程)
-    std::thread([react_engine, message, callbacks, run_id, session_id, transcript_path]() {
-        try {
-            auto result = react_engine->run(message, {}, callbacks);
-            
-            // 写入 assistant 消息到 Transcript (对齐 OpenClaw)
-            sessions::AppendTranscriptOptions opts;
-            opts.message = result.final_response;
-            opts.create_if_missing = false;
-            
-            auto append_result = sessions::append_assistant_message_to_transcript(
-                transcript_path,
-                opts
+    // ========================================================================
+    // 双层 Lane 队列入队 (严格对齐 OpenClaw run.ts:263-265)
+    //
+    // OpenClaw 原始逻辑:
+    //   return enqueueSession(() =>       // session:xxx Lane, maxConcurrent=1 (串行)
+    //     enqueueGlobal(async () => {     // main Lane, maxConcurrent=N (全局并发控制)
+    //       await runEmbeddedPiAgent(...)
+    //     })
+    //   );
+    //
+    // 效果:
+    //   - 同一 session 的 n 个请求: 严格串行（session lane maxConcurrent=1）
+    //   - 不同 session 之间: 并行（受 main lane maxConcurrent 限制）
+    // ========================================================================
+
+    auto& cmd_queue = queue::CommandQueue::Instance();
+
+    // session lane 名称: "session:<session_id>"
+    std::string session_lane = queue::ResolveSessionLane(session_id);
+
+    // 第一层: 入队到 session lane（串行，保证同一 session 请求不并发）
+    cmd_queue.enqueue_command_in_lane(
+        session_lane,
+        [&cmd_queue, react_engine, message, callbacks, run_id, session_id, transcript_path]() {
+            // 第二层: 在 session lane 内部，再入队到 global main lane（全局并发控制）
+            // 对齐 OpenClaw: enqueueGlobal(() => runEmbeddedPiAgent(...))
+            auto global_future = cmd_queue.enqueue_command_in_lane(
+                queue::CommandLane::Main,
+                [react_engine, message, callbacks, run_id, session_id, transcript_path]() {
+                    try {
+                        auto result = react_engine->run(message, {}, callbacks);
+
+                        // 写入 assistant 消息到 Transcript (对齐 OpenClaw)
+                        sessions::AppendTranscriptOptions opts;
+                        opts.message = result.final_response;
+                        opts.create_if_missing = false;
+
+                        auto append_result = sessions::append_assistant_message_to_transcript(
+                            transcript_path,
+                            opts
+                        );
+
+                        if (!append_result.ok) {
+                            spdlog::warn("[chat.send] Failed to write assistant message to transcript: {}",
+                                append_result.error);
+                        }
+
+                        spdlog::info("[chat.send] Agent completed: session={}, run_id={}, steps={}",
+                            session_id, run_id, result.total_steps);
+
+                    } catch (const std::exception& e) {
+                        spdlog::error("[chat.send] Agent exception: session={}, run_id={}, error={}",
+                            session_id, run_id, e.what());
+                    }
+                },
+                queue::EnqueueOptions{
+                    .label = "chat.send:" + session_id + ":" + run_id,
+                    .urgent = false
+                }
             );
-            
-            if (!append_result.ok) {
-                get_logger()->warn("[chat.send] Failed to write assistant message to transcript: {}",
-                    append_result.error);
+
+            // session lane 内等待 global lane 任务完成，保证串行语义
+            // 对齐 OpenClaw: session lane 的 task 是 enqueueGlobal 的 promise
+            try {
+                global_future.get();
+            } catch (const std::exception& e) {
+                spdlog::error("[chat.send] Global lane task failed: session={}, run_id={}, error={}",
+                    session_id, run_id, e.what());
             }
-            
-            get_logger()->info("[chat.send] Agent completed: session={}, run_id={}, steps={}",
-                session_id, run_id, result.total_steps);
-                
-        } catch (const std::exception& e) {
-            get_logger()->error("[chat.send] Agent exception: session={}, run_id={}, error={}",
-                session_id, run_id, e.what());
+        },
+        queue::EnqueueOptions{
+            .label = "session:" + session_id + ":" + run_id,
+            .urgent = false
         }
-    }).detach();
+    );
     
     // ========================================================================
     // Step 7: 立即返回 (不等待执行完成，对齐 OpenClaw)

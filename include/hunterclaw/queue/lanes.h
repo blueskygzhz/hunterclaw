@@ -33,5 +33,37 @@ inline CommandLane ParseCommandLane(const std::string& name) {
     return CommandLane::Main;  // 默认
 }
 
+// ============================================================================
+// Dynamic String Lane Helpers (对齐 OpenClaw pi-embedded-runner/lanes.ts)
+// ============================================================================
+
+// 解析 session lane 名称
+// 对齐 OpenClaw: resolveSessionLane(key) -> "session:<key>"
+// 每个 session 有独立的串行 Lane，保证同一 session 的请求串行执行
+inline std::string ResolveSessionLane(const std::string& session_key) {
+    if (session_key.empty()) {
+        return "session:main";
+    }
+    // 已经是 session: 前缀则直接返回
+    if (session_key.rfind("session:", 0) == 0) {
+        return session_key;
+    }
+    return "session:" + session_key;
+}
+
+// 解析 global lane 名称
+// 对齐 OpenClaw: resolveGlobalLane(lane?) -> "main" | "nested" | lane
+// Cron 内部操作使用 nested 避免死锁
+inline std::string ResolveGlobalLane(const std::string& lane = "") {
+    if (lane.empty()) {
+        return "main";
+    }
+    // Cron lane 内部操作使用 nested 避免死锁
+    if (lane == "cron") {
+        return "nested";
+    }
+    return lane;
+}
+
 }  // namespace queue
 }  // namespace hunterclaw

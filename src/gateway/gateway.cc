@@ -45,19 +45,7 @@ struct ConnectionHandshakeState {
 
 // 握手超时常量 (对齐 OpenClaw DEFAULT_HANDSHAKE_TIMEOUT_MS = 3000)
 static constexpr int64_t HANDSHAKE_TIMEOUT_MS = 3000;
-// tick 心跳间隔 (对齐 OpenClaw TICK_INTERVAL_MS = 30000)
-static constexpr int64_t TICK_INTERVAL_MS = 30000;
-// 健康刷新间隔 (对齐 OpenClaw HEALTH_REFRESH_INTERVAL_MS = 60000)
-static constexpr int64_t HEALTH_REFRESH_INTERVAL_MS = 60000;
-// 握手前最大 payload (对齐 OpenClaw MAX_PREAUTH_PAYLOAD_BYTES = 64KB)
-static constexpr size_t MAX_PREAUTH_PAYLOAD_BYTES = 64 * 1024;
-// 最大 payload (对齐 OpenClaw MAX_PAYLOAD_BYTES = 25MB)
-static constexpr size_t MAX_PAYLOAD_BYTES = 25 * 1024 * 1024;
-// 最大缓冲字节 (对齐 OpenClaw MAX_BUFFERED_BYTES = 50MB)
-static constexpr size_t MAX_BUFFERED_BYTES = 50 * 1024 * 1024;
-// 🎯 OpenClaw 对齐: 请求去重 (对应 server-constants.ts: DEDUPE_TTL_MS / DEDUPE_MAX)
-static constexpr int64_t DEDUPE_TTL_MS = 5 * 60000;  // 5 分钟
-static constexpr size_t  DEDUPE_MAX    = 1000;
+// (TICK_INTERVAL_MS, HEALTH_REFRESH_INTERVAL_MS, MAX_*_BYTES, DEDUPE_TTL_MS, DEDUPE_MAX defined in gateway.h)
 
 // 🎯 OpenClaw 对齐: GATEWAY_EVENTS 列表 (对应 server-methods-list.ts:GATEWAY_EVENTS)
 static const std::vector<std::string> GATEWAY_EVENTS = {
