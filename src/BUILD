@@ -631,27 +631,14 @@ cc_binary(
 )
 
 # ============================================================================
-# Plugin Libraries (commented out until implementation is complete)
+# Channel Plugins
 # ============================================================================
-
-# Feishu channel plugin
-# cc_library(
-#     name = "hunterclaw_channel_feishu",
-#     srcs = [
-#         "channels/feishu_channel.cc",
-#         "channels/feishu_stub.cc",
-#     ],
-#     deps = [
-#         ":hunterclaw_core",
-#     ],
-#     linkopts = ["-lcurl"],
-#     linkstatic = False,
-# )
-
-# Telegram channel plugin
-# cc_library(
-#     name = "hunterclaw_channel_telegram",
-#     srcs = ["//plugins/channels/telegram:telegram_channel.cc"],
-#     deps = [":hunterclaw_core"],
-#     linkstatic = False,
-# )
+# All channel plugins (discord, telegram, slack, feishu, google_chat) are
+# compiled as part of hunterclaw_core via glob(["channels/*.cc"]).
+#
+# Each src/channels/xxx_channel.cc contains:
+#   1. make_xxx_plugin() — ChannelPlugin descriptor implementation
+#   2. Static registrar  — registers into ChannelPluginRegistry at startup
+#
+# No separate plugin registration files needed (plugins/channels/ removed).
+# This aligns with OpenClaw: src/channels/plugins/ is the canonical location.
