@@ -115,7 +115,30 @@ struct SubagentEntry {
     bool result_delivered = false;          // Result delivered to requester
     int delivery_attempts = 0;              // Delivery retry count
     uint64_t last_delivery_attempt = 0;     // Last delivery timestamp
-    
+
+    // ✅ OpenClaw对齐: 冻结结果文本 (captureSubagentCompletionReply)
+    // 在 subagent 完成时从 session 历史捕获最终输出，避免 session 被删除后丢失
+    std::string frozen_result_text;         // Frozen final output (captured at completion)
+    bool frozen_result_captured = false;    // Whether frozen result was captured
+    uint64_t frozen_result_captured_at = 0; // Capture timestamp
+
+    // ✅ OpenClaw对齐: Announce 重试控制 (MAX_ANNOUNCE_RETRY_COUNT=3)
+    int announce_retry_count = 0;           // Number of announce retries attempted
+    uint64_t last_announce_retry_at = 0;    // Last retry timestamp
+
+    // ✅ OpenClaw对齐: Cleanup 状态 (finalizeSubagentCleanup)
+    bool cleanup_handled = false;           // Whether cleanup has been initiated
+    uint64_t cleanup_completed_at = 0;      // Cleanup completion timestamp (0 = not done)
+
+    // ✅ OpenClaw对齐: 子孙等待 (wakeOnDescendantSettle)
+    bool wake_on_descendant_settle = false; // Whether to wake after descendants settle
+
+    // ✅ OpenClaw对齐: Announce 抑制原因 (suppressAnnounceReason)
+    std::string suppress_announce_reason;   // "steer-restart" | "killed" | ""
+
+    // ✅ OpenClaw对齐: 结束原因 (endedReason)
+    std::string ended_reason;               // "complete" | "error" | "killed"
+
     // Notifications
     std::vector<std::string> pending_notifications;  // Queued events
     
@@ -196,6 +219,23 @@ public:
     
     /// Kill subagent and all its descendants
     core::Result<void> kill_subagent_tree(const std::string& subagent_run_id);
+
+    // ✅ OpenClaw对齐: 统计子孙中仍在运行的 run 数量 (countPendingDescendantRuns)
+    // 用于在 announce 前等待所有子孙完成，避免乱序
+    int count_pending_descendant_runs(const std::string& child_session_key);
+
+    // ✅ OpenClaw对齐: 判断 requester 是否是 subagent (isInternalAnnounceRequesterSession)
+    // depth >= 1 的 session 是 subagent，deliver=false；depth=0 是用户，deliver=true
+    bool is_requester_subagent(const std::string& requester_run_id);
+
+    // ✅ OpenClaw对齐: 列出某个 session 下所有子 subagent 的完成结果
+    // 用于 buildChildCompletionFindings
+    std::vector<std::shared_ptr<SubagentEntry>> list_completed_children(
+        const std::string& parent_run_id
+    );
+
+    // ✅ OpenClaw对齐: 重试所有延迟的 announce (retryDeferredCompletedAnnounces)
+    void retry_deferred_completed_announces(const std::string& exclude_run_id = "");
 
 private:
     mutable std::mutex mutex_;
@@ -322,6 +362,12 @@ private:
     
     // Build delivery message
     std::string build_delivery_message(const SubagentEntry& entry);
+    
+    // ✅ OpenClaw对齐: 从session历史捕获最终输出 (captureSubagentCompletionReply)
+    std::string capture_subagent_completion_reply(const std::string& subagent_run_id);
+    
+    // ✅ OpenClaw对齐: 汇总所有已完成子subagent的结果 (buildChildCompletionFindings)
+    std::string build_child_completion_findings(const std::string& parent_run_id);
     
     // Retry logic
     bool should_retry(const SubagentEntry& entry);
