@@ -17,13 +17,13 @@ namespace hunterclaw {
 namespace agents {
 
 // Forward declarations
-class Agent;
-class AgentManager;
+class AgentInstance;
+class AgentPool;
+// AgentManager is an alias for AgentPool (HunterClaw uses AgentPool)
+using AgentManager = AgentPool;
 
 // Type aliases for forward-declared types
-namespace {
-    using AgentPtr = std::shared_ptr<Agent>;
-}
+using AgentPtr = std::shared_ptr<AgentInstance>;
 
 // ============================================================================
 // Subagent Types & Configuration
@@ -212,7 +212,7 @@ private:
 // Subagent Spawner
 // ============================================================================
 
-class SubagentSpawner {
+class SubagentSpawner : public std::enable_shared_from_this<SubagentSpawner> {
 public:
     using Ptr = std::shared_ptr<SubagentSpawner>;
     
