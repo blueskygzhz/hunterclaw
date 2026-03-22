@@ -306,12 +306,21 @@ struct PluginHookAfterCompactionEvent {
 
 // ============================================================================
 // Plugin Hook — before_reset
+// Aligned with OpenClaw session-reset-service.ts
+// Fires before a session is reset; void hook (cannot cancel in OpenClaw).
 // ============================================================================
 
 struct PluginHookBeforeResetEvent {
-  std::optional<std::string> session_file;
-  std::optional<std::string> messages_json;
+  /** The stable session key (e.g. "main", "work"). */
+  std::optional<std::string> session_key;
+  /** The current (old) ephemeral session UUID, before reset. */
+  std::optional<std::string> old_session_id;
+  /** Reset reason: "reset" | "new". */
   std::optional<std::string> reason;
+  /** Path to the session JSONL transcript (if available). */
+  std::optional<std::string> session_file;
+  /** Serialized current messages (if available). */
+  std::optional<std::string> messages_json;
 };
 
 // ============================================================================
@@ -358,6 +367,8 @@ struct PluginHookToolContext {
   std::optional<std::string> session_key;
   /** Ephemeral session UUID — regenerated on /new and /reset. */
   std::optional<std::string> session_id;
+  /** Stable run identifier for this agent invocation. */
+  std::optional<std::string> run_id;
   std::string tool_name;
   /** Provider-specific tool call ID when available. */
   std::optional<std::string> tool_call_id;

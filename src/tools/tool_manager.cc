@@ -217,7 +217,7 @@ ToolResult ToolManager::execute_tool(
     if (hook_manager_) {
         PluginHookBeforeToolCallEvent before_event;
         before_event.tool_name = name;
-        before_event.params = params;
+        before_event.params_json = params.to_string();  // serialize to JSON string
 
         PluginHookToolContext tool_ctx;
         tool_ctx.tool_name = name;
@@ -228,13 +228,14 @@ ToolResult ToolManager::execute_tool(
 
         auto before_result = hook_manager_->run_before_tool_call(before_event, tool_ctx);
         if (before_result.has_value()) {
-            if (before_result->block.value_or(false)) {
+            if (before_result->block) {
                 std::string reason = before_result->block_reason.value_or("blocked by plugin hook");
                 log()->warn("Tool '{}' blocked by before_tool_call hook: {}", name, reason);
                 return tool_result::error(reason);
             }
-            if (before_result->params.has_value()) {
-                effective_params = before_result->params.value();
+            if (before_result->params_json.has_value()) {
+                auto parsed = core::JsonValue::parse(*before_result->params_json);
+                if (parsed.ok && parsed.value) effective_params = std::move(*parsed.value);
             }
         }
     }
@@ -263,7 +264,7 @@ ToolResult ToolManager::execute_tool(
     if (hook_manager_) {
         PluginHookAfterToolCallEvent after_event;
         after_event.tool_name = name;
-        after_event.params = effective_params;
+        after_event.params_json = effective_params.to_string();  // serialize to JSON string
         after_event.duration_ms = duration_ms;
         if (!error_msg.empty()) {
             after_event.error = error_msg;
@@ -271,7 +272,7 @@ ToolResult ToolManager::execute_tool(
             core::JsonValue result_json = core::JsonValue::object();
             result_json["success"] = result.success;
             if (!result.error.empty()) result_json["error"] = result.error;
-            after_event.result = result_json;
+            after_event.result_json = result_json.to_string();  // serialize to JSON string
         }
 
         PluginHookToolContext tool_ctx;

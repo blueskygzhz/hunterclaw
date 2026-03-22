@@ -1,6 +1,7 @@
 #include "hunterclaw/gateway/gateway.h"
 #include "hunterclaw/gateway/method_guard.h"
 #include "hunterclaw/channels/manager.h"
+#include "hunterclaw/tools/tool_hooks.h"   // get_global_hook_manager(), PluginHook* types
 #include "hunterclaw/core/utils.h"
 #include <nlohmann/json.hpp>
 #include <chrono>
@@ -603,11 +604,73 @@ core::Result<json> method_channel_send(
         return core::Result<json>::Err("Missing required parameters: channel_id, to, message");
     }
 
+    std::string channel_id = params["channel_id"];
+    std::string to         = params["to"];
+    std::string content    = params["message"];
+    std::string account_id = params.value("account_id", "");
+
+    // =========================================================================
+    // Hook: message_sending
+    // Aligned with OpenClaw channels/plugins/hooks.ts — modifying hook
+    // Fires before the message is sent; plugins may modify content or cancel.
+    // =========================================================================
+    auto* hook_mgr = tools::get_global_hook_manager();
+    if (hook_mgr && hook_mgr->has_hooks(plugins::PluginHookName::MESSAGE_SENDING)) {
+        tools::PluginHookMessageSendingEvent ms_event;
+        ms_event.to      = to;
+        ms_event.content = content;
+        tools::PluginHookMessageContext ms_ctx;
+        ms_ctx.channel_id  = channel_id;
+        ms_ctx.account_id  = account_id.empty() ? std::nullopt : std::make_optional(account_id);
+        try {
+            auto ms_result = hook_mgr->run_message_sending(ms_event, ms_ctx);
+            if (ms_result) {
+                if (ms_result->cancel) {
+                    // Plugin cancelled the send
+                    json result;
+                    result["ok"]       = false;
+                    result["cancelled"] = true;
+                    result["reason"]   = "cancelled by plugin hook";
+                    return core::Result<json>::Ok(result);
+                }
+                if (ms_result->content) {
+                    // Plugin modified the content
+                    content = *ms_result->content;
+                }
+            }
+        } catch (const std::exception& e) {
+            // message_sending hook failure is non-fatal
+        }
+    }
+
     // TODO: 实现消息发送
     // auto channel_mgr = server->channel_manager();
-    // auto result = channel_mgr->deliver_message(...);
-    
-    return core::Result<json>::Err("channel.send not implemented yet");
+    // auto send_result = channel_mgr->deliver_message(channel_id, account_id, to, content);
+    bool send_ok = false;  // placeholder
+    std::string send_error = "channel.send not implemented yet";
+
+    // =========================================================================
+    // Hook: message_sent
+    // Aligned with OpenClaw channels/plugins/hooks.ts — fire-and-forget
+    // Fires after the send attempt (success or failure).
+    // =========================================================================
+    if (hook_mgr && hook_mgr->has_hooks(plugins::PluginHookName::MESSAGE_SENT)) {
+        tools::PluginHookMessageSentEvent mst_event;
+        mst_event.to      = to;
+        mst_event.content = content;
+        mst_event.success = send_ok;
+        if (!send_ok) mst_event.error = send_error;
+        tools::PluginHookMessageContext mst_ctx;
+        mst_ctx.channel_id = channel_id;
+        mst_ctx.account_id = account_id.empty() ? std::nullopt : std::make_optional(account_id);
+        try {
+            hook_mgr->run_message_sent(mst_event, mst_ctx);
+        } catch (const std::exception& e) {
+            // fire-and-forget: ignore errors
+        }
+    }
+
+    return core::Result<json>::Err(send_error);
 }
 
 // ============================================================================

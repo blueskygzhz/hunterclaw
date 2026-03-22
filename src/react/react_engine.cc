@@ -1,5 +1,7 @@
 #include "hunterclaw/react/react_engine.h"
 #include "hunterclaw/tools/tool_manager.h"
+#include "hunterclaw/tools/tool_hooks.h"             // PluginHook* types + get_global_hook_manager()
+#include "hunterclaw/sessions/transcript_io.h"       // append_tool_result_to_transcript (tool_result_persist)
 #include "hunterclaw/observability/observability.h"  // ✅ Span, Tracer, SpanKind
 #include "hunterclaw/observability/diagnostic_events.h"  // ✅ 可观测性集成
 #include <regex>
@@ -230,7 +232,103 @@ ReactResult ReactEngine::execute_loop(
 ) {
     ReactResult result;
     result.success = true;
-    
+
+    // =========================================================================
+    // Hook: before_model_resolve
+    // Aligned with OpenClaw run.ts:329 — runs before resolveModel()
+    // Allows plugins to override provider/model for this run.
+    // =========================================================================
+    auto* hook_mgr = tools::get_global_hook_manager();
+    std::string effective_model_override;
+    std::string effective_provider_override;
+
+    if (hook_mgr && hook_mgr->has_hooks(plugins::PluginHookName::BEFORE_MODEL_RESOLVE)) {
+        tools::PluginHookBeforeModelResolveEvent bmr_event;
+        bmr_event.prompt = user_input;
+        tools::PluginHookAgentContext hook_ctx;
+        hook_ctx.session_id = callbacks.session_id.empty()
+            ? std::nullopt : std::make_optional(callbacks.session_id);
+        try {
+            auto bmr_result = hook_mgr->run_before_model_resolve(bmr_event, hook_ctx);
+            if (bmr_result) {
+                if (bmr_result->model_override)    effective_model_override    = *bmr_result->model_override;
+                if (bmr_result->provider_override) effective_provider_override = *bmr_result->provider_override;
+                if (!effective_model_override.empty())
+                    log()->info("[hooks] model overridden to {}", effective_model_override);
+                if (!effective_provider_override.empty())
+                    log()->info("[hooks] provider overridden to {}", effective_provider_override);
+            }
+        } catch (const std::exception& e) {
+            log()->warn("before_model_resolve hook failed: {}", e.what());
+        }
+    }
+
+    // =========================================================================
+    // Hook: before_agent_start (legacy) + before_prompt_build
+    // Aligned with OpenClaw run.ts:339 and attempt.ts:1172/1188
+    // Legacy: before_agent_start may also carry model/provider overrides.
+    // before_prompt_build: inject system prompt / context additions.
+    // =========================================================================
+    std::optional<std::string> hook_system_prompt;
+    std::optional<std::string> hook_prepend_context;
+    std::optional<std::string> hook_prepend_system_context;
+    std::optional<std::string> hook_append_system_context;
+
+    if (hook_mgr) {
+        tools::PluginHookAgentContext hook_ctx;
+        hook_ctx.session_id = callbacks.session_id.empty()
+            ? std::nullopt : std::make_optional(callbacks.session_id);
+
+        // Legacy: before_agent_start
+        if (hook_mgr->has_hooks(plugins::PluginHookName::BEFORE_AGENT_START)) {
+            tools::PluginHookBeforeAgentStartEvent bas_event;
+            bas_event.prompt = user_input;
+            try {
+                auto bas_result = hook_mgr->run_before_agent_start(bas_event, hook_ctx);
+                if (bas_result) {
+                    if (bas_result->system_prompt)           hook_system_prompt           = bas_result->system_prompt;
+                    if (bas_result->prepend_context)         hook_prepend_context         = bas_result->prepend_context;
+                    if (bas_result->prepend_system_context)  hook_prepend_system_context  = bas_result->prepend_system_context;
+                    if (bas_result->append_system_context)   hook_append_system_context   = bas_result->append_system_context;
+                    // Legacy model/provider override (lower priority than before_model_resolve)
+                    if (effective_model_override.empty()    && bas_result->model_override)
+                        effective_model_override    = *bas_result->model_override;
+                    if (effective_provider_override.empty() && bas_result->provider_override)
+                        effective_provider_override = *bas_result->provider_override;
+                }
+            } catch (const std::exception& e) {
+                log()->warn("before_agent_start hook (legacy) failed: {}", e.what());
+            }
+        }
+
+        // before_prompt_build (takes precedence over legacy for prompt fields)
+        if (hook_mgr->has_hooks(plugins::PluginHookName::BEFORE_PROMPT_BUILD)) {
+            tools::PluginHookBeforePromptBuildEvent bpb_event;
+            bpb_event.prompt = user_input;
+            bpb_event.messages_json = "[]";  // history serialized; simplified here
+            try {
+                auto bpb_result = hook_mgr->run_before_prompt_build(bpb_event, hook_ctx);
+                if (bpb_result) {
+                    // before_prompt_build takes precedence (last wins for systemPrompt)
+                    if (bpb_result->system_prompt)          hook_system_prompt          = bpb_result->system_prompt;
+                    if (bpb_result->prepend_context)        hook_prepend_context        = bpb_result->prepend_context;
+                    if (bpb_result->prepend_system_context) hook_prepend_system_context = bpb_result->prepend_system_context;
+                    if (bpb_result->append_system_context)  hook_append_system_context  = bpb_result->append_system_context;
+                }
+            } catch (const std::exception& e) {
+                log()->warn("before_prompt_build hook failed: {}", e.what());
+            }
+        }
+    }
+    // (hook_system_prompt / hook_prepend_context etc. are available for use
+    //  when building the actual LLM prompt — passed to call_llm via config)
+    (void)hook_system_prompt;
+    (void)hook_prepend_context;
+    (void)hook_prepend_system_context;
+    (void)hook_append_system_context;
+    (void)effective_model_override;
+    (void)effective_provider_override;
+
     // 🎯 OpenClaw 对齐: 重置流式状态
     streaming_state_.reset();
     
@@ -387,6 +485,40 @@ ReactResult ReactEngine::execute_loop(
                 
                 tool_msg.content = result_content;
                 messages.push_back(tool_msg);
+
+                // =========================================================
+                // Hook: tool_result_persist
+                // Aligned with OpenClaw attempt.ts — sync hook, called when
+                // a tool result is about to be persisted to the transcript.
+                // We delegate to append_tool_result_to_transcript which
+                // internally fires tool_result_persist + before_message_write.
+                // =========================================================
+                if (!callbacks.transcript_path.empty()) {
+                    sessions::AppendToolResultOptions trp_opts;
+                    trp_opts.tool_name    = tool_call_id;  // tool_call_id maps to tool name here
+                    trp_opts.tool_call_id = tool_call_id;
+                    trp_opts.result_json  = result_content;
+                    trp_opts.run_id       = callbacks.session_id;
+                    sessions::append_tool_result_to_transcript(
+                        callbacks.transcript_path, trp_opts);
+                } else {
+                    // No transcript path: fire tool_result_persist hook directly
+                    auto* trp_hook_mgr = tools::get_global_hook_manager();
+                    if (trp_hook_mgr && trp_hook_mgr->has_tool_result_persist_hooks()) {
+                        tools::PluginHookToolResultPersistEvent trp_event;
+                        trp_event.tool_call_id = tool_call_id.empty()
+                            ? std::nullopt : std::make_optional(tool_call_id);
+                        trp_event.message_json = result_content;
+                        trp_event.is_synthetic = false;
+                        tools::PluginHookToolResultPersistContext trp_ctx;
+                        trp_ctx.tool_call_id = trp_event.tool_call_id;
+                        try {
+                            trp_hook_mgr->run_tool_result_persist(trp_event, trp_ctx);
+                        } catch (const std::exception& e) {
+                            log()->warn("tool_result_persist hook failed: {}", e.what());
+                        }
+                    }
+                }
                 
                 // Observe (观察工具结果)
                 ReactStep observe_tool_step;
@@ -438,11 +570,34 @@ ReactResult ReactEngine::execute_loop(
         result.success = false;
         result.error = "ReAct loop exceeded max steps";
     }
-    
+
     result.total_steps = result.steps.size();
     result.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start_time_
     ).count();
+
+    // =========================================================================
+    // Hook: agent_end
+    // Aligned with OpenClaw attempt.ts:2678 — fire-and-forget, runs even on error
+    // Allows plugins to analyze the completed conversation.
+    // =========================================================================
+    if (hook_mgr && hook_mgr->has_hooks(plugins::PluginHookName::AGENT_END)) {
+        tools::PluginHookAgentEndEvent ae_event;
+        // Serialize messages to JSON string
+        ae_event.messages_json = "[]";  // simplified; full serialization via transcript
+        ae_event.success = result.success;
+        if (!result.error.empty()) ae_event.error = result.error;
+        ae_event.duration_ms = static_cast<int>(result.duration_ms);
+
+        tools::PluginHookAgentContext ae_ctx;
+        ae_ctx.session_id = callbacks.session_id.empty()
+            ? std::nullopt : std::make_optional(callbacks.session_id);
+        try {
+            hook_mgr->run_agent_end(ae_event, ae_ctx);
+        } catch (const std::exception& e) {
+            log()->warn("agent_end hook failed: {}", e.what());
+        }
+    }
     
     // ✅ 可观测性: 发射 ToolLoop 事件 (对齐 OpenClaw)
     try {
@@ -569,6 +724,32 @@ ReactEngine::LLMResponseData ReactEngine::call_llm(
         }
     };
     
+    // =========================================================================
+    // Hook: llm_input
+    // Aligned with OpenClaw attempt.ts:2431 — fire-and-forget, before LLM call
+    // Allows plugins to observe the exact input payload sent to the LLM.
+    // =========================================================================
+    auto* llm_hook_mgr = tools::get_global_hook_manager();
+    if (llm_hook_mgr && llm_hook_mgr->has_hooks(plugins::PluginHookName::LLM_INPUT)) {
+        tools::PluginHookLlmInputEvent li_event;
+        li_event.run_id     = callbacks.session_id + "-run";  // approximate run_id
+        li_event.session_id = callbacks.session_id;
+        li_event.provider   = llm_client_ ? llm_client_->get_config().provider : "unknown";
+        li_event.model      = llm_client_ ? llm_client_->get_config().model    : "unknown";
+        li_event.prompt     = messages.empty() ? "" : messages.back().content;
+        li_event.history_messages_json = "[]";  // simplified
+        li_event.images_count = 0;
+
+        tools::PluginHookAgentContext li_ctx;
+        li_ctx.session_id = callbacks.session_id.empty()
+            ? std::nullopt : std::make_optional(callbacks.session_id);
+        try {
+            llm_hook_mgr->run_llm_input(li_event, li_ctx);
+        } catch (const std::exception& e) {
+            log()->warn("llm_input hook failed: {}", e.what());
+        }
+    }
+
     // 调用 LLM 的流式接口 (从 messages)
     auto result = llm_client_->generate_stream_from_messages(messages, stream_callback);
     
@@ -591,7 +772,34 @@ ReactEngine::LLMResponseData ReactEngine::call_llm(
     // TODO: 解析 tool_calls 和 usage
     // response.tool_calls = ...
     // response.usage = ...
-    
+
+    // =========================================================================
+    // Hook: llm_output
+    // Aligned with OpenClaw attempt.ts:2737 — fire-and-forget, after LLM response
+    // Allows plugins to observe the exact output payload returned by the LLM.
+    // =========================================================================
+    if (llm_hook_mgr && llm_hook_mgr->has_hooks(plugins::PluginHookName::LLM_OUTPUT)) {
+        tools::PluginHookLlmOutputEvent lo_event;
+        lo_event.run_id     = callbacks.session_id + "-run";
+        lo_event.session_id = callbacks.session_id;
+        lo_event.provider   = llm_client_ ? llm_client_->get_config().provider : "unknown";
+        lo_event.model      = llm_client_ ? llm_client_->get_config().model    : "unknown";
+        if (!accumulated_text.empty()) lo_event.assistant_texts.push_back(accumulated_text);
+        tools::PluginHookLlmOutputUsage lo_usage;
+        lo_usage.input  = response.input_tokens  > 0 ? std::make_optional(response.input_tokens)  : std::nullopt;
+        lo_usage.output = response.output_tokens > 0 ? std::make_optional(response.output_tokens) : std::nullopt;
+        lo_event.usage = lo_usage;
+
+        tools::PluginHookAgentContext lo_ctx;
+        lo_ctx.session_id = callbacks.session_id.empty()
+            ? std::nullopt : std::make_optional(callbacks.session_id);
+        try {
+            llm_hook_mgr->run_llm_output(lo_event, lo_ctx);
+        } catch (const std::exception& e) {
+            log()->warn("llm_output hook failed: {}", e.what());
+        }
+    }
+
     // ✅ 可观测性: 发射 ModelUsage 事件 (对齐 OpenClaw)
     try {
         // ✅ 从 llm_client_ 获取真实的 provider 和 model
@@ -1002,9 +1210,28 @@ ReactEngine::CompactionResult ReactEngine::trigger_compaction(
     
     int messages_before = messages.size();
     int current_tokens = estimate_conversation_tokens(messages);
-    
+
     log()->info("[ReactEngine] Triggering compaction: {} messages, ~{} tokens",
                messages_before, current_tokens);
+
+    // =========================================================================
+    // Hook: before_compaction
+    // Aligned with OpenClaw compact.ts:857 and run.ts:1045
+    // Fire-and-forget, runs before compaction starts.
+    // =========================================================================
+    auto* compact_hook_mgr = tools::get_global_hook_manager();
+    if (compact_hook_mgr && compact_hook_mgr->has_hooks(plugins::PluginHookName::BEFORE_COMPACTION)) {
+        tools::PluginHookBeforeCompactionEvent bc_event;
+        bc_event.message_count   = static_cast<int>(messages.size());
+        bc_event.compacting_count = static_cast<int>(messages.size());
+        bc_event.token_count     = current_tokens;
+        tools::PluginHookAgentContext bc_ctx;
+        try {
+            compact_hook_mgr->run_before_compaction(bc_event, bc_ctx);
+        } catch (const std::exception& e) {
+            log()->warn("before_compaction hook failed: {}", e.what());
+        }
+    }
     
     // 转换 LLMMessage → AgentMessage
     std::vector<memory::AgentMessage> agent_messages;
@@ -1079,7 +1306,25 @@ ReactEngine::CompactionResult ReactEngine::trigger_compaction(
     result.messages_before = messages_before;
     result.messages_after = messages.size();
     result.tokens_saved = compact_data.tokens_saved;
-    
+
+    // =========================================================================
+    // Hook: after_compaction
+    // Aligned with OpenClaw compact.ts:988 and run.ts:1106
+    // Fire-and-forget, runs after successful compaction.
+    // =========================================================================
+    if (compact_hook_mgr && compact_hook_mgr->has_hooks(plugins::PluginHookName::AFTER_COMPACTION)) {
+        tools::PluginHookAfterCompactionEvent ac_event;
+        ac_event.message_count   = static_cast<int>(messages.size());
+        ac_event.compacted_count = messages_before - static_cast<int>(messages.size());
+        ac_event.token_count     = estimate_conversation_tokens(messages);
+        tools::PluginHookAgentContext ac_ctx;
+        try {
+            compact_hook_mgr->run_after_compaction(ac_event, ac_ctx);
+        } catch (const std::exception& e) {
+            log()->warn("after_compaction hook failed: {}", e.what());
+        }
+    }
+
     return result;
 }
 

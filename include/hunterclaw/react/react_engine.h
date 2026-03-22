@@ -96,6 +96,10 @@ struct StreamCallbacks {
     
     // 🎯 OpenClaw 对齐: 用于直连推送的 session_id
     std::string session_id;
+
+    // 🎯 OpenClaw 对齐: transcript 路径 (用于 tool_result_persist hook)
+    // 如果非空，工具结果将通过 append_tool_result_to_transcript 写入
+    std::string transcript_path;
 };
 
 // ReAct 配置

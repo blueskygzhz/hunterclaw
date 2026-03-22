@@ -1,6 +1,7 @@
 #include "hunterclaw/cli/gateway_commands.h"
 #include "hunterclaw/cli/command.h"
 #include "hunterclaw/gateway/gateway.h"
+#include "hunterclaw/tools/tool_hooks.h"   // get_global_hook_manager(), PluginHook* types
 #include "hunterclaw/infra/http_client.h"
 #include "hunterclaw/core/json.h"
 #include <iostream>
@@ -175,6 +176,24 @@ core::Result<void> GatewayStartCommand::execute(const std::vector<std::string>& 
     if (!start_result.is_ok()) {
         return core::Result<void>::err("Failed to start Gateway: " + start_result.error);
     }
+
+    // =========================================================================
+    // Hook: gateway_start
+    // Aligned with OpenClaw gateway/server.ts — fire-and-forget
+    // Fires after the gateway has successfully started and is accepting connections.
+    // =========================================================================
+    auto* hook_mgr = tools::get_global_hook_manager();
+    if (hook_mgr && hook_mgr->has_hooks(plugins::PluginHookName::GATEWAY_START)) {
+        tools::PluginHookGatewayStartEvent gs_event;
+        gs_event.port = port;
+        tools::PluginHookGatewayContext gs_ctx;
+        gs_ctx.port = port;
+        try {
+            hook_mgr->run_gateway_start(gs_event, gs_ctx);
+        } catch (const std::exception& e) {
+            std::cerr << "[gateway] gateway_start hook failed: " << e.what() << "\n";
+        }
+    }
     
     if (!daemon) {
         JsonOutput output{true, "started", "Gateway started successfully"};
@@ -227,6 +246,24 @@ core::Result<void> GatewayStopCommand::execute(const std::vector<std::string>& a
     
     // Send shutdown signal
     int signal = force ? SIGKILL : SIGTERM;
+
+    // =========================================================================
+    // Hook: gateway_stop
+    // Aligned with OpenClaw gateway/server.ts — fire-and-forget
+    // Fires before the gateway process is terminated.
+    // =========================================================================
+    auto* stop_hook_mgr = tools::get_global_hook_manager();
+    if (stop_hook_mgr && stop_hook_mgr->has_hooks(plugins::PluginHookName::GATEWAY_STOP)) {
+        tools::PluginHookGatewayStopEvent gstop_event;
+        gstop_event.reason = force ? std::make_optional(std::string("force")) : std::nullopt;
+        tools::PluginHookGatewayContext gstop_ctx;
+        try {
+            stop_hook_mgr->run_gateway_stop(gstop_event, gstop_ctx);
+        } catch (const std::exception& e) {
+            std::cerr << "[gateway] gateway_stop hook failed: " << e.what() << "\n";
+        }
+    }
+
     if (kill(pid, signal) != 0) {
         JsonOutput output{false, "error", "Failed to stop Gateway"};
         output.print();

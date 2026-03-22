@@ -1244,5 +1244,45 @@ std::vector<ChannelHealth> ChannelHealthMonitor::get_all_health() const {
     return result;
 }
 
+// ============================================================================
+// Hook: message_received
+// Aligned with OpenClaw channels/plugins/hooks.ts — fire-and-forget
+// Called by channel plugins when an inbound message is received.
+// ============================================================================
+void ChannelManager::fire_message_received(
+    const ChannelId& channel_id,
+    const std::string& account_id,
+    const std::string& from,
+    const std::string& content,
+    std::optional<int64_t> timestamp,
+    std::optional<std::string> metadata_json
+) {
+    // Record inbound activity (existing behavior)
+    record_channel_activity(channel_id, account_id, ChannelDirection::Inbound);
+
+    // Fire message_received hook
+    auto* hook_mgr = tools::get_global_hook_manager();
+    if (!hook_mgr || !hook_mgr->has_hooks(plugins::PluginHookName::MESSAGE_RECEIVED)) {
+        return;
+    }
+
+    tools::PluginHookMessageReceivedEvent mr_event;
+    mr_event.from      = from;
+    mr_event.content   = content;
+    mr_event.timestamp = timestamp;
+    mr_event.metadata_json = metadata_json;
+
+    tools::PluginHookMessageContext mr_ctx;
+    mr_ctx.channel_id  = channel_id;
+    mr_ctx.account_id  = account_id.empty() ? std::nullopt : std::make_optional(account_id);
+
+    try {
+        hook_mgr->run_message_received(mr_event, mr_ctx);
+    } catch (const std::exception& e) {
+        // fire-and-forget: log and continue
+        spdlog::warn("[channels] message_received hook failed: {}", e.what());
+    }
+}
+
 } // namespace channels
 } // namespace hunterclaw

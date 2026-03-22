@@ -592,31 +592,58 @@ public:
         //   - PluginHookToolContext: { agentId?, sessionKey?, sessionId?, runId?, toolName, toolCallId? }
         // ================================================================
         core::JsonValue params = raw_params;
+
+        // Build shared event + context for both private and global hook managers
+        PluginHookBeforeToolCallEvent before_event;
+        before_event.tool_name = "exec";
+        before_event.params_json = raw_params.to_string();
+
+        PluginHookToolContext tool_ctx;
+        tool_ctx.tool_name = "exec";
+        tool_ctx.agent_id = context_.agent_id.empty()
+            ? std::nullopt : std::make_optional(context_.agent_id);
+        tool_ctx.session_key = context_.session_key.empty()
+            ? std::nullopt : std::make_optional(context_.session_key);
+        tool_ctx.run_id = context_.run_id.empty()
+            ? std::nullopt : std::make_optional(context_.run_id);
+        tool_ctx.session_id = context_.session_id.empty()
+            ? std::nullopt : std::make_optional(context_.session_id);
+
+        // ── Private hook manager (exec-specific hooks) ──
         if (hook_manager_) {
-            PluginHookBeforeToolCallEvent before_event;
-            before_event.tool_name = "exec";
-            before_event.params = raw_params;
-
-            PluginHookToolContext tool_ctx;
-            tool_ctx.tool_name = "exec";
-            tool_ctx.agent_id = context_.agent_id.empty()
-                ? std::nullopt : std::make_optional(context_.agent_id);
-            tool_ctx.session_key = context_.session_key.empty()
-                ? std::nullopt : std::make_optional(context_.session_key);
-            tool_ctx.run_id = context_.run_id.empty()
-                ? std::nullopt : std::make_optional(context_.run_id);
-            tool_ctx.session_id = context_.session_id.empty()
-                ? std::nullopt : std::make_optional(context_.session_id);
-
             auto before_result = hook_manager_->run_before_tool_call(before_event, tool_ctx);
             if (before_result.has_value()) {
-                if (before_result->block.value_or(false)) {
+                if (before_result->block) {
                     std::string reason = before_result->block_reason.value_or("blocked by plugin hook");
                     log()->warn("exec: blocked by before_tool_call hook: {}", reason);
                     return tool_result::error("exec blocked: " + reason);
                 }
-                if (before_result->params.has_value()) {
-                    params = before_result->params.value();
+                if (before_result->params_json.has_value()) {
+                    auto parsed = core::JsonValue::parse(*before_result->params_json);
+                    if (parsed.ok && parsed.value) params = std::move(*parsed.value);
+                }
+            }
+        }
+
+        // ── Global hook manager (process-wide plugin hooks)
+        // Aligned with OpenClaw: all tools share the same global HookRunner
+        // ──────────────────────────────────────────────────────────────────
+        {
+            auto* global_mgr = get_global_hook_manager();
+            if (global_mgr && global_mgr->has_before_tool_call_hooks()) {
+                // Update params_json in case private hooks modified params
+                before_event.params_json = params.to_string();
+                auto global_result = global_mgr->run_before_tool_call(before_event, tool_ctx);
+                if (global_result.has_value()) {
+                    if (global_result->block) {
+                        std::string reason = global_result->block_reason.value_or("blocked by global plugin hook");
+                        log()->warn("exec: blocked by global before_tool_call hook: {}", reason);
+                        return tool_result::error("exec blocked: " + reason);
+                    }
+                    if (global_result->params_json.has_value()) {
+                        auto parsed = core::JsonValue::parse(*global_result->params_json);
+                        if (parsed.ok && parsed.value) params = std::move(*parsed.value);
+                    }
                 }
             }
         }
@@ -639,23 +666,23 @@ public:
         //   - PluginHookAfterToolCallEvent: { toolName, params, runId?, toolCallId?,
         //                                    result?, error?, durationMs? }
         // ================================================================
-        if (hook_manager_) {
+        if (hook_manager_ || get_global_hook_manager()) {
             auto end_time = std::chrono::steady_clock::now();
             double duration_ms = std::chrono::duration<double, std::milli>(
                 end_time - start_time).count();
 
             PluginHookAfterToolCallEvent after_event;
             after_event.tool_name = "exec";
-            after_event.params = params;
+            after_event.params_json = params.to_string();
             after_event.duration_ms = duration_ms;
             if (!error_msg.empty()) {
                 after_event.error = error_msg;
             } else {
-                // Serialize result as JSON value
+                // Serialize result as JSON string
                 core::JsonValue result_json = core::JsonValue::object();
                 result_json["success"] = result.success;
                 if (!result.error.empty()) result_json["error"] = result.error;
-                after_event.result = result_json;
+                after_event.result_json = result_json.to_string();
             }
 
             PluginHookToolContext tool_ctx;
@@ -669,7 +696,17 @@ public:
             tool_ctx.session_id = context_.session_id.empty()
                 ? std::nullopt : std::make_optional(context_.session_id);
 
-            hook_manager_->run_after_tool_call(after_event, tool_ctx);
+            // ── Private hook manager (exec-specific hooks) ──
+            if (hook_manager_) {
+                hook_manager_->run_after_tool_call(after_event, tool_ctx);
+            }
+
+            // ── Global hook manager (process-wide plugin hooks) ──
+            // Aligned with OpenClaw: all tools share the same global HookRunner
+            auto* global_mgr = get_global_hook_manager();
+            if (global_mgr && global_mgr->has_after_tool_call_hooks()) {
+                global_mgr->run_after_tool_call(after_event, tool_ctx);
+            }
         }
 
         return result;

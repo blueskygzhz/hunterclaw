@@ -5,6 +5,7 @@
 #include "hunterclaw/agents/agent_instance.h"
 #include "hunterclaw/sessions/session_manager.h"
 #include "hunterclaw/sessions/transcript_io.h"
+#include "hunterclaw/tools/tool_hooks.h"   // get_global_hook_manager(), PluginHook* types
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <filesystem>
@@ -320,7 +321,7 @@ core::Result<json> method_session_list(
     std::string sessions_dir;
     {
         auto cfg = server->config();
-        if (cfg) sessions_dir = cfg->sessions_dir();
+        if (cfg && !cfg->workspace_dir.empty()) sessions_dir = (std::filesystem::path(cfg->workspace_dir).parent_path() / "sessions").string();
         if (sessions_dir.empty()) {
             const char* home = std::getenv("HOME");
             sessions_dir = std::string(home ? home : "/tmp") + "/.hunterclaw/sessions";
@@ -487,7 +488,7 @@ core::Result<json> method_session_preview(
     std::string sessions_dir;
     {
         auto cfg = server->config();
-        if (cfg) sessions_dir = cfg->sessions_dir();
+        if (cfg && !cfg->workspace_dir.empty()) sessions_dir = (std::filesystem::path(cfg->workspace_dir).parent_path() / "sessions").string();
         if (sessions_dir.empty()) {
             const char* home = std::getenv("HOME");
             sessions_dir = std::string(home ? home : "/tmp") + "/.hunterclaw/sessions";
@@ -617,7 +618,7 @@ core::Result<json> method_session_patch(
     std::string sessions_dir;
     {
         auto cfg = server->config();
-        if (cfg) sessions_dir = cfg->sessions_dir();
+        if (cfg && !cfg->workspace_dir.empty()) sessions_dir = (std::filesystem::path(cfg->workspace_dir).parent_path() / "sessions").string();
         if (sessions_dir.empty()) {
             const char* home = std::getenv("HOME");
             sessions_dir = std::string(home ? home : "/tmp") + "/.hunterclaw/sessions";
@@ -835,7 +836,7 @@ core::Result<json> method_session_reset(
     std::string sessions_dir;
     {
         auto cfg = server->config();
-        if (cfg) sessions_dir = cfg->sessions_dir();
+        if (cfg && !cfg->workspace_dir.empty()) sessions_dir = (std::filesystem::path(cfg->workspace_dir).parent_path() / "sessions").string();
         if (sessions_dir.empty()) {
             const char* home = std::getenv("HOME");
             sessions_dir = std::string(home ? home : "/tmp") + "/.hunterclaw/sessions";
@@ -851,12 +852,37 @@ core::Result<json> method_session_reset(
         had_existing_entry = true;
     }
 
+    // =========================================================================
+    // Hook: before_reset
+    // Aligned with OpenClaw session-reset-service.ts — void hook, fire-and-forget
+    // Fires before the session is reset; plugins observe but cannot cancel.
+    // Called BEFORE cleanupSessionBeforeMutation so plugins see the old state.
+    // =========================================================================
+    {
+        auto* hook_mgr = tools::get_global_hook_manager();
+        if (hook_mgr && hook_mgr->has_hooks(plugins::PluginHookName::BEFORE_RESET)) {
+            tools::PluginHookBeforeResetEvent br_event;
+            br_event.session_key    = key;
+            br_event.reason         = reason;
+            br_event.old_session_id = had_existing_entry
+                ? std::make_optional(old_entry.session_id) : std::nullopt;
+            tools::PluginHookAgentContext br_ctx;
+            br_ctx.session_id = had_existing_entry ? old_entry.session_id : key;
+            try {
+                hook_mgr->run_before_reset(br_event, br_ctx);
+            } catch (const std::exception& e) {
+                // before_reset hook failure is non-fatal — log and continue
+                spdlog::warn("[sessions.reset] before_reset hook failed: {}", e.what());
+            }
+        }
+    }
+
     // 🎯 OpenClaw 对齐: Step 1 - cleanupSessionBeforeMutation
     // abort 当前 run, 清理队列
     cleanup_session_before_mutation(server, key);
 
     // 🎯 OpenClaw 对齐: Step 2 - updateSessionStore
-    // 生成新 sessionId，保留 label/thinkingLevel 等元数据
+h    // 生成新 sessionId，保留 label/thinkingLevel 等元数据
     // 对应 performGatewaySessionReset 中的 nextEntry 构造
     sessions::SessionEntry next_entry;
     next_entry.session_id       = core::utils::generate_uuid();
@@ -999,7 +1025,7 @@ core::Result<json> method_session_delete(
     std::string sessions_dir;
     {
         auto cfg = server->config();
-        if (cfg) sessions_dir = cfg->sessions_dir();
+        if (cfg && !cfg->workspace_dir.empty()) sessions_dir = (std::filesystem::path(cfg->workspace_dir).parent_path() / "sessions").string();
         if (sessions_dir.empty()) {
             const char* home = std::getenv("HOME");
             sessions_dir = std::string(home ? home : "/tmp") + "/.hunterclaw/sessions";
@@ -1106,7 +1132,7 @@ core::Result<json> method_session_get(
     std::string sessions_dir;
     {
         auto cfg = server->config();
-        if (cfg) sessions_dir = cfg->sessions_dir();
+        if (cfg && !cfg->workspace_dir.empty()) sessions_dir = (std::filesystem::path(cfg->workspace_dir).parent_path() / "sessions").string();
         if (sessions_dir.empty()) {
             const char* home = std::getenv("HOME");
             sessions_dir = std::string(home ? home : "/tmp") + "/.hunterclaw/sessions";
@@ -1202,7 +1228,7 @@ core::Result<json> method_session_compact(
     std::string sessions_dir;
     {
         auto cfg = server->config();
-        if (cfg) sessions_dir = cfg->sessions_dir();
+        if (cfg && !cfg->workspace_dir.empty()) sessions_dir = (std::filesystem::path(cfg->workspace_dir).parent_path() / "sessions").string();
         if (sessions_dir.empty()) {
             const char* home = std::getenv("HOME");
             sessions_dir = std::string(home ? home : "/tmp") + "/.hunterclaw/sessions";

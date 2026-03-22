@@ -3,35 +3,33 @@
 //
 // Strictly aligned with OpenClaw plugins/hooks.ts createHookRunner():
 //
-//   before_tool_call:
-//     - Sequential (modifying hook)
-//     - Priority-sorted (higher first)
-//     - Results merged: params/block/blockReason
-//     - Errors caught and logged (catchErrors=true by default)
+// void hooks (parallel/sequential, fire-and-forget):
+//   agent_end, llm_input, llm_output, before_compaction, after_compaction,
+//   before_reset, message_received, message_sent, after_tool_call,
+//   session_start, session_end, subagent_spawned, subagent_ended,
+//   gateway_start, gateway_stop
 //
-//   after_tool_call:
-//     - Parallel/sequential void hook
-//     - Priority-sorted (higher first)
-//     - Errors caught and logged
+// modifying hooks (sequential, results merged):
+//   before_model_resolve  — merge: first defined wins (modelOverride/providerOverride)
+//   before_prompt_build   — merge: systemPrompt last wins; context strings concatenated
+//   before_agent_start    — merge: combines both above
+//   message_sending       — merge: content/cancel last defined wins
+//   before_tool_call      — merge: params/block/blockReason first defined wins
+//   subagent_spawning     — merge: error status wins; threadBindingReady OR-ed
+//   subagent_delivery_target — merge: first defined origin wins
 //
-//   tool_result_persist:
-//     - Synchronous, sequential
-//     - Priority-sorted (higher first)
-//     - Each handler may return { message } to replace the current message
-//     - Guards against async handlers (this hook is sync-only)
-//
-//   before_message_write:
-//     - Synchronous, sequential
-//     - Priority-sorted (higher first)
-//     - If any handler returns { block: true }, return immediately
-//     - If handler returns { message }, use it for subsequent handlers
+// sync hooks (synchronous, sequential):
+//   tool_result_persist   — each handler may replace message
+//   before_message_write  — block short-circuits; message replaced per handler
 // ============================================================================
 
 #include "hunterclaw/tools/tool_hooks.h"
 #include <spdlog/spdlog.h>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <map>
+#include <mutex>
 #include <fstream>
 
 namespace hunterclaw {
@@ -45,141 +43,363 @@ namespace {
         }
         return logger;
     }
+
+    // Helper: concat two optional strings with newline separator
+    // Aligned with OpenClaw concatOptionalTextSegments
+    std::optional<std::string> concat_optional(
+        const std::optional<std::string>& left,
+        const std::optional<std::string>& right)
+    {
+        if (!left && !right) return std::nullopt;
+        if (!left)  return right;
+        if (!right) return left;
+        return *left + "\n" + *right;
+    }
 } // anonymous namespace
 
 // ============================================================================
-// plugin_hook_name_to_string
+// plugin_hook_name_to_string — delegates to plugins::plugin_hook_name_to_string
 // ============================================================================
 
 std::string plugin_hook_name_to_string(PluginHookName name) {
-    switch (name) {
-        case PluginHookName::BEFORE_MODEL_RESOLVE:      return "before_model_resolve";
-        case PluginHookName::BEFORE_PROMPT_BUILD:       return "before_prompt_build";
-        case PluginHookName::BEFORE_AGENT_START:        return "before_agent_start";
-        case PluginHookName::LLM_INPUT:                 return "llm_input";
-        case PluginHookName::LLM_OUTPUT:                return "llm_output";
-        case PluginHookName::AGENT_END:                 return "agent_end";
-        case PluginHookName::BEFORE_COMPACTION:         return "before_compaction";
-        case PluginHookName::AFTER_COMPACTION:          return "after_compaction";
-        case PluginHookName::BEFORE_RESET:              return "before_reset";
-        case PluginHookName::MESSAGE_RECEIVED:          return "message_received";
-        case PluginHookName::MESSAGE_SENDING:           return "message_sending";
-        case PluginHookName::MESSAGE_SENT:              return "message_sent";
-        case PluginHookName::BEFORE_TOOL_CALL:          return "before_tool_call";
-        case PluginHookName::AFTER_TOOL_CALL:           return "after_tool_call";
-        case PluginHookName::TOOL_RESULT_PERSIST:       return "tool_result_persist";
-        case PluginHookName::BEFORE_MESSAGE_WRITE:      return "before_message_write";
-        case PluginHookName::SESSION_START:             return "session_start";
-        case PluginHookName::SESSION_END:               return "session_end";
-        case PluginHookName::SUBAGENT_SPAWNING:         return "subagent_spawning";
-        case PluginHookName::SUBAGENT_DELIVERY_TARGET:  return "subagent_delivery_target";
-        case PluginHookName::SUBAGENT_SPAWNED:          return "subagent_spawned";
-        case PluginHookName::SUBAGENT_ENDED:            return "subagent_ended";
-        case PluginHookName::GATEWAY_START:             return "gateway_start";
-        case PluginHookName::GATEWAY_STOP:              return "gateway_stop";
-    }
-    return "unknown";
+    return plugins::plugin_hook_name_to_string(name);
 }
 
 // ============================================================================
-// ToolHookManager - Registration
+// Registration helpers (macro to reduce boilerplate)
 // ============================================================================
 
-void ToolHookManager::register_before_tool_call(
-    const std::string& plugin_id,
-    BeforeToolCallHandler handler,
-    int priority)
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-    before_tool_call_hooks_.push_back({plugin_id, std::move(handler), priority});
-    // Sort by priority descending (higher priority runs first)
-    // Aligned with: getHooksForName → .toSorted((a, b) => (b.priority ?? 0) - (a.priority ?? 0))
-    std::stable_sort(before_tool_call_hooks_.begin(), before_tool_call_hooks_.end(),
-        [](const BeforeToolCallEntry& a, const BeforeToolCallEntry& b) {
-            return a.priority > b.priority;
-        });
-    log()->debug("[hooks] registered before_tool_call hook from plugin '{}'", plugin_id);
+#define IMPL_REGISTER(method_name, vec_name, EntryType, HandlerType)          \
+void ToolHookManager::method_name(                                             \
+    const std::string& plugin_id, HandlerType handler, int priority)          \
+{                                                                              \
+    std::lock_guard<std::mutex> lock(mutex_);                                  \
+    vec_name.push_back({plugin_id, std::move(handler), priority});             \
+    sort_by_priority(vec_name);                                                \
+    log()->debug("[hooks] registered {} hook from plugin '{}'",                \
+        #method_name, plugin_id);                                              \
 }
 
-void ToolHookManager::register_after_tool_call(
-    const std::string& plugin_id,
-    AfterToolCallHandler handler,
-    int priority)
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-    after_tool_call_hooks_.push_back({plugin_id, std::move(handler), priority});
-    std::stable_sort(after_tool_call_hooks_.begin(), after_tool_call_hooks_.end(),
-        [](const AfterToolCallEntry& a, const AfterToolCallEntry& b) {
-            return a.priority > b.priority;
-        });
-    log()->debug("[hooks] registered after_tool_call hook from plugin '{}'", plugin_id);
-}
+// Agent hooks
+IMPL_REGISTER(register_before_model_resolve, before_model_resolve_hooks_, BeforeModelResolveEntry, BeforeModelResolveHandler)
+IMPL_REGISTER(register_before_prompt_build,  before_prompt_build_hooks_,  BeforePromptBuildEntry,  BeforePromptBuildHandler)
+IMPL_REGISTER(register_before_agent_start,   before_agent_start_hooks_,   BeforeAgentStartEntry,   BeforeAgentStartHandler)
+IMPL_REGISTER(register_llm_input,            llm_input_hooks_,            LlmInputEntry,           LlmInputHandler)
+IMPL_REGISTER(register_llm_output,           llm_output_hooks_,           LlmOutputEntry,          LlmOutputHandler)
+IMPL_REGISTER(register_agent_end,            agent_end_hooks_,            AgentEndEntry,           AgentEndHandler)
+IMPL_REGISTER(register_before_compaction,    before_compaction_hooks_,    BeforeCompactionEntry,   BeforeCompactionHandler)
+IMPL_REGISTER(register_after_compaction,     after_compaction_hooks_,     AfterCompactionEntry,    AfterCompactionHandler)
+IMPL_REGISTER(register_before_reset,         before_reset_hooks_,         BeforeResetEntry,        BeforeResetHandler)
+// Message hooks
+IMPL_REGISTER(register_message_received,     message_received_hooks_,     MessageReceivedEntry,    MessageReceivedHandler)
+IMPL_REGISTER(register_message_sending,      message_sending_hooks_,      MessageSendingEntry,     MessageSendingHandler)
+IMPL_REGISTER(register_message_sent,         message_sent_hooks_,         MessageSentEntry,        MessageSentHandler)
+// Tool hooks
+IMPL_REGISTER(register_before_tool_call,     before_tool_call_hooks_,     BeforeToolCallEntry,     BeforeToolCallHandler)
+IMPL_REGISTER(register_after_tool_call,      after_tool_call_hooks_,      AfterToolCallEntry,      AfterToolCallHandler)
+IMPL_REGISTER(register_tool_result_persist,  tool_result_persist_hooks_,  ToolResultPersistEntry,  ToolResultPersistHandler)
+// Message write hooks
+IMPL_REGISTER(register_before_message_write, before_message_write_hooks_, BeforeMessageWriteEntry, BeforeMessageWriteHandler)
+// Session hooks
+IMPL_REGISTER(register_session_start,        session_start_hooks_,        SessionStartEntry,       SessionStartHandler)
+IMPL_REGISTER(register_session_end,          session_end_hooks_,          SessionEndEntry,         SessionEndHandler)
+IMPL_REGISTER(register_subagent_spawning,    subagent_spawning_hooks_,    SubagentSpawningEntry,   SubagentSpawningHandler)
+IMPL_REGISTER(register_subagent_delivery_target, subagent_delivery_target_hooks_, SubagentDeliveryTargetEntry, SubagentDeliveryTargetHandler)
+IMPL_REGISTER(register_subagent_spawned,     subagent_spawned_hooks_,     SubagentSpawnedEntry,    SubagentSpawnedHandler)
+IMPL_REGISTER(register_subagent_ended,       subagent_ended_hooks_,       SubagentEndedEntry,      SubagentEndedHandler)
+// Gateway hooks
+IMPL_REGISTER(register_gateway_start,        gateway_start_hooks_,        GatewayStartEntry,       GatewayStartHandler)
+IMPL_REGISTER(register_gateway_stop,         gateway_stop_hooks_,         GatewayStopEntry,        GatewayStopHandler)
 
-void ToolHookManager::register_tool_result_persist(
-    const std::string& plugin_id,
-    ToolResultPersistHandler handler,
-    int priority)
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-    tool_result_persist_hooks_.push_back({plugin_id, std::move(handler), priority});
-    std::stable_sort(tool_result_persist_hooks_.begin(), tool_result_persist_hooks_.end(),
-        [](const ToolResultPersistEntry& a, const ToolResultPersistEntry& b) {
-            return a.priority > b.priority;
-        });
-    log()->debug("[hooks] registered tool_result_persist hook from plugin '{}'", plugin_id);
-}
+#undef IMPL_REGISTER
 
-void ToolHookManager::register_before_message_write(
-    const std::string& plugin_id,
-    BeforeMessageWriteHandler handler,
-    int priority)
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-    before_message_write_hooks_.push_back({plugin_id, std::move(handler), priority});
-    std::stable_sort(before_message_write_hooks_.begin(), before_message_write_hooks_.end(),
-        [](const BeforeMessageWriteEntry& a, const BeforeMessageWriteEntry& b) {
-            return a.priority > b.priority;
-        });
-    log()->debug("[hooks] registered before_message_write hook from plugin '{}'", plugin_id);
-}
+// ============================================================================
+// unregister_plugin / clear_all_hooks
+// ============================================================================
 
 void ToolHookManager::unregister_plugin(const std::string& plugin_id) {
     std::lock_guard<std::mutex> lock(mutex_);
-
-    auto remove_by_plugin = [&plugin_id](auto& vec) {
-        vec.erase(std::remove_if(vec.begin(), vec.end(),
-            [&plugin_id](const auto& entry) { return entry.plugin_id == plugin_id; }),
-            vec.end());
-    };
-
-    remove_by_plugin(before_tool_call_hooks_);
-    remove_by_plugin(after_tool_call_hooks_);
-    remove_by_plugin(tool_result_persist_hooks_);
-    remove_by_plugin(before_message_write_hooks_);
-
+    remove_plugin(before_model_resolve_hooks_,     plugin_id);
+    remove_plugin(before_prompt_build_hooks_,      plugin_id);
+    remove_plugin(before_agent_start_hooks_,       plugin_id);
+    remove_plugin(llm_input_hooks_,                plugin_id);
+    remove_plugin(llm_output_hooks_,               plugin_id);
+    remove_plugin(agent_end_hooks_,                plugin_id);
+    remove_plugin(before_compaction_hooks_,        plugin_id);
+    remove_plugin(after_compaction_hooks_,         plugin_id);
+    remove_plugin(before_reset_hooks_,             plugin_id);
+    remove_plugin(message_received_hooks_,         plugin_id);
+    remove_plugin(message_sending_hooks_,          plugin_id);
+    remove_plugin(message_sent_hooks_,             plugin_id);
+    remove_plugin(before_tool_call_hooks_,         plugin_id);
+    remove_plugin(after_tool_call_hooks_,          plugin_id);
+    remove_plugin(tool_result_persist_hooks_,      plugin_id);
+    remove_plugin(before_message_write_hooks_,     plugin_id);
+    remove_plugin(session_start_hooks_,            plugin_id);
+    remove_plugin(session_end_hooks_,              plugin_id);
+    remove_plugin(subagent_spawning_hooks_,        plugin_id);
+    remove_plugin(subagent_delivery_target_hooks_, plugin_id);
+    remove_plugin(subagent_spawned_hooks_,         plugin_id);
+    remove_plugin(subagent_ended_hooks_,           plugin_id);
+    remove_plugin(gateway_start_hooks_,            plugin_id);
+    remove_plugin(gateway_stop_hooks_,             plugin_id);
     log()->debug("[hooks] unregistered all hooks for plugin '{}'", plugin_id);
 }
 
 void ToolHookManager::clear_all_hooks() {
     std::lock_guard<std::mutex> lock(mutex_);
+    before_model_resolve_hooks_.clear();
+    before_prompt_build_hooks_.clear();
+    before_agent_start_hooks_.clear();
+    llm_input_hooks_.clear();
+    llm_output_hooks_.clear();
+    agent_end_hooks_.clear();
+    before_compaction_hooks_.clear();
+    after_compaction_hooks_.clear();
+    before_reset_hooks_.clear();
+    message_received_hooks_.clear();
+    message_sending_hooks_.clear();
+    message_sent_hooks_.clear();
     before_tool_call_hooks_.clear();
     after_tool_call_hooks_.clear();
     tool_result_persist_hooks_.clear();
     before_message_write_hooks_.clear();
+    session_start_hooks_.clear();
+    session_end_hooks_.clear();
+    subagent_spawning_hooks_.clear();
+    subagent_delivery_target_hooks_.clear();
+    subagent_spawned_hooks_.clear();
+    subagent_ended_hooks_.clear();
+    gateway_start_hooks_.clear();
+    gateway_stop_hooks_.clear();
     log()->debug("[hooks] cleared all hooks");
 }
 
 // ============================================================================
-// run_before_tool_call
+// Void hook helper (aligned with OpenClaw runVoidHook)
+// All handlers called sequentially; errors caught and logged.
+// ============================================================================
+
+#define IMPL_VOID_HOOK(run_method, vec_name, EventType, CtxType, hook_name_str) \
+void ToolHookManager::run_method(const EventType& event, const CtxType& ctx)    \
+{                                                                                \
+    std::vector<decltype(vec_name)::value_type> hooks;                           \
+    { std::lock_guard<std::mutex> lock(mutex_); hooks = vec_name; }              \
+    if (hooks.empty()) return;                                                   \
+    log()->debug("[hooks] running " hook_name_str " ({} handlers)", hooks.size()); \
+    for (const auto& entry : hooks) {                                            \
+        try { entry.handler(event, ctx); }                                       \
+        catch (const std::exception& e) {                                        \
+            log()->error("[hooks] " hook_name_str " handler from '{}' failed: {}", \
+                entry.plugin_id, e.what());                                      \
+        }                                                                        \
+    }                                                                            \
+}
+
+// Agent void hooks
+IMPL_VOID_HOOK(run_llm_input,          llm_input_hooks_,         PluginHookLlmInputEvent,         PluginHookAgentContext,   "llm_input")
+IMPL_VOID_HOOK(run_llm_output,         llm_output_hooks_,        PluginHookLlmOutputEvent,        PluginHookAgentContext,   "llm_output")
+IMPL_VOID_HOOK(run_agent_end,          agent_end_hooks_,         PluginHookAgentEndEvent,         PluginHookAgentContext,   "agent_end")
+IMPL_VOID_HOOK(run_before_compaction,  before_compaction_hooks_, PluginHookBeforeCompactionEvent, PluginHookAgentContext,   "before_compaction")
+IMPL_VOID_HOOK(run_after_compaction,   after_compaction_hooks_,  PluginHookAfterCompactionEvent,  PluginHookAgentContext,   "after_compaction")
+IMPL_VOID_HOOK(run_before_reset,       before_reset_hooks_,      PluginHookBeforeResetEvent,      PluginHookAgentContext,   "before_reset")
+// Message void hooks
+IMPL_VOID_HOOK(run_message_received,   message_received_hooks_,  PluginHookMessageReceivedEvent,  PluginHookMessageContext, "message_received")
+IMPL_VOID_HOOK(run_message_sent,       message_sent_hooks_,      PluginHookMessageSentEvent,      PluginHookMessageContext, "message_sent")
+// Tool void hooks
+IMPL_VOID_HOOK(run_after_tool_call,    after_tool_call_hooks_,   PluginHookAfterToolCallEvent,    PluginHookToolContext,    "after_tool_call")
+// Session void hooks
+IMPL_VOID_HOOK(run_session_start,      session_start_hooks_,     PluginHookSessionStartEvent,     PluginHookSessionContext, "session_start")
+IMPL_VOID_HOOK(run_session_end,        session_end_hooks_,       PluginHookSessionEndEvent,       PluginHookSessionContext, "session_end")
+IMPL_VOID_HOOK(run_subagent_spawned,   subagent_spawned_hooks_,  PluginHookSubagentSpawnedEvent,  PluginHookSubagentContext,"subagent_spawned")
+IMPL_VOID_HOOK(run_subagent_ended,     subagent_ended_hooks_,    PluginHookSubagentEndedEvent,    PluginHookSubagentContext,"subagent_ended")
+// Gateway void hooks
+IMPL_VOID_HOOK(run_gateway_start,      gateway_start_hooks_,     PluginHookGatewayStartEvent,     PluginHookGatewayContext, "gateway_start")
+IMPL_VOID_HOOK(run_gateway_stop,       gateway_stop_hooks_,      PluginHookGatewayStopEvent,      PluginHookGatewayContext, "gateway_stop")
+
+#undef IMPL_VOID_HOOK
+
+// ============================================================================
+// run_before_model_resolve (modifying hook)
+//
+// Aligned with OpenClaw mergeBeforeModelResolve:
+//   modelOverride:    acc?.modelOverride ?? next.modelOverride  (first defined wins)
+//   providerOverride: acc?.providerOverride ?? next.providerOverride
+// ============================================================================
+
+std::optional<PluginHookBeforeModelResolveResult> ToolHookManager::run_before_model_resolve(
+    const PluginHookBeforeModelResolveEvent& event,
+    const PluginHookAgentContext& ctx)
+{
+    std::vector<BeforeModelResolveEntry> hooks;
+    { std::lock_guard<std::mutex> lock(mutex_); hooks = before_model_resolve_hooks_; }
+    if (hooks.empty()) return std::nullopt;
+
+    log()->debug("[hooks] running before_model_resolve ({} handlers, sequential)", hooks.size());
+
+    std::optional<PluginHookBeforeModelResolveResult> accumulated;
+
+    for (const auto& entry : hooks) {
+        try {
+            auto result = entry.handler(event, ctx);
+            if (!result) continue;
+            if (!accumulated) {
+                accumulated = result;
+            } else {
+                // Aligned with OpenClaw mergeBeforeModelResolve:
+                // Keep the first defined override so higher-priority hooks win.
+                if (!accumulated->model_override && result->model_override)
+                    accumulated->model_override = result->model_override;
+                if (!accumulated->provider_override && result->provider_override)
+                    accumulated->provider_override = result->provider_override;
+            }
+        } catch (const std::exception& e) {
+            log()->error("[hooks] before_model_resolve handler from '{}' failed: {}",
+                entry.plugin_id, e.what());
+        }
+    }
+    return accumulated;
+}
+
+// ============================================================================
+// run_before_prompt_build (modifying hook)
+//
+// Aligned with OpenClaw mergeBeforePromptBuild:
+//   systemPrompt:          next.systemPrompt ?? acc?.systemPrompt  (last wins)
+//   prependContext:        concat(acc, next)
+//   prependSystemContext:  concat(acc, next)
+//   appendSystemContext:   concat(acc, next)
+// ============================================================================
+
+std::optional<PluginHookBeforePromptBuildResult> ToolHookManager::run_before_prompt_build(
+    const PluginHookBeforePromptBuildEvent& event,
+    const PluginHookAgentContext& ctx)
+{
+    std::vector<BeforePromptBuildEntry> hooks;
+    { std::lock_guard<std::mutex> lock(mutex_); hooks = before_prompt_build_hooks_; }
+    if (hooks.empty()) return std::nullopt;
+
+    log()->debug("[hooks] running before_prompt_build ({} handlers, sequential)", hooks.size());
+
+    std::optional<PluginHookBeforePromptBuildResult> accumulated;
+
+    for (const auto& entry : hooks) {
+        try {
+            auto result = entry.handler(event, ctx);
+            if (!result) continue;
+            if (!accumulated) {
+                accumulated = result;
+            } else {
+                // Aligned with OpenClaw mergeBeforePromptBuild:
+                // systemPrompt: next wins (last defined)
+                if (result->system_prompt)
+                    accumulated->system_prompt = result->system_prompt;
+                // context strings: concatenated
+                accumulated->prepend_context        = concat_optional(accumulated->prepend_context,        result->prepend_context);
+                accumulated->prepend_system_context = concat_optional(accumulated->prepend_system_context, result->prepend_system_context);
+                accumulated->append_system_context  = concat_optional(accumulated->append_system_context,  result->append_system_context);
+            }
+        } catch (const std::exception& e) {
+            log()->error("[hooks] before_prompt_build handler from '{}' failed: {}",
+                entry.plugin_id, e.what());
+        }
+    }
+    return accumulated;
+}
+
+// ============================================================================
+// run_before_agent_start (modifying hook)
+//
+// Aligned with OpenClaw runBeforeAgentStart:
+//   Combines mergeBeforePromptBuild + mergeBeforeModelResolve
+// ============================================================================
+
+std::optional<PluginHookBeforeAgentStartResult> ToolHookManager::run_before_agent_start(
+    const PluginHookBeforeAgentStartEvent& event,
+    const PluginHookAgentContext& ctx)
+{
+    std::vector<BeforeAgentStartEntry> hooks;
+    { std::lock_guard<std::mutex> lock(mutex_); hooks = before_agent_start_hooks_; }
+    if (hooks.empty()) return std::nullopt;
+
+    log()->debug("[hooks] running before_agent_start ({} handlers, sequential)", hooks.size());
+
+    std::optional<PluginHookBeforeAgentStartResult> accumulated;
+
+    for (const auto& entry : hooks) {
+        try {
+            auto result = entry.handler(event, ctx);
+            if (!result) continue;
+            if (!accumulated) {
+                accumulated = result;
+            } else {
+                // Aligned with OpenClaw: { ...mergeBeforePromptBuild, ...mergeBeforeModelResolve }
+                // prompt build fields
+                if (result->system_prompt)
+                    accumulated->system_prompt = result->system_prompt;
+                accumulated->prepend_context        = concat_optional(accumulated->prepend_context,        result->prepend_context);
+                accumulated->prepend_system_context = concat_optional(accumulated->prepend_system_context, result->prepend_system_context);
+                accumulated->append_system_context  = concat_optional(accumulated->append_system_context,  result->append_system_context);
+                // model resolve fields (first defined wins)
+                if (!accumulated->model_override && result->model_override)
+                    accumulated->model_override = result->model_override;
+                if (!accumulated->provider_override && result->provider_override)
+                    accumulated->provider_override = result->provider_override;
+            }
+        } catch (const std::exception& e) {
+            log()->error("[hooks] before_agent_start handler from '{}' failed: {}",
+                entry.plugin_id, e.what());
+        }
+    }
+    return accumulated;
+}
+
+// ============================================================================
+// run_message_sending (modifying hook)
+//
+// Aligned with OpenClaw runMessageSending merge:
+//   content: next.content ?? acc?.content  (last defined wins)
+//   cancel:  next.cancel  ?? acc?.cancel
+// ============================================================================
+
+std::optional<PluginHookMessageSendingResult> ToolHookManager::run_message_sending(
+    const PluginHookMessageSendingEvent& event,
+    const PluginHookMessageContext& ctx)
+{
+    std::vector<MessageSendingEntry> hooks;
+    { std::lock_guard<std::mutex> lock(mutex_); hooks = message_sending_hooks_; }
+    if (hooks.empty()) return std::nullopt;
+
+    log()->debug("[hooks] running message_sending ({} handlers, sequential)", hooks.size());
+
+    std::optional<PluginHookMessageSendingResult> accumulated;
+
+    for (const auto& entry : hooks) {
+        try {
+            auto result = entry.handler(event, ctx);
+            if (!result) continue;
+            if (!accumulated) {
+                accumulated = result;
+            } else {
+                // Aligned with OpenClaw: content/cancel last defined wins
+                if (result->content)  accumulated->content = result->content;
+                if (result->cancel)   accumulated->cancel  = result->cancel;
+            }
+        } catch (const std::exception& e) {
+            log()->error("[hooks] message_sending handler from '{}' failed: {}",
+                entry.plugin_id, e.what());
+        }
+    }
+    return accumulated;
+}
+
+// ============================================================================
+// run_before_tool_call (modifying hook)
 //
 // Aligned with OpenClaw runModifyingHook("before_tool_call", ...):
-//   - Sequential execution in priority order
-//   - Results merged: params/block/blockReason
-//     (first defined wins for params, last wins for block — aligned with
-//      OpenClaw merge: { params: next.params ?? acc?.params,
-//                        block: next.block ?? acc?.block,
-//                        blockReason: next.blockReason ?? acc?.blockReason })
-//   - Errors caught and logged (catchErrors=true)
+//   params:      next.params ?? acc?.params      (first defined wins)
+//   block:       next.block ?? acc?.block
+//   blockReason: next.blockReason ?? acc?.blockReason
 // ============================================================================
 
 std::optional<PluginHookBeforeToolCallResult> ToolHookManager::run_before_tool_call(
@@ -187,92 +407,125 @@ std::optional<PluginHookBeforeToolCallResult> ToolHookManager::run_before_tool_c
     const PluginHookToolContext& ctx)
 {
     std::vector<BeforeToolCallEntry> hooks;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        hooks = before_tool_call_hooks_;
-    }
+    { std::lock_guard<std::mutex> lock(mutex_); hooks = before_tool_call_hooks_; }
+    if (hooks.empty()) return std::nullopt;
 
-    if (hooks.empty()) {
-        return std::nullopt;
-    }
-
-    log()->debug("[hooks] running before_tool_call ({} handlers)", hooks.size());
+    log()->debug("[hooks] running before_tool_call ({} handlers, sequential)", hooks.size());
 
     std::optional<PluginHookBeforeToolCallResult> accumulated;
 
     for (const auto& entry : hooks) {
         try {
             auto result = entry.handler(event, ctx);
-
-            if (result.has_value()) {
-                if (!accumulated.has_value()) {
-                    accumulated = result;
-                } else {
-                    // Merge results (aligned with OpenClaw merge logic):
-                    // params: next.params ?? acc?.params  (first defined wins)
-                    // block:  next.block ?? acc?.block
-                    // blockReason: next.blockReason ?? acc?.blockReason
-                    auto& acc = accumulated.value();
-                    const auto& next = result.value();
-
-                    if (!acc.params.has_value() && next.params.has_value()) {
-                        acc.params = next.params;
-                    }
-                    if (!acc.block.has_value() && next.block.has_value()) {
-                        acc.block = next.block;
-                    }
-                    if (!acc.block_reason.has_value() && next.block_reason.has_value()) {
-                        acc.block_reason = next.block_reason;
-                    }
-                }
+            if (!result) continue;
+            if (!accumulated) {
+                accumulated = result;
+            } else {
+                // Aligned with OpenClaw merge: first defined wins
+                if (!accumulated->params_json  && result->params_json)  accumulated->params_json  = result->params_json;
+                if (!accumulated->block        && result->block)         accumulated->block        = result->block;
+                if (!accumulated->block_reason && result->block_reason)  accumulated->block_reason = result->block_reason;
             }
         } catch (const std::exception& e) {
-            // Aligned with OpenClaw handleHookError (catchErrors=true):
-            // log error but don't throw
             log()->error("[hooks] before_tool_call handler from '{}' failed: {}",
                 entry.plugin_id, e.what());
         }
     }
-
     return accumulated;
 }
 
 // ============================================================================
-// run_after_tool_call
+// run_subagent_spawning (modifying hook)
 //
-// Aligned with OpenClaw runVoidHook("after_tool_call", ...):
-//   - All handlers called (parallel in OpenClaw, sequential here for simplicity)
-//   - Errors caught and logged
+// Aligned with OpenClaw mergeSubagentSpawningResult:
+//   if acc.status == "error" → return acc (error wins)
+//   if next.status == "error" → return next
+//   otherwise: status="ok", threadBindingReady = acc || next
 // ============================================================================
 
-void ToolHookManager::run_after_tool_call(
-    const PluginHookAfterToolCallEvent& event,
-    const PluginHookToolContext& ctx)
+std::optional<PluginHookSubagentSpawningResult> ToolHookManager::run_subagent_spawning(
+    const PluginHookSubagentSpawningEvent& event,
+    const PluginHookSubagentContext& ctx)
 {
-    std::vector<AfterToolCallEntry> hooks;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        hooks = after_tool_call_hooks_;
-    }
+    std::vector<SubagentSpawningEntry> hooks;
+    { std::lock_guard<std::mutex> lock(mutex_); hooks = subagent_spawning_hooks_; }
+    if (hooks.empty()) return std::nullopt;
 
-    if (hooks.empty()) return;
+    log()->debug("[hooks] running subagent_spawning ({} handlers, sequential)", hooks.size());
 
-    log()->debug("[hooks] running after_tool_call ({} handlers)", hooks.size());
+    std::optional<PluginHookSubagentSpawningResult> accumulated;
 
     for (const auto& entry : hooks) {
         try {
-            entry.handler(event, ctx);
+            auto result = entry.handler(event, ctx);
+            if (!result) continue;
+            if (!accumulated) {
+                accumulated = result;
+            } else {
+                // Aligned with OpenClaw mergeSubagentSpawningResult:
+                // error wins; threadBindingReady OR-ed
+                if (!accumulated->ok) {
+                    // error wins — keep accumulated
+                } else if (!result->ok) {
+                    accumulated = result;
+                } else {
+                    // both ok: OR threadBindingReady
+                    accumulated->thread_binding_ready =
+                        accumulated->thread_binding_ready || result->thread_binding_ready;
+                }
+            }
         } catch (const std::exception& e) {
-            log()->error("[hooks] after_tool_call handler from '{}' failed: {}",
+            log()->error("[hooks] subagent_spawning handler from '{}' failed: {}",
                 entry.plugin_id, e.what());
         }
     }
+    return accumulated;
 }
 
 // ============================================================================
-// run_tool_result_persist
+// run_subagent_delivery_target (modifying hook)
 //
-// Aligned with OpenClaw runToolResultPersist() in plugins/hooks.ts:
+// Aligned with OpenClaw mergeSubagentDeliveryTargetResult:
+//   if acc.origin → return acc (first defined wins)
+//   otherwise → return next
+// ============================================================================
+
+std::optional<PluginHookSubagentDeliveryTargetResult> ToolHookManager::run_subagent_delivery_target(
+    const PluginHookSubagentDeliveryTargetEvent& event,
+    const PluginHookSubagentContext& ctx)
+{
+    std::vector<SubagentDeliveryTargetEntry> hooks;
+    { std::lock_guard<std::mutex> lock(mutex_); hooks = subagent_delivery_target_hooks_; }
+    if (hooks.empty()) return std::nullopt;
+
+    log()->debug("[hooks] running subagent_delivery_target ({} handlers, sequential)", hooks.size());
+
+    std::optional<PluginHookSubagentDeliveryTargetResult> accumulated;
+
+    for (const auto& entry : hooks) {
+        try {
+            auto result = entry.handler(event, ctx);
+            if (!result) continue;
+            if (!accumulated) {
+                accumulated = result;
+            } else {
+                // Aligned with OpenClaw mergeSubagentDeliveryTargetResult:
+                // first defined origin wins
+                if (!accumulated->origin && result->origin)
+                    accumulated->origin = result->origin;
+            }
+        } catch (const std::exception& e) {
+            log()->error("[hooks] subagent_delivery_target handler from '{}' failed: {}",
+                entry.plugin_id, e.what());
+        }
+    }
+    return accumulated;
+}
+
+// ============================================================================
+// run_tool_result_persist (sync hook)
+//
+// Aligned with OpenClaw runToolResultPersist():
 //   - Synchronous, sequential
 //   - Each handler may return { message } to replace the current message
 //   - Guards against async handlers (this hook is sync-only)
@@ -284,31 +537,25 @@ std::optional<PluginHookToolResultPersistResult> ToolHookManager::run_tool_resul
     const PluginHookToolResultPersistContext& ctx)
 {
     std::vector<ToolResultPersistEntry> hooks;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        hooks = tool_result_persist_hooks_;
-    }
-
+    { std::lock_guard<std::mutex> lock(mutex_); hooks = tool_result_persist_hooks_; }
     if (hooks.empty()) return std::nullopt;
 
     log()->debug("[hooks] running tool_result_persist ({} handlers)", hooks.size());
 
-    // Aligned with OpenClaw: let current = event.message;
-    core::JsonValue current = event.message;
+    // Aligned with OpenClaw: let current = event.message_json;
+    std::string current = event.message_json;
     bool modified = false;
 
     for (const auto& entry : hooks) {
         try {
-            // Build event with current message (aligned with OpenClaw:
-            // hook.handler({ ...event, message: current }, ctx))
             PluginHookToolResultPersistEvent current_event = event;
-            current_event.message = current;
+            current_event.message_json = current;
 
             auto result = entry.handler(current_event, ctx);
 
-            if (result.has_value() && result->message.has_value()) {
+            if (result && result->message_json) {
                 // Aligned with OpenClaw: const next = out?.message; if (next) { current = next; }
-                current = result->message.value();
+                current = *result->message_json;
                 modified = true;
             }
         } catch (const std::exception& e) {
@@ -319,17 +566,16 @@ std::optional<PluginHookToolResultPersistResult> ToolHookManager::run_tool_resul
 
     if (modified) {
         PluginHookToolResultPersistResult result;
-        result.message = current;
+        result.message_json = current;
         return result;
     }
-
     return std::nullopt;
 }
 
 // ============================================================================
-// run_before_message_write
+// run_before_message_write (sync hook)
 //
-// Aligned with OpenClaw runBeforeMessageWrite() in plugins/hooks.ts:
+// Aligned with OpenClaw runBeforeMessageWrite():
 //   - Synchronous, sequential
 //   - If any handler returns { block: true }, return immediately with block=true
 //   - If handler returns { message }, use it for subsequent handlers
@@ -343,36 +589,33 @@ std::optional<PluginHookBeforeMessageWriteResult> ToolHookManager::run_before_me
     const std::string& session_key)
 {
     std::vector<BeforeMessageWriteEntry> hooks;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        hooks = before_message_write_hooks_;
-    }
-
+    { std::lock_guard<std::mutex> lock(mutex_); hooks = before_message_write_hooks_; }
     if (hooks.empty()) return std::nullopt;
 
     log()->debug("[hooks] running before_message_write ({} handlers)", hooks.size());
 
-    // Aligned with OpenClaw: let current = event.message;
-    core::JsonValue current = event.message;
+    // Aligned with OpenClaw: let current = event.message_json;
+    std::string current = event.message_json;
+    bool modified = false;
 
     for (const auto& entry : hooks) {
         try {
-            // Build event with current message
             PluginHookBeforeMessageWriteEvent current_event = event;
-            current_event.message = current;
+            current_event.message_json = current;
 
             auto result = entry.handler(current_event, agent_id, session_key);
 
-            if (result.has_value()) {
+            if (result) {
                 // Aligned with OpenClaw: if (result?.block) { return { block: true }; }
                 if (result->block) {
                     PluginHookBeforeMessageWriteResult blocked;
                     blocked.block = true;
                     return blocked;
                 }
-                // Aligned with OpenClaw: if (result?.message) { current = result.message; }
-                if (result->message.has_value()) {
-                    current = result->message.value();
+                // Aligned with OpenClaw: if (result?.message) { current = result.message_json; }
+                if (result->message_json) {
+                    current = *result->message_json;
+                    modified = true;
                 }
             }
         } catch (const std::exception& e) {
@@ -382,23 +625,80 @@ std::optional<PluginHookBeforeMessageWriteResult> ToolHookManager::run_before_me
     }
 
     // Aligned with OpenClaw: if (current !== event.message) { return { message: current }; }
-    // (We track modification via pointer comparison — use a flag instead)
-    // Return nullopt if no modification occurred
-    // Note: We can't do reference equality on JsonValue, so we always return
-    // the current message if any handler ran (conservative approach)
-    if (!hooks.empty()) {
+    if (modified) {
         PluginHookBeforeMessageWriteResult result;
-        result.block = false;
-        result.message = current;
+        result.block        = false;
+        result.message_json = current;
         return result;
     }
-
     return std::nullopt;
 }
 
 // ============================================================================
 // Query methods
 // ============================================================================
+
+bool ToolHookManager::has_hooks(PluginHookName name) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    switch (name) {
+        case PluginHookName::BEFORE_MODEL_RESOLVE:     return !before_model_resolve_hooks_.empty();
+        case PluginHookName::BEFORE_PROMPT_BUILD:      return !before_prompt_build_hooks_.empty();
+        case PluginHookName::BEFORE_AGENT_START:       return !before_agent_start_hooks_.empty();
+        case PluginHookName::LLM_INPUT:                return !llm_input_hooks_.empty();
+        case PluginHookName::LLM_OUTPUT:               return !llm_output_hooks_.empty();
+        case PluginHookName::AGENT_END:                return !agent_end_hooks_.empty();
+        case PluginHookName::BEFORE_COMPACTION:        return !before_compaction_hooks_.empty();
+        case PluginHookName::AFTER_COMPACTION:         return !after_compaction_hooks_.empty();
+        case PluginHookName::BEFORE_RESET:             return !before_reset_hooks_.empty();
+        case PluginHookName::MESSAGE_RECEIVED:         return !message_received_hooks_.empty();
+        case PluginHookName::MESSAGE_SENDING:          return !message_sending_hooks_.empty();
+        case PluginHookName::MESSAGE_SENT:             return !message_sent_hooks_.empty();
+        case PluginHookName::BEFORE_TOOL_CALL:         return !before_tool_call_hooks_.empty();
+        case PluginHookName::AFTER_TOOL_CALL:          return !after_tool_call_hooks_.empty();
+        case PluginHookName::TOOL_RESULT_PERSIST:      return !tool_result_persist_hooks_.empty();
+        case PluginHookName::BEFORE_MESSAGE_WRITE:     return !before_message_write_hooks_.empty();
+        case PluginHookName::SESSION_START:            return !session_start_hooks_.empty();
+        case PluginHookName::SESSION_END:              return !session_end_hooks_.empty();
+        case PluginHookName::SUBAGENT_SPAWNING:        return !subagent_spawning_hooks_.empty();
+        case PluginHookName::SUBAGENT_DELIVERY_TARGET: return !subagent_delivery_target_hooks_.empty();
+        case PluginHookName::SUBAGENT_SPAWNED:         return !subagent_spawned_hooks_.empty();
+        case PluginHookName::SUBAGENT_ENDED:           return !subagent_ended_hooks_.empty();
+        case PluginHookName::GATEWAY_START:            return !gateway_start_hooks_.empty();
+        case PluginHookName::GATEWAY_STOP:             return !gateway_stop_hooks_.empty();
+    }
+    return false;
+}
+
+size_t ToolHookManager::hook_count(PluginHookName name) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    switch (name) {
+        case PluginHookName::BEFORE_MODEL_RESOLVE:     return before_model_resolve_hooks_.size();
+        case PluginHookName::BEFORE_PROMPT_BUILD:      return before_prompt_build_hooks_.size();
+        case PluginHookName::BEFORE_AGENT_START:       return before_agent_start_hooks_.size();
+        case PluginHookName::LLM_INPUT:                return llm_input_hooks_.size();
+        case PluginHookName::LLM_OUTPUT:               return llm_output_hooks_.size();
+        case PluginHookName::AGENT_END:                return agent_end_hooks_.size();
+        case PluginHookName::BEFORE_COMPACTION:        return before_compaction_hooks_.size();
+        case PluginHookName::AFTER_COMPACTION:         return after_compaction_hooks_.size();
+        case PluginHookName::BEFORE_RESET:             return before_reset_hooks_.size();
+        case PluginHookName::MESSAGE_RECEIVED:         return message_received_hooks_.size();
+        case PluginHookName::MESSAGE_SENDING:          return message_sending_hooks_.size();
+        case PluginHookName::MESSAGE_SENT:             return message_sent_hooks_.size();
+        case PluginHookName::BEFORE_TOOL_CALL:         return before_tool_call_hooks_.size();
+        case PluginHookName::AFTER_TOOL_CALL:          return after_tool_call_hooks_.size();
+        case PluginHookName::TOOL_RESULT_PERSIST:      return tool_result_persist_hooks_.size();
+        case PluginHookName::BEFORE_MESSAGE_WRITE:     return before_message_write_hooks_.size();
+        case PluginHookName::SESSION_START:            return session_start_hooks_.size();
+        case PluginHookName::SESSION_END:              return session_end_hooks_.size();
+        case PluginHookName::SUBAGENT_SPAWNING:        return subagent_spawning_hooks_.size();
+        case PluginHookName::SUBAGENT_DELIVERY_TARGET: return subagent_delivery_target_hooks_.size();
+        case PluginHookName::SUBAGENT_SPAWNED:         return subagent_spawned_hooks_.size();
+        case PluginHookName::SUBAGENT_ENDED:           return subagent_ended_hooks_.size();
+        case PluginHookName::GATEWAY_START:            return gateway_start_hooks_.size();
+        case PluginHookName::GATEWAY_STOP:             return gateway_stop_hooks_.size();
+    }
+    return 0;
+}
 
 bool ToolHookManager::has_before_tool_call_hooks() const {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -433,14 +733,36 @@ size_t ToolHookManager::after_tool_call_count() const {
 std::vector<std::string> ToolHookManager::list_plugin_ids() const {
     std::lock_guard<std::mutex> lock(mutex_);
     std::vector<std::string> ids;
-    for (const auto& e : before_tool_call_hooks_) {
-        if (std::find(ids.begin(), ids.end(), e.plugin_id) == ids.end())
-            ids.push_back(e.plugin_id);
-    }
-    for (const auto& e : after_tool_call_hooks_) {
-        if (std::find(ids.begin(), ids.end(), e.plugin_id) == ids.end())
-            ids.push_back(e.plugin_id);
-    }
+    auto add_ids = [&ids](const auto& vec) {
+        for (const auto& e : vec) {
+            if (std::find(ids.begin(), ids.end(), e.plugin_id) == ids.end())
+                ids.push_back(e.plugin_id);
+        }
+    };
+    add_ids(before_model_resolve_hooks_);
+    add_ids(before_prompt_build_hooks_);
+    add_ids(before_agent_start_hooks_);
+    add_ids(llm_input_hooks_);
+    add_ids(llm_output_hooks_);
+    add_ids(agent_end_hooks_);
+    add_ids(before_compaction_hooks_);
+    add_ids(after_compaction_hooks_);
+    add_ids(before_reset_hooks_);
+    add_ids(message_received_hooks_);
+    add_ids(message_sending_hooks_);
+    add_ids(message_sent_hooks_);
+    add_ids(before_tool_call_hooks_);
+    add_ids(after_tool_call_hooks_);
+    add_ids(tool_result_persist_hooks_);
+    add_ids(before_message_write_hooks_);
+    add_ids(session_start_hooks_);
+    add_ids(session_end_hooks_);
+    add_ids(subagent_spawning_hooks_);
+    add_ids(subagent_delivery_target_hooks_);
+    add_ids(subagent_spawned_hooks_);
+    add_ids(subagent_ended_hooks_);
+    add_ids(gateway_start_hooks_);
+    add_ids(gateway_stop_hooks_);
     return ids;
 }
 
@@ -452,56 +774,49 @@ namespace builtin_hooks {
 
 BeforeToolCallHandler create_param_validation_hook() {
     return [](const PluginHookBeforeToolCallEvent& event,
-              const PluginHookToolContext& ctx)
+              const PluginHookToolContext& /*ctx*/)
         -> std::optional<PluginHookBeforeToolCallResult>
     {
-        // Check params is an object
-        if (!event.params.is_object()) {
+        // params_json is a JSON string; basic validation via string check
+        const std::string& params = event.params_json;
+        if (params.empty() || params.front() != '{') {
             PluginHookBeforeToolCallResult result;
             result.block = true;
-            result.block_reason = "Tool parameters must be an object";
+            result.block_reason = "Tool parameters must be a JSON object";
             return result;
         }
-
-        // Tool-specific validation
         if (event.tool_name == "exec") {
-            if (!event.params.contains("command")) {
+            if (params.find("\"command\"") == std::string::npos) {
                 PluginHookBeforeToolCallResult result;
                 result.block = true;
                 result.block_reason = "exec tool requires 'command' parameter";
                 return result;
             }
         }
-
         if (event.tool_name == "read_file" || event.tool_name == "write_file") {
-            if (!event.params.contains("path")) {
+            if (params.find("\"path\"") == std::string::npos) {
                 PluginHookBeforeToolCallResult result;
                 result.block = true;
                 result.block_reason = event.tool_name + " requires 'path' parameter";
                 return result;
             }
         }
-
-        return std::nullopt;  // No modification
+        return std::nullopt;
     };
 }
 
 AfterToolCallHandler create_logging_hook() {
     return [](const PluginHookAfterToolCallEvent& event,
-              const PluginHookToolContext& ctx)
+              const PluginHookToolContext& /*ctx*/)
     {
         auto logger = spdlog::get("tools.hooks");
         if (!logger) return;
-
-        if (!event.error.has_value() || event.error->empty()) {
+        if (!event.error || event.error->empty()) {
             logger->info("[hooks] tool '{}' completed in {:.2f}ms",
-                event.tool_name,
-                event.duration_ms.value_or(0.0));
+                event.tool_name, event.duration_ms.value_or(0.0));
         } else {
             logger->error("[hooks] tool '{}' failed after {:.2f}ms: {}",
-                event.tool_name,
-                event.duration_ms.value_or(0.0),
-                event.error.value_or(""));
+                event.tool_name, event.duration_ms.value_or(0.0), *event.error);
         }
     };
 }
@@ -513,12 +828,11 @@ AfterToolCallHandler create_performance_monitoring_hook() {
         double min_duration_ms = std::numeric_limits<double>::max();
         double max_duration_ms = 0.0;
     };
-
     static std::map<std::string, ToolStats> stats_map;
     static std::mutex stats_mutex;
 
     return [](const PluginHookAfterToolCallEvent& event,
-              const PluginHookToolContext& ctx)
+              const PluginHookToolContext& /*ctx*/)
     {
         std::lock_guard<std::mutex> lock(stats_mutex);
         auto& stats = stats_map[event.tool_name];
@@ -527,7 +841,6 @@ AfterToolCallHandler create_performance_monitoring_hook() {
         stats.total_duration_ms += dur;
         stats.min_duration_ms = std::min(stats.min_duration_ms, dur);
         stats.max_duration_ms = std::max(stats.max_duration_ms, dur);
-
         if (stats.call_count % 100 == 0) {
             double avg = stats.total_duration_ms / stats.call_count;
             auto logger = spdlog::get("tools.hooks");
@@ -541,27 +854,18 @@ AfterToolCallHandler create_performance_monitoring_hook() {
 }
 
 AfterToolCallHandler create_error_collection_hook() {
-    struct ErrorStats {
-        int total_calls = 0;
-        int error_count = 0;
-        std::string last_error;
-    };
-
+    struct ErrorStats { int total_calls = 0; int error_count = 0; };
     static std::map<std::string, ErrorStats> error_map;
     static std::mutex error_mutex;
 
     return [](const PluginHookAfterToolCallEvent& event,
-              const PluginHookToolContext& ctx)
+              const PluginHookToolContext& /*ctx*/)
     {
         std::lock_guard<std::mutex> lock(error_mutex);
         auto& stats = error_map[event.tool_name];
         stats.total_calls++;
-
-        bool has_error = event.error.has_value() && !event.error->empty();
-        if (has_error) {
+        if (event.error && !event.error->empty()) {
             stats.error_count++;
-            stats.last_error = event.error.value_or("");
-
             double error_rate = static_cast<double>(stats.error_count) / stats.total_calls;
             if (error_rate > 0.5 && stats.total_calls >= 10) {
                 auto logger = spdlog::get("tools.hooks");
@@ -577,24 +881,20 @@ AfterToolCallHandler create_error_collection_hook() {
 
 AfterToolCallHandler create_audit_hook(const AuditHookConfig& config) {
     return [config](const PluginHookAfterToolCallEvent& event,
-                    const PluginHookToolContext& ctx)
+                    const PluginHookToolContext& /*ctx*/)
     {
         bool is_sensitive = std::find(
-            config.sensitive_tools.begin(),
-            config.sensitive_tools.end(),
+            config.sensitive_tools.begin(), config.sensitive_tools.end(),
             event.tool_name) != config.sensitive_tools.end();
-
         if (!is_sensitive) return;
-
         std::ofstream audit_log(config.audit_log_path, std::ios::app);
         if (audit_log.is_open()) {
             auto now = std::chrono::system_clock::now();
-            auto ts = std::chrono::system_clock::to_time_t(now);
+            auto ts  = std::chrono::system_clock::to_time_t(now);
             audit_log << "[" << std::ctime(&ts) << "] "
                       << "tool=" << event.tool_name
                       << " duration=" << event.duration_ms.value_or(0.0) << "ms"
-                      << " error=" << event.error.value_or("none")
-                      << "\n";
+                      << " error=" << event.error.value_or("none") << "\n";
         }
     };
 }
@@ -605,25 +905,21 @@ BeforeToolCallHandler create_rate_limit_hook(const RateLimitConfig& config) {
         int64_t window_start_minute = 0;
         int total_calls_in_window = 0;
     };
-
     static RateLimitState state;
     static std::mutex rate_mutex;
 
     return [config](const PluginHookBeforeToolCallEvent& event,
-                    const PluginHookToolContext& ctx)
+                    const PluginHookToolContext& /*ctx*/)
         -> std::optional<PluginHookBeforeToolCallResult>
     {
         std::lock_guard<std::mutex> lock(rate_mutex);
-
         auto now_ns = std::chrono::system_clock::now().time_since_epoch().count();
         int64_t current_minute = now_ns / 60000000000LL;
-
         if (current_minute != state.window_start_minute) {
             state.window_start_minute = current_minute;
             state.total_calls_in_window = 0;
             state.tool_call_counts.clear();
         }
-
         if (state.total_calls_in_window >= config.max_calls_per_minute) {
             PluginHookBeforeToolCallResult result;
             result.block = true;
@@ -631,7 +927,6 @@ BeforeToolCallHandler create_rate_limit_hook(const RateLimitConfig& config) {
                 std::to_string(config.max_calls_per_minute) + " calls/min";
             return result;
         }
-
         int tool_calls = state.tool_call_counts[event.tool_name];
         if (tool_calls >= config.max_calls_per_tool_per_minute) {
             PluginHookBeforeToolCallResult result;
@@ -640,10 +935,8 @@ BeforeToolCallHandler create_rate_limit_hook(const RateLimitConfig& config) {
                 std::to_string(config.max_calls_per_tool_per_minute) + " calls/min";
             return result;
         }
-
         state.total_calls_in_window++;
         state.tool_call_counts[event.tool_name]++;
-
         return std::nullopt;
     };
 }
@@ -651,7 +944,7 @@ BeforeToolCallHandler create_rate_limit_hook(const RateLimitConfig& config) {
 } // namespace builtin_hooks
 
 // ============================================================================
-// Param normalization (unchanged)
+// Param normalization (aligned with OpenClaw)
 // ============================================================================
 
 std::string to_camel_case(const std::string& snake_case) {
@@ -724,6 +1017,37 @@ core::JsonValue normalize_tool_params(
     }
 
     return normalized;
+}
+
+// ============================================================================
+// Global ToolHookManager
+// Aligned with OpenClaw getGlobalHookRunner() / setGlobalHookRunner()
+// ============================================================================
+
+namespace {
+    // Process-wide hook manager pointer (set by set_global_hook_manager)
+    std::atomic<ToolHookManager*> g_hook_manager{nullptr};
+    // Lazily-initialized owned instance (used by require_global_hook_manager)
+    std::unique_ptr<ToolHookManager> g_owned_hook_manager;
+    std::once_flag g_hook_manager_init_flag;
+}
+
+ToolHookManager* get_global_hook_manager() {
+    return g_hook_manager.load(std::memory_order_acquire);
+}
+
+void set_global_hook_manager(ToolHookManager* mgr) {
+    g_hook_manager.store(mgr, std::memory_order_release);
+}
+
+ToolHookManager& require_global_hook_manager() {
+    std::call_once(g_hook_manager_init_flag, []() {
+        if (!g_hook_manager.load(std::memory_order_acquire)) {
+            g_owned_hook_manager = std::make_unique<ToolHookManager>();
+            g_hook_manager.store(g_owned_hook_manager.get(), std::memory_order_release);
+        }
+    });
+    return *g_hook_manager.load(std::memory_order_acquire);
 }
 
 } // namespace tools

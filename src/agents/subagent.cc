@@ -1,6 +1,7 @@
 #include "hunterclaw/agents/subagent.h"
 #include "hunterclaw/core/utils.h"
 #include "hunterclaw/core/logging.h"
+#include "hunterclaw/tools/tool_hooks.h"   // get_global_hook_manager(), run_subagent_* hooks
 #include <spdlog/spdlog.h>
 #include <iostream>
 #include <algorithm>
@@ -577,6 +578,47 @@ core::Result<std::string> SubagentSpawner::spawn(
         std::chrono::system_clock::now().time_since_epoch()
     ).count();
     
+    // ========== 阶段 4a: run_subagent_spawning hook ==========
+    // ✅ 严格对齐 OpenClaw: ensureThreadBindingForSubagentSpawn()
+    // OpenClaw 在 thread=true 时调用 hookRunner.runSubagentSpawning()
+    // HunterClaw: 无论是否 thread_requested，都触发 spawning hook（modifying hook）
+    // 允许插件在 spawn 前做准备（如 Discord 插件创建 thread）
+    {
+        auto* global_mgr = tools::get_global_hook_manager();
+        if (global_mgr) {
+            try {
+                tools::PluginHookSubagentSpawningEvent spawning_event;
+                spawning_event.child_session_key = subagent_run_id;
+                spawning_event.agent_id = options.subagent_name;
+                spawning_event.label = options.description.empty()
+                    ? std::optional<std::string>{}
+                    : std::optional<std::string>{options.description};
+                spawning_event.mode = "run";  // HunterClaw 默认 run 模式
+                spawning_event.thread_requested = false;
+
+                tools::PluginHookSubagentContext spawning_ctx;
+                spawning_ctx.run_id = subagent_run_id;
+                spawning_ctx.child_session_key = subagent_run_id;
+                spawning_ctx.requester_session_key = requester_run_id;
+
+                auto spawning_result = global_mgr->run_subagent_spawning(
+                    spawning_event, spawning_ctx
+                );
+                // 如果插件返回 error，中止 spawn
+                if (spawning_result && !spawning_result->ok) {
+                    std::string err = spawning_result->error.value_or(
+                        "subagent_spawning hook rejected spawn"
+                    );
+                    log()->warn("[SubagentSpawner] subagent_spawning hook rejected: {}", err);
+                    return core::Result<std::string>::Err(err);
+                }
+            } catch (const std::exception& e) {
+                log()->warn("[SubagentSpawner] subagent_spawning hook failed: {}", e.what());
+                // 对齐 OpenClaw: hook 失败不阻止 spawn
+            }
+        }
+    }
+
     // ✅ 注册到 Registry
     auto reg_result = registry_->register_subagent(entry);
     if (reg_result.is_err()) {
@@ -599,6 +641,36 @@ core::Result<std::string> SubagentSpawner::spawn(
     
     // ========== 阶段 6: 更新状态为 Listening ==========
     registry_->update_state(subagent_run_id, SubagentState::Listening);
+
+    // ========== 阶段 6a: run_subagent_spawned hook ==========
+    // ✅ 严格对齐 OpenClaw: spawnSubagentDirect() 中 registerSubagentRun() 成功后
+    // if (hookRunner?.hasHooks("subagent_spawned")) { hookRunner.runSubagentSpawned(...) }
+    {
+        auto* global_mgr = tools::get_global_hook_manager();
+        if (global_mgr) {
+            try {
+                tools::PluginHookSubagentSpawnedEvent spawned_event;
+                spawned_event.run_id = subagent_run_id;
+                spawned_event.child_session_key = subagent_run_id;
+                spawned_event.agent_id = options.subagent_name;
+                spawned_event.label = options.description.empty()
+                    ? std::optional<std::string>{}
+                    : std::optional<std::string>{options.description};
+                spawned_event.mode = "run";
+                spawned_event.thread_requested = false;
+
+                tools::PluginHookSubagentContext spawned_ctx;
+                spawned_ctx.run_id = subagent_run_id;
+                spawned_ctx.child_session_key = subagent_run_id;
+                spawned_ctx.requester_session_key = requester_run_id;
+
+                global_mgr->run_subagent_spawned(spawned_event, spawned_ctx);
+            } catch (const std::exception& e) {
+                log()->warn("[SubagentSpawner] subagent_spawned hook failed: {}", e.what());
+                // 对齐 OpenClaw: hook 失败不影响 spawn 结果
+            }
+        }
+    }
     
     // ========== 阶段 7: 异步启动 Agent ==========
     /*
@@ -624,6 +696,31 @@ core::Result<std::string> SubagentSpawner::spawn(
             subagent->run(options.prompt, run_options);
         } catch (const std::exception& e) {
             log()->error("[SubagentSpawner] Subagent execution failed: {}", e.what());
+            // ========== 阶段 7a: run_subagent_ended hook (失败路径) ==========
+            // ✅ 严格对齐 OpenClaw: spawnSubagentDirect() 中 callGateway("agent") 失败时
+            // if (hasEndedHook) { hookRunner.runSubagentEnded(..., outcome: "error") }
+            auto* global_mgr = tools::get_global_hook_manager();
+            if (global_mgr) {
+                try {
+                    tools::PluginHookSubagentEndedEvent ended_event;
+                    ended_event.target_session_key = subagent_run_id;
+                    ended_event.target_kind = "subagent";
+                    ended_event.reason = "spawn-failed";
+                    ended_event.send_farewell = true;
+                    ended_event.run_id = subagent_run_id;
+                    ended_event.outcome = "error";
+                    ended_event.error = std::string(e.what());
+
+                    tools::PluginHookSubagentContext ended_ctx;
+                    ended_ctx.run_id = subagent_run_id;
+                    ended_ctx.child_session_key = subagent_run_id;
+                    ended_ctx.requester_session_key = requester_run_id;
+
+                    global_mgr->run_subagent_ended(ended_event, ended_ctx);
+                } catch (...) {
+                    // hook 失败不影响主流程
+                }
+            }
         }
     }).detach();
     */
@@ -807,6 +904,46 @@ core::Result<void> SubagentAnnouncer::attempt_delivery(
     // ✅ 构建消息 (用户友好格式)
     std::string message = build_delivery_message(*entry);
     
+    // ========== run_subagent_delivery_target hook ==========
+    // ✅ 严格对齐 OpenClaw: resolveSubagentCompletionOrigin() 中
+    // if (hookRunner?.hasHooks("subagent_delivery_target")) {
+    //     hookRunner.runSubagentDeliveryTarget(...) }
+    // 允许插件（如 Discord）覆盖投递目标（channel/thread）
+    {
+        auto* global_mgr = tools::get_global_hook_manager();
+        if (global_mgr) {
+            try {
+                tools::PluginHookSubagentDeliveryTargetEvent delivery_event;
+                delivery_event.child_session_key = entry->subagent_run_id;
+                delivery_event.requester_session_key = entry->requester_run_id;
+                delivery_event.child_run_id = entry->subagent_run_id;
+                delivery_event.spawn_mode = "run";
+                delivery_event.expects_completion_message = true;
+
+                tools::PluginHookSubagentContext delivery_ctx;
+                delivery_ctx.run_id = entry->subagent_run_id;
+                delivery_ctx.child_session_key = entry->subagent_run_id;
+                delivery_ctx.requester_session_key = entry->requester_run_id;
+
+                auto delivery_result = global_mgr->run_subagent_delivery_target(
+                    delivery_event, delivery_ctx
+                );
+                // 如果插件返回了新的 origin，可以用来覆盖投递目标
+                // 对齐 OpenClaw: mergeDeliveryContext(hookOrigin, requesterOrigin)
+                if (delivery_result && delivery_result->origin) {
+                    const auto& origin = *delivery_result->origin;
+                    if (origin.channel) {
+                        log()->debug("[SubagentAnnouncer] delivery_target hook overrode channel: {}",
+                                    *origin.channel);
+                    }
+                }
+            } catch (const std::exception& e) {
+                log()->warn("[SubagentAnnouncer] subagent_delivery_target hook failed: {}", e.what());
+                // 对齐 OpenClaw: hook 失败时回退到原始 requesterOrigin
+            }
+        }
+    }
+
     // ✅ 严格对齐 OpenClaw: 将结果通过事件流传递给父 Agent
     // 
     // OpenClaw 实现 (src/subagents/announcer.ts):
@@ -868,6 +1005,42 @@ core::Result<void> SubagentAnnouncer::attempt_delivery(
     log()->info("[SubagentAnnouncer] Delivered result: {} -> {} (attempts={})",
               entry->subagent_run_id, entry->requester_run_id, 
               entry->delivery_attempts);
+
+    // ========== run_subagent_ended hook ==========
+    // ✅ 严格对齐 OpenClaw: subagent_ended 在子 agent 完成投递后触发
+    // 对齐 OpenClaw subagent-announce.ts: 投递完成后触发 subagent_ended
+    // 以及 subagent-spawn.ts: spawn 失败时触发 subagent_ended
+    {
+        auto* global_mgr = tools::get_global_hook_manager();
+        if (global_mgr) {
+            try {
+                tools::PluginHookSubagentEndedEvent ended_event;
+                ended_event.target_session_key = entry->subagent_run_id;
+                ended_event.target_kind = "subagent";
+                ended_event.reason = "subagent-complete";
+                ended_event.send_farewell = false;
+                ended_event.run_id = entry->subagent_run_id;
+                ended_event.outcome = entry->has_error ? "error" : "ok";
+                if (entry->has_error && !entry->error_message.empty()) {
+                    ended_event.error = entry->error_message;
+                }
+                auto now_ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()
+                ).count();
+                ended_event.ended_at = now_ts;
+
+                tools::PluginHookSubagentContext ended_ctx;
+                ended_ctx.run_id = entry->subagent_run_id;
+                ended_ctx.child_session_key = entry->subagent_run_id;
+                ended_ctx.requester_session_key = entry->requester_run_id;
+
+                global_mgr->run_subagent_ended(ended_event, ended_ctx);
+            } catch (const std::exception& e) {
+                log()->warn("[SubagentAnnouncer] subagent_ended hook failed: {}", e.what());
+                // 对齐 OpenClaw: hook 失败不影响投递结果
+            }
+        }
+    }
     
     return core::Result<void>::Ok();
 }

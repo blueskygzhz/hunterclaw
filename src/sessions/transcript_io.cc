@@ -1,4 +1,5 @@
 #include "hunterclaw/sessions/transcript_io.h"
+#include "hunterclaw/tools/tool_hooks.h"   // get_global_hook_manager(), PluginHook* types
 #include "hunterclaw/core/utils.h"
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
@@ -206,7 +207,7 @@ AppendTranscriptResult append_assistant_message_to_transcript(
         message["provider"] = "hunterclaw";
         message["model"] = "gateway-injected";
         
-        // Idempotency key (如果提供)
+        // 4. Idempotency key (如果提供)
         if (!options.idempotency_key.empty()) {
             message["idempotencyKey"] = options.idempotency_key;
         }
@@ -220,30 +221,58 @@ AppendTranscriptResult append_assistant_message_to_transcript(
             message["hunterclawAbort"] = abort_meta;
         }
         
-        // 4. 生成 message_id
+        // 5. 生成 message_id
         std::string message_id = core::utils::generate_uuid();
-        
-        // 5. 构建 JSONL 行 (对齐 Pi SessionManager 格式)
+
+        // 6. 构建 JSONL 行 (before_message_write hook 前)
         json line;
         line["type"] = "message";
         line["id"] = message_id;
         line["message"] = message;
         // TODO: 实现 parentId 链 (需要读取最后一条消息的 id)
-        
-        // 6. 追加到文件
+
+        // =====================================================================
+        // Hook: before_message_write
+        // Aligned with OpenClaw sessions/transcript.ts — sync hook
+        // Allows plugins to block or modify messages before writing to JSONL.
+        // =====================================================================
+        auto* hook_mgr = tools::get_global_hook_manager();
+        std::string line_json = line.dump();
+        if (hook_mgr && hook_mgr->has_before_message_write_hooks()) {
+            tools::PluginHookBeforeMessageWriteEvent bmw_event;
+            bmw_event.message_json = line_json;
+            try {
+                auto bmw_result = hook_mgr->run_before_message_write(bmw_event);
+                if (bmw_result) {
+                    if (bmw_result->block) {
+                        // Message blocked by plugin — return success without writing
+                        log()->debug("Message blocked by before_message_write hook: {}", transcript_path);
+                        return { true, message_id, "" };
+                    }
+                    if (bmw_result->message_json) {
+                        // Use modified message JSON
+                        line_json = *bmw_result->message_json;
+                    }
+                }
+            } catch (const std::exception& e) {
+                log()->warn("before_message_write hook failed: {}", e.what());
+            }
+        }
+
+        // 7. 追加到文件
         std::ofstream ofs(transcript_path, std::ios::app);
         if (!ofs.is_open()) {
             return { false, "", "Failed to open transcript file for appending" };
         }
-        
-        ofs << line.dump() << "\n";
+
+        ofs << line_json << "\n";
         ofs.close();
-        
+
         log()->debug("Appended assistant message to transcript: {} (id: {})",
             transcript_path, message_id);
-        
+
         return { true, message_id, "" };
-        
+
     } catch (const std::exception& e) {
         return { false, "", e.what() };
     }
@@ -276,7 +305,7 @@ AppendTranscriptResult append_user_message_to_transcript(
         
         // 3. 生成 message_id
         std::string message_id = core::utils::generate_uuid();
-        
+
         // 4. 构建 JSONL 行
         json line;
         line["type"] = "message";
@@ -285,21 +314,165 @@ AppendTranscriptResult append_user_message_to_transcript(
         if (!run_id.empty()) {
             line["runId"] = run_id;
         }
-        
+
+        // =====================================================================
+        // Hook: before_message_write
+        // Aligned with OpenClaw sessions/transcript.ts — sync hook
+        // Allows plugins to block or modify user messages before writing.
+        // =====================================================================
+        auto* hook_mgr = tools::get_global_hook_manager();
+        std::string line_json = line.dump();
+        if (hook_mgr && hook_mgr->has_before_message_write_hooks()) {
+            tools::PluginHookBeforeMessageWriteEvent bmw_event;
+            bmw_event.message_json = line_json;
+            try {
+                auto bmw_result = hook_mgr->run_before_message_write(bmw_event);
+                if (bmw_result) {
+                    if (bmw_result->block) {
+                        log()->debug("User message blocked by before_message_write hook");
+                        return { true, message_id, "" };
+                    }
+                    if (bmw_result->message_json) {
+                        line_json = *bmw_result->message_json;
+                    }
+                }
+            } catch (const std::exception& e) {
+                log()->warn("before_message_write hook failed: {}", e.what());
+            }
+        }
+
         // 5. 追加到文件
         std::ofstream ofs(transcript_path, std::ios::app);
         if (!ofs.is_open()) {
             return { false, "", "Failed to open transcript file for appending" };
         }
-        
-        ofs << line.dump() << "\n";
+
+        ofs << line_json << "\n";
         ofs.close();
-        
+
         log()->debug("Appended user message to transcript: {} (id: {})",
             transcript_path, message_id);
-        
+
         return { true, message_id, "" };
-        
+
+    } catch (const std::exception& e) {
+        return { false, "", e.what() };
+    }
+}
+
+AppendTranscriptResult append_tool_result_to_transcript(
+    const std::string& transcript_path,
+    const AppendToolResultOptions& options
+) {
+    try {
+        // 1. 检查文件是否存在
+        if (!fs::exists(transcript_path)) {
+            return { false, "", "Transcript file not found" };
+        }
+
+        // 2. 构建 toolResult 消息 (对齐 OpenClaw toolResult message format)
+        json message;
+        message["role"] = "tool";
+        message["tool_call_id"] = options.tool_call_id;
+
+        // Content: wrap result_json as tool result content
+        json content_item;
+        content_item["type"] = "tool_result";
+        content_item["tool_use_id"] = options.tool_call_id;
+        content_item["content"] = options.result_json;
+        message["content"] = json::array({ content_item });
+
+        auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count();
+        message["timestamp"] = now_ms;
+
+        if (!options.tool_name.empty()) {
+            message["toolName"] = options.tool_name;
+        }
+        if (options.is_synthetic) {
+            message["isSynthetic"] = true;
+        }
+
+        // 3. 生成 message_id
+        std::string message_id = core::utils::generate_uuid();
+
+        // 4. 构建 JSONL 行
+        json line;
+        line["type"] = "message";
+        line["id"] = message_id;
+        line["message"] = message;
+        if (!options.run_id.empty()) {
+            line["runId"] = options.run_id;
+        }
+
+        // =====================================================================
+        // Hook: tool_result_persist
+        // Aligned with OpenClaw sessions/transcript.ts — sync hook
+        // Allows plugins to modify the toolResult message before writing to JSONL.
+        // Called BEFORE writing; handler may return modified message_json.
+        // =====================================================================
+        auto* hook_mgr = tools::get_global_hook_manager();
+        std::string line_json = line.dump();
+        if (hook_mgr && hook_mgr->has_tool_result_persist_hooks()) {
+            tools::PluginHookToolResultPersistEvent trp_event;
+            trp_event.tool_name    = options.tool_name.empty()
+                ? std::nullopt : std::make_optional(options.tool_name);
+            trp_event.tool_call_id = options.tool_call_id.empty()
+                ? std::nullopt : std::make_optional(options.tool_call_id);
+            trp_event.message_json = line_json;
+            trp_event.is_synthetic = options.is_synthetic;
+
+            tools::PluginHookToolResultPersistContext trp_ctx;
+            trp_ctx.tool_name    = trp_event.tool_name;
+            trp_ctx.tool_call_id = trp_event.tool_call_id;
+
+            try {
+                auto trp_result = hook_mgr->run_tool_result_persist(trp_event, trp_ctx);
+                if (trp_result && trp_result->message_json) {
+                    // Plugin returned a modified message — use it
+                    line_json = *trp_result->message_json;
+                }
+            } catch (const std::exception& e) {
+                log()->warn("tool_result_persist hook failed: {}", e.what());
+            }
+        }
+
+        // 5. Also run before_message_write (aligned with OpenClaw: toolResult goes
+        //    through the same write pipeline as other messages)
+        if (hook_mgr && hook_mgr->has_before_message_write_hooks()) {
+            tools::PluginHookBeforeMessageWriteEvent bmw_event;
+            bmw_event.message_json = line_json;
+            try {
+                auto bmw_result = hook_mgr->run_before_message_write(bmw_event);
+                if (bmw_result) {
+                    if (bmw_result->block) {
+                        log()->debug("Tool result blocked by before_message_write hook");
+                        return { true, message_id, "" };
+                    }
+                    if (bmw_result->message_json) {
+                        line_json = *bmw_result->message_json;
+                    }
+                }
+            } catch (const std::exception& e) {
+                log()->warn("before_message_write hook failed (tool result): {}", e.what());
+            }
+        }
+
+        // 6. 追加到文件
+        std::ofstream ofs(transcript_path, std::ios::app);
+        if (!ofs.is_open()) {
+            return { false, "", "Failed to open transcript file for appending" };
+        }
+
+        ofs << line_json << "\n";
+        ofs.close();
+
+        log()->debug("Appended tool result to transcript: {} (tool={}, id={})",
+            transcript_path, options.tool_name, message_id);
+
+        return { true, message_id, "" };
+
     } catch (const std::exception& e) {
         return { false, "", e.what() };
     }

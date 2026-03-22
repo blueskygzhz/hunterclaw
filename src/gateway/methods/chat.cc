@@ -6,6 +6,7 @@
 #include "hunterclaw/agents/agent_instance.h"
 #include "hunterclaw/react/react_engine.h"
 #include "hunterclaw/tools/tool.h"
+#include "hunterclaw/tools/tool_hooks.h"   // get_global_hook_manager(), PluginHook* types
 #include "hunterclaw/sessions/transcript_io.h"
 #include "hunterclaw/queue/command_queue.h"
 #include "hunterclaw/queue/lanes.h"
@@ -182,14 +183,35 @@ core::Result<json> method_chat_send(
     // ========================================================================
     // Step 5: 写入用户消息到 Transcript (对齐 OpenClaw)
     // ========================================================================
-    
+
     std::string sessions_dir = std::filesystem::path(agent->context().workspace_dir).parent_path() / "sessions";
     std::string transcript_path = sessions::resolve_transcript_path(
         session_id, 
         agent->context().agent_id,
         sessions_dir
     );
-    
+
+    // =========================================================================
+    // Hook: session_start
+    // Aligned with OpenClaw sessions/session-manager.ts — fire-and-forget
+    // Fires when a new session run begins (user sends first message or resumes).
+    // =========================================================================
+    auto* hook_mgr = tools::get_global_hook_manager();
+    if (hook_mgr && hook_mgr->has_hooks(plugins::PluginHookName::SESSION_START)) {
+        tools::PluginHookSessionStartEvent ss_event;
+        ss_event.session_id  = session_id;
+        ss_event.session_key = session_id;  // session_key == session_id in HunterClaw
+        tools::PluginHookSessionContext ss_ctx;
+        ss_ctx.session_id  = session_id;
+        ss_ctx.session_key = session_id;
+        ss_ctx.agent_id    = agent->context().agent_id;
+        try {
+            hook_mgr->run_session_start(ss_event, ss_ctx);
+        } catch (const std::exception& e) {
+            get_logger()->warn("[chat.send] session_start hook failed: {}", e.what());
+        }
+    }
+
     auto append_result = sessions::append_user_message_to_transcript(
         transcript_path, 
         message, 
@@ -216,6 +238,7 @@ core::Result<json> method_chat_send(
     // 配置流式回调 (对齐 OpenClaw)
     react::StreamCallbacks callbacks;
     callbacks.session_id = session_id;
+    callbacks.transcript_path = transcript_path;  // 用于 tool_result_persist hook
     
     // 助手输出流 (chat.delta)
     callbacks.on_assistant_delta = [server, session_id, run_id](const std::string& delta) {
@@ -400,6 +423,28 @@ core::Result<json> method_chat_send(
 
                         spdlog::info("[chat.send] Agent completed: session={}, run_id={}, steps={}",
                             session_id, run_id, result.total_steps);
+
+                        // =============================================================
+                        // Hook: session_end
+                        // Aligned with OpenClaw sessions/session-manager.ts — fire-and-forget
+                        // Fires when the agent run completes (success or error).
+                        // =============================================================
+                        auto* end_hook_mgr = tools::get_global_hook_manager();
+                        if (end_hook_mgr && end_hook_mgr->has_hooks(plugins::PluginHookName::SESSION_END)) {
+                            tools::PluginHookSessionEndEvent se_event;
+                            se_event.session_id    = session_id;
+                            se_event.session_key   = session_id;
+                            se_event.message_count = static_cast<int>(result.total_steps);
+                            se_event.duration_ms   = static_cast<int>(result.duration_ms);
+                            tools::PluginHookSessionContext se_ctx;
+                            se_ctx.session_id  = session_id;
+                            se_ctx.session_key = session_id;
+                            try {
+                                end_hook_mgr->run_session_end(se_event, se_ctx);
+                            } catch (const std::exception& e) {
+                                spdlog::warn("[chat.send] session_end hook failed: {}", e.what());
+                            }
+                        }
 
                     } catch (const std::exception& e) {
                         spdlog::error("[chat.send] Agent exception: session={}, run_id={}, error={}",

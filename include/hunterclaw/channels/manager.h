@@ -3,6 +3,7 @@
 #include "hunterclaw/channels/plugin.h"
 #include "hunterclaw/core/types.h"
 #include "hunterclaw/core/json.h"
+#include "hunterclaw/tools/tool_hooks.h"   // get_global_hook_manager(), PluginHook* types
 #include <spdlog/spdlog.h>
 
 // Forward declaration — avoid circular include with message_dispatcher.h
@@ -218,6 +219,21 @@ public:
         const ChannelId& channel_id,
         const nlohmann::json& args
     ) const;
+
+    // =========================================================================
+    // Hook: message_received
+    // Aligned with OpenClaw channels/plugins/hooks.ts — fire-and-forget
+    // Called by channel plugins when an inbound message is received.
+    // Fires the message_received hook so plugins can observe all inbound traffic.
+    // =========================================================================
+    void fire_message_received(
+        const ChannelId& channel_id,
+        const std::string& account_id,
+        const std::string& from,
+        const std::string& content,
+        std::optional<int64_t> timestamp = std::nullopt,
+        std::optional<std::string> metadata_json = std::nullopt
+    );
 
 private:
     std::unique_ptr<ChannelManagerImpl> impl_;

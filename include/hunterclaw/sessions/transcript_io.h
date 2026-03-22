@@ -91,6 +91,30 @@ AppendTranscriptResult append_user_message_to_transcript(
 );
 
 // ============================================================================
+// Tool Result Persist (对齐 OpenClaw tool_result_persist hook)
+// ============================================================================
+
+struct AppendToolResultOptions {
+    std::string tool_name;
+    std::string tool_call_id;
+    std::string result_json;   // Serialized tool result content
+    bool is_synthetic = false; // True when synthesized by guard/repair step
+    std::string run_id;
+};
+
+/**
+ * 追加工具结果消息到 transcript，并触发 tool_result_persist hook
+ *
+ * Aligned with OpenClaw sessions/transcript.ts appendToolResultMessage()
+ * Hook: tool_result_persist — sync, sequential, allows plugins to modify
+ *       the toolResult message before it is written to JSONL.
+ */
+AppendTranscriptResult append_tool_result_to_transcript(
+    const std::string& transcript_path,
+    const AppendToolResultOptions& options
+);
+
+// ============================================================================
 // Transcript 读取 (对齐 OpenClaw)
 // ============================================================================
 
