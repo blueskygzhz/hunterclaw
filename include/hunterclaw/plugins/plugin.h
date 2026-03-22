@@ -105,7 +105,7 @@ private:
 };
 
 // ============================================================================
-// Plugin Registry (for discovering and installing plugins)
+// Plugin Remote Registry (for discovering and installing plugins from remote)
 // ============================================================================
 
 struct PluginRegistryEntry {
@@ -119,9 +119,9 @@ struct PluginRegistryEntry {
     double rating;
 };
 
-class PluginRegistry {
+class PluginRemoteRegistry {
 public:
-    explicit PluginRegistry(const std::string& registry_url);
+    explicit PluginRemoteRegistry(const std::string& registry_url);
     
     // Search and discovery
     core::Result<std::vector<PluginRegistryEntry>> search(const std::string& query);

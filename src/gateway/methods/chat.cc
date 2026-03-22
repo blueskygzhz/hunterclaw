@@ -397,12 +397,12 @@ core::Result<json> method_chat_send(
     // 第一层: 入队到 session lane（串行，保证同一 session 请求不并发）
     cmd_queue.enqueue_command_in_lane(
         session_lane,
-        [&cmd_queue, react_engine, message, callbacks, run_id, session_id, transcript_path]() {
+        std::function<void()>([&cmd_queue, react_engine, message, callbacks, run_id, session_id, transcript_path]() {
             // 第二层: 在 session lane 内部，再入队到 global main lane（全局并发控制）
             // 对齐 OpenClaw: enqueueGlobal(() => runEmbeddedPiAgent(...))
             auto global_future = cmd_queue.enqueue_command_in_lane(
                 queue::CommandLane::Main,
-                [react_engine, message, callbacks, run_id, session_id, transcript_path]() {
+                std::function<void()>([react_engine, message, callbacks, run_id, session_id, transcript_path]() {
                     try {
                         auto result = react_engine->run(message, {}, callbacks);
 
@@ -417,11 +417,11 @@ core::Result<json> method_chat_send(
                         );
 
                         if (!append_result.ok) {
-                            spdlog::warn("[chat.send] Failed to write assistant message to transcript: {}",
+                            get_logger()->warn("[chat.send] Failed to write assistant message to transcript: {}",
                                 append_result.error);
                         }
 
-                        spdlog::info("[chat.send] Agent completed: session={}, run_id={}, steps={}",
+                        get_logger()->info("[chat.send] Agent completed: session={}, run_id={}, steps={}",
                             session_id, run_id, result.total_steps);
 
                         // =============================================================
@@ -442,15 +442,15 @@ core::Result<json> method_chat_send(
                             try {
                                 end_hook_mgr->run_session_end(se_event, se_ctx);
                             } catch (const std::exception& e) {
-                                spdlog::warn("[chat.send] session_end hook failed: {}", e.what());
+                                get_logger()->warn("[chat.send] session_end hook failed: {}", e.what());
                             }
                         }
 
                     } catch (const std::exception& e) {
-                        spdlog::error("[chat.send] Agent exception: session={}, run_id={}, error={}",
+                        get_logger()->error("[chat.send] Agent exception: session={}, run_id={}, error={}",
                             session_id, run_id, e.what());
                     }
-                },
+                }),
                 queue::EnqueueOptions{
                     .label = "chat.send:" + session_id + ":" + run_id,
                     .urgent = false
@@ -462,10 +462,10 @@ core::Result<json> method_chat_send(
             try {
                 global_future.get();
             } catch (const std::exception& e) {
-                spdlog::error("[chat.send] Global lane task failed: session={}, run_id={}, error={}",
+                get_logger()->error("[chat.send] Global lane task failed: session={}, run_id={}, error={}",
                     session_id, run_id, e.what());
             }
-        },
+        }),
         queue::EnqueueOptions{
             .label = "session:" + session_id + ":" + run_id,
             .urgent = false

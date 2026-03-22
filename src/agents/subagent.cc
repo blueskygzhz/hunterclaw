@@ -811,7 +811,7 @@ core::Result<std::string> SubagentSpawner::spawn(
                 } else {
                     // 执行成功，保存结果
                     // 对齐 OpenClaw: captureSubagentCompletionReply()
-                    registry->set_result(subagent_run_id, result.value, false, "");
+                    registry->set_result(subagent_run_id, result.value.value_or(""), false, "");
                     log()->info("[SubagentSpawner] Subagent execution completed: {}",
                                subagent_run_id);
                 }

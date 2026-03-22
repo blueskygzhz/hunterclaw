@@ -1,6 +1,7 @@
 #include "hunterclaw/gateway/gateway.h"
 #include "hunterclaw/gateway/method_guard.h"
 #include "hunterclaw/core/utils.h"
+#include "hunterclaw/core/logging.h"
 #include "hunterclaw/agents/agent_pool.h"
 #include "hunterclaw/agents/agent_instance.h"
 #include "hunterclaw/sessions/session_manager.h"
@@ -119,37 +120,27 @@ static std::string extract_agent_id_from_key(const std::string& key) {
     return key.substr(first + 1, second - first - 1);
 }
 
+// ── 辅助: 从 server config 推导 sessions_dir ──
+// 对齐 chat.cc: workspace_dir/../sessions
+static std::string resolve_sessions_dir_from_server(
+    std::shared_ptr<GatewayServer> server
+) {
+    auto cfg = server->config();
+    if (cfg && !cfg->workspace_dir.empty()) {
+        return (fs::path(cfg->workspace_dir).parent_path() / "sessions").string();
+    }
+    const char* home = std::getenv("HOME");
+    return std::string(home ? home : "/tmp") + "/.hunterclaw/sessions";
+}
+
 // ── 辅助: 获取 SessionManager 实例 ──
 // 对齐 OpenClaw: loadSessionStore(storePath)
 static std::shared_ptr<sessions::SessionManager> get_session_manager(
     std::shared_ptr<GatewayServer> server
 ) {
-    // 从 server config 获取 sessions 存储路径
-    auto cfg = server->config();
-    std::string sessions_dir;
-    if (cfg) {
-        sessions_dir = cfg->sessions_dir();
-    }
-    if (sessions_dir.empty()) {
-        // 默认路径
-        const char* home = std::getenv("HOME");
-        sessions_dir = std::string(home ? home : "/tmp") + "/.hunterclaw/sessions";
-    }
+    std::string sessions_dir = resolve_sessions_dir_from_server(server);
     sessions::SessionConfig session_cfg;
     return sessions::SessionManager::create(sessions_dir, session_cfg);
-}
-
-// ── 辅助: 获取 agent 的 workspace_dir ──
-static std::string get_agent_workspace_dir(
-    std::shared_ptr<GatewayServer> server,
-    const std::string& agent_id
-) {
-    auto cfg = server->config();
-    if (cfg) {
-        return cfg->agent_workspace_dir(agent_id);
-    }
-    const char* home = std::getenv("HOME");
-    return std::string(home ? home : "/tmp") + "/.hunterclaw/agents/" + agent_id + "/workspace";
 }
 
 // ── 辅助: 构建 GatewaySessionRow JSON ──
@@ -882,7 +873,7 @@ core::Result<json> method_session_reset(
     cleanup_session_before_mutation(server, key);
 
     // 🎯 OpenClaw 对齐: Step 2 - updateSessionStore
-h    // 生成新 sessionId，保留 label/thinkingLevel 等元数据
+    // 生成新 sessionId，保留 label/thinkingLevel 等元数据
     // 对应 performGatewaySessionReset 中的 nextEntry 构造
     sessions::SessionEntry next_entry;
     next_entry.session_id       = core::utils::generate_uuid();
