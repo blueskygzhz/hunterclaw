@@ -155,49 +155,119 @@ static json to_json(const SessionEntry& session) {
     j["agentId"] = session.agent_id;
     j["createdAt"] = session.created_at;
     j["updatedAt"] = session.updated_at;
-    
-    j["inputTokens"] = session.input_tokens;
-    j["outputTokens"] = session.output_tokens;
-    j["totalTokens"] = session.total_tokens;
-    j["contextTokens"] = session.context_tokens;
-    
+
+    j["inputTokens"]      = session.input_tokens;
+    j["outputTokens"]     = session.output_tokens;
+    j["totalTokens"]      = session.total_tokens;
+    j["totalTokensFresh"] = session.total_tokens_fresh;
+    j["systemSent"]       = session.system_sent;
+    j["abortedLastRun"]   = session.aborted_last_run;
+
+    if (session.context_tokens) j["contextTokens"] = *session.context_tokens;
+    if (session.label)          j["label"]          = *session.label;
+    if (session.display_name)   j["displayName"]    = *session.display_name;
+    if (session.chat_type)      j["chatType"]       = *session.chat_type;
+    if (session.subject)        j["subject"]        = *session.subject;
+    if (session.channel)        j["channel"]        = *session.channel;
+    if (session.group_channel)  j["groupChannel"]   = *session.group_channel;
+    if (session.space)          j["space"]          = *session.space;
+    if (session.model)          j["model"]          = *session.model;
+    if (session.model_provider) j["modelProvider"]  = *session.model_provider;
+    if (session.thinking_level) j["thinkingLevel"]  = *session.thinking_level;
+    if (session.fast_mode)      j["fastMode"]       = *session.fast_mode;
+    if (session.verbose_level)  j["verboseLevel"]   = *session.verbose_level;
+    if (session.reasoning_level) j["reasoningLevel"] = *session.reasoning_level;
+    if (session.elevated_level) j["elevatedLevel"]  = *session.elevated_level;
+    if (session.send_policy)    j["sendPolicy"]     = *session.send_policy;
+    if (session.response_usage) j["responseUsage"]  = *session.response_usage;
+    if (session.spawned_by)     j["spawnedBy"]      = *session.spawned_by;
+    if (session.last_channel)   j["lastChannel"]    = *session.last_channel;
+    if (session.last_to)        j["lastTo"]         = *session.last_to;
+    if (session.last_account_id) j["lastAccountId"] = *session.last_account_id;
+    if (session.last_thread_id) j["lastThreadId"]   = *session.last_thread_id;
+    if (session.tts_auto)       j["ttsAuto"]        = *session.tts_auto;
+
     j["metadata"] = to_json(session.metadata);
     j["messages"] = session.messages;
-    
+
     return j;
 }
 
 static SessionEntry session_from_json(const json& j) {
     SessionEntry session;
-    session.session_id = j.value("sessionId", "");
+    session.session_id  = j.value("sessionId", "");
     session.session_key = j.value("sessionKey", "");
-    session.agent_id = j.value("agentId", "");
-    session.created_at = j.value("createdAt", 0ULL);
-    session.updated_at = j.value("updatedAt", 0ULL);
-    
-    session.input_tokens = j.value("inputTokens", 0);
-    session.output_tokens = j.value("outputTokens", 0);
-    session.total_tokens = j.value("totalTokens", 0);
-    session.context_tokens = j.value("contextTokens", 0);
-    
+    session.agent_id    = j.value("agentId", "");
+    session.created_at  = j.value("createdAt", 0ULL);
+    session.updated_at  = j.value("updatedAt", 0ULL);
+
+    session.input_tokens       = j.value("inputTokens", 0);
+    session.output_tokens      = j.value("outputTokens", 0);
+    session.total_tokens       = j.value("totalTokens", 0);
+    session.total_tokens_fresh = j.value("totalTokensFresh", false);
+    session.system_sent        = j.value("systemSent", false);
+    session.aborted_last_run   = j.value("abortedLastRun", false);
+
+    if (j.contains("contextTokens") && j["contextTokens"].is_number())
+        session.context_tokens = j["contextTokens"].get<int>();
+    if (j.contains("label") && j["label"].is_string())
+        session.label = j["label"].get<std::string>();
+    if (j.contains("displayName") && j["displayName"].is_string())
+        session.display_name = j["displayName"].get<std::string>();
+    if (j.contains("chatType") && j["chatType"].is_string())
+        session.chat_type = j["chatType"].get<std::string>();
+    if (j.contains("subject") && j["subject"].is_string())
+        session.subject = j["subject"].get<std::string>();
+    if (j.contains("channel") && j["channel"].is_string())
+        session.channel = j["channel"].get<std::string>();
+    if (j.contains("groupChannel") && j["groupChannel"].is_string())
+        session.group_channel = j["groupChannel"].get<std::string>();
+    if (j.contains("space") && j["space"].is_string())
+        session.space = j["space"].get<std::string>();
+    if (j.contains("model") && j["model"].is_string())
+        session.model = j["model"].get<std::string>();
+    if (j.contains("modelProvider") && j["modelProvider"].is_string())
+        session.model_provider = j["modelProvider"].get<std::string>();
+    if (j.contains("thinkingLevel") && j["thinkingLevel"].is_string())
+        session.thinking_level = j["thinkingLevel"].get<std::string>();
+    if (j.contains("fastMode") && j["fastMode"].is_boolean())
+        session.fast_mode = j["fastMode"].get<bool>();
+    if (j.contains("verboseLevel") && j["verboseLevel"].is_string())
+        session.verbose_level = j["verboseLevel"].get<std::string>();
+    if (j.contains("reasoningLevel") && j["reasoningLevel"].is_string())
+        session.reasoning_level = j["reasoningLevel"].get<std::string>();
+    if (j.contains("elevatedLevel") && j["elevatedLevel"].is_string())
+        session.elevated_level = j["elevatedLevel"].get<std::string>();
+    if (j.contains("sendPolicy") && j["sendPolicy"].is_string())
+        session.send_policy = j["sendPolicy"].get<std::string>();
+    if (j.contains("responseUsage") && j["responseUsage"].is_string())
+        session.response_usage = j["responseUsage"].get<std::string>();
+    if (j.contains("spawnedBy") && j["spawnedBy"].is_string())
+        session.spawned_by = j["spawnedBy"].get<std::string>();
+    if (j.contains("lastChannel") && j["lastChannel"].is_string())
+        session.last_channel = j["lastChannel"].get<std::string>();
+    if (j.contains("lastTo") && j["lastTo"].is_string())
+        session.last_to = j["lastTo"].get<std::string>();
+    if (j.contains("lastAccountId") && j["lastAccountId"].is_string())
+        session.last_account_id = j["lastAccountId"].get<std::string>();
+    if (j.contains("lastThreadId") && j["lastThreadId"].is_string())
+        session.last_thread_id = j["lastThreadId"].get<std::string>();
+    if (j.contains("ttsAuto") && j["ttsAuto"].is_string())
+        session.tts_auto = j["ttsAuto"].get<std::string>();
+
     if (j.contains("metadata")) {
         session.metadata = metadata_from_json(j["metadata"]);
     }
-    
+
     // ACP 集成
     if (j.contains("acp")) {
         session.acp = acp_meta_from_json(j["acp"]);
     }
-    
-    // 会话标识
-    if (j.contains("label")) session.label = j["label"].get<std::string>();
-    if (j.contains("displayName")) session.display_name = j["displayName"].get<std::string>();
-    if (j.contains("chatType")) session.chat_type = j["chatType"].get<std::string>();
-    
+
     if (j.contains("messages")) {
         session.messages = j["messages"].get<std::vector<std::string>>();
     }
-    
+
     return session;
 }
 

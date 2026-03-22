@@ -699,8 +699,8 @@ core::Result<json> method_config_apply(
     // ── Step 5: audit 日志 ──
     // 🎯 OpenClaw 对齐: context.logGateway.info("config.apply write ...")
     std::string actor_id = client_ctx.account_id.empty() ? client_ctx.conn_id : client_ctx.account_id;
-    spdlog::info("[config.apply] write actor={} changedPaths={} restartReason=config.apply",
-        actor_id, summarize_changed_paths(changed_paths));
+    { auto _l = spdlog::get("console"); if (_l) _l->info("[config.apply] write actor={} changedPaths={} restartReason=config.apply",
+        actor_id, summarize_changed_paths(changed_paths)); }
 
     // ── Step 6: writeConfigFile ──
     // 🎯 OpenClaw 对齐: writeConfigFile(parsed.config, writeOptions)
@@ -764,7 +764,7 @@ core::Result<json> method_config_apply(
             changed_paths
         );
         if (restart.coalesced) {
-            spdlog::warn("[config.apply] restart coalesced actor={} delayMs={}", actor_id, restart.delay_ms);
+            { auto _l = spdlog::get("console"); if (_l) _l->warn("[config.apply] restart coalesced actor={} delayMs={}", actor_id, restart.delay_ms); }
         }
         restart_result = json{
             {"scheduled", restart.scheduled},

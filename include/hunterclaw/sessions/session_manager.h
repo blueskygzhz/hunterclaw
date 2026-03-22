@@ -72,29 +72,57 @@ struct SessionEntry {
     std::string session_id;        // 会话ID (UUID)
     std::string session_key;       // 会话key (唯一标识)
     std::string agent_id;          // Agent ID
-    uint64_t created_at;           // 创建时间戳
-    uint64_t updated_at;           // 更新时间戳
-    
-    // Token 统计
+    uint64_t created_at = 0;       // 创建时间戳
+    uint64_t updated_at = 0;       // 更新时间戳
+
+    // Token 统计 (对齐 OpenClaw)
     int input_tokens = 0;
     int output_tokens = 0;
     int total_tokens = 0;
-    int context_tokens = 0;
-    
+    bool total_tokens_fresh = false;  // ✅ 对齐 OpenClaw: totalTokensFresh
+
+    // 运行状态 (对齐 OpenClaw)
+    bool system_sent = false;         // ✅ 对齐 OpenClaw: systemSent
+    bool aborted_last_run = false;    // ✅ 对齐 OpenClaw: abortedLastRun
+
     // 基础元数据
     SessionMetadata metadata;
-    
+
     // ACP 集成 (可选 - 支持 ACP 协议)
     std::optional<SessionAcpMeta> acp;
-    
+
     // 会话标识 (对齐 OpenClaw)
     std::optional<std::string> label;          // 会话标签 (用户友好名称)
     std::optional<std::string> display_name;   // 显示名称
     std::optional<std::string> chat_type;      // 聊天类型: dm/group/channel
+    std::optional<std::string> subject;        // ✅ 对齐 OpenClaw: subject
+    std::optional<std::string> channel;        // ✅ 对齐 OpenClaw: channel
+    std::optional<std::string> group_channel;  // ✅ 对齐 OpenClaw: groupChannel
+    std::optional<std::string> space;          // ✅ 对齐 OpenClaw: space
 
-    // Aligned with openclaw: ttsAuto mode for this session
-    // "off" | "always" | "inbound" | "tagged"
-    std::optional<std::string> tts_auto;
+    // 模型配置 (对齐 OpenClaw)
+    std::optional<std::string> model;           // ✅ 对齐 OpenClaw: model (runtime)
+    std::optional<std::string> model_provider;  // ✅ 对齐 OpenClaw: modelProvider
+    std::optional<int> context_tokens;          // ✅ 对齐 OpenClaw: contextTokens
+
+    // 行为配置 (对齐 OpenClaw)
+    std::optional<std::string> thinking_level;  // ✅ "low"|"medium"|"high"|"xhigh"
+    std::optional<bool>        fast_mode;        // ✅ 对齐 OpenClaw: fastMode
+    std::optional<std::string> verbose_level;   // ✅ 对齐 OpenClaw: verboseLevel
+    std::optional<std::string> reasoning_level; // ✅ "on"|"off"|"stream"
+    std::optional<std::string> elevated_level;  // ✅ "on"|"off"|"ask"|"full"
+    std::optional<std::string> send_policy;     // ✅ "allow"|"deny"
+    std::optional<std::string> response_usage;  // ✅ "tokens"|"full"
+
+    // 派生/路由字段 (对齐 OpenClaw)
+    std::optional<std::string> spawned_by;      // ✅ 对齐 OpenClaw: spawnedBy
+    std::optional<std::string> last_channel;    // ✅ 对齐 OpenClaw: lastChannel
+    std::optional<std::string> last_to;         // ✅ 对齐 OpenClaw: lastTo
+    std::optional<std::string> last_account_id; // ✅ 对齐 OpenClaw: lastAccountId
+    std::optional<std::string> last_thread_id;  // ✅ 对齐 OpenClaw: lastThreadId
+
+    // TTS 配置
+    std::optional<std::string> tts_auto;  // "off"|"always"|"inbound"|"tagged"
 
     // 会话历史 (简化版，实际可能需要独立存储)
     std::vector<std::string> messages;

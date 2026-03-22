@@ -994,67 +994,71 @@ void HttpGateway::send_sse_chunk(httplib::Response& res, const std::string& data
     res.set_content("data: " + data + "\n\n", "text/event-stream");
 }
 
-// ========== Webhook Endpoints (🎯 OpenClaw 对齐) ==========
+// ========== Webhook Endpoints (🎯 OpenClaw 严格对齐) ==========
+// 对齐 OpenClaw server-http.ts createHooksRequestHandler + server/hooks.ts
 
 void HttpGateway::handle_webhook_hook(const httplib::Request& req, httplib::Response& res) {
     std::string hook_path = req.matches[1];
 
     log_info("Webhook hook: POST /hooks/{}", hook_path);
 
-    // Aligned with openclaw: token must NOT be in query parameters
-    // (server-http.ts: if (url.searchParams.has("token")) → 400)
+    // ✅ Aligned with openclaw: token must NOT be in query parameters
+    // server-http.ts: if (url.searchParams.has("token")) → 400
     if (req.has_param("token")) {
         res.status = 400;
         res.set_header("Content-Type", "text/plain; charset=utf-8");
         res.set_content(
             "Hook token must be provided via Authorization: Bearer <token> or "
-            "X-HunterClaw-Token header (query parameters are not allowed).",
+            "X-OpenClaw-Token header (query parameters are not allowed).",
             "text/plain"
         );
         return;
     }
 
-    // Aligned with openclaw: only POST is allowed
-    // (already enforced by httplib route, but double-check for safety)
-
-    // Aligned with openclaw: extractHookToken(req)
-    // Priority: Authorization: Bearer <token> > X-HunterClaw-Token (≈ X-OpenClaw-Token)
+    // ✅ Aligned with openclaw: extractHookToken(req)
+    // Priority: Authorization: Bearer <token> > X-OpenClaw-Token
     std::string provided_token;
 
     // Method 1: Authorization: Bearer <token>
     if (req.has_header("Authorization")) {
         std::string auth_header = req.get_header_value("Authorization");
-        if (auth_header.size() >= 7 && auth_header.substr(0, 7) == "Bearer ") {
+        // Case-insensitive "bearer " prefix check
+        std::string lower_auth = auth_header;
+        std::transform(lower_auth.begin(), lower_auth.end(), lower_auth.begin(), ::tolower);
+        if (lower_auth.size() > 7 && lower_auth.substr(0, 7) == "bearer ") {
             provided_token = auth_header.substr(7);
+            // trim leading/trailing whitespace
+            provided_token.erase(0, provided_token.find_first_not_of(" \t"));
+            provided_token.erase(provided_token.find_last_not_of(" \t") + 1);
         }
     }
 
-    // Method 2: X-HunterClaw-Token header
-    // (aligned with openclaw: X-OpenClaw-Token)
-    if (provided_token.empty() && req.has_header("X-HunterClaw-Token")) {
-        provided_token = req.get_header_value("X-HunterClaw-Token");
+    // Method 2: X-OpenClaw-Token header (aligned with openclaw)
+    if (provided_token.empty() && req.has_header("X-OpenClaw-Token")) {
+        provided_token = req.get_header_value("X-OpenClaw-Token");
+        provided_token.erase(0, provided_token.find_first_not_of(" \t"));
+        provided_token.erase(provided_token.find_last_not_of(" \t") + 1);
     }
 
-    // Aligned with openclaw: safeEqualSecret(token, hooksConfig.token)
+    // ✅ Aligned with openclaw: safeEqualSecret(token, hooksConfig.token)
     // Constant-time comparison to prevent timing attacks.
-    // If no token is configured, reject all requests.
     bool authenticated = false;
     if (!provided_token.empty() && !options_.bearer_token.empty()) {
         authenticated = hunterclaw::security::timing_safe_equal(provided_token, options_.bearer_token);
     }
 
     if (!authenticated) {
-        // Aligned with openclaw: hookAuthLimiter.recordFailure + 401
-        // (rate limiter integration is a future step)
+        // ✅ Aligned with openclaw: hookAuthLimiter.recordFailure + 401
+        // TODO: integrate rate limiter (hookAuthLimiter: 20 failures / 60s)
         res.set_header("Connection", "close");
         res.status = 401;
         res.set_header("Content-Type", "text/plain; charset=utf-8");
         res.set_content("Unauthorized", "text/plain");
         return;
     }
-    // Aligned with openclaw: hookAuthLimiter.reset(clientKey) on success
+    // ✅ Aligned with openclaw: hookAuthLimiter.reset(clientKey) on success
 
-    // Aligned with openclaw: subPath check — must be non-empty
+    // ✅ Aligned with openclaw: subPath check — must be non-empty
     if (hook_path.empty()) {
         res.status = 404;
         res.set_header("Content-Type", "text/plain; charset=utf-8");
@@ -1062,8 +1066,10 @@ void HttpGateway::handle_webhook_hook(const httplib::Request& req, httplib::Resp
         return;
     }
 
-    // Aligned with openclaw: readJsonBody(req, hooksConfig.maxBodyBytes)
-    if (req.body.size() > 10 * 1024 * 1024) {  // 10MB default
+    // ✅ Aligned with openclaw: readJsonBody(req, hooksConfig.maxBodyBytes)
+    // OpenClaw default: 256KB (DEFAULT_HOOKS_MAX_BODY_BYTES = 256 * 1024)
+    static constexpr size_t DEFAULT_HOOKS_MAX_BODY_BYTES = 256 * 1024;
+    if (req.body.size() > DEFAULT_HOOKS_MAX_BODY_BYTES) {
         json error_body = {{"ok", false}, {"error", "payload too large"}};
         res.status = 413;
         res.set_header("Content-Type", "application/json; charset=utf-8");
@@ -1071,122 +1077,224 @@ void HttpGateway::handle_webhook_hook(const httplib::Request& req, httplib::Resp
         return;
     }
 
-    // 解析请求体
-    try {
-        auto body = json::parse(req.body);
-
-        // 🎯 多种 Webhook 格式解析
-        std::string text;
-        std::string from;
-        std::string channel = hook_path;  // 默认使用 hook_path 作为 channel
-        
-        // 格式 1: Telegram Webhook
-        if (body.contains("message")) {
-            auto message = body["message"];
-            if (message.contains("text")) {
-                text = message["text"].get<std::string>();
+    // ✅ Aligned with openclaw: parse body, default to {} on empty/non-object
+    json payload = json::object();
+    if (!req.body.empty()) {
+        try {
+            auto parsed = json::parse(req.body);
+            if (parsed.is_object()) {
+                payload = parsed;
             }
-            if (message.contains("from")) {
-                auto from_obj = message["from"];
-                if (from_obj.contains("username")) {
-                    from = from_obj["username"].get<std::string>();
-                } else if (from_obj.contains("first_name")) {
-                    from = from_obj["first_name"].get<std::string>();
+        } catch (const std::exception& e) {
+            json error_body = {{"ok", false}, {"error", std::string("invalid json: ") + e.what()}};
+            res.status = 400;
+            res.set_header("Content-Type", "application/json; charset=utf-8");
+            res.set_content(error_body.dump(), "application/json");
+            return;
+        }
+    }
+
+    // ✅ Aligned with openclaw: resolveHookIdempotencyKey
+    // Priority: Idempotency-Key header > X-OpenClaw-Idempotency-Key header > payload.idempotencyKey
+    std::string idempotency_key;
+    if (req.has_header("Idempotency-Key")) {
+        idempotency_key = req.get_header_value("Idempotency-Key");
+    } else if (req.has_header("X-OpenClaw-Idempotency-Key")) {
+        idempotency_key = req.get_header_value("X-OpenClaw-Idempotency-Key");
+    } else if (payload.contains("idempotencyKey") && payload["idempotencyKey"].is_string()) {
+        idempotency_key = payload["idempotencyKey"].get<std::string>();
+    }
+    // Trim and enforce max length (aligned with openclaw: MAX_HOOK_IDEMPOTENCY_KEY_LENGTH = 256)
+    idempotency_key.erase(0, idempotency_key.find_first_not_of(" \t"));
+    idempotency_key.erase(idempotency_key.find_last_not_of(" \t") + 1);
+    if (idempotency_key.size() > 256) {
+        idempotency_key.clear();
+    }
+
+    // ✅ Aligned with openclaw: subPath === "wake"
+    // normalizeWakePayload: text (required), mode ("now" | "next-heartbeat")
+    if (hook_path == "wake") {
+        std::string text;
+        if (payload.contains("text") && payload["text"].is_string()) {
+            text = payload["text"].get<std::string>();
+            // trim
+            text.erase(0, text.find_first_not_of(" \t\n\r"));
+            text.erase(text.find_last_not_of(" \t\n\r") + 1);
+        }
+        if (text.empty()) {
+            json error_body = {{"ok", false}, {"error", "text required"}};
+            res.status = 400;
+            res.set_header("Content-Type", "application/json; charset=utf-8");
+            res.set_content(error_body.dump(), "application/json");
+            return;
+        }
+        std::string mode = "now";
+        if (payload.contains("mode") && payload["mode"].is_string() &&
+            payload["mode"].get<std::string>() == "next-heartbeat") {
+            mode = "next-heartbeat";
+        }
+        // ✅ Aligned with openclaw: dispatchWakeHook → enqueueSystemEvent + requestHeartbeatNow
+        json wake_params = {{"text", text}, {"mode", mode}};
+        invoke_rpc("hook.wake", wake_params);  // internal dispatch
+        json response = {{"ok", true}, {"mode", mode}};
+        res.status = 200;
+        res.set_header("Content-Type", "application/json; charset=utf-8");
+        res.set_content(response.dump(), "application/json");
+        return;
+    }
+
+    // ✅ Aligned with openclaw: subPath === "agent"
+    // normalizeAgentPayload: message (required), name (default "Hook"), agentId, wakeMode,
+    //   sessionKey, channel, to, model, thinking, timeoutSeconds, deliver
+    if (hook_path == "agent") {
+        // message: required, non-empty
+        std::string message;
+        if (payload.contains("message") && payload["message"].is_string()) {
+            message = payload["message"].get<std::string>();
+            message.erase(0, message.find_first_not_of(" \t\n\r"));
+            message.erase(message.find_last_not_of(" \t\n\r") + 1);
+        }
+        if (message.empty()) {
+            json error_body = {{"ok", false}, {"error", "message required"}};
+            res.status = 400;
+            res.set_header("Content-Type", "application/json; charset=utf-8");
+            res.set_content(error_body.dump(), "application/json");
+            return;
+        }
+
+        // name: optional, default "Hook"
+        std::string name = "Hook";
+        if (payload.contains("name") && payload["name"].is_string()) {
+            std::string raw_name = payload["name"].get<std::string>();
+            raw_name.erase(0, raw_name.find_first_not_of(" \t"));
+            raw_name.erase(raw_name.find_last_not_of(" \t") + 1);
+            if (!raw_name.empty()) name = raw_name;
+        }
+
+        // agentId: optional
+        std::string agent_id;
+        if (payload.contains("agentId") && payload["agentId"].is_string()) {
+            agent_id = payload["agentId"].get<std::string>();
+            agent_id.erase(0, agent_id.find_first_not_of(" \t"));
+            agent_id.erase(agent_id.find_last_not_of(" \t") + 1);
+        }
+
+        // wakeMode: "now" | "next-heartbeat", default "now"
+        std::string wake_mode = "now";
+        if (payload.contains("wakeMode") && payload["wakeMode"].is_string() &&
+            payload["wakeMode"].get<std::string>() == "next-heartbeat") {
+            wake_mode = "next-heartbeat";
+        }
+
+        // sessionKey: optional
+        std::string session_key;
+        if (payload.contains("sessionKey") && payload["sessionKey"].is_string()) {
+            session_key = payload["sessionKey"].get<std::string>();
+            session_key.erase(0, session_key.find_first_not_of(" \t"));
+            session_key.erase(session_key.find_last_not_of(" \t") + 1);
+        }
+
+        // channel: optional, default "last"
+        std::string channel = "last";
+        if (payload.contains("channel") && payload["channel"].is_string()) {
+            std::string raw_ch = payload["channel"].get<std::string>();
+            raw_ch.erase(0, raw_ch.find_first_not_of(" \t"));
+            raw_ch.erase(raw_ch.find_last_not_of(" \t") + 1);
+            if (!raw_ch.empty()) channel = raw_ch;
+        }
+
+        // to: optional
+        std::string to;
+        if (payload.contains("to") && payload["to"].is_string()) {
+            to = payload["to"].get<std::string>();
+            to.erase(0, to.find_first_not_of(" \t"));
+            to.erase(to.find_last_not_of(" \t") + 1);
+        }
+
+        // model: optional, if provided must be non-empty
+        std::string model;
+        if (payload.contains("model")) {
+            if (payload["model"].is_string()) {
+                model = payload["model"].get<std::string>();
+                model.erase(0, model.find_first_not_of(" \t"));
+                model.erase(model.find_last_not_of(" \t") + 1);
+                if (model.empty()) {
+                    // ✅ Aligned with openclaw: if modelRaw !== undefined && !model → error
+                    json error_body = {{"ok", false}, {"error", "model required"}};
+                    res.status = 400;
+                    res.set_header("Content-Type", "application/json; charset=utf-8");
+                    res.set_content(error_body.dump(), "application/json");
+                    return;
                 }
             }
         }
-        // 格式 2: Discord Webhook
-        else if (body.contains("content")) {
-            text = body["content"].get<std::string>();
-            if (body.contains("author") && body["author"].contains("username")) {
-                from = body["author"]["username"].get<std::string>();
+
+        // thinking: optional
+        std::string thinking;
+        if (payload.contains("thinking") && payload["thinking"].is_string()) {
+            thinking = payload["thinking"].get<std::string>();
+            thinking.erase(0, thinking.find_first_not_of(" \t"));
+            thinking.erase(thinking.find_last_not_of(" \t") + 1);
+        }
+
+        // timeoutSeconds: optional, must be finite positive number
+        std::optional<int> timeout_seconds;
+        if (payload.contains("timeoutSeconds") && payload["timeoutSeconds"].is_number()) {
+            double raw_timeout = payload["timeoutSeconds"].get<double>();
+            if (std::isfinite(raw_timeout) && raw_timeout > 0) {
+                timeout_seconds = static_cast<int>(raw_timeout);
             }
         }
-        // 格式 3: Generic Webhook
-        else if (body.contains("text")) {
-            text = body["text"].get<std::string>();
-            if (body.contains("from")) {
-                from = body["from"].get<std::string>();
-            }
+
+        // deliver: optional, default true (resolveHookDeliver: raw !== false)
+        bool deliver = true;
+        if (payload.contains("deliver") && payload["deliver"].is_boolean()) {
+            deliver = payload["deliver"].get<bool>();
         }
-        
-        if (text.empty()) {
-            send_error(res, 400, "Missing 'text' or 'message' field in webhook payload");
-            return;
-        }
-        
-        // 🎯 外部内容安全包装 (防止 Prompt Injection)
-        std::string wrapped_content = wrap_external_content(text, hook_path, from, channel);
-        
-        // 🎯 分发到 Agent (使用默认 Session Key)
+
+        // ✅ Aligned with openclaw: dispatchAgentHook → runCronIsolatedAgentTurn
+        // Build dispatch params for internal RPC
         json dispatch_params = {
-            {"session_key", "agent:main:device:webhook"},
-            {"content", wrapped_content},
-            {"metadata", {
-                {"source", "webhook"},
-                {"hook_path", hook_path},
-                {"from", from},
-                {"channel", channel}
-            }}
+            {"message", message},
+            {"name", name},
+            {"wakeMode", wake_mode},
+            {"deliver", deliver},
+            {"channel", channel},
+            {"idempotencyKey", idempotency_key}
         };
-        
-        log_debug("Dispatching webhook message to agent: {}", dispatch_params.dump());
-        
-        // 调用 message.dispatch RPC
-        auto result = invoke_rpc("message.dispatch", dispatch_params);
-        
+        if (!agent_id.empty())    dispatch_params["agentId"] = agent_id;
+        if (!session_key.empty()) dispatch_params["sessionKey"] = session_key;
+        if (!to.empty())          dispatch_params["to"] = to;
+        if (!model.empty())       dispatch_params["model"] = model;
+        if (!thinking.empty())    dispatch_params["thinking"] = thinking;
+        if (timeout_seconds)      dispatch_params["timeoutSeconds"] = *timeout_seconds;
+
+        log_debug("Dispatching hook agent: {}", dispatch_params.dump());
+
+        auto result = invoke_rpc("hook.agent", dispatch_params);
+
         if (result.is_ok()) {
-            json response = {
-                {"ok", true},
-                {"message", "Webhook message dispatched successfully"}
-            };
-            send_json(res, 200, response);
+            std::string run_id = result.value.has_value() && result.value->contains("runId")
+                ? result.value->at("runId").get<std::string>()
+                : "";
+            json response = {{"ok", true}, {"runId", run_id}};
+            res.status = 200;
+            res.set_header("Content-Type", "application/json; charset=utf-8");
+            res.set_content(response.dump(), "application/json");
         } else {
-            send_error(res, 500, result.error);
+            json error_body = {{"ok", false}, {"error", result.error}};
+            res.status = 400;
+            res.set_header("Content-Type", "application/json; charset=utf-8");
+            res.set_content(error_body.dump(), "application/json");
         }
-        
-    } catch (const std::exception& e) {
-        send_error(res, 400, std::string("Invalid webhook payload: ") + e.what());
+        return;
     }
-}
 
-// 🎯 OpenClaw 对齐: 外部内容安全包装
-std::string HttpGateway::wrap_external_content(
-    const std::string& content,
-    const std::string& source,
-    const std::string& from,
-    const std::string& channel
-) {
-    // 生成唯一边界标记 (防止 Prompt Injection)
-    std::string marker_id = generate_marker_id();
-    std::string boundary = "===EXTERNAL_CONTENT_" + marker_id + "===";
-    
-    std::ostringstream oss;
-    oss << "\n" << boundary << "\n";
-    oss << "Source: " << source << "\n";
-    if (!from.empty()) {
-        oss << "From: " << from << "\n";
-    }
-    if (!channel.empty()) {
-        oss << "Channel: " << channel << "\n";
-    }
-    oss << "---\n";
-    oss << content << "\n";
-    oss << boundary << "\n";
-    
-    return oss.str();
-}
-
-// 🎯 OpenClaw 对齐: 生成唯一标记 ID
-std::string HttpGateway::generate_marker_id() {
-    static std::atomic<uint64_t> counter{0};
-    auto now = std::chrono::system_clock::now().time_since_epoch().count();
-    uint64_t id = counter.fetch_add(1) + now;
-    
-    // 转换为 16 进制字符串 (8 位)
-    std::ostringstream oss;
-    oss << std::hex << std::setw(8) << std::setfill('0') << (id & 0xFFFFFFFF);
-    return oss.str();
+    // ✅ Aligned with openclaw: unknown subPath → 404
+    // (mappings support is a future extension)
+    res.status = 404;
+    res.set_header("Content-Type", "text/plain; charset=utf-8");
+    res.set_content("Not Found", "text/plain");
 }
 
 core::Result<json> HttpGateway::invoke_rpc(

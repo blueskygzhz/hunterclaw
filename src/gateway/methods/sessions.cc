@@ -177,13 +177,31 @@ static json build_session_row(
     row["inputTokens"]      = entry.input_tokens;
     row["outputTokens"]     = entry.output_tokens;
     row["totalTokens"]      = entry.total_tokens;
-    row["totalTokensFresh"] = true;
-    row["systemSent"]       = false;
-    row["abortedLastRun"]   = false;
+    row["totalTokensFresh"] = (entry.total_tokens > 0);
+    row["systemSent"]       = entry.system_sent;
+    row["abortedLastRun"]   = entry.aborted_last_run;
 
     // 🎯 OpenClaw 对齐: model 信息 (从 entry 读取)
-    row["model"]         = "";
-    row["modelProvider"] = "";
+    row["model"]         = entry.model.value_or("");
+    row["modelProvider"] = entry.model_provider.value_or("");
+
+    // 🎯 OpenClaw 对齐: 额外字段
+    if (entry.spawned_by)        row["spawnedBy"]      = *entry.spawned_by;
+    if (entry.channel)           row["channel"]        = *entry.channel;
+    if (entry.subject)           row["subject"]        = *entry.subject;
+    if (entry.group_channel)     row["groupChannel"]   = *entry.group_channel;
+    if (entry.space)             row["space"]          = *entry.space;
+    if (entry.send_policy)       row["sendPolicy"]     = *entry.send_policy;
+    if (entry.thinking_level)    row["thinkingLevel"]  = *entry.thinking_level;
+    if (entry.fast_mode)         row["fastMode"]       = *entry.fast_mode;
+    if (entry.verbose_level)     row["verboseLevel"]   = *entry.verbose_level;
+    if (entry.reasoning_level)   row["reasoningLevel"] = *entry.reasoning_level;
+    if (entry.elevated_level)    row["elevatedLevel"]  = *entry.elevated_level;
+    if (entry.response_usage)    row["responseUsage"]  = *entry.response_usage;
+    if (entry.context_tokens)    row["contextTokens"]  = *entry.context_tokens;
+    if (entry.last_channel)      row["lastChannel"]    = *entry.last_channel;
+    if (entry.last_to)           row["lastTo"]         = *entry.last_to;
+    if (entry.last_account_id)   row["lastAccountId"]  = *entry.last_account_id;
 
     // 🎯 OpenClaw 对齐: derivedTitle / lastMessagePreview
     if (include_derived_titles || include_last_message) {
@@ -337,16 +355,19 @@ core::Result<json> method_session_list(
         if (!include_unknown && key == "unknown") continue;
 
         // 🎯 OpenClaw 对齐: agentId 过滤
+        // OpenClaw: if (!parsed) return false (非 agent: 前缀的 key 也过滤掉)
         if (!agent_id_filter.empty()) {
-            std::string key_agent = extract_agent_id_from_key(key);
             if (key == "global" || key == "unknown") continue;
+            // 必须是 agent: 前缀
+            if (key.substr(0, 6) != "agent:") continue;
+            std::string key_agent = extract_agent_id_from_key(key);
             if (key_agent != agent_id_filter) continue;
         }
 
         // 🎯 OpenClaw 对齐: spawnedBy 过滤
         if (!spawned_by.empty()) {
             if (key == "unknown" || key == "global") continue;
-            // HunterClaw SessionEntry 暂无 spawnedBy 字段，跳过
+            if (!entry.spawned_by || *entry.spawned_by != spawned_by) continue;
         }
 
         // 🎯 OpenClaw 对齐: label 过滤
@@ -411,10 +432,11 @@ core::Result<json> method_session_list(
     result["sessions"] = sessions_array;
 
     // 🎯 OpenClaw 对齐: getSessionDefaults
+    // OpenClaw: { modelProvider, model, contextTokens }
     json defaults;
     defaults["modelProvider"] = nullptr;
     defaults["model"]         = nullptr;
-    defaults["contextTokens"] = nullptr;
+    defaults["contextTokens"] = nullptr;  // TODO: resolve from config
     result["defaults"] = defaults;
 
     return core::Result<json>::Ok(result);
@@ -616,16 +638,133 @@ core::Result<json> method_session_patch(
         entry.updated_at  = entry.created_at;
     }
 
-    // 🎯 OpenClaw 对齐: applySessionsPatchToStore - 支持的 patch 字段
-    // label, model, thinking, thinkingLevel, verboseLevel, reasoningLevel,
-    // fastMode, toolPolicy, externalContentHandling, deliveryPolicy,
-    // systemPrompt, elevated
-    if (params.contains("label") && params["label"].is_string()) {
-        entry.label = params["label"].get<std::string>();
+    // 🎯 OpenClaw 对齐: applySessionsPatchToStore
+    // label: 支持 null（清除）或 string（设置，需唯一性检查）
+    if (params.contains("label")) {
+        if (params["label"].is_null()) {
+            entry.label = std::nullopt;
+        } else if (params["label"].is_string()) {
+            std::string new_label = params["label"].get<std::string>();
+            new_label.erase(0, new_label.find_first_not_of(" \t"));
+            new_label.erase(new_label.find_last_not_of(" \t") + 1);
+            if (!new_label.empty()) {
+                // 🎯 OpenClaw 对齐: label 唯一性检查
+                auto all_sessions_result = session_mgr->list_sessions(std::nullopt);
+                if (all_sessions_result.is_ok()) {
+                    for (const auto& other : all_sessions_result.get()) {
+                        if (other.session_key != key && other.label && *other.label == new_label) {
+                            return core::Result<json>::Err("label already in use: " + new_label);
+                        }
+                    }
+                }
+                entry.label = new_label;
+            }
+        }
     }
-    if (params.contains("displayName") && params["displayName"].is_string()) {
-        entry.display_name = params["displayName"].get<std::string>();
+
+    if (params.contains("displayName")) {
+        if (params["displayName"].is_null()) {
+            entry.display_name = std::nullopt;
+        } else if (params["displayName"].is_string()) {
+            entry.display_name = params["displayName"].get<std::string>();
+        }
     }
+
+    // 🎯 OpenClaw 对齐: thinkingLevel
+    if (params.contains("thinkingLevel")) {
+        if (params["thinkingLevel"].is_null()) {
+            entry.thinking_level = std::nullopt;
+        } else if (params["thinkingLevel"].is_string()) {
+            std::string v = params["thinkingLevel"].get<std::string>();
+            static const std::set<std::string> valid_levels = {"low", "medium", "high", "xhigh"};
+            if (valid_levels.count(v)) entry.thinking_level = v;
+            else return core::Result<json>::Err("invalid thinkingLevel");
+        }
+    }
+
+    // 🎯 OpenClaw 对齐: fastMode
+    if (params.contains("fastMode")) {
+        if (params["fastMode"].is_null()) {
+            entry.fast_mode = std::nullopt;
+        } else if (params["fastMode"].is_boolean()) {
+            entry.fast_mode = params["fastMode"].get<bool>();
+        }
+    }
+
+    // 🎯 OpenClaw 对齐: verboseLevel
+    if (params.contains("verboseLevel")) {
+        if (params["verboseLevel"].is_null()) {
+            entry.verbose_level = std::nullopt;
+        } else if (params["verboseLevel"].is_string()) {
+            entry.verbose_level = params["verboseLevel"].get<std::string>();
+        }
+    }
+
+    // 🎯 OpenClaw 对齐: reasoningLevel
+    if (params.contains("reasoningLevel")) {
+        if (params["reasoningLevel"].is_null()) {
+            entry.reasoning_level = std::nullopt;
+        } else if (params["reasoningLevel"].is_string()) {
+            std::string v = params["reasoningLevel"].get<std::string>();
+            static const std::set<std::string> valid_rl = {"on", "off", "stream"};
+            if (valid_rl.count(v)) entry.reasoning_level = v;
+            else return core::Result<json>::Err("invalid reasoningLevel (use \"on\"|\"off\"|\"stream\")");
+        }
+    }
+
+    // 🎯 OpenClaw 对齐: elevatedLevel
+    if (params.contains("elevatedLevel")) {
+        if (params["elevatedLevel"].is_null()) {
+            entry.elevated_level = std::nullopt;
+        } else if (params["elevatedLevel"].is_string()) {
+            std::string v = params["elevatedLevel"].get<std::string>();
+            static const std::set<std::string> valid_el = {"on", "off", "ask", "full"};
+            if (valid_el.count(v)) entry.elevated_level = v;
+            else return core::Result<json>::Err("invalid elevatedLevel (use \"on\"|\"off\"|\"ask\"|\"full\")");
+        }
+    }
+
+    // 🎯 OpenClaw 对齐: sendPolicy
+    if (params.contains("sendPolicy")) {
+        if (params["sendPolicy"].is_null()) {
+            entry.send_policy = std::nullopt;
+        } else if (params["sendPolicy"].is_string()) {
+            std::string v = params["sendPolicy"].get<std::string>();
+            if (v == "allow" || v == "deny") entry.send_policy = v;
+            else return core::Result<json>::Err("invalid sendPolicy (use \"allow\"|\"deny\")");
+        }
+    }
+
+    // 🎯 OpenClaw 对齐: responseUsage
+    if (params.contains("responseUsage")) {
+        if (params["responseUsage"].is_null()) {
+            entry.response_usage = std::nullopt;
+        } else if (params["responseUsage"].is_string()) {
+            std::string v = params["responseUsage"].get<std::string>();
+            static const std::set<std::string> valid_ru = {"off", "tokens", "full"};
+            if (valid_ru.count(v)) {
+                if (v == "off") entry.response_usage = std::nullopt;
+                else entry.response_usage = v;
+            } else {
+                return core::Result<json>::Err("invalid responseUsage (use \"off\"|\"tokens\"|\"full\")");
+            }
+        }
+    }
+
+    // 🎯 OpenClaw 对齐: model (简化版，不做 catalog 验证)
+    if (params.contains("model")) {
+        if (params["model"].is_null()) {
+            entry.model = std::nullopt;
+            entry.model_provider = std::nullopt;
+        } else if (params["model"].is_string()) {
+            std::string v = params["model"].get<std::string>();
+            v.erase(0, v.find_first_not_of(" \t"));
+            v.erase(v.find_last_not_of(" \t") + 1);
+            if (v.empty()) return core::Result<json>::Err("invalid model: empty");
+            entry.model = v;
+        }
+    }
+
     entry.updated_at = (uint64_t)now_ms();
 
     // 🎯 OpenClaw 对齐: 持久化到 SessionManager
@@ -635,25 +774,22 @@ core::Result<json> method_session_patch(
     json entry_json;
     entry_json["sessionId"] = entry.session_id;
     entry_json["updatedAt"] = (int64_t)entry.updated_at;
-    if (entry.label)        entry_json["label"]       = *entry.label;
-    if (entry.display_name) entry_json["displayName"]  = *entry.display_name;
-
-    // 透传所有 patch 字段到 entry_json (对齐 OpenClaw)
-    static const std::vector<std::string> patchable_fields = {
-        "model", "thinking", "thinkingLevel", "verboseLevel",
-        "reasoningLevel", "fastMode", "toolPolicy", "externalContentHandling",
-        "deliveryPolicy", "systemPrompt", "elevated"
-    };
-    for (const auto& field : patchable_fields) {
-        if (params.contains(field)) {
-            entry_json[field] = params[field];
-        }
-    }
+    if (entry.label)           entry_json["label"]          = *entry.label;
+    if (entry.display_name)    entry_json["displayName"]    = *entry.display_name;
+    if (entry.model)           entry_json["model"]           = *entry.model;
+    if (entry.model_provider)  entry_json["modelProvider"]  = *entry.model_provider;
+    if (entry.thinking_level)  entry_json["thinkingLevel"]  = *entry.thinking_level;
+    if (entry.fast_mode)       entry_json["fastMode"]        = *entry.fast_mode;
+    if (entry.verbose_level)   entry_json["verboseLevel"]   = *entry.verbose_level;
+    if (entry.reasoning_level) entry_json["reasoningLevel"] = *entry.reasoning_level;
+    if (entry.elevated_level)  entry_json["elevatedLevel"]  = *entry.elevated_level;
+    if (entry.send_policy)     entry_json["sendPolicy"]     = *entry.send_policy;
+    if (entry.response_usage)  entry_json["responseUsage"]  = *entry.response_usage;
 
     // 🎯 OpenClaw 对齐: resolveSessionModelRef
     json resolved;
-    resolved["modelProvider"] = nullptr;
-    resolved["model"]         = params.value("model", "");
+    resolved["modelProvider"] = entry.model_provider ? json(*entry.model_provider) : json(nullptr);
+    resolved["model"]         = entry.model ? json(*entry.model) : json("");
 
     json result;
     result["ok"]       = true;
@@ -720,28 +856,59 @@ core::Result<json> method_session_reset(
     cleanup_session_before_mutation(server, key);
 
     // 🎯 OpenClaw 对齐: Step 2 - updateSessionStore
-    // 生成新 sessionId, 保留 label/model 等元数据
+    // 生成新 sessionId，保留 label/thinkingLevel 等元数据
+    // 对应 performGatewaySessionReset 中的 nextEntry 构造
     sessions::SessionEntry next_entry;
-    next_entry.session_id  = core::utils::generate_uuid();
-    next_entry.session_key = key;
-    next_entry.agent_id    = had_existing_entry ? old_entry.agent_id : extract_agent_id_from_key(key);
-    next_entry.created_at  = had_existing_entry ? old_entry.created_at : (uint64_t)now_ms();
-    next_entry.updated_at  = (uint64_t)now_ms();
-    next_entry.input_tokens  = 0;
-    next_entry.output_tokens = 0;
-    next_entry.total_tokens  = 0;
-    // 🎯 OpenClaw 对齐: 保留 label (currentEntry?.label)
+    next_entry.session_id       = core::utils::generate_uuid();
+    next_entry.session_key      = key;
+    next_entry.agent_id         = had_existing_entry ? old_entry.agent_id : extract_agent_id_from_key(key);
+    next_entry.created_at       = had_existing_entry ? old_entry.created_at : (uint64_t)now_ms();
+    next_entry.updated_at       = (uint64_t)now_ms();
+    next_entry.system_sent      = false;
+    next_entry.aborted_last_run = false;
+    next_entry.input_tokens     = 0;
+    next_entry.output_tokens    = 0;
+    next_entry.total_tokens     = 0;
+    next_entry.total_tokens_fresh = true;
+    // 🎯 OpenClaw 对齐: 保留 label
     if (had_existing_entry && old_entry.label) {
         next_entry.label = old_entry.label;
-    }
-    // 🎯 OpenClaw 对齐: 保留 display_name
-    if (had_existing_entry && old_entry.display_name) {
-        next_entry.display_name = old_entry.display_name;
     }
     // 🎯 OpenClaw 对齐: 保留 chat_type
     if (had_existing_entry && old_entry.chat_type) {
         next_entry.chat_type = old_entry.chat_type;
     }
+    // 🎯 OpenClaw 对齐: 保留 thinkingLevel / fastMode / verboseLevel / reasoningLevel
+    if (had_existing_entry && old_entry.thinking_level) {
+        next_entry.thinking_level = old_entry.thinking_level;
+    }
+    if (had_existing_entry && old_entry.fast_mode) {
+        next_entry.fast_mode = old_entry.fast_mode;
+    }
+    if (had_existing_entry && old_entry.verbose_level) {
+        next_entry.verbose_level = old_entry.verbose_level;
+    }
+    if (had_existing_entry && old_entry.reasoning_level) {
+        next_entry.reasoning_level = old_entry.reasoning_level;
+    }
+    if (had_existing_entry && old_entry.response_usage) {
+        next_entry.response_usage = old_entry.response_usage;
+    }
+    if (had_existing_entry && old_entry.send_policy) {
+        next_entry.send_policy = old_entry.send_policy;
+    }
+    // 🎯 OpenClaw 对齐: 保留 lastChannel / lastTo / lastAccountId
+    if (had_existing_entry && old_entry.last_channel) {
+        next_entry.last_channel = old_entry.last_channel;
+    }
+    if (had_existing_entry && old_entry.last_to) {
+        next_entry.last_to = old_entry.last_to;
+    }
+    if (had_existing_entry && old_entry.last_account_id) {
+        next_entry.last_account_id = old_entry.last_account_id;
+    }
+    // 🎯 OpenClaw 对齐: stripRuntimeModelState - reset 时清除 runtime model state
+    // (model/modelProvider/contextTokens 不保留，让下次运行重新解析)
 
     // 持久化新 entry
     session_mgr->update_session(next_entry);
@@ -769,15 +936,20 @@ core::Result<json> method_session_reset(
 
     // 🎯 OpenClaw 对齐: 构建返回值 (对齐 performGatewaySessionReset 返回)
     json entry_json;
-    entry_json["sessionId"]       = next_entry.session_id;
-    entry_json["updatedAt"]       = (int64_t)next_entry.updated_at;
-    entry_json["systemSent"]      = false;
-    entry_json["abortedLastRun"]  = false;
-    entry_json["inputTokens"]     = 0;
-    entry_json["outputTokens"]    = 0;
-    entry_json["totalTokens"]     = 0;
+    entry_json["sessionId"]        = next_entry.session_id;
+    entry_json["updatedAt"]        = (int64_t)next_entry.updated_at;
+    entry_json["systemSent"]       = false;
+    entry_json["abortedLastRun"]   = false;
+    entry_json["inputTokens"]      = 0;
+    entry_json["outputTokens"]     = 0;
+    entry_json["totalTokens"]      = 0;
     entry_json["totalTokensFresh"] = true;
-    if (next_entry.label) entry_json["label"] = *next_entry.label;
+    if (next_entry.label)           entry_json["label"]          = *next_entry.label;
+    if (next_entry.thinking_level)  entry_json["thinkingLevel"]  = *next_entry.thinking_level;
+    if (next_entry.fast_mode)       entry_json["fastMode"]       = *next_entry.fast_mode;
+    if (next_entry.verbose_level)   entry_json["verboseLevel"]   = *next_entry.verbose_level;
+    if (next_entry.reasoning_level) entry_json["reasoningLevel"] = *next_entry.reasoning_level;
+    if (next_entry.send_policy)     entry_json["sendPolicy"]     = *next_entry.send_policy;
 
     json result;
     result["ok"]    = true;
@@ -844,7 +1016,21 @@ core::Result<json> method_session_delete(
     }
 
     // 🎯 OpenClaw 对齐: Step 1 - cleanupSessionBeforeMutation
-    cleanup_session_before_mutation(server, key);
+    // OpenClaw: if (mutationCleanupError) respond(false, ...) and return
+    {
+        auto agent_pool = server->agent_pool();
+        if (agent_pool) {
+            auto agent = agent_pool->get_agent(key);
+            if (agent) {
+                auto react_engine = agent->react_engine();
+                if (react_engine) {
+                    react_engine->cancel();
+                }
+            }
+        }
+    }
+    // 🎯 OpenClaw 对齐: clearSessionQueues + stopSubagentsForRequester
+    // (简化版：直接 cancel，不等待 run 结束)
 
     // 🎯 OpenClaw 对齐: Step 2 - updateSessionStore (delete entry)
     bool deleted = false;
