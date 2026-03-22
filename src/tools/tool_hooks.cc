@@ -58,11 +58,37 @@ namespace {
 } // anonymous namespace
 
 // ============================================================================
-// plugin_hook_name_to_string — delegates to plugins::plugin_hook_name_to_string
+// plugin_hook_name_to_string — inline implementation (no dependency on plugins lib)
 // ============================================================================
 
 std::string plugin_hook_name_to_string(PluginHookName name) {
-    return plugins::plugin_hook_name_to_string(name);
+    switch (name) {
+        case PluginHookName::BEFORE_MODEL_RESOLVE:       return "before_model_resolve";
+        case PluginHookName::BEFORE_PROMPT_BUILD:        return "before_prompt_build";
+        case PluginHookName::BEFORE_AGENT_START:         return "before_agent_start";
+        case PluginHookName::LLM_INPUT:                  return "llm_input";
+        case PluginHookName::LLM_OUTPUT:                 return "llm_output";
+        case PluginHookName::AGENT_END:                  return "agent_end";
+        case PluginHookName::BEFORE_COMPACTION:          return "before_compaction";
+        case PluginHookName::AFTER_COMPACTION:           return "after_compaction";
+        case PluginHookName::BEFORE_RESET:               return "before_reset";
+        case PluginHookName::MESSAGE_RECEIVED:           return "message_received";
+        case PluginHookName::MESSAGE_SENDING:            return "message_sending";
+        case PluginHookName::MESSAGE_SENT:               return "message_sent";
+        case PluginHookName::BEFORE_TOOL_CALL:           return "before_tool_call";
+        case PluginHookName::AFTER_TOOL_CALL:            return "after_tool_call";
+        case PluginHookName::TOOL_RESULT_PERSIST:        return "tool_result_persist";
+        case PluginHookName::BEFORE_MESSAGE_WRITE:       return "before_message_write";
+        case PluginHookName::SESSION_START:              return "session_start";
+        case PluginHookName::SESSION_END:                return "session_end";
+        case PluginHookName::SUBAGENT_SPAWNING:          return "subagent_spawning";
+        case PluginHookName::SUBAGENT_DELIVERY_TARGET:   return "subagent_delivery_target";
+        case PluginHookName::SUBAGENT_SPAWNED:           return "subagent_spawned";
+        case PluginHookName::SUBAGENT_ENDED:             return "subagent_ended";
+        case PluginHookName::GATEWAY_START:              return "gateway_start";
+        case PluginHookName::GATEWAY_STOP:               return "gateway_stop";
+        default:                                         return "unknown";
+    }
 }
 
 // ============================================================================

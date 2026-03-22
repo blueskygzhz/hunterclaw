@@ -175,6 +175,29 @@ cc_library(
 )
 
 # ============================================================================
+# Queue Library - CommandQueue, CommandLane, EnqueueOptions
+# ============================================================================
+cc_library(
+    name = "hunterclaw_queue",
+    srcs = glob(["queue/*.cc"]),
+    deps = [
+        "//:hunterclaw_headers",
+        "@nlohmann_json//:json",
+    ],
+    copts = [
+        "-std=c++17",
+        "-Wall",
+        "-Wextra",
+        "-I/usr/include/spdlog",
+    ],
+    linkopts = [
+        "-lpthread",
+    ],
+    linkstatic = False,
+    visibility = ["//visibility:public"],
+)
+
+# ============================================================================
 # Gateway Library - OpenClaw 对齐的 HTTP/WebSocket Gateway
 # ============================================================================
 cc_library(
@@ -199,6 +222,7 @@ cc_library(
         ":hunterclaw_react",         # ✅ 添加 react 依赖
         ":hunterclaw_cron",          # ✅ 添加 cron 依赖
         ":hunterclaw_observability", # ✅ 添加 observability 依赖 (WebhookReceivedEvent vtable)
+        ":hunterclaw_queue",         # ✅ 添加 queue 依赖 (CommandQueue)
         "@nlohmann_json//:json",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -519,7 +543,6 @@ cc_library(
         "process/*.cc",
         "hooks/*.cc",
         "routing/*.cc",
-        "queue/*.cc",
         "pairing/*.cc",
         "security/*.cc",
         "secrets/*.cc",
@@ -549,6 +572,7 @@ cc_library(
         ":hunterclaw_react",  # ✅ 添加 react 依赖
         ":hunterclaw_observability",  # ✅ 添加 observability 依赖
         ":hunterclaw_outbound",  # ✅ 添加 outbound 依赖 (deliver_outbound_payloads)
+        ":hunterclaw_queue",     # ✅ 添加 queue 依赖 (CommandQueue)
         "//:hunterclaw_headers",
         "//third_party:httplib",
         "//third_party:subprocess",  # ✅ 添加 subprocess 依赖

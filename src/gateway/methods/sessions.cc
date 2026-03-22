@@ -863,7 +863,7 @@ core::Result<json> method_session_reset(
                 hook_mgr->run_before_reset(br_event, br_ctx);
             } catch (const std::exception& e) {
                 // before_reset hook failure is non-fatal — log and continue
-                spdlog::warn("[sessions.reset] before_reset hook failed: {}", e.what());
+                hunterclaw::core::get_logger()->warn("[sessions.reset] before_reset hook failed: {}", e.what());
             }
         }
     }

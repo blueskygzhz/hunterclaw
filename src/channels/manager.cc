@@ -1280,7 +1280,7 @@ void ChannelManager::fire_message_received(
         hook_mgr->run_message_received(mr_event, mr_ctx);
     } catch (const std::exception& e) {
         // fire-and-forget: log and continue
-        spdlog::warn("[channels] message_received hook failed: {}", e.what());
+        log()->warn("[channels] message_received hook failed: {}", e.what());
     }
 }
 
