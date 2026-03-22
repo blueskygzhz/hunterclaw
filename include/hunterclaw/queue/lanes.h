@@ -51,6 +51,12 @@ inline std::string ResolveSessionLane(const std::string& session_key) {
     return "session:" + session_key;
 }
 
+// 解析 embedded session lane 名称（对齐 OpenClaw: resolveEmbeddedSessionLane）
+// 与 ResolveSessionLane 等价，用于 auto_reply 层将请求入队到 session:xxx 动态 lane
+inline std::string ResolveEmbeddedSessionLane(const std::string& session_key) {
+    return ResolveSessionLane(session_key);
+}
+
 // 解析 global lane 名称
 // 对齐 OpenClaw: resolveGlobalLane(lane?) -> "main" | "nested" | lane
 // Cron 内部操作使用 nested 避免死锁

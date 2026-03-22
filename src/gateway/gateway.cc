@@ -1,5 +1,6 @@
 #include "hunterclaw/gateway/gateway.h"
 #include "hunterclaw/gateway/connection_pool.h"
+#include "hunterclaw/gateway/server_lanes.h"  // 对齐 OpenClaw: applyGatewayLaneConcurrency
 #include "hunterclaw/agents/agent_pool.h"
 #include "hunterclaw/core/utils.h"
 #include "hunterclaw/observability/diagnostic_events.h"  // ✅ 可观测性集成
@@ -1823,6 +1824,9 @@ core::Result<bool> GatewayServer::start() {
     if (impl_->running.load()) {
         return core::Result<bool>::Err("Server already running");
     }
+    // 对齐 OpenClaw server-lanes.ts: applyGatewayLaneConcurrency(cfg)
+    // 从配置文件读取并设置各 lane 的并发数（Main/Cron/Subagent）
+    apply_gateway_lane_concurrency(impl_->config->data);
     auto result = impl_->server_impl->start();
     if (result.is_ok()) {
         impl_->running.store(true);

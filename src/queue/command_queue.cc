@@ -52,7 +52,7 @@ public:
         // 对齐 OpenClaw server-lanes.ts: applyGatewayLaneConcurrency
         lanes_[CommandLane::Main].max_concurrent = 1;      // 主通道串行（由配置覆盖）
         lanes_[CommandLane::Cron].max_concurrent = 1;      // Cron通道（由配置覆盖）
-        lanes_[CommandLane::Subagent].max_concurrent = 4;  // 子代理通道（由配置覆盖）
+        lanes_[CommandLane::Subagent].max_concurrent = 8;  // 子代理通道（对齐 OpenClaw DEFAULT_SUBAGENT_MAX_CONCURRENT=8，由配置覆盖）
         lanes_[CommandLane::Nested].max_concurrent = 2;    // 嵌套通道
         
         // 启动工作线程（每个固定通道一个）
