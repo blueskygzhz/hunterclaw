@@ -197,7 +197,9 @@ core::Result<json> method_chat_send(
     // Step 5: 写入用户消息到 Transcript (对齐 OpenClaw)
     // ========================================================================
 
-    std::string sessions_dir = std::filesystem::path(agent->context().workspace_dir).parent_path() / "sessions";
+    // workspace_dir = {base}/{agent_id}/sessions/{session_id}
+    // sessions_dir  = {base}/{agent_id}/sessions  (parent_path of workspace_dir)
+    std::string sessions_dir = std::filesystem::path(agent->context().workspace_dir).parent_path().string();
     std::string transcript_path = sessions::resolve_transcript_path(
         session_id, 
         agent->context().agent_id,
@@ -644,7 +646,7 @@ core::Result<json> method_chat_history(
     // Step 3: 读取 Transcript (对齐 OpenClaw)
     // ========================================================================
     
-    std::string sessions_dir = std::filesystem::path(agent->context().workspace_dir).parent_path() / "sessions";
+    std::string sessions_dir = std::filesystem::path(agent->context().workspace_dir).parent_path().string();
     std::string transcript_path = sessions::resolve_transcript_path(
         session_id,
         agent->context().agent_id,
@@ -741,7 +743,7 @@ core::Result<json> method_chat_inject(
     // Step 3: 写入 Transcript (对齐 OpenClaw)
     // ========================================================================
     
-    std::string sessions_dir = std::filesystem::path(agent->context().workspace_dir).parent_path() / "sessions";
+    std::string sessions_dir = std::filesystem::path(agent->context().workspace_dir).parent_path().string();
     std::string transcript_path = sessions::resolve_transcript_path(
         session_id,
         agent->context().agent_id,
@@ -907,7 +909,7 @@ core::Result<json> method_chat_regenerate(
     }
 
     // 2. 读取 transcript，找到最后一条 user 消息
-    std::string sessions_dir_regen = std::filesystem::path(agent_regen->context().workspace_dir).parent_path() / "sessions";
+    std::string sessions_dir_regen = std::filesystem::path(agent_regen->context().workspace_dir).parent_path().string();
     std::string transcript_path_regen = sessions::resolve_transcript_path(
         session_id, agent_regen->context().agent_id, sessions_dir_regen
     );
@@ -1005,7 +1007,7 @@ core::Result<json> method_chat_fork(
     }
 
     // 1. 解析源 transcript 路径
-    std::string sessions_dir_fork = std::filesystem::path(agent_fork->context().workspace_dir).parent_path() / "sessions";
+    std::string sessions_dir_fork = std::filesystem::path(agent_fork->context().workspace_dir).parent_path().string();
     std::string src_transcript = sessions::resolve_transcript_path(
         session_id, agent_fork->context().agent_id, sessions_dir_fork
     );
@@ -1017,7 +1019,7 @@ core::Result<json> method_chat_fork(
     }
 
     // 3. 复制 transcript 文件
-    std::string sessions_dir_forked = std::filesystem::path(forked_agent->context().workspace_dir).parent_path() / "sessions";
+    std::string sessions_dir_forked = std::filesystem::path(forked_agent->context().workspace_dir).parent_path().string();
     std::string dst_transcript = sessions::resolve_transcript_path(
         forked_key, forked_agent->context().agent_id, sessions_dir_forked
     );
@@ -1077,7 +1079,7 @@ core::Result<json> method_chat_summarize(
     }
 
     // 读取最近消息
-    std::string sessions_dir_sum = std::filesystem::path(agent_sum->context().workspace_dir).parent_path() / "sessions";
+    std::string sessions_dir_sum = std::filesystem::path(agent_sum->context().workspace_dir).parent_path().string();
     std::string transcript_path_sum = sessions::resolve_transcript_path(
         session_id, agent_sum->context().agent_id, sessions_dir_sum
     );
@@ -1157,7 +1159,7 @@ core::Result<json> method_chat_edit(
         return core::Result<json>::Err("No active agent for session: " + session_id);
     }
 
-    std::string sessions_dir_edit = std::filesystem::path(agent_edit->context().workspace_dir).parent_path() / "sessions";
+    std::string sessions_dir_edit = std::filesystem::path(agent_edit->context().workspace_dir).parent_path().string();
     std::string transcript_path_edit = sessions::resolve_transcript_path(
         session_id, agent_edit->context().agent_id, sessions_dir_edit
     );
@@ -1246,7 +1248,7 @@ core::Result<json> method_chat_delete(
         return core::Result<json>::Err("No active agent for session: " + session_id);
     }
 
-    std::string sessions_dir_del = std::filesystem::path(agent_del->context().workspace_dir).parent_path() / "sessions";
+    std::string sessions_dir_del = std::filesystem::path(agent_del->context().workspace_dir).parent_path().string();
     std::string transcript_path_del = sessions::resolve_transcript_path(
         session_id, agent_del->context().agent_id, sessions_dir_del
     );
@@ -1319,7 +1321,7 @@ core::Result<json> method_chat_transcript(
         // ✅ 对齐 OpenClaw: 从 transcript 读取消息
         auto agent_tr = agent_pool->get_agent(session_id);
         if (agent_tr) {
-            std::string sessions_dir_tr = std::filesystem::path(agent_tr->context().workspace_dir).parent_path() / "sessions";
+            std::string sessions_dir_tr = std::filesystem::path(agent_tr->context().workspace_dir).parent_path().string();
             std::string transcript_path_tr = sessions::resolve_transcript_path(
                 session_id, agent_tr->context().agent_id, sessions_dir_tr
             );
@@ -1382,7 +1384,7 @@ core::Result<json> method_chat_export(
         // ✅ 对齐 OpenClaw: 从 transcript 读取并按格式导出
         auto agent_exp = agent_pool->get_agent(session_id);
         if (agent_exp) {
-            std::string sessions_dir_exp = std::filesystem::path(agent_exp->context().workspace_dir).parent_path() / "sessions";
+            std::string sessions_dir_exp = std::filesystem::path(agent_exp->context().workspace_dir).parent_path().string();
             std::string transcript_path_exp = sessions::resolve_transcript_path(
                 session_id, agent_exp->context().agent_id, sessions_dir_exp
             );

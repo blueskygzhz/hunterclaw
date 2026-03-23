@@ -758,7 +758,7 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
     std::vector<react::LLMMessage> history = sessions::read_transcript_messages(transcript_path, 200);
 
     // 去掉最后一条（刚写入的用户消息），避免 ReactEngine 重复添加
-    if (!history.empty() && history.back().role == react::LLMMessageRole::User) {
+    if (!history.empty() && history.back().role == llm::LLMMessageRole::User) {
         history.pop_back();
     }
 
