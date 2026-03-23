@@ -2,6 +2,10 @@
 #include "hunterclaw/core/utils.h"
 #include <map>
 #include <mutex>
+#include <atomic>
+#include <thread>
+#include <chrono>
+#include <filesystem>
 #include <dlfcn.h>
 
 namespace hunterclaw {
@@ -18,6 +22,10 @@ struct PluginManager::Impl {
     std::map<std::string, std::shared_ptr<Plugin>> plugins_;
     std::map<std::string, std::string> plugin_paths_;
     std::mutex mutex_;
+    // ✅ 对齐 OpenClaw: 文件监控热重载
+    std::atomic<bool> watching_{false};
+    std::thread watch_thread_;
+    std::map<std::string, std::filesystem::file_time_type> file_mtimes_;
     
     core::Result<bool> load(const std::string& plugin_id, const std::string& path) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -136,11 +144,46 @@ std::shared_ptr<Plugin> PluginManager::get(const std::string& plugin_id) const {
 }
 
 void PluginManager::start_watch() {
-    // TODO: Implement file watching for hot reload
+    // ✅ 对齐 OpenClaw: 文件监控热重载 (chokidar.watch)
+    if (impl_->watching_.exchange(true)) return;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex_);
+        for (const auto& [id, path] : impl_->plugin_paths_) {
+            try { impl_->file_mtimes_[path] = std::filesystem::last_write_time(path); } catch (...) {}
+        }
+    }
+    impl_->watch_thread_ = std::thread([this]() {
+        while (impl_->watching_.load()) {
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            if (!impl_->watching_.load()) break;
+            std::vector<std::pair<std::string, std::string>> changed;
+            {
+                std::lock_guard<std::mutex> lock(impl_->mutex_);
+                for (const auto& [id, path] : impl_->plugin_paths_) {
+                    try {
+                        auto mtime = std::filesystem::last_write_time(path);
+                        auto it = impl_->file_mtimes_.find(path);
+                        if (it == impl_->file_mtimes_.end() || it->second != mtime) {
+                            impl_->file_mtimes_[path] = mtime;
+                            changed.push_back({id, path});
+                        }
+                    } catch (...) {}
+                }
+            }
+            for (const auto& [id, path] : changed) {
+                impl_->unload(id);
+                impl_->load(id, path);
+            }
+        }
+    });
 }
 
 void PluginManager::stop_watch() {
-    // TODO: Stop file watching
+    // ✅ 对齐 OpenClaw: 停止文件监控
+    impl_->watching_.store(false);
+    if (impl_->watch_thread_.joinable()) {
+        impl_->watch_thread_.join();
+    }
 }
 
 // ============================================================================

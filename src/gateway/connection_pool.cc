@@ -250,17 +250,29 @@ void ConnectionPool::disconnect_slow_consumer(
 }
 
 bool ConnectionPool::has_event_scope(const WsClient& client, const std::string& event) const {
-    // 检查客户端是否有权接收该事件
-    // TODO: 实现基于 scope 的访问控制
-    return true;
+    // ✅ 对齐 OpenClaw: 基于 scope 的访问控制
+    // OpenClaw: client.scopes 包含允许订阅的事件模式
+    // 如果 scopes 为空，默认允许所有事件
+    if (client.scopes.empty()) return true;
+
+    for (const auto& scope : client.scopes) {
+        if (match_event_pattern(scope, event)) return true;
+    }
+    return false;
 }
 
 bool ConnectionPool::match_event_pattern(const std::string& pattern, const std::string& event) const {
-    // 简单的通配符匹配
+    // ✅ 对齐 OpenClaw: 支持通配符匹配 (agent.*, tool.* 等)
     if (pattern == "*") return true;
-    
-    // TODO: 实现完整的模式匹配 (支持 agent.*, tool.* 等)
-    return pattern == event;
+    if (pattern == event) return true;
+
+    // 支持 prefix.* 模式
+    if (pattern.size() > 2 && pattern.back() == '*' && pattern[pattern.size()-2] == '.') {
+        std::string prefix = pattern.substr(0, pattern.size() - 1);  // 去掉 '*'
+        return event.rfind(prefix, 0) == 0;  // event 以 prefix 开头
+    }
+
+    return false;
 }
 
 std::string ConnectionPool::create_event_frame(

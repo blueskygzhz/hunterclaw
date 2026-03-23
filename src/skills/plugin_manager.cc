@@ -158,8 +158,7 @@ core::Result<std::shared_ptr<SkillPlugin>> SkillPluginLoader::load_plugin(
         }
     );
     
-    // 6. 初始化插件 (TODO: 传递配置)
-    std::map<std::string, std::string> config;
+    // \u2705 \u5bf9\u9f50 OpenClaw: \u4f20\u9012\u914d\u7f6e\u7ed9\u63d2\u4ef6 init\n    // OpenClaw: plugin.init({ config: skillConfig, env: process.env })\n    std::map<std::string, std::string> config;\n    // \u4ece\u5168\u5c40\u914d\u7f6e\u8bfb\u53d6\u63d2\u4ef6\u914d\u7f6e\n    if (config_) {\n        const auto& entries = config_->skills.entries;\n        auto it = entries.find(manifest.id);\n        if (it != entries.end()) {\n            // \u5c06 env \u914d\u7f6e\u4f20\u9012\u7ed9\u63d2\u4ef6\n            for (const auto& [k, v] : it->second.env) {\n                config[k] = v;\n            }\n            if (!it->second.api_key.empty()) {\n                config[\"apiKey\"] = it->second.api_key;\n            }\n        }\n    }
     auto init_result = plugin->init(config);
     if (init_result.is_err()) {
         return core::Result<std::shared_ptr<SkillPlugin>>::Err(

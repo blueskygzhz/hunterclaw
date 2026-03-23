@@ -13,6 +13,9 @@
 #include <vector>
 #include <map>
 #include <functional>
+#include <queue>
+#include <mutex>
+#include <atomic>
 
 namespace hunterclaw {
 namespace agents {
@@ -101,6 +104,9 @@ public:
     /**
      * 处理用户消息
      * 
+     * 线程安全：如果 Agent 当前正在处理消息，新消息会入队等待。
+     * 对齐 OpenClaw：Node.js 单线程事件循环天然串行，C++ 通过消息队列模拟。
+     * 
      * @param message 用户消息
      * @param options 可选参数 (channel_id, account_id, etc.)
      * @return Agent 响应 (或错误)
@@ -109,6 +115,28 @@ public:
         const std::string& message,
         const std::map<std::string, std::string>& options = {}
     );
+
+    /**
+     * 非阻塞入队消息（供 SubagentAnnouncer 使用）
+     * 
+     * 对齐 OpenClaw：maybeQueueSubagentAnnounce()
+     * 当父 Agent 正在运行时，将 subagent 结果消息入队，
+     * 等当前轮次完成后在两轮推理之间的间隙串行执行，避免并发冲突。
+     * 
+     * @param message 要注入的消息
+     * @param options 可选参数
+     */
+    void enqueue_message(
+        const std::string& message,
+        const std::map<std::string, std::string>& options = {}
+    );
+
+    /**
+     * 检查 Agent 当前是否正在处理消息
+     */
+    bool is_processing() const {
+        return is_processing_.load();
+    }
     
     /**
      * 获取隔离上下文
@@ -183,12 +211,27 @@ private:
     
     // ✅ OpenClaw 对齐: 事件回调系统
     std::vector<EventCallback> event_callbacks_;
+
+    // ✅ OpenClaw 对齐: 消息队列（对齐 Node.js 事件循环串行模型）
+    // 参考: openclaw maybeQueueSubagentAnnounce / sendSubagentAnnounceDirectly
+    // 当 Agent 正在处理消息时，新消息入队；处理完成后自动消费队列
+    struct PendingMessage {
+        std::string message;
+        std::map<std::string, std::string> options;
+    };
+    std::queue<PendingMessage> pending_messages_;
+    mutable std::mutex pending_messages_mutex_;
+    std::atomic<bool> is_processing_{false};
     
     // 辅助方法
     void initialize_workspace();
     void initialize_memory();
     void initialize_tools();
     void emit_lifecycle_event(AgentLifecyclePhase phase, const core::JsonValue& data);
+
+    // 消费消息队列（在每轮 process_message 完成后调用）
+    // 对齐 OpenClaw：事件循环在 await 完成后自动处理下一个排队消息
+    void drain_pending_messages();
     
     // Overflow 重试循环 (对齐 OpenClaw)
     core::Result<std::string> process_message_with_overflow_retry(

@@ -229,7 +229,25 @@ AppendTranscriptResult append_assistant_message_to_transcript(
         line["type"] = "message";
         line["id"] = message_id;
         line["message"] = message;
-        // TODO: 实现 parentId 链 (需要读取最后一条消息的 id)
+        // ✅ 对齐 OpenClaw: 实现 parentId 链 (读取最后一条消息的 id)
+        // 从文件末尾读取最后一行，获取上一条消息的 id
+        {
+            std::ifstream rf(transcript_path);
+            if (rf.is_open()) {
+                std::string last_line, cur_line;
+                while (std::getline(rf, cur_line)) {
+                    if (!cur_line.empty()) last_line = cur_line;
+                }
+                if (!last_line.empty()) {
+                    try {
+                        auto last_json = json::parse(last_line);
+                        if (last_json.contains("id") && last_json["id"].is_string()) {
+                            line["parentId"] = last_json["id"].get<std::string>();
+                        }
+                    } catch (...) {}
+                }
+            }
+        }
 
         // =====================================================================
         // Hook: before_message_write

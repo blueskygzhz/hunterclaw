@@ -39,44 +39,83 @@ std::string ToolParams::read_string(const std::string& key, bool required,
         return default_val;
     }
     
-    // TODO: 实现JsonValue的成员访问
-    // 这里简化处理,实际需要从params_中取值
-    if (required) {
-        throw std::runtime_error("Required parameter '" + key + "' missing");
+    // ✅ 对齐 OpenClaw: 实现 JsonValue 的成员访问
+    if (!params_.is_object() || !params_.has(key)) {
+        if (required) {
+            throw std::runtime_error("Required parameter '" + key + "' missing");
+        }
+        return default_val;
     }
-    return default_val;
-}
+    const auto& val = params_[key];
+    if (val.is_string()) return val.as_string();
+    if (val.is_number()) return std::to_string(val.as_number());
+    if (val.is_bool()) return val.as_bool() ? "true" : "false";
+    if (required) throw std::runtime_error("Parameter '" + key + "' is not a string");
+    return default_val;}
 
 double ToolParams::read_number(const std::string& key, bool required, double default_val) const {
-    if (required) {
-        throw std::runtime_error("Required parameter '" + key + "' missing");
+    if (!params_.is_object() || !params_.has(key)) {
+        if (required) throw std::runtime_error("Required parameter '" + key + "' missing");
+        return default_val;
     }
+    const auto& val = params_[key];
+    if (val.is_number()) return val.as_number();
+    if (val.is_string()) { try { return std::stod(val.as_string()); } catch (...) {} }
+    if (required) throw std::runtime_error("Parameter '" + key + "' is not a number");
     return default_val;
 }
 
 int64_t ToolParams::read_int(const std::string& key, bool required, int64_t default_val) const {
-    if (required) {
-        throw std::runtime_error("Required parameter '" + key + "' missing");
+    if (!params_.is_object() || !params_.has(key)) {
+        if (required) throw std::runtime_error("Required parameter '" + key + "' missing");
+        return default_val;
     }
+    const auto& val = params_[key];
+    if (val.is_number()) return static_cast<int64_t>(val.as_number());
+    if (val.is_string()) { try { return std::stoll(val.as_string()); } catch (...) {} }
+    if (required) throw std::runtime_error("Parameter '" + key + "' is not an integer");
     return default_val;
 }
 
 bool ToolParams::read_bool(const std::string& key, bool required, bool default_val) const {
-    if (required) {
-        throw std::runtime_error("Required parameter '" + key + "' missing");
+    if (!params_.is_object() || !params_.has(key)) {
+        if (required) throw std::runtime_error("Required parameter '" + key + "' missing");
+        return default_val;
     }
+    const auto& val = params_[key];
+    if (val.is_bool()) return val.as_bool();
+    if (val.is_string()) {
+        const auto& s = val.as_string();
+        if (s == "true" || s == "1" || s == "yes") return true;
+        if (s == "false" || s == "0" || s == "no") return false;
+    }
+    if (val.is_number()) return val.as_number() != 0.0;
+    if (required) throw std::runtime_error("Parameter '" + key + "' is not a boolean");
     return default_val;
 }
 
 std::vector<std::string> ToolParams::read_string_array(const std::string& key, bool required) const {
-    if (required) {
-        throw std::runtime_error("Required parameter '" + key + "' missing");
+    if (!params_.is_object() || !params_.has(key)) {
+        if (required) throw std::runtime_error("Required parameter '" + key + "' missing");
+        return {};
     }
-    return {};
+    const auto& val = params_[key];
+    std::vector<std::string> result;
+    if (val.is_array()) {
+        for (size_t i = 0; i < val.size(); ++i) {
+            const auto& item = val[i];
+            if (item.is_string()) result.push_back(item.as_string());
+            else if (item.is_number()) result.push_back(std::to_string(item.as_number()));
+        }
+    } else if (val.is_string()) {
+        result.push_back(val.as_string());
+    }
+    return result;
 }
 
 bool ToolParams::has(const std::string& key) const {
-    return false;  // TODO: 实现
+    // ✅ 对齐 OpenClaw: 实现 JsonValue 的 has 方法
+    return params_.is_object() && params_.has(key);
 }
 
 // ToolManager实现

@@ -119,13 +119,22 @@ struct EmbeddingProviderOptions {
     std::string model;
     std::string fallback;  // provider id or "none"
     
-    // Remote provider options (embeddings.ts:64-67)
-    // TODO: Define RemoteEmbeddingOptions
-    // std::optional<RemoteEmbeddingOptions> remote;
+    // ✅ 对齐 OpenClaw: RemoteEmbeddingOptions (embeddings.ts:64-67)
+    struct RemoteEmbeddingOptions {
+        std::string base_url;   // API base URL
+        std::string api_key;    // API key
+        std::string model;      // model override
+        int dimensions = 0;     // embedding dimensions
+    };
+    std::optional<RemoteEmbeddingOptions> remote;
     
-    // Local provider options (embeddings.ts:71-74)
-    // TODO: Define LocalEmbeddingOptions  
-    // std::optional<LocalEmbeddingOptions> local;
+    // ✅ 对齐 OpenClaw: LocalEmbeddingOptions (embeddings.ts:71-74)
+    struct LocalEmbeddingOptions {
+        std::string model_path;  // path to local model
+        std::string model_type;  // "onnx", "llama", etc.
+        int threads = 4;         // inference threads
+    };
+    std::optional<LocalEmbeddingOptions> local;
     
     // Gemini-specific options
     std::optional<int> output_dimensionality;  // 768, 1536, or 3072

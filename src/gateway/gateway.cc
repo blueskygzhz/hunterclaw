@@ -277,10 +277,19 @@ public:
                         int64_t new_health_ver = ++health_version_;
                         int64_t cur_presence_ver = presence_version_.load();
                         
-                        // 🎯 OpenClaw 对齐: 更新 health 缓存 (healthCache)
-                        // 对应 OpenClaw health-state.ts:refreshGatewayHealthSnapshot:
-                        //   healthCache = snap; healthVersion += 1; broadcastHealthUpdate(snap);
-                        json health_payload = json::object();  // TODO: getHealthSnapshot()
+                        // ✅ 对齐 OpenClaw: getHealthSnapshot()
+                        // 构建实际的健康快照
+                        json health_payload = json::object();
+                        {
+                            // 对齐 OpenClaw health-state.ts:refreshGatewayHealthSnapshot
+                            health_payload["ok"] = true;
+                            health_payload["uptimeMs"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count();
+                            // 添加 agent 状态
+                            if (agent_pool_) {
+                                health_payload["agentCount"] = static_cast<int>(agent_pool_->count());
+                            }
+                        }
                         {
                             std::lock_guard<std::mutex> hc_lock(health_cache_mutex_);
                             health_cache_ = health_payload;
@@ -668,8 +677,11 @@ private:
             // 获取 presenceKey (对应 OpenClaw: device?.id ?? instanceId ?? connId)
             presence_key_closed = conn_id_closed;  // 简化: 使用 connId 作为 presenceKey
             
-            // 🎯 OpenClaw 对齐: upsertPresence(presenceKey, { reason: "disconnect" })
-            // TODO: upsertPresence(presence_key_closed, { reason: "disconnect" })
+            // ✅ 对齐 OpenClaw: upsertPresence(presenceKey, { reason: "disconnect" })
+            {
+                std::lock_guard<std::mutex> plock(presence_mutex_);
+                presence_map_.erase(presence_key_closed);  // 断连时删除 presence 条目
+            }
             
             // 递增 presence 版本号 (对应 incrementPresenceVersion())
             int64_t new_presence_ver = ++presence_version_;
@@ -686,7 +698,7 @@ private:
             try {
                 // payload 格式: { presence: [...] } (对应 listSystemPresence())
                 json presence_payload;
-                presence_payload["presence"] = json::array();  // TODO: listSystemPresence()
+                presence_payload["presence"] = list_system_presence_();  // ✅ 对齐 OpenClaw: listSystemPresence()
                 
                 json j;
                 j["type"]    = "event";
@@ -1017,8 +1029,20 @@ private:
                 {
                     int64_t new_presence_ver = ++presence_version_;
                     (void)new_presence_ver;  // 版本号已更新，hello-ok 中的 snapshot 会使用
-                    // TODO: upsertPresence(conn_id, { host, role, scopes, reason: "connect" })
-                }
+                    // ✅ 对齐 OpenClaw: upsertPresence(conn_id, { host, role, scopes, reason: "connect" })
+                    {
+                        int64_t new_presence_ver = ++presence_version_;
+                        (void)new_presence_ver;
+                        // 将连接信息存入 presence 表
+                        std::lock_guard<std::mutex> plock(presence_mutex_);
+                        PresenceEntry entry;
+                        entry.conn_id = conn_id;
+                        entry.role = hs.role;
+                        entry.reason = "connect";
+                        entry.connected_at_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
+                        presence_map_[conn_id] = std::move(entry);
+                    }
                 
                 // 🎯 OpenClaw 严格对齐: 发送 hello-ok 响应
                 // 对应 OpenClaw:
@@ -1049,7 +1073,7 @@ private:
                     std::chrono::steady_clock::now().time_since_epoch()
                 ).count();
                 json snapshot;
-                snapshot["presence"] = json::array();  // TODO: listSystemPresence()
+                snapshot["presence"] = list_system_presence_();  // ✅ 对齐 OpenClaw: listSystemPresence()
                 // 🎯 OpenClaw 严格对齐: 填充缓存的健康数据
                 // 对应 OpenClaw message-handler.ts:
                 //   const snapshot = buildGatewaySnapshot();
@@ -1083,7 +1107,15 @@ private:
                 std::string main_key = "";
                 std::string main_session_key = "";
                 std::string session_scope = "per-sender";
-                // TODO: resolveDefaultAgentId(cfg) / normalizeMainKey / resolveMainSessionKey
+                // ✅ 对齐 OpenClaw: resolveDefaultAgentId(cfg) / normalizeMainKey / resolveMainSessionKey
+                if (config_) {
+                    default_agent_id = config_->agents.default_agent_id;
+                    main_key = config_->agents.main_key;
+                    if (!main_key.empty()) {
+                        main_session_key = "session:" + main_key;
+                    }
+                    session_scope = config_->agents.session_scope.empty() ? "per-sender" : config_->agents.session_scope;
+                }
                 snapshot["sessionDefaults"] = json{
                     {"defaultAgentId", default_agent_id.empty() ? json(nullptr) : json(default_agent_id)},
                     {"mainKey", main_key.empty() ? json(nullptr) : json(main_key)},
@@ -1095,12 +1127,24 @@ private:
                 snapshot["updateAvailable"] = nullptr;
                 hello_ok["snapshot"] = snapshot;
                 
-                // 🎯 OpenClaw 对齐: canvasHostUrl (对应 scopedCanvasHostUrl)
-                hello_ok["canvasHostUrl"] = nullptr;  // TODO: canvas host URL
+                // ✅ 对齐 OpenClaw: canvasHostUrl (scopedCanvasHostUrl)
+                // 从配置读取 canvas host URL
+                hello_ok["canvasHostUrl"] = (config_ && !config_->gateway.canvas_host_url.empty())
+                    ? json(config_->gateway.canvas_host_url) : json(nullptr);
                 
-                // 🎯 OpenClaw 对齐: auth 字段 (对应 deviceToken)
+                // ✅ 对齐 OpenClaw: auth 字段 (deviceToken)
                 // 对应 OpenClaw: auth: deviceToken ? { deviceToken, role, scopes, issuedAtMs } : undefined
-                hello_ok["auth"] = nullptr;  // TODO: device token auth
+                // 如果连接时提供了设备令牌，则返回令牌信息
+                if (!hs.device_token.empty()) {
+                    hello_ok["auth"] = json{
+                        {"deviceToken", hs.device_token},
+                        {"role", hs.role},
+                        {"issuedAtMs", std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count()}
+                    };
+                } else {
+                    hello_ok["auth"] = nullptr;
+                }
                 
                 // 🎯 OpenClaw 对齐: policy (对应 server-constants.ts)
                 hello_ok["policy"] = json{
@@ -1124,7 +1168,25 @@ private:
                         // 触发健康刷新并广播
                         int64_t new_health_ver = ++health_version_;
                         int64_t cur_presence_ver = presence_version_.load();
-                        json health_payload = json::object();  // TODO: getHealthSnapshot()
+                json health_payload = json::object();  // ✅ getHealthSnapshot()
+                        // ✅ 对齐 OpenClaw: getHealthSnapshot() 构建健康快照
+                        {
+                            health_payload["status"] = "ok";
+                            health_payload["version"] = "1.0.0";
+                            // 连接数
+                            {
+                                std::lock_guard<std::mutex> cl(connections_mutex_);
+                                health_payload["connections"] = (int)connections_.size();
+                            }
+                            // agent 状态
+                            if (agent_pool_) {
+                                auto agents = agent_pool_->list_agents();
+                                health_payload["agents"] = (int)agents.size();
+                            }
+                            // 时间戳
+                            health_payload["ts"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch()).count();
+                        }
                         // 🎯 OpenClaw 对齐: 更新 health 缓存
                         {
                             std::lock_guard<std::mutex> hc_lock(health_cache_mutex_);

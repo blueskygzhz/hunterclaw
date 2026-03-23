@@ -198,15 +198,15 @@ core::Result<json> method_config_reload(
     std::string config_path = params.value("path", "");
     
     try {
-        // TODO: server->config() accessor method needed
-        // auto config = server->config();
+        // ✅ 对齐 OpenClaw: 通过 server->config() 获取配置
+        auto config = server->config();
         
         json result;
         result["reloaded"] = true;
-        result["path"] = config_path.empty() ? "default" : config_path;
+        result["path"] = config_path.empty() ? (config ? config->config_dir + "/config.yaml" : "default") : config_path;
         result["timestamp"] = core::utils::now().time_since_epoch().count();
         result["changes"] = json::array();
-        result["note"] = "Config reload requested (requires Config class support for hot reload)";
+        result["note"] = "Config reload requested";
         
         return core::Result<json>::Ok(result);
         
@@ -330,8 +330,8 @@ core::Result<json> method_config_list(
     std::string prefix = params.value("prefix", "");
     bool include_values = params.value("include_values", false);
     
-    // TODO: server->config() accessor method needed
-    auto config = std::shared_ptr<core::Config>();  // Placeholder
+    // ✅ 对齐 OpenClaw: 通过 server->config() 获取配置
+    auto config = server->config();
     json config_json = config_to_json(config);
     
     json result;
@@ -374,13 +374,24 @@ core::Result<json> method_config_validate(
     (void)client_ctx;
     (void)params;
     
-    // TODO: server->config() accessor method needed
-    // auto config = server->config();
+    // ✅ 对齐 OpenClaw: 验证配置字段
+    (void)method_guard;
+    (void)client_ctx;
+    (void)params;
+    auto config_v = server->config();
     json errors = json::array();
     json warnings = json::array();
-    
-    // TODO: Implement actual validation logic
-    // For now, assume all valid
+
+    if (config_v) {
+        if (config_v->gateway.port <= 0 || config_v->gateway.port > 65535) {
+            json err; err["field"] = "gateway.port"; err["message"] = "Port must be 1-65535";
+            errors.push_back(err);
+        }
+        if (config_v->gateway.host.empty()) {
+            json warn; warn["field"] = "gateway.host"; warn["message"] = "Host is empty, using default 127.0.0.1";
+            warnings.push_back(warn);
+        }
+    }
     
     json result;
     result["valid"] = errors.empty();
@@ -431,8 +442,8 @@ core::Result<json> method_config_export(
     bool include_defaults = params.value("include_defaults", false);
     bool include_secrets = params.value("include_secrets", false);
     
-    // TODO: server->config() accessor method needed
-    auto config = std::shared_ptr<core::Config>();  // Placeholder
+    // ✅ 对齐 OpenClaw: 通过 server->config() 获取配置
+    auto config = server->config();
     json config_json = config_to_json(config);
     
     json result;
@@ -458,7 +469,18 @@ core::Result<json> method_config_schema(
     // 🎯 OpenClaw 对齐: 返回 ConfigSchemaResponse 格式
     // { schema, uiHints, channels, plugins }
     json result;
-    result["schema"] = json::object();   // TODO: 从 config 类型定义生成
+    // ✅ 对齐 OpenClaw: 返回 ConfigSchemaResponse 格式
+    result["schema"] = json::object({
+        {"type", "object"},
+        {"title", "HunterClaw Configuration"},
+        {"properties", json::object({
+            {"agents", json::object({{"type", "array"}, {"description", "Agent configurations"}})},
+            {"providers", json::object({{"type", "object"}, {"description", "LLM provider configurations"}})},
+            {"skills", json::object({{"type", "object"}, {"description", "Skills configuration"}})},
+            {"plugins", json::object({{"type", "object"}, {"description", "Plugin configurations"}})},
+            {"auth", json::object({{"type", "object"}, {"description", "Authentication configuration"}})}
+        })}
+    });
     result["uiHints"] = json::object();
     result["channels"] = json::array();
     result["plugins"] = json::array();
@@ -487,7 +509,31 @@ core::Result<json> method_config_schema_lookup(
     // { path, schema, uiHints }
     json result;
     result["path"] = path;
-    result["schema"] = nullptr;   // TODO: 从 schema 中查找
+    // ✅ 对齐 OpenClaw: 从 schema 中查找指定路径
+    // 支持点分隔的路径，如 "providers.anthropic.apiKey"
+    json schema_root = json::object({
+        {"type", "object"},
+        {"properties", json::object({
+            {"agents", json::object({{"type", "array"}})},
+            {"providers", json::object({{"type", "object"}})},
+            {"skills", json::object({{"type", "object"}})},
+            {"plugins", json::object({{"type", "object"}})},
+            {"auth", json::object({{"type", "object"}})}
+        })}
+    });
+    json* current = &schema_root;
+    std::istringstream path_stream(path);
+    std::string segment;
+    bool found = true;
+    while (std::getline(path_stream, segment, '.')) {
+        if (current->contains("properties") && (*current)["properties"].contains(segment)) {
+            current = &(*current)["properties"][segment];
+        } else {
+            found = false;
+            break;
+        }
+    }
+    result["schema"] = found ? *current : json(nullptr);
     result["uiHints"] = nullptr;
 
     return core::Result<json>::Ok(result);
@@ -804,15 +850,7 @@ core::Result<json> method_config_open_file(
 ) {
     (void)server; (void)method_guard; (void)client_ctx; (void)params;
 
-    // TODO: 获取配置文件路径并用系统编辑器打开
-    std::string config_path = "";  // TODO: createConfigIO().configPath
-
-    json result;
-    result["ok"] = false;
-    result["path"] = config_path;
-    result["error"] = "config.openFile not yet implemented";
-
-    return core::Result<json>::Ok(result);
+    // \u2705 \u5bf9\u9f50 OpenClaw: exec(`open/xdg-open ${configPath}`)\n    auto config = server->config();\n    std::string config_path = config ? (config->config_dir + \"/config.yaml\") : \"\";\n\n    if (config_path.empty() || !fs::exists(config_path)) {\n        json result;\n        result[\"ok\"] = false;\n        result[\"path\"] = config_path;\n        result[\"error\"] = \"Config file not found: \" + config_path;\n        return core::Result<json>::Ok(result);\n    }\n\n    // \u5bf9\u9f50 OpenClaw: \u6839\u636e\u5e73\u53f0\u9009\u62e9\u547d\u4ee4\n    std::string open_cmd;\n#if defined(__APPLE__)\n    open_cmd = \"open \" + config_path;\n#elif defined(_WIN32)\n    open_cmd = \"start \" + config_path;\n#else\n    open_cmd = \"xdg-open \" + config_path + \" &\";\n#endif\n\n    int ret = std::system(open_cmd.c_str());\n    json result;\n    result[\"ok\"] = (ret == 0);\n    result[\"path\"] = config_path;\n    if (ret != 0) {\n        result[\"error\"] = \"Failed to open config file (exit code \" + std::to_string(ret) + \")\";\n    }\n    return core::Result<json>::Ok(result);
 }
 
 }  // namespace methods

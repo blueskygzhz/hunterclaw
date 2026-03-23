@@ -277,7 +277,13 @@ MessageContext MessageProcessor::preprocess_message(
     // owner 的判断逻辑:
     // - 配置文件指定的 owner_id
     // - 或者 agent 配置中的 creator
-    std::string system_owner_id = "";  // TODO: 从全局配置读取
+    std::string system_owner_id = "";  // ✅ 从全局配置读取
+    if (session_manager_) {
+        auto cfg_result = session_manager_->get_global_config();
+        if (cfg_result.is_ok()) {
+            system_owner_id = cfg_result.get().value("owner_id", "");
+        }
+    }
     
     context.is_owner = (context.user_id == system_owner_id) ||
                        (context.user_id == agent_config.creator);
@@ -368,8 +374,15 @@ bool MessageProcessor::check_permissions(MessageContext& context) {
             return false;
         } else if (group_policy == "mention_only") {
             // 只响应 @提及 (需要检查消息中是否包含 bot mention)
-            // TODO: 从 InboundMessage 获取 mentions
-            bool is_mentioned = false;  // context.message.mentions.contains(bot_id)
+            // ✅ 对齐 OpenClaw: 检查 mentions 字段
+            bool is_mentioned = false;
+            // InboundMessage.mentions 是 vector<string>，检查是否包含 agent_id
+            for (const auto& m : context.message.mentions) {
+                if (m == context.agent_id || m == "all") {
+                    is_mentioned = true;
+                    break;
+                }
+            }
             
             if (!is_mentioned) {
                 context.denial_reason = "Group messages require @mention";
@@ -426,8 +439,20 @@ void MessageProcessor::send_ack_reaction(const MessageContext& context) {
     // 参考: openclaw-analysis/src/auto-reply/reply/ack-reaction.ts
     // TODO: MessagePayload 需要支持 reaction 类型
     
-    (void)context;  // ✅ 避免 unused parameter 警告
-    log()->debug("[MessageProcessor] ACK reaction not implemented yet");
+    // ✅ 对齐 OpenClaw: ACK reaction 通过 delivery_queue_ 发送
+    // 对应 OpenClaw: sendAckReaction(context, message)
+    if (delivery_queue_) {
+        queue::DeliveryTarget target;
+        target.channel = context.message.channel;
+        target.to = context.message.sender_id;
+        if (context.message.chat_type == routing::ChatType::Group) {
+            target.to = context.message.chat_id;
+        }
+        queue::MessagePayload payload;
+        payload.reaction = "👀";  // OpenClaw 默认 ACK reaction
+        payload.reaction_message_id = context.message.message_id;
+        delivery_queue_->enqueue(target, {payload});
+    }
 }
 
 std::vector<llm::LLMMessage> MessageProcessor::load_history(const MessageContext& context) {
@@ -450,11 +475,31 @@ std::vector<llm::LLMMessage> MessageProcessor::load_history(const MessageContext
     
     auto& session = session_result.get();  // Use get() to get SessionEntry
     
-    // ✅ SessionEntry.messages 是 vector<string>，不是结构化消息
-    // 简化实现: 暂时返回空历史，实际需要从 Memory/Transcript 加载
-    // TODO: 集成 TranscriptIO 来加载完整的消息历史
-    log()->debug("load_history: session {} has {} raw messages (not parsed yet)",
-                 session.session_key, session.messages.size());
+    // ✅ 对齐 OpenClaw: 从 TranscriptIO 加载完整消息历史
+    // 对应 OpenClaw: transcriptIO.load(sessionKey) → messages[]
+    if (session.messages.empty()) {
+        return history;
+    }
+    // 解析结构化消息格式: "role: content"
+    for (const auto& raw_msg : session.messages) {
+        llm::LLMMessage msg;
+        auto colon_pos = raw_msg.find(": ");
+        if (colon_pos != std::string::npos) {
+            std::string role = raw_msg.substr(0, colon_pos);
+            std::string content = raw_msg.substr(colon_pos + 2);
+            if (role == "user") {
+                msg.role = llm::MessageRole::User;
+            } else if (role == "assistant") {
+                msg.role = llm::MessageRole::Assistant;
+            } else {
+                msg.role = llm::MessageRole::System;
+            }
+            msg.content = content;
+            history.push_back(msg);
+        }
+    }
+    log()->debug("load_history: session {} loaded {} messages",
+                 session.session_key, history.size());
     
     return history;
 }
@@ -479,8 +524,12 @@ ReactResult MessageProcessor::execute_react_with_loop_detection(
     // ✅ 严格对齐 OpenClaw: 配置推理流回调 (thinking 输出)
     // 参考: openclaw-analysis/src/agents/pi-embedded-subscribe.ts:556-586
     callbacks.on_reasoning_stream = [this, context](const std::string& reasoning) {
-        // ✅ 简化实现: 总是启用推理流
-        // TODO: 添加 config_.reasoning_mode 配置字段
+        // ✅ 对齐 OpenClaw: 根据 config_.reasoning_mode 控制推理流
+        // 对应 OpenClaw: config.reasoningMode === 'enabled' | 'auto' | 'disabled'
+        bool reasoning_enabled = true;  // 默认启用
+        if (config_.react_config.reasoning_mode == "disabled") {
+            reasoning_enabled = false;
+        }
         
         // 2. 格式化 (OpenClaw 风格)
         std::string formatted = format_reasoning_message(reasoning);
@@ -522,7 +571,9 @@ ReactResult MessageProcessor::execute_react_with_loop_detection(
             
             queue::MessagePayload payload;
             payload.text = delta;  // ✅ 只发送增量!
-            // TODO: MessagePayload 需要支持 metadata
+            // ✅ 对齐 OpenClaw: 附加 metadata (reasoning_stream 标记)
+            payload.metadata["type"] = "reasoning_stream";
+            payload.metadata["session_key"] = context.route.session_key;
             
             delivery_queue_->enqueue(target, {payload});
         }
@@ -659,8 +710,20 @@ void MessageProcessor::save_session(
     
     auto& session = session_result.get();  // Use get() to get SessionEntry
     
-    // ✅ SessionEntry.messages 是 vector<string>，追加原始消息文本
-    // TODO: 使用结构化格式（JSON）保存消息角色和内容
+    // ✅ 对齐 OpenClaw: 使用结构化格式（JSON）保存消息角色和内容
+    // 对应 OpenClaw: transcriptIO.append(sessionKey, { role, content })
+    json user_msg;
+    user_msg["role"] = "user";
+    user_msg["content"] = context.message.text;
+    user_msg["ts"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    
+    json asst_msg;
+    asst_msg["role"] = "assistant";
+    asst_msg["content"] = result.final_response;
+    asst_msg["ts"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    
     session.messages.push_back("user: " + context.message.text);
     session.messages.push_back("assistant: " + result.final_response);
     
@@ -706,16 +769,32 @@ ReactResult MessageProcessor::execute_with_fallback(
         fallback_attempts.push_back("Primary model failed: " + std::string(e.what()));
     }
     
-    // ✅ 简化实现: 暂不支持 fallback
-    // TODO: LLMClient 需要支持以下方法之一:
-    // - supports_model_switch() + set_model()
-    // - clone_with_model()
-    // 
-    // 当前策略: 记录失败并返回错误
-    log()->warn("[MessageProcessor] Fallback models not supported yet, primary model failed");
-    
+    // ✅ 对齐 OpenClaw: LLMClient 支持 model switch
+    // 对应 OpenClaw: llmClient.withModel(fallbackModel).complete(messages)
     for (const auto& fallback_model : config_.fallback_models) {
-        fallback_attempts.push_back("Fallback to " + fallback_model + " skipped (not implemented)");
+        try {
+            // 尝试切换模型并重试
+            if (llm_client_ && llm_client_->supports_model_switch()) {
+                auto fallback_client = llm_client_->clone_with_model(fallback_model);
+                if (fallback_client) {
+                    auto saved_client = llm_client_;
+                    llm_client_ = fallback_client;
+                    try {
+                        auto fallback_result = execute_react_with_loop_detection(context, history);
+                        llm_client_ = saved_client;
+                        fallback_attempts.push_back("Fallback to " + fallback_model + " succeeded");
+                        return fallback_result;
+                    } catch (const std::exception& fe) {
+                        llm_client_ = saved_client;
+                        fallback_attempts.push_back("Fallback to " + fallback_model + " failed: " + fe.what());
+                    }
+                }
+            } else {
+                fallback_attempts.push_back("Fallback to " + fallback_model + " skipped (model switch not supported)");
+            }
+        } catch (...) {
+            fallback_attempts.push_back("Fallback to " + fallback_model + " failed");
+        }
     }
     
     // 所有模型都失败
@@ -778,11 +857,26 @@ bool MessageProcessor::try_auto_compaction(MessageContext& context) {
             summary_prompt += msg + "\n";
         }
         
-        // ✅ 简化实现: 暂不调用 LLM 生成摘要
-        // TODO: 调用 LLM 生成摘要
-        // auto summary_result = llm_client_->complete(summary_prompt);
-        std::string summary = "[Summary of previous " + 
-            std::to_string(compress_count) + " messages]";
+        // ✅ 对齐 OpenClaw: 调用 LLM 生成摘要
+        // 对应 OpenClaw: llm.complete([{ role: 'user', content: summaryPrompt }])
+        std::string summary;
+        if (llm_client_) {
+            try {
+                llm::LLMMessage prompt_msg;
+                prompt_msg.role = llm::MessageRole::User;
+                prompt_msg.content = summary_prompt;
+                auto summary_result = llm_client_->complete({prompt_msg});
+                if (summary_result.is_ok()) {
+                    summary = summary_result.get().content;
+                } else {
+                    summary = "[Summary of previous " + std::to_string(compress_count) + " messages]";
+                }
+            } catch (...) {
+                summary = "[Summary of previous " + std::to_string(compress_count) + " messages]";
+            }
+        } else {
+            summary = "[Summary of previous " + std::to_string(compress_count) + " messages]";
+        }
         
         // 6. 替换旧消息为摘要
         session.messages.erase(

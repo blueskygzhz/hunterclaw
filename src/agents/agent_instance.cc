@@ -7,6 +7,7 @@
 #include "hunterclaw/llm/llm_client.h"       // ✅ LLMClient
 #include "hunterclaw/tools/tool.h"            // ✅ ToolManager
 #include "hunterclaw/tools/tool_manager.h"    // ✅ ToolManager::create
+#include "hunterclaw/sessions/transcript_io.h"  // ✅ 对齐 OpenClaw: transcript 读写
 #include <spdlog/spdlog.h>
 #include <filesystem>
 #include <sstream>
@@ -196,11 +197,81 @@ core::Result<std::string> AgentInstance::process_message(
     const std::string& message,
     const std::map<std::string, std::string>& options
 ) {
-    // ✅ 使用 Overflow 重试循环 (对齐 OpenClaw)
+    // ✅ 对齐 OpenClaw: 并发安全保护
+    // OpenClaw 依赖 Node.js 单线程事件循环天然串行，C++ 需要显式保护
+    // 对齐 OpenClaw: sendSubagentAnnounceDirectly 在 Agent 空闲时直接调用
+    //             maybeQueueSubagentAnnounce 在 Agent 忙时入队等待
     if (!react_engine_) {
         return core::Result<std::string>::Err("ReactEngine not initialized");
     }
-    return process_message_with_overflow_retry(message, options);
+
+    // 如果当前正在处理，将消息入队（非阻塞）
+    // 对齐 OpenClaw: maybeQueueSubagentAnnounce()
+    if (is_processing_.load()) {
+        enqueue_message(message, options);
+        spdlog::get("default")->debug(
+            "[AgentInstance] Agent busy, message queued: session={}, queue_size={}",
+            ctx_.session_id,
+            [this]() {
+                std::lock_guard<std::mutex> lock(pending_messages_mutex_);
+                return pending_messages_.size();
+            }()
+        );
+        return core::Result<std::string>::Ok("queued");
+    }
+
+    // 标记为处理中
+    is_processing_.store(true);
+    auto result = process_message_with_overflow_retry(message, options);
+    is_processing_.store(false);
+
+    // 处理完成后，消费队列中的消息
+    // 对齐 OpenClaw: 事件循环在 await 完成后自动处理下一个排队消息
+    drain_pending_messages();
+
+    return result;
+}
+
+void AgentInstance::enqueue_message(
+    const std::string& message,
+    const std::map<std::string, std::string>& options
+) {
+    std::lock_guard<std::mutex> lock(pending_messages_mutex_);
+    pending_messages_.push({message, options});
+    spdlog::get("default")->debug(
+        "[AgentInstance] Message enqueued: session={}, queue_size={}",
+        ctx_.session_id, pending_messages_.size()
+    );
+}
+
+void AgentInstance::drain_pending_messages() {
+    // 对齐 OpenClaw: 事件循环在当前任务完成后自动处理下一个排队消息
+    // 注意：这里不能持锁调用 process_message_with_overflow_retry，
+    //       因为它会再次调用 drain_pending_messages，形成递归处理链
+    while (true) {
+        PendingMessage pending;
+        {
+            std::lock_guard<std::mutex> lock(pending_messages_mutex_);
+            if (pending_messages_.empty()) {
+                break;
+            }
+            pending = pending_messages_.front();
+            pending_messages_.pop();
+        }
+
+        spdlog::get("default")->info(
+            "[AgentInstance] Processing queued message: session={}, remaining={}",
+            ctx_.session_id,
+            [this]() {
+                std::lock_guard<std::mutex> lock(pending_messages_mutex_);
+                return pending_messages_.size();
+            }()
+        );
+
+        is_processing_.store(true);
+        process_message_with_overflow_retry(pending.message, pending.options);
+        is_processing_.store(false);
+    }
 }
 
 void AgentInstance::cleanup() {
@@ -658,54 +729,84 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
         emit_lifecycle_event(AgentLifecyclePhase::ToolExecution, data);
     };
     
-    // ✅ 严格对齐 OpenClaw: 加载历史消息
-    std::vector<react::LLMMessage> history;
-    
+    // ✅ 严格对齐 OpenClaw: 计算 transcript 路径
+    // OpenClaw: transcriptIO.load(sessionKey) 在每次 run 前加载历史
+    // workspace_dir = {base}/{agent_id}/sessions/{session_id}
+    // sessions_dir  = {base}/{agent_id}/sessions
+    // transcript    = {sessions_dir}/agent-{agent_id}/session-{session_id}.jsonl
+    std::string sessions_dir = std::filesystem::path(ctx_.workspace_dir).parent_path().string();
+    std::string transcript_path = sessions::resolve_transcript_path(
+        ctx_.session_id,
+        ctx_.agent_id,
+        sessions_dir
+    );
+
+    // ✅ 对齐 OpenClaw: 确保 transcript 文件存在
+    sessions::ensure_transcript_file(transcript_path, ctx_.session_id);
+
+    // ✅ 对齐 OpenClaw: 写入用户消息到 transcript
+    // OpenClaw: transcriptIO.append(sessionKey, { role: "user", content: message })
+    {
+        std::string run_id = ctx_.current_run_id.value_or(core::utils::generate_uuid());
+        sessions::append_user_message_to_transcript(transcript_path, message, run_id);
+    }
+
+    // ✅ 对齐 OpenClaw: 从 transcript 加载历史消息
+    // OpenClaw: transcriptIO.load(sessionKey) → messages[] → 传给 ReactEngine::run()
+    // 这是关键：每次 process_message 都从 transcript 加载完整历史，
+    // 保证父 Agent 收到 [task_completion] 时能看到之前所有的对话上下文
+    std::vector<react::LLMMessage> history = sessions::read_transcript_messages(transcript_path, 200);
+
+    // 去掉最后一条（刚写入的用户消息），避免 ReactEngine 重复添加
+    if (!history.empty() && history.back().role == react::LLMMessageRole::User) {
+        history.pop_back();
+    }
+
+    spdlog::get("default")->debug("[AgentInstance] Loaded {} history messages from transcript: session={}",
+        history.size(), ctx_.session_id);
+
     if (ctx_.memory) {
         try {
-            // Align with openclaw: warmSession() triggers memory sync on session start
-            // MemoryIndexManager handles session memory internally via sessionsDirty/sessionDeltas
-            // We call sync to ensure memory is up-to-date before processing
             memory::SyncParams sync_params;
             sync_params.reason = "session-start";
             ctx_.memory->sync(sync_params);
-
-            spdlog::get("default")->debug("[AgentInstance] Memory warmed for session: {}",
-                         ctx_.session_id);
         } catch (const std::exception& e) {
             spdlog::get("default")->warn("[AgentInstance] Exception warming memory: {}", e.what());
         }
     }
-    
-    if (history.empty()) {
-        spdlog::get("default")->debug("[AgentInstance] Starting fresh conversation (no history)");
-    }
-    
+
+    // ✅ 对齐 OpenClaw: 设置 transcript_path 到 callbacks（用于 tool_result_persist hook）
+    callbacks.transcript_path = transcript_path;
+
     // ✅ Overflow 重试循环 (对齐 OpenClaw)
     for (int attempt = 0; attempt < MAX_OVERFLOW_ATTEMPTS; ++attempt) {
         try {
-            // 尝试执行 ReAct
+            // 尝试执行 ReAct（传入从 transcript 加载的历史）
             auto result = react_engine_->run(message, history, callbacks);
-            
+
             // 检查是否成功
             if (result.success) {
-                // Align with openclaw: session memory is handled by MemoryIndexManager
-                // via sessionsDirty/sessionDeltas mechanism (manager.ts).
-                // Conversations are stored as JSONL files and indexed automatically.
-                // No manual add_memory() call needed here.
+                // ✅ 对齐 OpenClaw: 写入 assistant 消息到 transcript
+                // OpenClaw: transcriptIO.append(sessionKey, { role: "assistant", content: response })
+                if (!result.final_response.empty()) {
+                    sessions::AppendTranscriptOptions opts;
+                    opts.message = result.final_response;
+                    opts.create_if_missing = false;
+                    sessions::append_assistant_message_to_transcript(transcript_path, opts);
+                }
+
                 if (ctx_.memory) {
-                    // Trigger async sync to index any new session files
                     memory::SyncParams sync_params;
                     sync_params.reason = "session-end";
                     ctx_.memory->sync(sync_params);
                 }
-                
+
                 spdlog::get("default")->info("[AgentInstance] Message processed: steps={}, tool_calls={}, duration={}ms",
                     result.total_steps, result.tool_calls, result.duration_ms);
-                
+
                 return core::Result<std::string>::Ok(result.final_response);
             }
-            
+
             // ✅ 检测 Context Overflow Error (对齐 OpenClaw)
             bool is_overflow = react_engine_->is_context_overflow_error(result.error);
             

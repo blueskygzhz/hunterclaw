@@ -71,12 +71,44 @@ namespace {
         return false;
     }
     
-    // 检查配置路径是否为真值 - 简化实现（暂不支持嵌套查询）
+    // ✅ 对齐 OpenClaw: isConfigPathTruthy
+    // 支持点分隔的路径查询，如 "providers.anthropic.apiKey"
     bool is_config_truthy(std::shared_ptr<core::Config> config, const std::string& path) {
-        // TODO: 实现配置查询逻辑
+        if (!config || path.empty()) return false;
+
+        // 将路径分割为部分
+        std::vector<std::string> parts;
+        std::istringstream ss(path);
+        std::string part;
+        while (std::getline(ss, part, '.')) {
+            if (!part.empty()) parts.push_back(part);
+        }
+        if (parts.empty()) return false;
+
+        // 遍历已知配置字段（对齐 OpenClaw 支持的路径）
+        // providers.anthropic.apiKey
+        if (parts.size() >= 3 && parts[0] == "providers") {
+            const std::string& provider = parts[1];
+            const std::string& field = parts[2];
+            if (field == "apiKey" || field == "api_key") {
+                // 检查环境变量（对齐 OpenClaw 优先级）
+                std::string env_key = "ANTHROPIC_API_KEY";
+                if (provider == "openai") env_key = "OPENAI_API_KEY";
+                else if (provider == "gemini") env_key = "GEMINI_API_KEY";
+                else if (provider == "ollama") return true;  // ollama 无需 key
+                const char* val = std::getenv(env_key.c_str());
+                return val && std::strlen(val) > 0;
+            }
+        }
+
+        // gateway.auth.enabled
+        if (parts.size() >= 2 && parts[0] == "gateway" && parts[1] == "auth") {
+            return config->gateway.auth.enabled;
+        }
+
+        // 默认: 返回 false（未知路径）
         return false;
-    }
-}
+    }}
 
 // SkillManager::Impl
 struct SkillManager::Impl {
@@ -162,12 +194,12 @@ struct SkillManager::Impl {
         // ===================================================================
         // 4. Plugin Skills (OpenClaw 对齐: 扩展插件层)
         // ===================================================================
-        // TODO: 实现 plugin_manager_ 后启用
+// TODO: 实现 plugin_manager_ 后启用
         // if (plugin_manager_) {
         //     for (const auto& plugin : plugin_manager_->get_enabled_plugins()) {
-        //         std::string plugin_skills_path = 
+        //         std::string plugin_skills_path =
         //             core::utils::expand_path("~/.openclaw/extensions/" + plugin + "/skills");
-        //         
+        //
         //         if (fs::exists(plugin_skills_path)) {
         //             roots.push_back({plugin_skills_path, SkillSource::Plugin});
         //             log()->info("Loading plugin skills: {}", plugin);
@@ -608,10 +640,68 @@ core::Result<bool> SkillManager::install_skill(
         spec = &entry.metadata.install[0];
     }
     
-    // TODO: 实现实际的安装逻辑 (Brew, Node, Go, Download)
+    // ✅ 对齐 OpenClaw: installSkill (src/agents/skills-install.ts)
+    // 支持: brew, node (npm/pnpm/yarn/bun), go, uv, download
     log()->info("Installing skill '{}' using '{}'", skill_name, spec->label);
-    
-    return core::Result<bool>::Err("Installation not yet implemented");
+
+    // 构建安装命令
+    std::string install_cmd;
+    switch (spec->kind) {
+        case SkillInstallKind::Brew:
+            if (!spec->formula.empty()) {
+                install_cmd = "brew install " + spec->formula;
+            } else if (!spec->bins.empty()) {
+                install_cmd = "brew install " + spec->bins[0];
+            }
+            break;
+        case SkillInstallKind::Node:
+            // 优先使用 pnpm，其次 npm
+            {
+                const char* pnpm = std::getenv("PNPM_HOME");
+                std::string pkg_mgr = pnpm ? "pnpm" : "npm";
+                if (!spec->formula.empty()) {
+                    install_cmd = pkg_mgr + " install -g " + spec->formula;
+                } else if (!spec->bins.empty()) {
+                    install_cmd = pkg_mgr + " install -g " + spec->bins[0];
+                }
+            }
+            break;
+        case SkillInstallKind::Go:
+            if (!spec->formula.empty()) {
+                install_cmd = "go install " + spec->formula + "@latest";
+            }
+            break;
+        case SkillInstallKind::Uv:
+            if (!spec->formula.empty()) {
+                install_cmd = "uv tool install " + spec->formula;
+            } else if (!spec->bins.empty()) {
+                install_cmd = "uv tool install " + spec->bins[0];
+            }
+            break;
+        case SkillInstallKind::Download:
+            // Download 安装需要下载 URL，解压，移动到 targetDir
+            // 对齐 OpenClaw skills-install-download.ts
+            return core::Result<bool>::Err("Download install requires skills_install_impl integration");
+        default:
+            return core::Result<bool>::Err("Unknown install kind for: " + skill_name);
+    }
+
+    if (install_cmd.empty()) {
+        return core::Result<bool>::Err("Cannot determine install command for: " + skill_name);
+    }
+
+    log()->info("Running install command: {}", install_cmd);
+
+    // 执行安装命令（对齐 OpenClaw: 捕获 stdout/stderr）
+    int ret = std::system(install_cmd.c_str());
+    if (ret != 0) {
+        return core::Result<bool>::Err(
+            "Install command failed (exit code " + std::to_string(ret) + "): " + install_cmd
+        );
+    }
+
+    log()->info("Skill '{}' installed successfully", skill_name);
+    return core::Result<bool>::Ok(true);
 }
 
 // 安全扫描

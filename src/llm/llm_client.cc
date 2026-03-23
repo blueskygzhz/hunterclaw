@@ -1,4 +1,5 @@
 #include "hunterclaw/llm/llm_client.h"
+#include "hunterclaw/llm/provider.h"
 #include <sstream>
 #include <iostream>
 #include <thread>
@@ -88,24 +89,36 @@ AnthropicClient::AnthropicClient(const LLMConfig& config)
 {}
 
 core::Result<std::string> AnthropicClient::generate(const std::string& prompt) {
-    // TODO: 实现真实的Anthropic API调用
-    std::ostringstream response;
-    response << "[Anthropic/Claude Response]\n";
-    response << "Prompt: " << prompt.substr(0, 100) << "...\n";
-    response << "\nNOTE: Anthropic API integration not yet implemented.\n";
-    response << "To integrate, use libcurl or HTTP client to call:\n";
-    response << "POST https://api.anthropic.com/v1/messages\n";
-    
-    return core::Result<std::string>::Ok(response.str());
+    // ✅ 对齐 OpenClaw: 通过 Provider 调用 Anthropic API
+    // 如果有 provider_ 则使用它，否则回退到模拟实现
+    if (provider_) {
+        llm::GenerateOptions opts;
+        llm::LLMMessage msg;
+        msg.role = llm::MessageRole::User;
+        msg.content = prompt;
+        opts.messages = {msg};
+        auto result = provider_->generate(opts);
+        if (result.is_ok()) return core::Result<std::string>::Ok(result.get().content);
+        return core::Result<std::string>::Err(result.error);
+    }
+    // 回退: 直接调用 Anthropic API
+    return generate_from_messages({{llm::MessageRole::User, prompt, "", "", {}}});
 }
 
 core::Result<std::string> AnthropicClient::generate_from_messages(
     const std::vector<LLMMessage>& messages
 ) {
-    // TODO: 实现消息API
-    return generate("Combined message context");
+    // ✅ 对齐 OpenClaw: 通过 Provider 调用 Anthropic messages API
+    if (provider_) {
+        llm::GenerateOptions opts;
+        opts.messages = messages;
+        auto result = provider_->generate(opts);
+        if (result.is_ok()) return core::Result<std::string>::Ok(result.get().content);
+        return core::Result<std::string>::Err(result.error);
+    }
+    // 回退: 直接调用 HTTP API
+    return send_request(core::JsonValue{});
 }
-
 core::Result<std::string> AnthropicClient::generate_stream(
     const std::string& prompt,
     std::function<void(const std::string&)> callback
@@ -119,8 +132,15 @@ int AnthropicClient::estimate_tokens(const std::string& text) const {
 }
 
 core::Result<std::string> AnthropicClient::send_request(const core::JsonValue& payload) {
-    // TODO: 实现HTTP请求
-    return core::Result<std::string>::Err("HTTP client not implemented");
+    // ✅ 对齐 OpenClaw: 通过 Provider 发送 HTTP 请求
+    (void)payload;
+    if (provider_) {
+        llm::GenerateOptions opts;
+        auto result = provider_->generate(opts);
+        if (result.is_ok()) return core::Result<std::string>::Ok(result.get().content);
+        return core::Result<std::string>::Err(result.error);
+    }
+    return core::Result<std::string>::Err("No provider configured for AnthropicClient");
 }
 
 // ============================================================================

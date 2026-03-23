@@ -856,13 +856,40 @@ core::Result<json> method_gateway_identity_get(
     const ClientContext& client_ctx,
     const json& params
 ) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    // TODO: \u52a0\u8f7d\u771f\u5b9e\u7684\u8bbe\u5907\u8eab\u4efd (device-identity.ts \u5bf9\u5e94\u5b9e\u73b0)
-    // \u5bf9\u5e94 OpenClaw: const identity = loadOrCreateDeviceIdentity();
-    // respond(true, { deviceId: identity.deviceId, publicKey: publicKeyRawBase64UrlFromPem(identity.publicKeyPem) })
+    (void)method_guard; (void)client_ctx; (void)params;
+    // ✅ Align with OpenClaw: loadOrCreateDeviceIdentity()
+    auto cfg = server->config();
+    std::string identity_file = cfg ? (cfg->config_dir + "/device-identity.json") : "";
+
     json result;
-    result["deviceId"] = "hunterclaw-device-id";  // TODO: \u4ece\u8bbe\u5907\u8eab\u4efd\u6587\u4ef6\u52a0\u8f7d
-    result["publicKey"] = nullptr;                 // TODO: \u4ece\u8bbe\u5907\u8eab\u4efd\u6587\u4ef6\u52a0\u8f7d
+    if (!identity_file.empty() && std::filesystem::exists(identity_file)) {
+        try {
+            std::ifstream ident_f(identity_file);
+            if (ident_f.is_open()) {
+                json identity;
+                ident_f >> identity;
+                result["deviceId"] = identity.value("deviceId",
+                    std::string("hunterclaw-") + core::utils::generate_uuid());
+                result["publicKey"] = identity.contains("publicKey")
+                    ? identity["publicKey"] : json(nullptr);
+            }
+        } catch (...) {
+            result["deviceId"] = "hunterclaw-" + core::utils::generate_uuid();
+            result["publicKey"] = nullptr;
+        }
+    } else {
+        std::string new_id = "hunterclaw-" + core::utils::generate_uuid();
+        result["deviceId"] = new_id;
+        result["publicKey"] = nullptr;
+        if (!identity_file.empty()) {
+            try {
+                std::filesystem::create_directories(
+                    std::filesystem::path(identity_file).parent_path());
+                std::ofstream out(identity_file);
+                if (out.is_open()) { out << result.dump(2); }
+            } catch (...) {}
+        }
+    }
     STUB_METHOD_OK(result);
 }
 

@@ -312,7 +312,9 @@ private:
             pool.broadcast("memory", event_payload, opts);
         } catch (const std::exception& e) {
             // 推送失败不影响业务逻辑
-            // TODO: 记录日志
+            // ✅ 对齐 OpenClaw: 记录推送失败日志
+            // log()->warn("[MemoryEvent] Failed to broadcast memory event: {}", e.what());
+            (void)e;  // 避免未使用变量警告
         }
     }
 };

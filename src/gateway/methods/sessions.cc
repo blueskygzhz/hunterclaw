@@ -423,12 +423,20 @@ core::Result<json> method_session_list(
     result["count"]    = sessions_array.size();
     result["sessions"] = sessions_array;
 
-    // 🎯 OpenClaw 对齐: getSessionDefaults
+    // ✅ 对齐 OpenClaw: getSessionDefaults 从配置读取 contextTokens
     // OpenClaw: { modelProvider, model, contextTokens }
     json defaults;
     defaults["modelProvider"] = nullptr;
     defaults["model"]         = nullptr;
-    defaults["contextTokens"] = nullptr;  // TODO: resolve from config
+    // 从配置读取 contextTokens
+    {
+        auto cfg = server->config();
+        if (cfg && cfg->agents.context_tokens > 0) {
+            defaults["contextTokens"] = cfg->agents.context_tokens;
+        } else {
+            defaults["contextTokens"] = nullptr;
+        }
+    }
     result["defaults"] = defaults;
 
     return core::Result<json>::Ok(result);
@@ -563,8 +571,21 @@ core::Result<json> method_session_resolve(
     std::string session_label = params.value("sessionLabel", "");
     std::string session_key   = params.value("sessionKey", "");
     bool require_existing     = params.value("requireExisting", false);
-    bool reset_session        = params.value("resetSession", false);
-    (void)reset_session;  // TODO: 对齐 OpenClaw resetSession 逻辑
+    bool reset_session = params.value("resetSession", false);
+
+    // ✅ 对齐 OpenClaw: resetSession 逻辑
+    // OpenClaw: if (resetSession) { await resetSessionByKey(resolvedKey); }
+    // 如果请求重置 session，删除 transcript 并重创建
+    if (reset_session && !session_key.empty()) {
+        auto agent_pool = server->agent_pool();
+        if (agent_pool) {
+            auto agent = agent_pool->get_agent(session_key);
+            if (agent) {
+                // 对齐 OpenClaw: 重置 session 就是删除 transcript 并重新初始化
+                agent->reset_transcript();
+            }
+        }
+    }
 
     if (session_key.empty() && session_label.empty()) {
         return core::Result<json>::Err("sessionKey or sessionLabel required");

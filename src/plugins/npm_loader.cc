@@ -158,8 +158,7 @@ NpmPluginLoader::NpmPluginLoader(std::shared_ptr<core::Config> config)
     : impl_(std::make_unique<Impl>())
 {
     impl_->config = config;
-    // TODO: Read from config when Config API is available
-    impl_->cache_dir = "~/.hunterclaw/npm_cache";
+    // \u2705 \u5bf9\u9f50 OpenClaw: \u4ece\u914d\u7f6e\u8bfb\u53d6 npm \u7f13\u5b58\u76ee\u5f55\n    if (config && !config->plugins.npm_cache_dir.empty()) {\n        impl_->cache_dir = config->plugins.npm_cache_dir;\n    } else {\n        impl_->cache_dir = \"~/.hunterclaw/npm_cache\";\n    }
     
     // 展开 ~ 符号
     if (impl_->cache_dir[0] == '~') {

@@ -36,6 +36,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <sys/wait.h>
+#include <signal.h>
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -349,8 +350,12 @@ std::unique_ptr<ExecProcessHandle> run_exec_process(
         return outcome;
     });
 
-    handle->kill_fn = []() {
-        // TODO: implement process kill via session tracking
+    handle->kill_fn = [handle]() {
+        // ✅ 对齐 OpenClaw: 通过 session tracking 终止进程
+        // 使用 SIGTERM 发送给进程组
+        if (handle && handle->pid > 0) {
+            ::kill(-handle->pid, SIGTERM);
+        }
     };
 
     return handle;

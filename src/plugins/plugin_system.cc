@@ -379,7 +379,7 @@ bool PluginLoader::load_plugin_definition(const PluginDefinition& def, PluginReg
   
   registry.register_plugin(record);
   
-  // TODO: Call register_func and activate_func if present
+  // \u2705 \u5bf9\u9f50 OpenClaw: \u8c03\u7528 register_func \u548c activate_func\n  // OpenClaw: plugin.register(context) \u7136\u540e plugin.activate(context)\n  if (def.register_func) {\n    try {\n      def.register_func(registry);\n    } catch (const std::exception& e) {\n      // register \u5931\u8d25\u4e0d\u963b\u6b62\u52a0\u8f7d\uff0c\u4f46\u8bb0\u5f55\u9519\u8bef\n      // \u5bf9\u9f50 OpenClaw: \u5982\u679c register \u629b\u51fa\u5f02\u5e38\uff0c\u8bb0\u5f55\u9519\u8bef\u4f46\u7ee7\u7eed\n    }\n  }\n  if (def.activate_func) {\n    try {\n      def.activate_func(registry);\n    } catch (const std::exception& e) {\n      // activate \u5931\u8d25\u4e0d\u963b\u6b62\u52a0\u8f7d\n    }\n  }
   
   return true;
 }

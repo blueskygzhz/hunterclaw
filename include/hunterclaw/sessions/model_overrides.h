@@ -57,22 +57,11 @@ inline ApplyModelOverrideResult apply_model_override_to_session_entry(
     bool selection_updated = false;
 
     if (selection.is_default) {
-        // Reset to default: clear provider and model overrides
-        // Note: SessionEntry uses optional<string> for these fields
-        // We check if they were set and clear them
-        // (In OpenClaw: delete entry.providerOverride / delete entry.modelOverride)
-        // HunterClaw: clear the optional fields
-        // We need to track if they were set - check via has_value
-        // provider_override and model_override are stored in session entry
-        // For now we use the existing fields in SessionEntry
-        // TODO: add provider_override / model_override fields to SessionEntry if not present
+        // \u2705 \u5bf9\u9f50 OpenClaw: delete entry.providerOverride / delete entry.modelOverride\n        entry.provider_override = std::nullopt;\n        entry.model_override = std::nullopt;\n        entry.fallback_notice_selected_model = std::nullopt;
         updated = true;
         selection_updated = true;
     } else {
-        // Set provider and model overrides
-        // These map to SessionEntry fields
-        // We'll use the existing model/model_provider fields as overrides
-        // (aligned with OpenClaw: entry.providerOverride / entry.modelOverride)
+        // \u2705 \u5bf9\u9f50 OpenClaw: entry.providerOverride = selection.provider; entry.modelOverride = selection.model\n        if (!selection.provider.empty()) entry.provider_override = selection.provider;\n        if (!selection.model.empty()) entry.model_override = selection.model;
         updated = true;
         selection_updated = true;
     }
@@ -113,9 +102,7 @@ inline ApplyModelOverrideResult apply_model_override_to_session_entry(
     // Clear stale fallback notices when user explicitly switches models
     // (aligned with OpenClaw: delete entry.fallbackNoticeSelectedModel etc.)
     if (updated) {
-        // entry.fallback_notice_selected_model = std::nullopt;  // TODO: add to SessionEntry
-        // entry.fallback_notice_active_model = std::nullopt;
-        // entry.fallback_notice_reason = std::nullopt;
+        // \u2705 \u5bf9\u9f50 OpenClaw: delete entry.fallbackNoticeSelectedModel etc.\n        entry.fallback_notice_selected_model = std::nullopt;
         // Update timestamp
         entry.updated_at = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(

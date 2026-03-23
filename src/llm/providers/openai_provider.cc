@@ -3,10 +3,11 @@
 #include "hunterclaw/core/result.h"
 #include <curl/curl.h>
 #include <json/json.h>
+#include <functional>
 #include <sstream>
-#include <thread>
+#include <string>
 #include <chrono>
-
+#include <thread>
 namespace hunterclaw {
 namespace llm {
 
@@ -143,10 +144,104 @@ public:
         const GenerateOptions& options,
         StreamCallback callback
     ) override {
-        // TODO: 实现流式响应 (SSE)
-        (void)options;  // 避免未使用参数警告
-        (void)callback;
-        return core::Result<GenerateResponse>::Err("Streaming not yet implemented for OpenAI");
+        // ✅ 对齐 OpenClaw: OpenAI SSE 流式处理
+        // 对应 OpenClaw: openai.chat.completions.stream()
+        auto request_json = build_stream_request_json(options);
+        
+        std::map<std::string, std::string> headers = {
+            {"Content-Type", "application/json"},
+            {"Authorization", "Bearer " + config_.api_key},
+            {"Accept", "text/event-stream"}
+        };
+        for (const auto& [key, value] : config_.headers) {
+            headers[key] = value;
+        }
+        
+        std::string url = config_.base_url + "/chat/completions";
+        GenerateResponse final_response;
+        std::string accumulated_text;
+        
+        // SSE 流式回调
+        auto sse_callback = [&](const std::string& chunk) {
+            std::istringstream stream(chunk);
+            std::string line;
+            while (std::getline(stream, line)) {
+                if (line.substr(0, 6) == "data: ") {
+                    std::string data = line.substr(6);
+                    if (data == "[DONE]") {
+                        if (callback) callback("", true);
+                        break;
+                    }
+                    try {
+                        auto j = Json::Value();
+                        Json::CharReaderBuilder reader;
+                        std::istringstream ss(data);
+                        std::string errs;
+                        if (Json::parseFromStream(reader, ss, &j, &errs)) {
+                            if (j.isMember("choices") && j["choices"].isArray() && j["choices"].size() > 0) {
+                                auto& delta = j["choices"][0]["delta"];
+                                if (delta.isMember("content") && delta["content"].isString()) {
+                                    std::string text = delta["content"].asString();
+                                    accumulated_text += text;
+                                    if (callback) callback(text, false);
+                                }
+                            }
+                            // 使用统计
+                            if (j.isMember("usage")) {
+                                final_response.usage.input_tokens = j["usage"].get("prompt_tokens", 0).asInt();
+                                final_response.usage.output_tokens = j["usage"].get("completion_tokens", 0).asInt();
+                            }
+                        }
+                    } catch (...) {}
+                }
+            }
+        };
+        
+        // 使用 curl 进行 SSE 请求
+        CURL* curl = curl_easy_init();
+        if (!curl) return core::Result<GenerateResponse>::Err("Failed to init curl");
+        
+        struct SseState { std::string buffer; std::function<void(const std::string&)> cb; };
+        SseState state{.cb = sse_callback};
+        
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_POST, 1L);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request_json.c_str());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)request_json.size());
+        
+        struct curl_slist* curl_headers = nullptr;
+        for (const auto& [k, v] : headers) {
+            curl_headers = curl_slist_append(curl_headers, (k + ": " + v).c_str());
+        }
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, curl_headers);
+        
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
+            +[](char* ptr, size_t size, size_t nmemb, void* ud) -> size_t {
+                auto* s = static_cast<SseState*>(ud);
+                s->buffer.append(ptr, size * nmemb);
+                size_t pos;
+                while ((pos = s->buffer.find('\n')) != std::string::npos) {
+                    std::string line = s->buffer.substr(0, pos + 1);
+                    s->buffer.erase(0, pos + 1);
+                    s->cb(line);
+                }
+                return size * nmemb;
+            });
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &state);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
+        
+        CURLcode res = curl_easy_perform(curl);
+        curl_slist_free_all(curl_headers);
+        curl_easy_cleanup(curl);
+        
+        if (res != CURLE_OK) {
+            return core::Result<GenerateResponse>::Err(
+                std::string("OpenAI stream error: ") + curl_easy_strerror(res));
+        }
+        
+        final_response.content = accumulated_text;
+        final_response.finish_reason = "stop";
+        return core::Result<GenerateResponse>::Ok(final_response);
     }
     
     int estimate_tokens(const std::string& text) const override {
@@ -175,6 +270,32 @@ public:
     }
     
 private:
+    std::string build_stream_request_json(const GenerateOptions& options) {
+        // 与 build_request_json 相同，但添加 stream: true
+        Json::Value root;
+        root["model"] = config_.model;
+        root["stream"] = true;  // ✅ 启用 SSE 流式
+        
+        Json::Value messages_json(Json::arrayValue);
+        for (const auto& msg : options.messages) {
+            Json::Value msg_json;
+            switch (msg.role) {
+                case MessageRole::System:    msg_json["role"] = "system"; break;
+                case MessageRole::User:      msg_json["role"] = "user"; break;
+                case MessageRole::Assistant: msg_json["role"] = "assistant"; break;
+                default:                     msg_json["role"] = "user"; break;
+            }
+            msg_json["content"] = msg.content;
+            messages_json.append(msg_json);
+        }
+        root["messages"] = messages_json;
+        if (options.max_tokens.has_value()) root["max_tokens"] = options.max_tokens.value();
+        if (options.temperature.has_value()) root["temperature"] = options.temperature.value();
+        
+        Json::StreamWriterBuilder writer;
+        return Json::writeString(writer, root);
+    }
+    
     std::string build_request_json(const GenerateOptions& options) {
         Json::Value root;
         root["model"] = config_.model;

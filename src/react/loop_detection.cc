@@ -21,10 +21,14 @@ std::string compute_sha256(const std::string& data) {
     return oss.str();
 }
 
-// JSON 序列化 (简化版)
+// JSON 序列化 (对齐 OpenClaw)
 std::string serialize_json(const core::JsonValue& json) {
-    // TODO: 实现完整的 JSON 序列化
-    return "{}";  // 占位符
+    // ✅ 对齐 OpenClaw: 使用 to_json() 转换为 nlohmann::json 再序列化
+    try {
+        return json.to_json().dump();
+    } catch (...) {
+        return "null";
+    }
 }
 
 } // namespace

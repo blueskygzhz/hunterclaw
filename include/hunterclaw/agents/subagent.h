@@ -55,6 +55,7 @@ struct SubagentDepthInfo {
 struct SubagentSpawnOptions {
     std::string subagent_name;              // Subagent type name (e.g., "code-explorer")
     std::string description;                // Short task description (3-5 words)
+    std::string label;                      // Short label for display (maps to SubagentRunRecord.label)
     std::string prompt;                     // Full task prompt for subagent
     
     // Optional overrides
@@ -91,6 +92,7 @@ struct SubagentEntry {
     std::string requester_run_id;           // Parent agent run ID
     std::string requester_agent_id;         // Parent agent ID
     std::string subagent_name;              // Subagent type name
+    std::string label;                      // Short label (maps to SubagentRunRecord.label)
     
     // Depth tracking
     SubagentDepthInfo depth_info;
@@ -116,11 +118,24 @@ struct SubagentEntry {
     int delivery_attempts = 0;              // Delivery retry count
     uint64_t last_delivery_attempt = 0;     // Last delivery timestamp
 
+    // ✅ OpenClaw对齐: task/cleanup/spawnMode (SubagentRunRecord)
+    std::string task;                       // Task description (maps to SubagentRunRecord.task)
+    std::string cleanup = "delete";         // "delete" | "keep" (maps to SubagentRunRecord.cleanup)
+    std::string spawn_mode = "run";         // "run" | "session" (maps to SubagentRunRecord.spawnMode)
+    std::string requester_display_key;      // Display key for requester
+    std::string controller_session_key;     // Controller session key (for nested orchestration)
+    bool expects_completion_message = false; // Whether requester expects a completion message
+
     // ✅ OpenClaw对齐: 冻结结果文本 (captureSubagentCompletionReply)
     // 在 subagent 完成时从 session 历史捕获最终输出，避免 session 被删除后丢失
     std::string frozen_result_text;         // Frozen final output (captured at completion)
     bool frozen_result_captured = false;    // Whether frozen result was captured
     uint64_t frozen_result_captured_at = 0; // Capture timestamp
+
+    // ✅ OpenClaw对齐: fallbackFrozenResultText (wake continuation 场景)
+    // 当 wake continuation run 以 NO_REPLY 结束时，使用此 fallback
+    std::string fallback_frozen_result_text;         // Fallback frozen result
+    uint64_t fallback_frozen_result_captured_at = 0; // Fallback capture timestamp
 
     // ✅ OpenClaw对齐: Announce 重试控制 (MAX_ANNOUNCE_RETRY_COUNT=3)
     int announce_retry_count = 0;           // Number of announce retries attempted
@@ -138,6 +153,12 @@ struct SubagentEntry {
 
     // ✅ OpenClaw对齐: 结束原因 (endedReason)
     std::string ended_reason;               // "complete" | "error" | "killed"
+
+    // ✅ OpenClaw对齐: endedHookEmittedAt
+    uint64_t ended_hook_emitted_at = 0;     // Timestamp when subagent_ended hook was emitted
+
+    // ✅ OpenClaw对齐: archiveAtMs (run 模式下的归档时间)
+    uint64_t archive_at_ms = 0;             // Archive timestamp (0 = no archive)
 
     // Notifications
     std::vector<std::string> pending_notifications;  // Queued events

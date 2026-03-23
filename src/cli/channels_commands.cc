@@ -37,8 +37,14 @@ namespace {
             return core::Result<core::JsonValue>::err("Failed to open config file");
         }
         
-        // TODO: Parse JSON
-        return core::Result<core::JsonValue>::ok(core::JsonValue::array());
+        // ✅ 对齐 OpenClaw: 解析 JSON 配置文件
+        try {
+            nlohmann::json j;
+            file >> j;
+            return core::Result<core::JsonValue>::ok(core::JsonValue(j));
+        } catch (const std::exception& e) {
+            return core::Result<core::JsonValue>::err(std::string("Failed to parse JSON: ") + e.what());
+        }
     }
     
     // 保存渠道配置

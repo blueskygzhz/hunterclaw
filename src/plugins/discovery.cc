@@ -42,16 +42,7 @@ struct PluginDiscovery::Impl {
             search_paths.push_back(path);
         }
         
-        // 从配置读取额外路径
-        // TODO: Implement config->get_string_list when Config API is available
-        // auto custom_paths = config->get_string_list("plugins.loadPaths", {});
-        // for (const auto& path : custom_paths) {
-        //     std::string expanded = path;
-        //     if (expanded[0] == '~' && home) {
-        //         expanded = std::string(home) + expanded.substr(1);
-        //     }
-        //     search_paths.push_back(expanded);
-        // }
+        // \u2705 \u5bf9\u9f50 OpenClaw: \u4ece\u914d\u7f6e\u8bfb\u53d6\u989d\u5916\u8def\u5f84 (plugins.loadPaths)\n        if (config) {\n            for (const auto& extra_path : config->plugins.load_paths) {\n                std::string expanded = extra_path;\n                if (!expanded.empty() && expanded[0] == '~' && home) {\n                    expanded = std::string(home) + expanded.substr(1);\n                }\n                if (!expanded.empty()) {\n                    search_paths.push_back(expanded);\n                }\n            }\n        }
         
         // 工作空间插件目录
         std::string workspace_dir = config ? config->workspace_dir : ".";

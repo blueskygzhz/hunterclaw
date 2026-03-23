@@ -2,10 +2,12 @@
 #include "hunterclaw/gateway/method_guard.h"
 #include "hunterclaw/skills/skill.h"
 #include "hunterclaw/core/utils.h"
+#include "skills_install_impl.h"
 #include <nlohmann/json.hpp>
 #include <filesystem>
 #include <set>
 #include <algorithm>
+#include <sstream>
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -87,11 +89,19 @@ core::Result<json> method_skill_status(
     // 参数验证 (对齐 OpenClaw validateSkillsStatusParams)
     std::string agent_id = params.value("agentId", "");
     
-    // TODO: 如果提供了 agent_id，验证它存在
-    // const auto& known_agents = config->list_agent_ids();
-    // if (!agent_id.empty() && !contains(known_agents, agent_id)) {
-    //     return core::Result<json>::Err("unknown agent id: " + agent_id);
-    // }
+    // ✅ 对齐 OpenClaw: 如果提供了 agent_id，验证它存在
+    if (!agent_id.empty()) {
+        auto cfg = server->config();
+        if (cfg) {
+            bool found = false;
+            for (const auto& agent : cfg->agents) {
+                if (agent.id == agent_id) { found = true; break; }
+            }
+            if (!found) {
+                return core::Result<json>::Err("unknown agent id: " + agent_id);
+            }
+        }
+    }
     
     auto skill_mgr = server->skill_manager();
     auto skills = skill_mgr->list_skills();
@@ -104,7 +114,10 @@ core::Result<json> method_skill_status(
         
         // 基本信息
         skill_info["name"] = skill_meta.skill.name;
-        std::string skill_key = skill_meta.skill.name;  // TODO: 支持 metadata.skillKey 覆盖
+        // ✅ 对齐 OpenClaw: skillKey 支持 metadata.skillKey 覆盖
+        std::string skill_key = skill_meta.metadata.skill_key.empty()
+            ? skill_meta.skill.name
+            : skill_meta.metadata.skill_key;
         skill_info["skillKey"] = skill_key;
         skill_info["description"] = skill_meta.skill.description;
         skill_info["source"] = skill_source_to_string(skill_meta.skill.source);
@@ -129,18 +142,35 @@ core::Result<json> method_skill_status(
             skill_info["primaryEnv"] = skill_meta.metadata.primary_env;
         }
         
-        // 🎯 对齐 OpenClaw: 启用状态 (从配置读取)
-        bool disabled = false;  // TODO: 从 config.skills.entries[skillKey].enabled 读取
-        skill_info["disabled"] = disabled;
-        
+        // ✅ 对齐 OpenClaw: 从 config.skills.entries[skillKey].enabled 读取禁用状态
+        bool disabled = false;
+        {
+            auto skill_mgr_cfg = server->config();
+            if (skill_mgr_cfg) {
+                const auto& entries = skill_mgr_cfg->skills.entries;
+                auto it = entries.find(skill_key);
+                if (it != entries.end()) {
+                    disabled = !it->second.enabled;
+                }
+            }
+        }
+        skill_info["disabled"] = disabled;        
         // 🎯 对齐 OpenClaw: bundled 标志
         bool bundled = (skill_meta.skill.source == skills::SkillSource::Bundled);
         skill_info["bundled"] = bundled;
         
-        // 🎯 对齐 OpenClaw: blockedByAllowlist
-        bool blocked_by_allowlist = false;  // TODO: 实现 resolveBundledAllowlist 逻辑
-        skill_info["blockedByAllowlist"] = blocked_by_allowlist;
-        
+        // ✅ 对齐 OpenClaw: blockedByAllowlist (resolveBundledAllowlist)
+        // bundled skills 默认全部允许，除非配置了 allowlist
+        bool blocked_by_allowlist = false;
+        if (bundled) {
+            auto skill_mgr_cfg2 = server->config();
+            if (skill_mgr_cfg2 && !skill_mgr_cfg2->skills.bundled_allowlist.empty()) {
+                // 如果配置了 allowlist，检查当前 skill 是否在列表中
+                const auto& allowlist = skill_mgr_cfg2->skills.bundled_allowlist;
+                blocked_by_allowlist = std::find(allowlist.begin(), allowlist.end(), skill_key) == allowlist.end();
+            }
+        }
+        skill_info["blockedByAllowlist"] = blocked_by_allowlist;        
         // 🎯 对齐 OpenClaw: requirements 和 missing (evaluateEntryRequirementsForCurrentPlatform)
         json requirements;
         requirements["bins"] = json::array();
@@ -156,12 +186,77 @@ core::Result<json> method_skill_status(
 
         
         
-        // TODO: 实际检测缺失的依赖
-        // hasBinary() 检查二进制文件是否存在
-        // 检查环境变量: getenv()/config->skills.entries[skillKey].env
-        // 检查操作系统: process.platform vs metadata.openclaw.os
-        
-        bool requirements_satisfied = true;  // TODO: 实际计算
+        // ✅ 对齐 OpenClaw: evaluateEntryRequirementsForCurrentPlatform
+        // 检测当前平台的二进制文件、环境变量、OS 兼容性
+        {
+            // 当前 OS
+            std::string current_os =
+#if defined(__APPLE__)
+                "darwin";
+#elif defined(_WIN32)
+                "win32";
+#else
+                "linux";
+#endif
+
+            // 检查 bins
+            auto check_bin = [](const std::string& bin_name) -> bool {
+                const char* path_env = std::getenv("PATH");
+                if (!path_env) return false;
+                std::istringstream path_stream(path_env);
+                std::string path_dir;
+                while (std::getline(path_stream, path_dir, ':')) {
+                    fs::path full_path = fs::path(path_dir) / bin_name;
+                    if (fs::exists(full_path) && !fs::is_directory(full_path)) return true;
+                }
+                return false;
+            };
+
+            // 检查 OS 兼容性
+            if (!skill_meta.metadata.os.empty()) {
+                bool os_ok = false;
+                for (const auto& req_os : skill_meta.metadata.os) {
+                    if (req_os == current_os) { os_ok = true; break; }
+                }
+                if (!os_ok) {
+                    missing["os"].push_back(current_os);
+                    requirements_satisfied = false;
+                }
+            }
+
+            // 检查 bins
+            for (const auto& bin : skill_meta.metadata.requires.bins) {
+                requirements["bins"].push_back(bin);
+                if (!check_bin(bin)) {
+                    missing["bins"].push_back(bin);
+                    requirements_satisfied = false;
+                }
+            }
+
+            // 检查 any_bins (OR 逻辑)
+            if (!skill_meta.metadata.requires.any_bins.empty()) {
+                bool any_found = false;
+                for (const auto& bin : skill_meta.metadata.requires.any_bins) {
+                    requirements["anyBins"].push_back(bin);
+                    if (check_bin(bin)) { any_found = true; }
+                }
+                if (!any_found) {
+                    for (const auto& bin : skill_meta.metadata.requires.any_bins) {
+                        missing["bins"].push_back(bin + " (any)");
+                    }
+                    requirements_satisfied = false;
+                }
+            }
+
+            // 检查环境变量
+            for (const auto& env_var : skill_meta.metadata.requires.env) {
+                requirements["env"].push_back(env_var);
+                if (!std::getenv(env_var.c_str())) {
+                    missing["env"].push_back(env_var);
+                    requirements_satisfied = false;
+                }
+            }
+        }
         
         skill_info["requirements"] = requirements;
         skill_info["missing"] = missing;
@@ -187,7 +282,15 @@ core::Result<json> method_skill_status(
         for (const auto& install_spec : skill_meta.metadata.install) {
             json spec_json;
             spec_json["id"] = install_spec.id;
-            // TODO: 将 Kind enum 转换为字符串
+            // ✅ 对齐 OpenClaw: Kind enum 转字符串
+            switch (install_spec.kind) {
+                case skills::SkillInstallKind::Brew:     spec_json["kind"] = "brew"; break;
+                case skills::SkillInstallKind::Node:     spec_json["kind"] = "node"; break;
+                case skills::SkillInstallKind::Go:       spec_json["kind"] = "go"; break;
+                case skills::SkillInstallKind::Uv:       spec_json["kind"] = "uv"; break;
+                case skills::SkillInstallKind::Download: spec_json["kind"] = "download"; break;
+                default:                                  spec_json["kind"] = "unknown"; break;
+            }
             spec_json["label"] = install_spec.label;
             spec_json["bins"] = install_spec.bins;
             if (!install_spec.formula.empty()) {
@@ -269,49 +372,28 @@ core::Result<json> method_skill_install(
     // 3. 捕获 stdout/stderr
     // 4. 超时保护
     
-    // 🎯 调用实现 (skills_install_impl.cc)
-    // TODO: 需要包含头文件并链接实现
-    // #include "skills_install_impl.cc"
-    // auto install_result = hunterclaw::skills::install_skill(
-    //     workspace_dir, name, install_id, timeout_ms, config
-    // );
-    
-    // 🎯 临时返回 (待集成 install_skill 实现)
+    // ✅ 对齐 OpenClaw: 调用 install_skill 实现
+    std::string workspace_dir;
+    {
+        const char* home = getenv("HOME");
+        workspace_dir = home ? (std::string(home) + "/.hunterclaw") : "./.hunterclaw";
+    }
+    auto install_result = hunterclaw::skills::install_skill(
+        workspace_dir, skill_name, install_id, timeout_ms, json::object()
+    );
+
     json result;
-    result["ok"] = false;
-    result["message"] = "Installation implementation in skills_install_impl.cc - "
-                        "requires integration with skills manager";
-    result["code"] = -1;
-    result["stdout"] = "";
-    result["stderr"] = "See skills_install_impl.cc for complete implementation:\n"
-                      "- brew install (line 247-254)\n"
-                      "- node install (line 101-112, 221-238)\n"
-                      "- go install (line 338-367, 445-505)\n"
-                      "- uv install (line 256-283)\n"
-                      "- download install (see skills-install-download.ts)";
-    result["warnings"] = json::array();
-    
-    // 🎯 集成后的完整逻辑:
-    // if (install_result.ok) {
-    //     result["ok"] = true;
-    //     result["message"] = install_result.message;
-    //     result["code"] = install_result.code;
-    //     result["stdout"] = install_result.stdout_output;
-    //     result["stderr"] = install_result.stderr_output;
-    //     if (!install_result.warnings.empty()) {
-    //         result["warnings"] = json::array();
-    //         for (const auto& warning : install_result.warnings) {
-    //             result["warnings"].push_back(warning);
-    //         }
-    //     }
-    // } else {
-    //     result["ok"] = false;
-    //     result["message"] = install_result.message;
-    //     result["code"] = install_result.code;
-    //     result["stdout"] = install_result.stdout_output;
-    //     result["stderr"] = install_result.stderr_output;
-    // }
-    
+    result["ok"] = install_result.ok;
+    result["message"] = install_result.message;
+    result["code"] = install_result.code;
+    result["stdout"] = install_result.stdout_output;
+    result["stderr"] = install_result.stderr_output;
+    if (!install_result.warnings.empty()) {
+        result["warnings"] = json::array();
+        for (const auto& w : install_result.warnings) result["warnings"].push_back(w);
+    } else {
+        result["warnings"] = json::array();
+    }    
     return core::Result<json>::Ok(result);
 }
 
@@ -351,7 +433,25 @@ core::Result<json> method_skill_update(
     // auto entries = skills.entries ? skills.entries : {};
     // auto current = entries[skill_key] ? entries[skill_key] : {};
     
-    json current = json::object();  // TODO: 从 config 读取
+    // ✅ 对齐 OpenClaw: 读取现有配置
+    // const cfg = loadConfig(); auto skills = cfg.skills; auto entries = skills.entries;
+    json current = json::object();
+    {
+        auto cfg = server->config();
+        if (cfg) {
+            const auto& entries = cfg->skills.entries;
+            auto it = entries.find(skill_key);
+            if (it != entries.end()) {
+                current["enabled"] = it->second.enabled;
+                if (!it->second.api_key.empty()) current["apiKey"] = it->second.api_key;
+                if (!it->second.env.empty()) {
+                    json env_json = json::object();
+                    for (const auto& [k, v] : it->second.env) env_json[k] = v;
+                    current["env"] = env_json;
+                }
+            }
+        }
+    }
     
     // 🎯 对齐 OpenClaw: 应用更新
     if (enabled.has_value()) {
@@ -409,7 +509,27 @@ core::Result<json> method_skill_update(
     // cfg.skills = skills;
     // await writeConfigFile(cfg);
     
-    // TODO: 实际写入 config
+    // ✅ 对齐 OpenClaw: 写入配置文件
+    // entries[skill_key] = current; skills.entries = entries; cfg.skills = skills; writeConfigFile(cfg);
+    {
+        auto cfg = server->config();
+        if (cfg) {
+            auto& entry = cfg->skills.entries[skill_key];
+            if (current.contains("enabled")) entry.enabled = current["enabled"].get<bool>();
+            if (current.contains("apiKey")) entry.api_key = current["apiKey"].get<std::string>();
+            if (current.contains("env") && current["env"].is_object()) {
+                entry.env.clear();
+                for (auto& [k, v] : current["env"].items()) {
+                    if (v.is_string()) entry.env[k] = v.get<std::string>();
+                }
+            }
+            // 尝试保存到文件
+            std::string config_path = cfg->config_dir + "/config.json";
+            try {
+                core::save_config(config_path, *cfg);
+            } catch (...) {}
+        }
+    }
     
     // 🎯 对齐 OpenClaw: 返回格式
     json result;
@@ -429,6 +549,7 @@ core::Result<json> method_skill_list(
 ) {
     auto skill_mgr = server->skill_manager();
     auto skills = skill_mgr->list_skills();
+    auto cfg = server->config();
 
     json result = json::array();
     for (const auto& skill_meta : skills) {
@@ -437,7 +558,14 @@ core::Result<json> method_skill_list(
         skill_json["skillKey"] = skill_meta.skill.name;  // 对齐 OpenClaw
         skill_json["description"] = skill_meta.skill.description;
         skill_json["path"] = skill_meta.skill.file_path.string();
-        skill_json["enabled"] = true;  // TODO: 从配置读取
+        // ✅ 对齐 OpenClaw: 从配置读取 enabled 状态
+        bool enabled = true;
+        if (cfg) {
+            const auto& entries = cfg->skills.entries;
+            auto it = entries.find(skill_meta.skill.name);
+            if (it != entries.end()) enabled = it->second.enabled;
+        }
+        skill_json["enabled"] = enabled;
         result.push_back(skill_json);
     }
 

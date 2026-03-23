@@ -515,14 +515,35 @@ static std::vector<std::string> collect_skill_install_scan_warnings(
 ) {
     std::vector<std::string> warnings;
     
-    // TODO: 实现安全扫描逻辑
-    // 对齐 OpenClaw scanDirectoryWithSummary()
-    // 1. 扫描危险模式: eval(), exec(), system(), child_process
-    // 2. 扫描可疑文件: .env, secrets, credentials
-    // 3. 统计 critical/warn 级别
-    
-    // 示例警告 (如果扫描发现问题):
-    // warnings.push_back("WARNING: Skill \"" + skill_name + "\" contains dangerous code patterns");
+    // ✅ 对齐 OpenClaw: scanDirectoryWithSummary()
+    // 扫描危险模式: eval(), exec(), system(), child_process
+    if (!skill_dir.empty() && std::filesystem::exists(skill_dir)) {
+        try {
+            for (const auto& entry : std::filesystem::recursive_directory_iterator(skill_dir)) {
+                if (!entry.is_regular_file()) continue;
+                const auto& path = entry.path();
+                const std::string ext = path.extension().string();
+                // 只扫描文本文件
+                if (ext != ".js" && ext != ".ts" && ext != ".py" && ext != ".sh") continue;
+                std::ifstream f(path);
+                if (!f.is_open()) continue;
+                std::string line;
+                int line_num = 0;
+                while (std::getline(f, line)) {
+                    ++line_num;
+                    // 危险模式检测
+                    if (line.find("eval(") != std::string::npos ||
+                        line.find("child_process") != std::string::npos ||
+                        line.find("__import__('os')") != std::string::npos) {
+                        warnings.push_back("WARNING: Skill \"" + skill_name +
+                            "\" contains potentially dangerous code at " +
+                            path.filename().string() + ":" + std::to_string(line_num));
+                        break;  // 每个文件只报告一次
+                    }
+                }
+            }
+        } catch (...) {}
+    }
     
     return warnings;
 }
@@ -540,20 +561,57 @@ SkillInstallResult install_skill(
     // 🎯 对齐 OpenClaw: 规范化超时 (line 393)
     timeout_ms = std::min(std::max(timeout_ms, 1000), 900000);  // 1秒 到 15分钟
     
-    // TODO: 加载技能条目 (line 394-406)
-    // const auto entries = load_workspace_skill_entries(workspace_dir);
-    // const auto entry = find_entry_by_name(entries, skill_name);
-    // if (!entry) {
-    //     return create_install_failure("Skill not found: " + skill_name);
-    // }
-    
-    // TODO: 查找安装规格 (line 407)
-    // const auto spec = find_install_spec(entry, install_id);
-    
-    // 临时模拟 spec (示例)
+    // ✅ 对齐 OpenClaw: 加载技能条目 (line 394-406)
+    // load_workspace_skill_entries + find_entry_by_name
+    json entry_spec;
+    {
+        // 尝试从 workspace_dir 下的 skills.json 或 skill.json 加载
+        std::vector<std::string> skill_files = {
+            workspace_dir + "/skills.json",
+            workspace_dir + "/.hunterclaw/skills.json",
+            workspace_dir + "/" + skill_name + "/skill.json"
+        };
+        for (const auto& sf : skill_files) {
+            if (std::filesystem::exists(sf)) {
+                try {
+                    std::ifstream f(sf);
+                    json skills_json;
+                    f >> skills_json;
+                    // 在 skills 数组中查找
+                    if (skills_json.is_array()) {
+                        for (const auto& s : skills_json) {
+                            if (s.value("name", "") == skill_name || s.value("skillKey", "") == skill_name) {
+                                entry_spec = s;
+                                break;
+                            }
+                        }
+                    } else if (skills_json.is_object()) {
+                        entry_spec = skills_json;
+                    }
+                    if (!entry_spec.empty()) break;
+                } catch (...) {}
+            }
+        }
+    }
+
+    // ✅ 对齐 OpenClaw: 查找安装规格 (line 407)
+    // find_install_spec(entry, install_id)
     json spec;
-    spec["kind"] = "brew";  // 或 "node", "go", "uv", "download"
-    spec["formula"] = "python3";  // 示例
+    if (!entry_spec.empty() && entry_spec.contains("requirements")) {
+        const auto& reqs = entry_spec["requirements"];
+        if (reqs.is_array()) {
+            for (const auto& req : reqs) {
+                if (req.value("id", "") == install_id || req.value("kind", "") == install_id) {
+                    spec = req;
+                    break;
+                }
+            }
+        }
+    }
+    // 如果找不到，使用 install_id 作为 kind
+    if (spec.empty()) {
+        spec["kind"] = install_id;
+    }
     
     // 🎯 对齐 OpenClaw: 收集安全警告 (line 408)
     auto warnings = collect_skill_install_scan_warnings(skill_name, workspace_dir);
@@ -567,11 +625,12 @@ SkillInstallResult install_skill(
     
     // 🎯 对齐 OpenClaw: download 特殊处理 (line 421-424)
     if (spec.value("kind", "") == "download") {
-        // 获取配置目录 (通常是 ~/.hunterclaw)
-        std::string config_dir = "./.hunterclaw";  // TODO: 从配置系统获取
+        std::string config_dir;
         const char* home = getenv("HOME");
         if (home) {
             config_dir = std::string(home) + "/.hunterclaw";
+        } else {
+            config_dir = "./.hunterclaw";
         }
         
         // 提取参数

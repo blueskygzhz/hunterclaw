@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <dirent.h>
+#include <filesystem>
 #include <fstream>
 #include <regex>
 #include <set>
@@ -332,12 +333,14 @@ bool is_skill_eligible(
     if (entry.metadata.contains("os")) {
         auto os_list = entry.metadata["os"];
         if (os_list.is_array() && os_list.size() > 0) {
-            // TODO: 检测当前平台
-            std::string current_os = "linux";  // 简化实现
-#ifdef __APPLE__
-            current_os = "darwin";
-#elif _WIN32
-            current_os = "win32";
+            // ✅ 对齐 OpenClaw: 检测当前平台
+            std::string current_os =
+#if defined(__APPLE__)
+                "darwin";
+#elif defined(_WIN32)
+                "win32";
+#else
+                "linux";
 #endif
             
             bool os_matched = false;
@@ -361,11 +364,25 @@ bool is_skill_eligible(
         // 检查必需的二进制文件
         if (requires.contains("bins") && requires["bins"].is_array()) {
             for (const auto& bin : requires["bins"]) {
+                // ✅ 对齐 OpenClaw: hasBinary() 检查
+                // 使用 PATH 遍历查找可执行文件，不依赖 system()
                 std::string bin_name = bin.get<std::string>();
-                // TODO: 实现 hasBinary() 检查
-                // 简化实现: 使用 which 命令
-                std::string cmd = "which " + bin_name + " >/dev/null 2>&1";
-                if (system(cmd.c_str()) != 0) {
+                bool bin_found = false;
+                {
+                    const char* path_env = std::getenv("PATH");
+                    if (path_env) {
+                        std::istringstream path_stream(path_env);
+                        std::string path_dir;
+                        while (std::getline(path_stream, path_dir, ':')) {
+                            std::filesystem::path full_path = std::filesystem::path(path_dir) / bin_name;
+                            if (std::filesystem::exists(full_path) && !std::filesystem::is_directory(full_path)) {
+                                bin_found = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!bin_found) {
                     return false;  // 缺少必需的二进制文件
                 }
             }

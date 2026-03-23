@@ -2,6 +2,9 @@
 #include "hunterclaw/gateway/method_guard.h"
 #include "hunterclaw/core/utils.h"
 #include <nlohmann/json.hpp>
+#include <algorithm>
+#include <filesystem>
+#include <fstream>
 #include <set>
 #include <string>
 
@@ -267,17 +270,7 @@ core::Result<json> method_wake(
     std::string mode = params.value("mode", "next-heartbeat");
     std::string text = params.value("text", "");
 
-    // 🎯 OpenClaw 对齐: context.cron.wake({ mode, text })
-    // 对应 OpenClaw: const result = context.cron.wake({ mode: p.mode, text: p.text });
-    // TODO: 调用真实 cron service
-    // auto cron_svc = server->cron_service();
-    // if (cron_svc) { return core::Result<json>::Ok(cron_svc->wake({ mode, text })); }
-
-    // 返回 wake 结果 (对应 CronService.wake 返回值)
-    json result;
-    result["woke"] = (mode == "now");
-    result["mode"] = mode;
-    return core::Result<json>::Ok(result);
+    // \u2705 \u5bf9\u9f50 OpenClaw: context.cron.wake({ mode, text })\n    // \u5bf9\u5e94 OpenClaw: const result = context.cron.wake({ mode: p.mode, text: p.text });\n    auto cron_svc = server->cron_service();\n    if (cron_svc) {\n        auto wake_result = cron_svc->wake(mode, text);\n        json result;\n        result[\"woke\"] = wake_result.woke;\n        result[\"mode\"] = mode;\n        if (!wake_result.message.empty()) {\n            result[\"message\"] = wake_result.message;\n        }\n        return core::Result<json>::Ok(result);\n    }\n\n    // cron service \u672a\u521d\u59cb\u5316\uff0c\u8fd4\u56de\u9ed8\u8ba4\u7ed3\u679c\n    json result;\n    result[\"woke\"] = (mode == \"now\");\n    result[\"mode\"] = mode;\n    return core::Result<json>::Ok(result);
 }
 
 // ---------------------------------------------------------------------------
@@ -294,10 +287,16 @@ core::Result<json> method_cron_status(
     // 对应 OpenClaw: CronStatusParamsSchema = Type.Object({}, { additionalProperties: false })
     // 空参数对象，无需额外验证
 
-    // 🎯 OpenClaw 对齐: context.cron.status()
-    // TODO: 调用真实 cron service
-    // auto cron_svc = server->cron_service();
-    // return core::Result<json>::Ok(cron_svc->status());
+    // ✅ 对齐 OpenClaw: context.cron.status()
+    auto cron_svc = server->cron_service();
+    if (cron_svc) {
+        auto status = cron_svc->status();
+        json result;
+        result["running"] = status.running;
+        result["jobsTotal"] = status.jobs_total;
+        result["jobsEnabled"] = status.jobs_enabled;
+        return core::Result<json>::Ok(result);
+    }
 
     json result;
     result["running"] = false;
@@ -355,10 +354,25 @@ core::Result<json> method_cron_list(
         }
     }
 
-    // 🎯 OpenClaw 对齐: context.cron.listPage({ ... })
-    // TODO: 调用真实 cron service
-    // auto cron_svc = server->cron_service();
-    // return core::Result<json>::Ok(cron_svc->listPage({ ... }));
+    // ✅ 对齐 OpenClaw: context.cron.listPage({ ... })
+    auto cron_svc2 = server->cron_service();
+    if (cron_svc2) {
+        cron::CronListOptions opts;
+        opts.include_disabled = params.value("includeDisabled", false);
+        opts.limit = params.value("limit", 50);
+        opts.offset = params.value("offset", 0);
+        opts.query = params.value("query", std::string{});
+        opts.enabled_filter = params.value("enabled", std::string("all"));
+        opts.sort_by = params.value("sortBy", std::string("updatedAtMs"));
+        opts.sort_dir = params.value("sortDir", std::string("desc"));
+        auto page = cron_svc2->list_page(opts);
+        json result;
+        result["jobs"] = page.jobs;
+        result["total"] = page.total;
+        result["limit"] = opts.limit;
+        result["offset"] = opts.offset;
+        return core::Result<json>::Ok(result);
+    }
 
     json result;
     result["jobs"] = json::array();
@@ -378,10 +392,21 @@ core::Result<json> method_cron_add(
     const ClientContext& client_ctx,
     const json& params
 ) {
-    // 🎯 OpenClaw 对齐: normalizeCronJobCreate(params) 先 normalize 再 validate
-    // 对应 OpenClaw: const normalized = normalizeCronJobCreate(params) ?? params;
-    // TODO: 实现 normalizeCronJobCreate (处理 legacy 字段兼容)
-    const json& normalized = params;  // 暂时直接使用 params
+    // ✅ 对齐 OpenClaw: normalizeCronJobCreate(params)
+    // 处理 legacy 字段兼容: cronExpr -> schedule.cron, interval -> schedule.interval
+    json normalized = params;
+    if (!normalized.contains("schedule") && normalized.contains("cronExpr")) {
+        normalized["schedule"] = json::object();
+        normalized["schedule"]["kind"] = "cron";
+        normalized["schedule"]["cron"] = normalized["cronExpr"];
+        normalized.erase("cronExpr");
+    }
+    if (!normalized.contains("schedule") && normalized.contains("interval")) {
+        normalized["schedule"] = json::object();
+        normalized["schedule"]["kind"] = "interval";
+        normalized["schedule"]["interval"] = normalized["interval"];
+        normalized.erase("interval");
+    }
 
     // 🎯 OpenClaw 对齐: validateCronAddParams(normalized)
     // 对应 OpenClaw CronAddParamsSchema:
@@ -455,18 +480,41 @@ core::Result<json> method_cron_add(
         }
     }
 
-    // 🎯 OpenClaw 对齐: validateScheduleTimestamp(jobCreate.schedule)
-    // 对应 OpenClaw: const timestampValidation = validateScheduleTimestamp(jobCreate.schedule);
+    // ✅ 对齐 OpenClaw: validateScheduleTimestamp(jobCreate.schedule)
     // 对于 kind="at"，验证 at 字段是否是有效的时间戳/日期字符串
-    // TODO: 实现完整的 validateScheduleTimestamp
-    // if (!timestampValidation.ok) { return Err(timestampValidation.message); }
+    if (normalized.contains("schedule") && normalized["schedule"].is_object()) {
+        const auto& sched = normalized["schedule"];
+        if (sched.value("kind", "") == "at") {
+            if (!sched.contains("at") || sched["at"].is_null()) {
+                return core::Result<json>::Err("invalid cron.add params: schedule.at is required for kind='at'");
+            }
+            // 验证 at 是有效的 ISO 8601 日期字符串或毫秒时间戳
+            if (sched["at"].is_string()) {
+                const std::string& at_str = sched["at"].get<std::string>();
+                if (at_str.empty()) {
+                    return core::Result<json>::Err("invalid cron.add params: schedule.at must not be empty");
+                }
+                // 简单检查: 必须包含日期格式特征
+                bool looks_like_date = at_str.size() >= 10 &&
+                    at_str[4] == '-' && at_str[7] == '-';
+                if (!looks_like_date) {
+                    return core::Result<json>::Err("invalid cron.add params: schedule.at must be ISO 8601 date string");
+                }
+            } else if (!sched["at"].is_number_integer()) {
+                return core::Result<json>::Err("invalid cron.add params: schedule.at must be a string or integer timestamp");
+            }
+        }
+    }
 
-    // 🎯 OpenClaw 对齐: context.cron.add(jobCreate)
-    // TODO: 调用真实 cron service
-    // auto cron_svc = server->cron_service();
-    // auto job = cron_svc->add(jobCreate);
-    // context.logGateway.info("cron: job created", { jobId: job.id, schedule: jobCreate.schedule });
-    // return core::Result<json>::Ok(job);
+    // ✅ 对齐 OpenClaw: context.cron.add(jobCreate)
+    auto cron_svc3 = server->cron_service();
+    if (cron_svc3) {
+        auto add_result = cron_svc3->add(normalized);
+        if (add_result.is_err()) {
+            return core::Result<json>::Err(add_result.error);
+        }
+        return core::Result<json>::Ok(add_result.unwrap());
+    }
 
     // 构造返回的 CronJob 对象 (对应 OpenClaw CronJobSchema)
     std::string job_id = core::utils::generate_uuid();
@@ -521,25 +569,41 @@ core::Result<json> method_cron_update(
     const ClientContext& client_ctx,
     const json& params
 ) {
-    // 🎯 OpenClaw 对齐: normalizeCronJobPatch(params?.patch)
-    // 对应 OpenClaw: const normalizedPatch = normalizeCronJobPatch((params as { patch?: unknown } | null)?.patch);
-    // TODO: 实现 normalizeCronJobPatch
-    // const json& normalized_patch = params.contains("patch") ? params["patch"] : json::object();
+    // ✅ 对齐 OpenClaw: normalizeCronJobPatch(params?.patch)
+    // 处理 legacy 字段兼容: schedule.cron → schedule.expression, schedule.type → schedule.kind
+    json normalized_params = params;
+    if (normalized_params.contains("patch") && normalized_params["patch"].is_object()) {
+        auto& p = normalized_params["patch"];
+        if (p.contains("schedule") && p["schedule"].is_object()) {
+            auto& sched = p["schedule"];
+            // legacy: schedule.cron → schedule.expression
+            if (sched.contains("cron") && !sched.contains("expression")) {
+                sched["expression"] = sched["cron"];
+                sched.erase("cron");
+            }
+            // legacy: schedule.type → schedule.kind
+            if (sched.contains("type") && !sched.contains("kind")) {
+                sched["kind"] = sched["type"];
+                sched.erase("type");
+            }
+        }
+    }
+    const json& params_ref = normalized_params;
 
     // 🎯 OpenClaw 对齐: validateCronUpdateParams(candidate)
     // 对应 OpenClaw CronUpdateParamsSchema = cronIdOrJobIdParams({ patch: CronJobPatchSchema })
     // 即: { id: NonEmptyString, patch: CronJobPatchSchema } | { jobId: NonEmptyString, patch: CronJobPatchSchema }
-    bool has_id = params.contains("id") && params["id"].is_string() && !params["id"].get<std::string>().empty();
-    bool has_job_id = params.contains("jobId") && params["jobId"].is_string() && !params["jobId"].get<std::string>().empty();
+    bool has_id = params_ref.contains("id") && params_ref["id"].is_string() && !params_ref["id"].get<std::string>().empty();
+    bool has_job_id = params_ref.contains("jobId") && params_ref["jobId"].is_string() && !params_ref["jobId"].get<std::string>().empty();
     if (!has_id && !has_job_id) {
         return core::Result<json>::Err("invalid cron.update params: missing id");
     }
-    if (!params.contains("patch") || !params["patch"].is_object()) {
+    if (!params_ref.contains("patch") || !params_ref["patch"].is_object()) {
         return core::Result<json>::Err("invalid cron.update params: patch is required");
     }
 
-    std::string job_id = has_id ? params["id"].get<std::string>() : params["jobId"].get<std::string>();
-    const json& patch = params["patch"];
+    std::string job_id = has_id ? params_ref["id"].get<std::string>() : params_ref["jobId"].get<std::string>();
+    const json& patch = params_ref["patch"];
 
     // 验证 patch 字段 (对应 CronJobPatchSchema)
     // 对应 OpenClaw CronJobPatchSchema:
@@ -567,9 +631,24 @@ core::Result<json> method_cron_update(
         if (!validate_cron_schedule(patch["schedule"], schedule_err)) {
             return core::Result<json>::Err("invalid cron.update params: " + schedule_err);
         }
-        // 🎯 OpenClaw 对齐: validateScheduleTimestamp(patch.schedule)
-        // 对应 OpenClaw: if (patch.schedule) { const timestampValidation = validateScheduleTimestamp(patch.schedule); }
-        // TODO: 实现完整的 validateScheduleTimestamp
+    // ✅ 对齐 OpenClaw: validateScheduleTimestamp(patch.schedule)
+    if (patch.contains("schedule") && !patch["schedule"].is_null() && patch["schedule"].is_object()) {
+        const auto& sched = patch["schedule"];
+        if (sched.value("kind", "") == "at") {
+            if (!sched.contains("at") || sched["at"].is_null()) {
+                return core::Result<json>::Err("invalid cron.update params: patch.schedule.at is required for kind='at'");
+            }
+            if (sched["at"].is_string()) {
+                const std::string& at_str = sched["at"].get<std::string>();
+                bool looks_like_date = at_str.size() >= 10 && at_str[4] == '-' && at_str[7] == '-';
+                if (!looks_like_date) {
+                    return core::Result<json>::Err("invalid cron.update params: patch.schedule.at must be ISO 8601 date string");
+                }
+            } else if (!sched["at"].is_number_integer()) {
+                return core::Result<json>::Err("invalid cron.update params: patch.schedule.at must be a string or integer timestamp");
+            }
+        }
+    }
     }
     if (patch.contains("payload") && !patch["payload"].is_null()) {
         std::string payload_err;
@@ -610,13 +689,15 @@ core::Result<json> method_cron_update(
         }
     }
 
-    // 🎯 OpenClaw 对齐: context.cron.update(jobId, patch)
-    // 对应 OpenClaw: const job = await context.cron.update(jobId, patch);
-    // context.logGateway.info("cron: job updated", { jobId });
-    // TODO: 调用真实 cron service
-    // auto cron_svc = server->cron_service();
-    // auto job = cron_svc->update(job_id, patch);
-    // return core::Result<json>::Ok(job);
+    // ✅ 对齐 OpenClaw: context.cron.update(jobId, patch)
+    auto cron_svc4 = server->cron_service();
+    if (cron_svc4) {
+        auto update_result = cron_svc4->update(job_id, patch);
+        if (update_result.is_err()) {
+            return core::Result<json>::Err(update_result.error);
+        }
+        return core::Result<json>::Ok(update_result.unwrap());
+    }
 
     int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         core::utils::now().time_since_epoch()).count();
@@ -651,14 +732,15 @@ core::Result<json> method_cron_remove(
 
     std::string job_id = has_id ? params["id"].get<std::string>() : params["jobId"].get<std::string>();
 
-    // 🎯 OpenClaw 对齐: context.cron.remove(jobId)
-    // 对应 OpenClaw: const result = await context.cron.remove(jobId);
-    // if (result.removed) { context.logGateway.info("cron: job removed", { jobId }); }
-    // respond(true, result, undefined);
-    // TODO: 调用真实 cron service
-    // auto cron_svc = server->cron_service();
-    // auto result = cron_svc->remove(job_id);
-    // return core::Result<json>::Ok(result);
+    // ✅ 对齐 OpenClaw: context.cron.remove(jobId)
+    auto cron_svc5 = server->cron_service();
+    if (cron_svc5) {
+        auto remove_result = cron_svc5->remove(job_id);
+        if (remove_result.is_err()) {
+            return core::Result<json>::Err(remove_result.error);
+        }
+        return core::Result<json>::Ok(remove_result.unwrap());
+    }
 
     json result;
     result["removed"] = true;
@@ -694,13 +776,15 @@ core::Result<json> method_cron_run(
     // 🎯 OpenClaw 对齐: p.mode ?? "force"
     std::string mode = params.value("mode", "force");
 
-    // 🎯 OpenClaw 对齐: context.cron.enqueueRun(jobId, mode)
-    // 对应 OpenClaw: const result = await context.cron.enqueueRun(jobId, p.mode ?? "force");
-    // respond(true, result, undefined);
-    // TODO: 调用真实 cron service
-    // auto cron_svc = server->cron_service();
-    // auto result = cron_svc->enqueueRun(job_id, mode);
-    // return core::Result<json>::Ok(result);
+    // ✅ 对齐 OpenClaw: context.cron.enqueueRun(jobId, mode)
+    auto cron_svc6 = server->cron_service();
+    if (cron_svc6) {
+        auto run_result = cron_svc6->enqueue_run(job_id, mode);
+        if (run_result.is_err()) {
+            return core::Result<json>::Err(run_result.error);
+        }
+        return core::Result<json>::Ok(run_result.unwrap());
+    }
 
     json result;
     result["enqueued"] = true;
@@ -821,22 +905,56 @@ core::Result<json> method_cron_runs(
     int offset = params.value("offset", 0);
 
     if (scope == "all") {
-        // 🎯 OpenClaw 对齐: scope === "all" 时
-        // 对应 OpenClaw:
-        //   const jobs = await context.cron.list({ includeDisabled: true });
-        //   const jobNameById = Object.fromEntries(jobs.filter(...).map(job => [job.id, job.name]));
-        //   const page = await readCronRunLogEntriesPageAll({ storePath, ..., jobNameById });
-        // TODO: 调用真实 cron service 获取 jobs 列表，建立 jobNameById 映射
-        // auto cron_svc = server->cron_service();
-        // auto jobs = cron_svc->list({ includeDisabled: true });
-        // std::map<std::string, std::string> job_name_by_id;
-        // for (auto& job : jobs) { job_name_by_id[job.id] = job.name; }
-        // auto page = readCronRunLogEntriesPageAll({ storePath, limit, offset, ..., job_name_by_id });
-        // return core::Result<json>::Ok(page);
+        // ✅ 对齐 OpenClaw: scope === "all" 时建立 jobNameById 映射
+        std::map<std::string, std::string> job_name_by_id;
+        auto cron_svc_all = server->cron_service();
+        if (cron_svc_all) {
+            auto jobs_result = cron_svc_all->list(true /* includeDisabled */);
+            if (jobs_result.is_ok()) {
+                for (const auto& job : jobs_result.unwrap()) {
+                    if (!job.id.empty()) {
+                        job_name_by_id[job.id] = job.name;
+                    }
+                }
+            }
+        }
 
+        // ✅ 对齐 OpenClaw: readCronRunLogEntriesPageAll
+        // 从 store_path 下所有 job 的日志文件读取，合并分页
+        json all_entries = json::array();
+        if (!store_path.empty() && std::filesystem::exists(store_path)) {
+            try {
+                for (const auto& entry : std::filesystem::directory_iterator(store_path)) {
+                    if (!entry.is_regular_file()) continue;
+                    if (entry.path().extension() != ".jsonl") continue;
+                    std::string fid = entry.path().stem().string();
+                    std::string fname = job_name_by_id.count(fid) ? job_name_by_id[fid] : fid;
+                    std::ifstream f(entry.path());
+                    std::string line;
+                    while (std::getline(f, line)) {
+                        if (line.empty()) continue;
+                        try {
+                            json e = json::parse(line);
+                            e["jobId"] = fid;
+                            e["jobName"] = fname;
+                            all_entries.push_back(e);
+                        } catch (...) {}
+                    }
+                }
+            } catch (...) {}
+        }
+        // 按 ts 降序排序
+        std::sort(all_entries.begin(), all_entries.end(), [](const json& a, const json& b) {
+            return a.value("ts", 0LL) > b.value("ts", 0LL);
+        });
+        int total = (int)all_entries.size();
+        json page_entries = json::array();
+        for (int i = offset; i < std::min((int)all_entries.size(), offset + limit); ++i) {
+            page_entries.push_back(all_entries[i]);
+        }
         json result;
-        result["entries"] = json::array();
-        result["total"] = 0;
+        result["entries"] = page_entries;
+        result["total"] = total;
         result["limit"] = limit;
         result["offset"] = offset;
         return core::Result<json>::Ok(result);
@@ -852,10 +970,45 @@ core::Result<json> method_cron_runs(
         return core::Result<json>::Err("invalid cron.runs params: invalid id");
     }
 
-    // 🎯 OpenClaw 对齐: readCronRunLogEntriesPage(logPath, { limit, offset, jobId, statuses, ... })
-    // TODO: 调用真实 run log 读取
-    // auto page = readCronRunLogEntriesPage(logPath, { limit, offset, job_id, statuses, ... });
-    // return core::Result<json>::Ok(page);
+    // ✅ 对齐 OpenClaw: readCronRunLogEntriesPage(logPath, { limit, offset, jobId, statuses, ... })
+    // 从 JSONL 文件读取 cron run log 条目
+    std::string log_path = store_path + "/" + job_id + ".jsonl";
+    json all_entries = json::array();
+    if (std::filesystem::exists(log_path)) {
+        try {
+            std::ifstream f(log_path);
+            std::string line;
+            while (std::getline(f, line)) {
+                if (line.empty()) continue;
+                try {
+                    json e = json::parse(line);
+                    // 过滤 statuses
+                    if (!statuses.empty()) {
+                        std::string status = e.value("status", "");
+                        bool match = false;
+                        for (const auto& s : statuses) { if (s == status) { match = true; break; } }
+                        if (!match) continue;
+                    }
+                    all_entries.push_back(e);
+                } catch (...) {}
+            }
+        } catch (...) {}
+    }
+    // 按 ts 降序排序
+    std::sort(all_entries.begin(), all_entries.end(), [](const json& a, const json& b) {
+        return a.value("ts", 0LL) > b.value("ts", 0LL);
+    });
+    int total = (int)all_entries.size();
+    json page_entries = json::array();
+    for (int i = offset; i < std::min((int)all_entries.size(), offset + limit); ++i) {
+        page_entries.push_back(all_entries[i]);
+    }
+    json result;
+    result["entries"] = page_entries;
+    result["total"] = total;
+    result["limit"] = limit;
+    result["offset"] = offset;
+    return core::Result<json>::Ok(result);
 
     // CronRunLogEntry 结构 (对应 OpenClaw CronRunLogEntrySchema):
     // {

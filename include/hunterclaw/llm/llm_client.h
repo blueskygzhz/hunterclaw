@@ -216,9 +216,13 @@ public:
     void set_config(const LLMConfig& config) override { config_ = config; }
     
     int estimate_tokens(const std::string& text) const override;
+    
+    // ✅ 对齐 OpenClaw: 设置底层 Provider
+    void set_provider(std::shared_ptr<Provider> provider) { provider_ = provider; }
 
 private:
     LLMConfig config_;
+    std::shared_ptr<Provider> provider_;  // ✅ 底层 Provider 实现
     
     core::Result<std::string> send_request(const core::JsonValue& payload);
 };

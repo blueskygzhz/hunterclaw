@@ -7,6 +7,12 @@
 #include <functional>
 #include <string>
 #include <map>
+#include <unordered_map>
+#include <vector>
+#include <chrono>
+#include <mutex>
+#include <thread>
+#include <atomic>
 
 namespace httplib {
     class Server;
@@ -272,6 +278,10 @@ private:
     std::atomic<bool> running_{false};
     
     MiddlewareChain middleware_chain_;
+    
+    // ✅ 对齐 OpenClaw: hookAuthLimiter (20 failures / 60s)
+    mutable std::mutex auth_limiter_mutex_;
+    std::unordered_map<std::string, std::vector<std::chrono::steady_clock::time_point>> auth_failure_records_;
     
     // OpenAI API compatibility layer (initialized when LLM client is set)
     std::shared_ptr<http::OpenAICompat> openai_compat_;

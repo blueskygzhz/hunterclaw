@@ -224,11 +224,24 @@ core::Result<json> WebSearchTool::search_brave(
     }
     std::string api_key = api_key_env;
     
-    // 构建请求 URL (对齐 OpenClaw line 1812-1835)
+    // ✅ 对齐 OpenClaw: URL encode 查询字符串
+    auto url_encode = [](const std::string& s) -> std::string {
+        std::string result;
+        for (unsigned char c : s) {
+            if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+                result += c;
+            } else {
+                char buf[4];
+                snprintf(buf, sizeof(buf), "%%%02X", c);
+                result += buf;
+            }
+        }
+        return result;
+    };
     std::string url = BRAVE_SEARCH_ENDPOINT;
-    url += "?q=" + query;  // TODO: URL encode
+    url += "?q=" + url_encode(query);
     url += "&count=" + std::to_string(count);
-    url += "&country=" + country;
+    url += "&country=" + url_encode(country);
     
     if (!language.empty()) {
         url += "&search_lang=" + language;

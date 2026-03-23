@@ -5,7 +5,12 @@
 #include "hunterclaw/core/utils.h"
 #include <nlohmann/json.hpp>
 #include <chrono>
+#include <deque>
+#include <filesystem>
+#include <fstream>
 #include <set>
+
+namespace fs = std::filesystem;
 
 using json = nlohmann::json;
 
@@ -169,9 +174,17 @@ core::Result<json> method_channel_status(
 
     for (const auto& ch_id : known_channels) {
         channel_order.push_back(ch_id);
-        channel_labels[ch_id] = ch_id;  // TODO: 从 plugin.config.label 获取
-        channel_detail_labels[ch_id] = ch_id;
-        channel_meta[ch_id] = json{{"id", ch_id}};
+
+        // \u2705 \u5bf9\u9f50 OpenClaw: \u4ece plugin.config.label \u83b7\u53d6 channel label
+        // OpenClaw: plugin.config?.label ?? plugin.id
+        std::string label = ch_id;  // \u9ed8\u8ba4\u4f7f\u7528 channel id
+        auto plugin_opt = server->plugin_system() ? server->plugin_system()->get_plugin(ch_id) : std::nullopt;
+        if (plugin_opt && !plugin_opt->config.label.empty()) {
+            label = plugin_opt->config.label;
+        }
+        channel_labels[ch_id] = label;
+        channel_detail_labels[ch_id] = label;
+        channel_meta[ch_id] = json{{"id", ch_id}, {"label", label}};
     }
 
     // 🎯 OpenClaw 对齐: channels / channelAccounts / channelDefaultAccountId
@@ -441,8 +454,34 @@ core::Result<json> method_channel_logs(
     result["channel"] = channel_filter;
     result["lines"] = lines;
     
-    // TODO: 从日志文件读取最后 N 行
+    // ✅ 对齐 OpenClaw: 从日志文件读取最后 N 行
     // 日志格式: [timestamp] [level] [subsystem] message
+    {
+        auto cfg = server->config();
+        std::string log_dir = cfg ? (cfg->workspace_dir + "/logs") : "./logs";
+        std::string log_file = log_dir + "/gateway.log";
+        if (!channel_filter.empty()) {
+            log_file = log_dir + "/channel-" + channel_filter + ".log";
+        }
+
+        if (fs::exists(log_file)) {
+            std::ifstream f(log_file);
+            if (f.is_open()) {
+                // 读取所有行，只保留最后 N 行
+                std::deque<std::string> log_lines;
+                std::string line;
+                while (std::getline(f, line)) {
+                    log_lines.push_back(line);
+                    if ((int)log_lines.size() > lines) {
+                        log_lines.pop_front();
+                    }
+                }
+                for (const auto& l : log_lines) {
+                    result["logs"].push_back(l);
+                }
+            }
+        }
+    }
     
     return core::Result<json>::Ok(result);
 }
@@ -643,11 +682,17 @@ core::Result<json> method_channel_send(
         }
     }
 
-    // TODO: 实现消息发送
-    // auto channel_mgr = server->channel_manager();
-    // auto send_result = channel_mgr->deliver_message(channel_id, account_id, to, content);
-    bool send_ok = false;  // placeholder
-    std::string send_error = "channel.send not implemented yet";
+    // ✅ 对齐 OpenClaw: 通过 channel_manager 发送消息
+    auto channel_mgr = server->channel_manager();
+    bool send_ok = false;
+    std::string send_error;
+    if (channel_mgr) {
+        auto send_result = channel_mgr->deliver_message(channel_id, account_id, to, content);
+        send_ok = !send_result.is_err();
+        if (!send_ok) send_error = send_result.error;
+    } else {
+        send_error = "channel manager not available";
+    }
 
     // =========================================================================
     // Hook: message_sent

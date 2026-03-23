@@ -16,6 +16,8 @@
 #include <thread>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
+#include "hunterclaw/llm/llm_client.h"
 
 using json = nlohmann::json;
 
@@ -110,10 +112,21 @@ core::Result<json> method_chat_send(
     
     if (is_stop_command(message)) {
         get_logger()->info("[chat.send] Stop command detected: session={}", session_id);
-        
-        // TODO: 调用 abort_chat_run(session_id)
-        // 当前返回确认
-        
+
+        // ✅ 对齐 OpenClaw: abort_chat_run(session_id)
+        // 通过 AgentPool 获取 Agent，调用 ReactEngine::cancel() 中止当前运行
+        auto agent_pool_for_abort = server->agent_pool();
+        if (agent_pool_for_abort) {
+            auto agent_for_abort = agent_pool_for_abort->get_agent(session_id);
+            if (agent_for_abort) {
+                auto re = agent_for_abort->react_engine();
+                if (re) {
+                    re->cancel();
+                    get_logger()->info("[chat.send] Aborted running agent via stop command: session={}", session_id);
+                }
+            }
+        }
+
         json result;
         result["ok"] = true;
         result["stopped"] = true;
@@ -404,7 +417,14 @@ core::Result<json> method_chat_send(
                 queue::CommandLane::Main,
                 std::function<void()>([react_engine, message, callbacks, run_id, session_id, transcript_path]() {
                     try {
-                        auto result = react_engine->run(message, {}, callbacks);
+                        // ✅ 对齐 OpenClaw: 从 transcript 加载历史消息
+                        // OpenClaw: transcriptIO.load(sessionKey) → messages[] → 传给 ReactEngine::run()
+                        auto history = sessions::read_transcript_messages(transcript_path, 200);
+                        // 去掉最后一条（刚写入的用户消息），避免 ReactEngine 重复添加
+                        if (!history.empty() && history.back().role == llm::LLMMessageRole::User) {
+                            history.pop_back();
+                        }
+                        auto result = react_engine->run(message, history, callbacks);
 
                         // 写入 assistant 消息到 Transcript (对齐 OpenClaw)
                         sessions::AppendTranscriptOptions opts;
@@ -547,11 +567,13 @@ core::Result<json> method_chat_abort(
     bool aborted = false;
     std::vector<std::string> aborted_runs;
     
-    // ReactEngine 只支持 cancel() 当前执行，没有 run_id 管理
-    // TODO: 实现基于 run_id 的 abort 功能
+    // ✅ 对齐 OpenClaw: abort_chat_run
+    // ReactEngine::cancel() 中止当前正在执行的 run
+    // OpenClaw 通过 AbortController 实现 run_id 级别的中止
+    // HunterClaw: cancel() 中止当前 session 的所有活跃 run（session 级别）
     react_engine->cancel();
     aborted = true;
-    
+
     if (run_id.empty()) {
         aborted_runs.push_back("all");
     } else {
@@ -807,11 +829,49 @@ core::Result<json> method_chat_update_params(
         return core::Result<json>::Err("Missing required parameter: session_id");
     }
 
-    // TODO: Update session parameters via session manager
+    // ✅ 对齐 OpenClaw: updateSessionParams
+    // OpenClaw 将 thinkingLevel/fastMode/verboseLevel 等参数写入 session store
+    // HunterClaw: 通过 AgentPool 获取 Agent，更新其运行时配置
+    auto agent_pool_up = server->agent_pool();
+    bool updated = false;
+    if (agent_pool_up) {
+        auto agent_up = agent_pool_up->get_agent(session_id);
+        if (agent_up) {
+            // 更新 ReactEngine 配置（如 max_steps、reasoning_mode 等）
+            auto re = agent_up->react_engine();
+            if (re) {
+                react::ReactConfig new_cfg = re->config();
+
+                // thinkingLevel → reasoning_mode
+                if (params.contains("thinkingLevel")) {
+                    std::string level = params["thinkingLevel"];
+                    if (level == "none" || level == "off") {
+                        new_cfg.reasoning_mode = react::ReactConfig::ReasoningMode::Off;
+                    } else if (level == "low") {
+                        new_cfg.reasoning_mode = react::ReactConfig::ReasoningMode::Low;
+                    } else if (level == "high" || level == "max") {
+                        new_cfg.reasoning_mode = react::ReactConfig::ReasoningMode::High;
+                    } else {
+                        new_cfg.reasoning_mode = react::ReactConfig::ReasoningMode::Auto;
+                    }
+                }
+
+                // maxSteps
+                if (params.contains("maxSteps") && params["maxSteps"].is_number()) {
+                    new_cfg.max_steps = params["maxSteps"].get<int>();
+                }
+
+                re->update_config(new_cfg);
+                updated = true;
+                get_logger()->info("[chat.update_params] Updated agent config: session={}", session_id);
+            }
+        }
+    }
+
     json result;
     result["ok"] = true;
     result["session_id"] = session_id;
-    result["updated"] = true;
+    result["updated"] = updated;
 
     return core::Result<json>::Ok(result);
 }
@@ -838,10 +898,71 @@ core::Result<json> method_chat_regenerate(
         return core::Result<json>::Err("AgentPool not initialized");
     }
 
-    // TODO: Trigger regeneration via agent
+    // ✅ 对齐 OpenClaw: regenerate
+    // OpenClaw: 删除最后一条 assistant 消息，重新触发 agent run
+    // 1. 获取 Agent
+    auto agent_regen = agent_pool->get_agent(session_id);
+    if (!agent_regen) {
+        return core::Result<json>::Err("No active agent for session: " + session_id);
+    }
+
+    // 2. 读取 transcript，找到最后一条 user 消息
+    std::string sessions_dir_regen = std::filesystem::path(agent_regen->context().workspace_dir).parent_path() / "sessions";
+    std::string transcript_path_regen = sessions::resolve_transcript_path(
+        session_id, agent_regen->context().agent_id, sessions_dir_regen
+    );
+
+    auto messages_regen = sessions::read_transcript_messages(transcript_path_regen, 10);
+    std::string last_user_message;
+    for (auto it = messages_regen.rbegin(); it != messages_regen.rend(); ++it) {
+        if (it->role == llm::LLMMessageRole::User) {
+            last_user_message = it->content;
+            break;
+        }
+    }
+
+    if (last_user_message.empty()) {
+        return core::Result<json>::Err("No user message found to regenerate");
+    }
+
+    // 3. 生成新的 run_id
+    std::string regen_run_id = generate_run_id();
+
+    // 4. 通过 session lane 重新触发 agent run（对齐 OpenClaw 双层 lane）
+    auto& cmd_queue_regen = queue::CommandQueue::Instance();
+    std::string session_lane_regen = queue::ResolveSessionLane(session_id);
+    auto re_regen = agent_regen->react_engine();
+
+    cmd_queue_regen.enqueue_command_in_lane(
+        session_lane_regen,
+        std::function<void()>([&cmd_queue_regen, re_regen, last_user_message, regen_run_id, session_id, transcript_path_regen]() {
+            auto global_future = cmd_queue_regen.enqueue_command_in_lane(
+                queue::CommandLane::Main,
+                std::function<void()>([re_regen, last_user_message, regen_run_id, session_id, transcript_path_regen]() {
+                    react::StreamCallbacks cb;
+                    cb.session_id = session_id;
+                    cb.transcript_path = transcript_path_regen;
+                    try {
+                        auto result = re_regen->run(last_user_message, {}, cb);
+                        sessions::AppendTranscriptOptions opts;
+                        opts.message = result.final_response;
+                        opts.create_if_missing = false;
+                        sessions::append_assistant_message_to_transcript(transcript_path_regen, opts);
+                    } catch (const std::exception& e) {
+                        spdlog::get("chat")->error("[chat.regenerate] Exception: session={}, error={}", session_id, e.what());
+                    }
+                }),
+                queue::EnqueueOptions{.label = "chat.regenerate:" + session_id + ":" + regen_run_id, .urgent = false}
+            );
+            try { global_future.get(); } catch (...) {}
+        }),
+        queue::EnqueueOptions{.label = "session:regen:" + session_id, .urgent = false}
+    );
+
     json result;
     result["ok"] = true;
     result["session_id"] = session_id;
+    result["run_id"] = regen_run_id;
     result["status"] = "regenerating";
 
     return core::Result<json>::Ok(result);
@@ -871,7 +992,47 @@ core::Result<json> method_chat_fork(
     ).count();
     std::string forked_key = session_id + ":fork:" + std::to_string(ts);
 
-    // TODO: Actually fork the session transcript
+    // ✅ 对齐 OpenClaw: fork session
+    // OpenClaw: 复制 transcript 文件到新 session，创建新 Agent 实例
+    auto agent_pool_fork = server->agent_pool();
+    if (!agent_pool_fork) {
+        return core::Result<json>::Err("AgentPool not initialized");
+    }
+
+    auto agent_fork = agent_pool_fork->get_agent(session_id);
+    if (!agent_fork) {
+        return core::Result<json>::Err("No active agent for session: " + session_id);
+    }
+
+    // 1. 解析源 transcript 路径
+    std::string sessions_dir_fork = std::filesystem::path(agent_fork->context().workspace_dir).parent_path() / "sessions";
+    std::string src_transcript = sessions::resolve_transcript_path(
+        session_id, agent_fork->context().agent_id, sessions_dir_fork
+    );
+
+    // 2. 创建新 Agent（forked session）
+    auto forked_agent = agent_pool_fork->get_or_create_agent(forked_key, agent_fork->context().agent_id);
+    if (!forked_agent) {
+        return core::Result<json>::Err("Failed to create forked agent");
+    }
+
+    // 3. 复制 transcript 文件
+    std::string sessions_dir_forked = std::filesystem::path(forked_agent->context().workspace_dir).parent_path() / "sessions";
+    std::string dst_transcript = sessions::resolve_transcript_path(
+        forked_key, forked_agent->context().agent_id, sessions_dir_forked
+    );
+
+    try {
+        if (std::filesystem::exists(src_transcript)) {
+            std::filesystem::create_directories(std::filesystem::path(dst_transcript).parent_path());
+            std::filesystem::copy_file(src_transcript, dst_transcript,
+                std::filesystem::copy_options::overwrite_existing);
+            get_logger()->info("[chat.fork] Transcript copied: {} -> {}", src_transcript, dst_transcript);
+        }
+    } catch (const std::exception& e) {
+        get_logger()->warn("[chat.fork] Failed to copy transcript: {}", e.what());
+        // 不中止，允许空 fork
+    }
 
     json result;
     result["ok"] = true;
@@ -903,13 +1064,62 @@ core::Result<json> method_chat_summarize(
         return core::Result<json>::Err("AgentPool not initialized");
     }
 
-    // TODO: Trigger summarization via agent/LLM
+    // ✅ 对齐 OpenClaw: summarize session
+    // OpenClaw: 读取 transcript，通过 LLM 生成摘要，写入 session store
+    auto agent_sum = agent_pool->get_agent(session_id);
+    if (!agent_sum) {
+        json result;
+        result["ok"] = true;
+        result["session_id"] = session_id;
+        result["summary"] = "";
+        result["status"] = "no_agent";
+        return core::Result<json>::Ok(result);
+    }
+
+    // 读取最近消息
+    std::string sessions_dir_sum = std::filesystem::path(agent_sum->context().workspace_dir).parent_path() / "sessions";
+    std::string transcript_path_sum = sessions::resolve_transcript_path(
+        session_id, agent_sum->context().agent_id, sessions_dir_sum
+    );
+    auto messages_sum = sessions::read_transcript_messages(transcript_path_sum, 50);
+
+    // 构建摘要 prompt（对齐 OpenClaw compaction 逻辑）
+    std::string conversation_text;
+    for (const auto& msg : messages_sum) {
+        std::string role_str;
+        switch (msg.role) {
+            case llm::LLMMessageRole::User:      role_str = "User"; break;
+            case llm::LLMMessageRole::Assistant: role_str = "Assistant"; break;
+            default: continue;
+        }
+        conversation_text += role_str + ": " + msg.content + "\n";
+    }
+
+    // 通过 ReactEngine 生成摘要（单轮，无工具）
+    std::string summary;
+    auto re_sum = agent_sum->react_engine();
+    if (re_sum && !conversation_text.empty()) {
+        std::string summarize_prompt =
+            "Please provide a concise summary of the following conversation in 2-3 sentences:\n\n" +
+            conversation_text;
+        try {
+            react::StreamCallbacks sum_cb;
+            sum_cb.session_id = session_id;
+            auto sum_result = re_sum->run(summarize_prompt, {}, sum_cb);
+            if (sum_result.success) {
+                summary = sum_result.final_response;
+            }
+        } catch (const std::exception& e) {
+            get_logger()->warn("[chat.summarize] LLM summarization failed: {}", e.what());
+        }
+    }
 
     json result;
     result["ok"] = true;
     result["session_id"] = session_id;
-    result["summary"] = "";  // Placeholder
-    result["status"] = "not_implemented";
+    result["summary"] = summary;
+    result["status"] = summary.empty() ? "empty" : "ok";
+    result["message_count"] = static_cast<int>(messages_sum.size());
 
     return core::Result<json>::Ok(result);
 }
@@ -935,13 +1145,71 @@ core::Result<json> method_chat_edit(
         return core::Result<json>::Err("Missing required parameters: session_id, message_id");
     }
 
-    // TODO: Edit message in session transcript
+    // ✅ 对齐 OpenClaw: edit message in transcript
+    // OpenClaw: 读取 JSONL，找到对应 message_id，替换 content，写回
+    auto agent_pool_edit = server->agent_pool();
+    if (!agent_pool_edit) {
+        return core::Result<json>::Err("AgentPool not initialized");
+    }
+
+    auto agent_edit = agent_pool_edit->get_agent(session_id);
+    if (!agent_edit) {
+        return core::Result<json>::Err("No active agent for session: " + session_id);
+    }
+
+    std::string sessions_dir_edit = std::filesystem::path(agent_edit->context().workspace_dir).parent_path() / "sessions";
+    std::string transcript_path_edit = sessions::resolve_transcript_path(
+        session_id, agent_edit->context().agent_id, sessions_dir_edit
+    );
+
+    // 读取 JSONL 文件，逐行处理
+    bool edited = false;
+    if (std::filesystem::exists(transcript_path_edit)) {
+        std::ifstream in_file(transcript_path_edit);
+        std::vector<std::string> lines;
+        std::string line;
+        while (std::getline(in_file, line)) {
+            if (!line.empty()) {
+                try {
+                    auto entry = json::parse(line);
+                    // 匹配 message_id（对齐 OpenClaw transcript 格式）
+                    if (entry.value("id", "") == message_id ||
+                        entry.value("messageId", "") == message_id) {
+                        // 更新 content
+                        if (entry.contains("content") && entry["content"].is_array()) {
+                            entry["content"] = json::array({{"type", "text"}, {"text", new_content}});
+                        } else {
+                            entry["content"] = new_content;
+                        }
+                        entry["edited"] = true;
+                        entry["edited_at"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
+                        edited = true;
+                        lines.push_back(entry.dump());
+                    } else {
+                        lines.push_back(line);
+                    }
+                } catch (...) {
+                    lines.push_back(line);
+                }
+            }
+        }
+        in_file.close();
+
+        if (edited) {
+            // 写回文件
+            std::ofstream out_file(transcript_path_edit, std::ios::trunc);
+            for (const auto& l : lines) {
+                out_file << l << "\n";
+            }
+        }
+    }
 
     json result;
     result["ok"] = true;
     result["session_id"] = session_id;
     result["message_id"] = message_id;
-    result["edited"] = true;
+    result["edited"] = edited;
 
     return core::Result<json>::Ok(result);
 }
@@ -966,13 +1234,58 @@ core::Result<json> method_chat_delete(
         return core::Result<json>::Err("Missing required parameters: session_id, message_id");
     }
 
-    // TODO: Delete message from session transcript
+    // ✅ 对齐 OpenClaw: delete message from transcript
+    // OpenClaw: 读取 JSONL，过滤掉对应 message_id 的行，写回
+    auto agent_pool_del = server->agent_pool();
+    if (!agent_pool_del) {
+        return core::Result<json>::Err("AgentPool not initialized");
+    }
+
+    auto agent_del = agent_pool_del->get_agent(session_id);
+    if (!agent_del) {
+        return core::Result<json>::Err("No active agent for session: " + session_id);
+    }
+
+    std::string sessions_dir_del = std::filesystem::path(agent_del->context().workspace_dir).parent_path() / "sessions";
+    std::string transcript_path_del = sessions::resolve_transcript_path(
+        session_id, agent_del->context().agent_id, sessions_dir_del
+    );
+
+    bool deleted = false;
+    if (std::filesystem::exists(transcript_path_del)) {
+        std::ifstream in_file(transcript_path_del);
+        std::vector<std::string> lines;
+        std::string line;
+        while (std::getline(in_file, line)) {
+            if (!line.empty()) {
+                try {
+                    auto entry = json::parse(line);
+                    if (entry.value("id", "") == message_id ||
+                        entry.value("messageId", "") == message_id) {
+                        deleted = true;  // 跳过此行（删除）
+                    } else {
+                        lines.push_back(line);
+                    }
+                } catch (...) {
+                    lines.push_back(line);
+                }
+            }
+        }
+        in_file.close();
+
+        if (deleted) {
+            std::ofstream out_file(transcript_path_del, std::ios::trunc);
+            for (const auto& l : lines) {
+                out_file << l << "\n";
+            }
+        }
+    }
 
     json result;
     result["ok"] = true;
     result["session_id"] = session_id;
     result["message_id"] = message_id;
-    result["deleted"] = true;
+    result["deleted"] = deleted;
 
     return core::Result<json>::Ok(result);
 }
@@ -1003,7 +1316,35 @@ core::Result<json> method_chat_transcript(
     json messages = json::array();
 
     if (agent_pool) {
-        // TODO: Get transcript from agent's session
+        // ✅ 对齐 OpenClaw: 从 transcript 读取消息
+        auto agent_tr = agent_pool->get_agent(session_id);
+        if (agent_tr) {
+            std::string sessions_dir_tr = std::filesystem::path(agent_tr->context().workspace_dir).parent_path() / "sessions";
+            std::string transcript_path_tr = sessions::resolve_transcript_path(
+                session_id, agent_tr->context().agent_id, sessions_dir_tr
+            );
+
+            // 读取 JSONL，转换为 JSON 数组（带 offset/limit 分页）
+            if (std::filesystem::exists(transcript_path_tr)) {
+                std::ifstream in_file(transcript_path_tr);
+                std::vector<json> all_entries;
+                std::string line;
+                while (std::getline(in_file, line)) {
+                    if (!line.empty()) {
+                        try {
+                            all_entries.push_back(json::parse(line));
+                        } catch (...) {}
+                    }
+                }
+
+                // 应用 offset/limit
+                int start = std::min(offset, static_cast<int>(all_entries.size()));
+                int end = std::min(start + limit, static_cast<int>(all_entries.size()));
+                for (int i = start; i < end; ++i) {
+                    messages.push_back(all_entries[i]);
+                }
+            }
+        }
     }
 
     json result;
@@ -1038,7 +1379,58 @@ core::Result<json> method_chat_export(
     json messages = json::array();
 
     if (agent_pool) {
-        // TODO: Get transcript from agent's session
+        // ✅ 对齐 OpenClaw: 从 transcript 读取并按格式导出
+        auto agent_exp = agent_pool->get_agent(session_id);
+        if (agent_exp) {
+            std::string sessions_dir_exp = std::filesystem::path(agent_exp->context().workspace_dir).parent_path() / "sessions";
+            std::string transcript_path_exp = sessions::resolve_transcript_path(
+                session_id, agent_exp->context().agent_id, sessions_dir_exp
+            );
+
+            auto msgs = sessions::read_transcript_messages(transcript_path_exp, 1000);
+
+            if (format == "markdown") {
+                // Markdown 格式导出
+                std::string md;
+                for (const auto& msg : msgs) {
+                    std::string role_str;
+                    switch (msg.role) {
+                        case llm::LLMMessageRole::User:      role_str = "**User**"; break;
+                        case llm::LLMMessageRole::Assistant: role_str = "**Assistant**"; break;
+                        default: continue;
+                    }
+                    md += role_str + "\n\n" + msg.content + "\n\n---\n\n";
+                }
+                messages = md;
+            } else if (format == "text") {
+                // 纯文本格式
+                std::string txt;
+                for (const auto& msg : msgs) {
+                    std::string role_str;
+                    switch (msg.role) {
+                        case llm::LLMMessageRole::User:      role_str = "User"; break;
+                        case llm::LLMMessageRole::Assistant: role_str = "Assistant"; break;
+                        default: continue;
+                    }
+                    txt += role_str + ": " + msg.content + "\n";
+                }
+                messages = txt;
+            } else {
+                // JSON 格式（默认）
+                json msgs_array = json::array();
+                for (const auto& msg : msgs) {
+                    json m;
+                    switch (msg.role) {
+                        case llm::LLMMessageRole::User:      m["role"] = "user"; break;
+                        case llm::LLMMessageRole::Assistant: m["role"] = "assistant"; break;
+                        default: m["role"] = "system"; break;
+                    }
+                    m["content"] = msg.content;
+                    msgs_array.push_back(m);
+                }
+                messages = msgs_array;
+            }
+        }
     }
 
     json result;
@@ -1046,7 +1438,7 @@ core::Result<json> method_chat_export(
     result["session_id"] = session_id;
     result["format"] = format;
     result["data"] = messages;
-    result["count"] = messages.size();
+    result["count"] = messages.is_array() ? messages.size() : 0;
 
     return core::Result<json>::Ok(result);
 }

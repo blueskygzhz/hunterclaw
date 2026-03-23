@@ -271,7 +271,7 @@ void GatewayCronIntegration::set_context(
 
 nlohmann::json GatewayCronIntegration::job_to_json(const CronJob& job) {
     nlohmann::json j;
-    // TODO: Implement proper JSON serialization for CronJob
+    // ✅ 对齐 OpenClaw: 完整的 CronJob JSON 序列化
     j["id"] = job.id;
     j["name"] = job.name;
     j["enabled"] = job.enabled;
@@ -279,6 +279,29 @@ nlohmann::json GatewayCronIntegration::job_to_json(const CronJob& job) {
     j["wakeMode"] = job.wake_mode;
     j["createdAtMs"] = job.created_at_ms;
     j["updatedAtMs"] = job.updated_at_ms;
+    // schedule
+    nlohmann::json schedule;
+    switch (job.schedule.kind) {
+        case CronSchedule::Kind::AT:   schedule["kind"] = "at"; schedule["at"] = job.schedule.at; break;
+        case CronSchedule::Kind::EVERY: schedule["kind"] = "every"; schedule["everyMs"] = job.schedule.every_ms; break;
+        case CronSchedule::Kind::CRON:  schedule["kind"] = "cron"; schedule["expr"] = job.schedule.expr; break;
+    }
+    j["schedule"] = schedule;
+    // payload
+    nlohmann::json payload;
+    payload["kind"] = (job.payload.kind == CronPayload::Kind::AGENT_TURN) ? "agent-turn" : "system-event";
+    payload["text"] = job.payload.text;
+    j["payload"] = payload;
+    // delivery
+    nlohmann::json delivery;
+    switch (job.delivery.mode) {
+        case CronDeliveryMode::NONE:     delivery["mode"] = "none"; break;
+        case CronDeliveryMode::ANNOUNCE: delivery["mode"] = "announce"; break;
+        case CronDeliveryMode::WEBHOOK:  delivery["mode"] = "webhook"; break;
+    }
+    if (job.delivery.channel) delivery["channel"] = *job.delivery.channel;
+    if (job.delivery.to) delivery["to"] = *job.delivery.to;
+    j["delivery"] = delivery;
     return j;
 }
 
@@ -299,9 +322,37 @@ CronJobCreate GatewayCronIntegration::json_to_job_create(const nlohmann::json& j
         job_create.wake_mode = j["wakeMode"].get<std::string>();
     }
     
-    // TODO: Parse schedule, payload, delivery from JSON
-    
-    return job_create;
+    // ✅ 对齐 OpenClaw: 解析 schedule, payload, delivery
+    if (j.contains("schedule")) {
+        const auto& s = j["schedule"];
+        std::string kind = s.value("kind", "cron");
+        if (kind == "at") {
+            job_create.schedule.kind = CronSchedule::Kind::AT;
+            job_create.schedule.at = s.value("at", "");
+        } else if (kind == "every") {
+            job_create.schedule.kind = CronSchedule::Kind::EVERY;
+            job_create.schedule.every_ms = s.value("everyMs", 0LL);
+        } else {
+            job_create.schedule.kind = CronSchedule::Kind::CRON;
+            job_create.schedule.expr = s.value("expr", "");
+            if (s.contains("tz")) job_create.schedule.tz = s["tz"].get<std::string>();
+        }
+    }
+    if (j.contains("payload")) {
+        const auto& p = j["payload"];
+        std::string kind = p.value("kind", "agent-turn");
+        job_create.payload.kind = (kind == "system-event") ? CronPayload::Kind::SYSTEM_EVENT : CronPayload::Kind::AGENT_TURN;
+        job_create.payload.text = p.value("text", "");
+    }
+    if (j.contains("delivery")) {
+        const auto& d = j["delivery"];
+        std::string mode = d.value("mode", "none");
+        if (mode == "announce") job_create.delivery.mode = CronDeliveryMode::ANNOUNCE;
+        else if (mode == "webhook") job_create.delivery.mode = CronDeliveryMode::WEBHOOK;
+        else job_create.delivery.mode = CronDeliveryMode::NONE;
+        if (d.contains("channel")) job_create.delivery.channel = d["channel"].get<std::string>();
+        if (d.contains("to")) job_create.delivery.to = d["to"].get<std::string>();
+    }
 }
 
 CronJobPatch GatewayCronIntegration::json_to_job_patch(const nlohmann::json& j) {
@@ -315,9 +366,41 @@ CronJobPatch GatewayCronIntegration::json_to_job_patch(const nlohmann::json& j) 
         patch.enabled = j["enabled"].get<bool>();
     }
     
-    // TODO: Parse schedule, payload, delivery from JSON
-    
-    return patch;
+    // ✅ 对齐 OpenClaw: 解析 schedule, payload, delivery
+    if (j.contains("schedule")) {
+        const auto& s = j["schedule"];
+        CronSchedule sched;
+        std::string kind = s.value("kind", "cron");
+        if (kind == "at") {
+            sched.kind = CronSchedule::Kind::AT;
+            sched.at = s.value("at", "");
+        } else if (kind == "every") {
+            sched.kind = CronSchedule::Kind::EVERY;
+            sched.every_ms = s.value("everyMs", 0LL);
+        } else {
+            sched.kind = CronSchedule::Kind::CRON;
+            sched.expr = s.value("expr", "");
+        }
+        patch.schedule = sched;
+    }
+    if (j.contains("payload")) {
+        const auto& p = j["payload"];
+        CronPayload payload;
+        std::string kind = p.value("kind", "agent-turn");
+        payload.kind = (kind == "system-event") ? CronPayload::Kind::SYSTEM_EVENT : CronPayload::Kind::AGENT_TURN;
+        payload.text = p.value("text", "");
+        patch.payload = payload;
+    }
+    if (j.contains("delivery")) {
+        const auto& d = j["delivery"];
+        CronDelivery delivery;
+        std::string mode = d.value("mode", "none");
+        if (mode == "announce") delivery.mode = CronDeliveryMode::ANNOUNCE;
+        else if (mode == "webhook") delivery.mode = CronDeliveryMode::WEBHOOK;
+        if (d.contains("channel")) delivery.channel = d["channel"].get<std::string>();
+        if (d.contains("to")) delivery.to = d["to"].get<std::string>();
+        patch.delivery = delivery;
+    }
 }
 
 } // namespace cron

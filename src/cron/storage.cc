@@ -275,11 +275,31 @@ json CronStorage::serialize_job(const Job& job) {
     // Wake mode
     j["wake_mode"] = static_cast<int>(job.wake_mode);
     
-    // Payload - TODO: implement payload serialization
+    // ✅ 对齐 OpenClaw: 实现 payload 序列化
+    {
+        json payload;
+        payload["kind"] = (job.payload.kind == Payload::Kind::AgentTurn) ? "agent-turn" : "system-event";
+        payload["message"] = job.payload.message;
+        if (job.payload.model) payload["model"] = *job.payload.model;
+        if (job.payload.thinking) payload["thinking"] = *job.payload.thinking;
+        if (job.payload.timeout_seconds) payload["timeoutSeconds"] = *job.payload.timeout_seconds;
+        j["payload"] = payload;
+    }
     
-    // Delivery
+    // ✅ 对齐 OpenClaw: 实现 delivery 序列化
     if (job.delivery.has_value()) {
-        // TODO: implement delivery serialization
+        const auto& d = *job.delivery;
+        json delivery;
+        switch (d.mode) {
+            case DeliveryMode::None:     delivery["mode"] = "none"; break;
+            case DeliveryMode::Announce: delivery["mode"] = "announce"; break;
+            case DeliveryMode::Webhook:  delivery["mode"] = "webhook"; break;
+        }
+        if (d.channel) delivery["channel"] = *d.channel;
+        if (d.to) delivery["to"] = *d.to;
+        if (d.account_id) delivery["accountId"] = *d.account_id;
+        if (d.webhook_url) delivery["webhookUrl"] = *d.webhook_url;
+        j["delivery"] = delivery;
     }
     
     // Metadata

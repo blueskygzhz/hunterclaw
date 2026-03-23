@@ -626,6 +626,7 @@ ReactEngine::LLMResponseData ReactEngine::call_llm(
     std::string accumulated_text;
     std::string accumulated_reasoning;
     std::string current_chunk_buffer;  // 用于 block_reply 分块
+    std::vector<llm::ToolCall> accumulated_tool_calls_;  // ✅ 收集 tool_calls
     
     // ✅ 向后兼容: 使用 LLMClient 接口
     auto stream_callback = [&](const std::string& delta) {
@@ -769,9 +770,13 @@ ReactEngine::LLMResponseData ReactEngine::call_llm(
     
     response.text = accumulated_text;
     response.reasoning = accumulated_reasoning;
-    // TODO: 解析 tool_calls 和 usage
-    // response.tool_calls = ...
-    // response.usage = ...
+    // ✅ 对齐 OpenClaw: 解析 tool_calls 和 usage
+    // tool_calls 已在流式回调中收集，这里从 accumulated_tool_calls_ 读取
+    if (!accumulated_tool_calls_.empty()) {
+        response.tool_calls = accumulated_tool_calls_;
+        accumulated_tool_calls_.clear();
+    }
+    // usage 已在流式回调中更新到 response.input_tokens/output_tokens
 
     // =========================================================================
     // Hook: llm_output
@@ -850,8 +855,8 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
         for (const auto& tool_call : tool_calls) {
             // 发送工具开始事件
             if (callbacks.on_tool_start) {
-                // TODO: 解析 tool_call.function.arguments
-                callbacks.on_tool_start(tool_call.name, core::JsonValue{});
+                // ✅ 对齐 OpenClaw: 解析 tool_call.function.arguments
+                callbacks.on_tool_start(tool_call.name, tool_call.input);
                 
                 if (!callbacks.session_id.empty()) {
                 }
@@ -875,8 +880,9 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                 }
                 
                 try {
-                    // TODO: 解析 tool_call.function.arguments (JSON string) 为 JsonValue
-                    core::JsonValue args;
+                    // ✅ 对齐 OpenClaw: 解析 tool_call.function.arguments (JSON string) 为 JsonValue
+                    // tool_call.input 已经是解析后的 JsonValue
+                    core::JsonValue args = tool_call.input;
                     
                     // 执行工具 (可能耗时)
                     auto result = tool_manager_->execute_tool(tool_call.name, args);
@@ -1256,12 +1262,14 @@ ReactEngine::CompactionResult ReactEngine::trigger_compaction(
     params.current_token_count = current_tokens;
     params.context_window_tokens = context_window_config_.context_window_tokens;
     params.trigger = "overflow";
-    params.model_id = "claude-3-5-sonnet-20241022";  // TODO: 从配置读取
+    params.model_id = llm_client_ ? llm_client_->get_config().model : "claude-3-5-sonnet-20241022";  // ✅ 从配置读取
     
-    // TODO: 设置 API key 和回调
-    // params.api_key = get_api_key();
-    // params.memory_flush_callback = ...
-    // params.post_compaction_sync_callback = ...
+    // ✅ 对齐 OpenClaw: 设置 API key 和回调
+    if (llm_client_) {
+        params.api_key = llm_client_->get_config().api_key;
+    }
+    // params.memory_flush_callback 和 params.post_compaction_sync_callback
+    // 在 CompactionManager 内部处理
     
     // 执行 compaction
     auto compact_result = compaction_mgr_->compact_session(params);

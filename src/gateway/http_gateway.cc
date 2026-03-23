@@ -1048,15 +1048,14 @@ void HttpGateway::handle_webhook_hook(const httplib::Request& req, httplib::Resp
     }
 
     if (!authenticated) {
-        // ✅ Aligned with openclaw: hookAuthLimiter.recordFailure + 401
-        // TODO: integrate rate limiter (hookAuthLimiter: 20 failures / 60s)
+        // \u2705 \u5bf9\u9f50 OpenClaw: hookAuthLimiter.recordFailure + 401\n        // hookAuthLimiter: 20 failures / 60s \u6ed1\u52a8\u7a97\u53e3\u9650\u6d41\n        {\n            std::lock_guard<std::mutex> lock(auth_limiter_mutex_);\n            std::string client_key = req.remote_addr;\n            auto now = std::chrono::steady_clock::now();\n            auto& record = auth_failure_records_[client_key];\n            // \u6e05\u9664 60s \u4ee5\u524d\u7684\u8bb0\u5f55\n            record.erase(std::remove_if(record.begin(), record.end(),\n                [&now](const auto& t) {\n                    return std::chrono::duration_cast<std::chrono::seconds>(now - t).count() > 60;\n                }), record.end());\n            record.push_back(now);\n            // \u8d85\u8fc7 20 \u6b21\u5931\u8d25\uff0c\u8fd4\u56de 429\n            if (record.size() > 20) {\n                res.set_header(\"Connection\", \"close\");\n                res.status = 429;\n                res.set_header(\"Content-Type\", \"text/plain; charset=utf-8\");\n                res.set_content(\"Too Many Requests\", \"text/plain\");\n                return;\n            }\n        }
         res.set_header("Connection", "close");
         res.status = 401;
         res.set_header("Content-Type", "text/plain; charset=utf-8");
         res.set_content("Unauthorized", "text/plain");
         return;
     }
-    // ✅ Aligned with openclaw: hookAuthLimiter.reset(clientKey) on success
+    // \u2705 \u5bf9\u9f50 OpenClaw: hookAuthLimiter.reset(clientKey) on success\n    {\n        std::lock_guard<std::mutex> lock(auth_limiter_mutex_);\n        auth_failure_records_.erase(req.remote_addr);\n    }
 
     // ✅ Aligned with openclaw: subPath check — must be non-empty
     if (hook_path.empty()) {

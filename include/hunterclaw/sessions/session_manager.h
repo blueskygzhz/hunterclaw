@@ -104,6 +104,9 @@ struct SessionEntry {
     std::optional<std::string> model;           // ✅ 对齐 OpenClaw: model (runtime)
     std::optional<std::string> model_provider;  // ✅ 对齐 OpenClaw: modelProvider
     std::optional<int> context_tokens;          // ✅ 对齐 OpenClaw: contextTokens
+    std::optional<std::string> provider_override; // ✅ 对齐 OpenClaw: providerOverride
+    std::optional<std::string> model_override;    // ✅ 对齐 OpenClaw: modelOverride
+    std::optional<std::string> fallback_notice_selected_model; // ✅ 对齐 OpenClaw: fallbackNoticeSelectedModel
 
     // 行为配置 (对齐 OpenClaw)
     std::optional<std::string> thinking_level;  // ✅ "low"|"medium"|"high"|"xhigh"

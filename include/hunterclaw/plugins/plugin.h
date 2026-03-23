@@ -176,8 +176,12 @@ private:
     const char* hunterclaw_plugin_get_manifest() { \
         static std::string manifest_json; \
         if (manifest_json.empty() && g_plugin_instance) { \
-            /* Serialize manifest to JSON */ \
-            manifest_json = "{}"; /* TODO: actual serialization */ \
+            /* \u2705 \u5bf9\u9f50 OpenClaw: \u5e8f\u5217\u5316 manifest \u5230 JSON */ \
+            manifest_json = std::string("{") + \
+                "\"id\":\"" + g_plugin_instance->id() + "\"," + \
+                "\"name\":\"" + g_plugin_instance->name() + "\"," + \
+                "\"version\":\"" + g_plugin_instance->version() + "\"" + \
+                "}"; \
         } \
         return manifest_json.c_str(); \
     }
