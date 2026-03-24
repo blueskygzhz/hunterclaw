@@ -164,9 +164,9 @@ core::Result<json> method_skill_status(
         bool blocked_by_allowlist = false;
         if (bundled) {
             auto skill_mgr_cfg2 = server->config();
-            if (skill_mgr_cfg2 && !skill_mgr_cfg2->skills.bundled_allowlist.empty()) {
+            if (skill_mgr_cfg2 && !skill_mgr_cfg2->skills.allow_bundled.empty()) {
                 // 如果配置了 allowlist，检查当前 skill 是否在列表中
-                const auto& allowlist = skill_mgr_cfg2->skills.bundled_allowlist;
+                const auto& allowlist = skill_mgr_cfg2->skills.allow_bundled;
                 blocked_by_allowlist = std::find(allowlist.begin(), allowlist.end(), skill_key) == allowlist.end();
             }
         }
@@ -188,6 +188,7 @@ core::Result<json> method_skill_status(
         
         // ✅ 对齐 OpenClaw: evaluateEntryRequirementsForCurrentPlatform
         // 检测当前平台的二进制文件、环境变量、OS 兼容性
+        bool requirements_satisfied = true;
         {
             // 当前 OS
             std::string current_os =
@@ -443,7 +444,11 @@ core::Result<json> method_skill_update(
             auto it = entries.find(skill_key);
             if (it != entries.end()) {
                 current["enabled"] = it->second.enabled;
-                if (!it->second.api_key.empty()) current["apiKey"] = it->second.api_key;
+                // api_key is stored in config["apiKey"]
+                auto cfg_it = it->second.config.find("apiKey");
+                if (cfg_it != it->second.config.end() && cfg_it->second.is_string()) {
+                    current["apiKey"] = cfg_it->second.get<std::string>();
+                }
                 if (!it->second.env.empty()) {
                     json env_json = json::object();
                     for (const auto& [k, v] : it->second.env) env_json[k] = v;
@@ -516,7 +521,8 @@ core::Result<json> method_skill_update(
         if (cfg) {
             auto& entry = cfg->skills.entries[skill_key];
             if (current.contains("enabled")) entry.enabled = current["enabled"].get<bool>();
-            if (current.contains("apiKey")) entry.api_key = current["apiKey"].get<std::string>();
+            // api_key is stored in config["apiKey"]
+            if (current.contains("apiKey")) entry.config["apiKey"] = current["apiKey"].get<std::string>();
             if (current.contains("env") && current["env"].is_object()) {
                 entry.env.clear();
                 for (auto& [k, v] : current["env"].items()) {

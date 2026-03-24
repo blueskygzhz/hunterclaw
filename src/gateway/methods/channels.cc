@@ -178,10 +178,7 @@ core::Result<json> method_channel_status(
         // \u2705 \u5bf9\u9f50 OpenClaw: \u4ece plugin.config.label \u83b7\u53d6 channel label
         // OpenClaw: plugin.config?.label ?? plugin.id
         std::string label = ch_id;  // \u9ed8\u8ba4\u4f7f\u7528 channel id
-        auto plugin_opt = server->plugin_system() ? server->plugin_system()->get_plugin(ch_id) : std::nullopt;
-        if (plugin_opt && !plugin_opt->config.label.empty()) {
-            label = plugin_opt->config.label;
-        }
+        // Note: plugin_system() not available; label defaults to channel id
         channel_labels[ch_id] = label;
         channel_detail_labels[ch_id] = label;
         channel_meta[ch_id] = json{{"id", ch_id}, {"label", label}};
@@ -686,12 +683,11 @@ core::Result<json> method_channel_send(
     auto channel_mgr = server->channel_manager();
     bool send_ok = false;
     std::string send_error;
-    if (channel_mgr) {
-        auto send_result = channel_mgr->deliver_message(channel_id, account_id, to, content);
-        send_ok = !send_result.is_err();
-        if (!send_ok) send_error = send_result.error;
-    } else {
+    // Note: ChannelManager::deliver_message() not yet implemented
+    if (!channel_mgr) {
         send_error = "channel manager not available";
+    } else {
+        send_error = "deliver_message not implemented; use delivery queue";
     }
 
     // =========================================================================

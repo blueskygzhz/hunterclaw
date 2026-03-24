@@ -93,16 +93,29 @@ core::Result<std::string> AnthropicClient::generate(const std::string& prompt) {
     // 如果有 provider_ 则使用它，否则回退到模拟实现
     if (provider_) {
         llm::GenerateOptions opts;
-        llm::LLMMessage msg;
-        msg.role = llm::MessageRole::User;
-        msg.content = prompt;
+        llm::Message msg = llm::Message::user(prompt);
         opts.messages = {msg};
         auto result = provider_->generate(opts);
         if (result.is_ok()) return core::Result<std::string>::Ok(result.get().content);
         return core::Result<std::string>::Err(result.error);
     }
     // 回退: 直接调用 Anthropic API
-    return generate_from_messages({{llm::MessageRole::User, prompt, "", "", {}}});
+    return generate_from_messages({LLMMessage::user(prompt)});
+}
+
+// Helper: 将 LLMMessage 转换为 provider::Message
+static llm::Message llm_message_to_provider_message(const LLMMessage& m) {
+    llm::Message msg;
+    switch (m.role) {
+        case LLMMessageRole::System:    msg.role = llm::MessageRole::System;    break;
+        case LLMMessageRole::User:      msg.role = llm::MessageRole::User;      break;
+        case LLMMessageRole::Assistant: msg.role = llm::MessageRole::Assistant; break;
+        case LLMMessageRole::Tool:      msg.role = llm::MessageRole::Tool;      break;
+    }
+    msg.content = m.content;
+    msg.tool_call_id = m.tool_call_id;
+    msg.name = m.name;
+    return msg;
 }
 
 core::Result<std::string> AnthropicClient::generate_from_messages(
@@ -111,7 +124,9 @@ core::Result<std::string> AnthropicClient::generate_from_messages(
     // ✅ 对齐 OpenClaw: 通过 Provider 调用 Anthropic messages API
     if (provider_) {
         llm::GenerateOptions opts;
-        opts.messages = messages;
+        for (const auto& m : messages) {
+            opts.messages.push_back(llm_message_to_provider_message(m));
+        }
         auto result = provider_->generate(opts);
         if (result.is_ok()) return core::Result<std::string>::Ok(result.get().content);
         return core::Result<std::string>::Err(result.error);

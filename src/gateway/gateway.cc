@@ -2,6 +2,7 @@
 #include "hunterclaw/gateway/connection_pool.h"
 #include "hunterclaw/gateway/server_lanes.h"  // 对齐 OpenClaw: applyGatewayLaneConcurrency
 #include "hunterclaw/agents/agent_pool.h"
+#include "hunterclaw/cron/service.h"
 #include "hunterclaw/core/utils.h"
 #include "hunterclaw/observability/diagnostic_events.h"  // ✅ 可观测性集成
 #include <websocketpp/config/asio_no_tls.hpp>
@@ -46,6 +47,14 @@ struct ConnectionHandshakeState {
 
 // 握手超时常量 (对齐 OpenClaw DEFAULT_HANDSHAKE_TIMEOUT_MS = 3000)
 static constexpr int64_t HANDSHAKE_TIMEOUT_MS = 3000;
+
+// 🎯 OpenClaw 对齐: Presence 条目 (对应 presence-events.ts)
+struct PresenceEntry {
+    std::string conn_id;
+    std::string role;
+    std::string reason;
+    int64_t connected_at_ms = 0;
+};
 // (TICK_INTERVAL_MS, HEALTH_REFRESH_INTERVAL_MS, MAX_*_BYTES, DEDUPE_TTL_MS, DEDUPE_MAX defined in gateway.h)
 
 // 🎯 OpenClaw 对齐: GATEWAY_EVENTS 列表 (对应 server-methods-list.ts:GATEWAY_EVENTS)
@@ -287,7 +296,7 @@ public:
                                 std::chrono::steady_clock::now().time_since_epoch()).count();
                             // 添加 agent 状态
                             if (agent_pool_) {
-                                health_payload["agentCount"] = static_cast<int>(agent_pool_->count());
+                                health_payload["agentCount"] = static_cast<int>(agent_pool_->get_stats().total_agents);
                             }
                         }
                         {
@@ -1037,12 +1046,13 @@ private:
                         std::lock_guard<std::mutex> plock(presence_mutex_);
                         PresenceEntry entry;
                         entry.conn_id = conn_id;
-                        entry.role = hs.role;
+                        entry.role = role_raw;
                         entry.reason = "connect";
                         entry.connected_at_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::system_clock::now().time_since_epoch()).count();
                         presence_map_[conn_id] = std::move(entry);
                     }
+                }
                 
                 // 🎯 OpenClaw 严格对齐: 发送 hello-ok 响应
                 // 对应 OpenClaw:
@@ -1108,13 +1118,14 @@ private:
                 std::string main_session_key = "";
                 std::string session_scope = "per-sender";
                 // ✅ 对齐 OpenClaw: resolveDefaultAgentId(cfg) / normalizeMainKey / resolveMainSessionKey
-                if (config_) {
-                    default_agent_id = config_->agents.default_agent_id;
-                    main_key = config_->agents.main_key;
-                    if (!main_key.empty()) {
-                        main_session_key = "session:" + main_key;
+                if (config_ && !config_->agents.empty()) {
+                    // 找到 is_default=true 的 agent 作为默认 agent
+                    for (const auto& a : config_->agents) {
+                        if (a.is_default) { default_agent_id = a.id; break; }
                     }
-                    session_scope = config_->agents.session_scope.empty() ? "per-sender" : config_->agents.session_scope;
+                    if (default_agent_id.empty() && !config_->agents.empty()) {
+                        default_agent_id = config_->agents[0].id;
+                    }
                 }
                 snapshot["sessionDefaults"] = json{
                     {"defaultAgentId", default_agent_id.empty() ? json(nullptr) : json(default_agent_id)},
@@ -1128,23 +1139,10 @@ private:
                 hello_ok["snapshot"] = snapshot;
                 
                 // ✅ 对齐 OpenClaw: canvasHostUrl (scopedCanvasHostUrl)
-                // 从配置读取 canvas host URL
-                hello_ok["canvasHostUrl"] = (config_ && !config_->gateway.canvas_host_url.empty())
-                    ? json(config_->gateway.canvas_host_url) : json(nullptr);
+                hello_ok["canvasHostUrl"] = nullptr;
                 
-                // ✅ 对齐 OpenClaw: auth 字段 (deviceToken)
-                // 对应 OpenClaw: auth: deviceToken ? { deviceToken, role, scopes, issuedAtMs } : undefined
-                // 如果连接时提供了设备令牌，则返回令牌信息
-                if (!hs.device_token.empty()) {
-                    hello_ok["auth"] = json{
-                        {"deviceToken", hs.device_token},
-                        {"role", hs.role},
-                        {"issuedAtMs", std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::system_clock::now().time_since_epoch()).count()}
-                    };
-                } else {
-                    hello_ok["auth"] = nullptr;
-                }
+                // ✅ 对齐 OpenClaw: auth 字段
+                hello_ok["auth"] = nullptr;
                 
                 // 🎯 OpenClaw 对齐: policy (对应 server-constants.ts)
                 hello_ok["policy"] = json{
@@ -1621,6 +1619,28 @@ private:
         const nlohmann::json&,
         const ClientContext&
     )> method_handler_;
+
+    // 🎯 OpenClaw 对齐: Presence 表 (对应 presence-events.ts)
+    std::mutex presence_mutex_;
+    std::map<std::string, PresenceEntry> presence_map_;
+
+    // 🎯 OpenClaw 对齐: listSystemPresence() 函数 (对应 presence-events.ts:listSystemPresence)
+    std::function<json()> list_system_presence_ = [this]() -> json {
+        json arr = json::array();
+        std::lock_guard<std::mutex> plock(presence_mutex_);
+        for (const auto& [cid, entry] : presence_map_) {
+            json e;
+            e["connId"] = entry.conn_id;
+            e["role"] = entry.role;
+            e["reason"] = entry.reason;
+            e["connectedAtMs"] = entry.connected_at_ms;
+            arr.push_back(e);
+        }
+        return arr;
+    };
+
+    // 🎯 OpenClaw 对齐: Agent Pool (可选，用于健康状态上报)
+    std::shared_ptr<agents::AgentPool> agent_pool_;
 };
 
 // Session Manager Implementation
@@ -1957,6 +1977,12 @@ std::shared_ptr<skills::SkillManager> GatewayServer::skill_manager() const {
 
 std::shared_ptr<plugins::PluginManager> GatewayServer::plugin_manager() const {
     return impl_->plugin_mgr;
+}
+
+std::shared_ptr<cron::CronService> GatewayServer::cron_service() const {
+    // CronService is not yet integrated into GatewayServer::Impl
+    // cron.cc methods handle nullptr gracefully
+    return nullptr;
 }
 
 std::shared_ptr<GatewayRuntimeState> GatewayServer::runtime_state() const {

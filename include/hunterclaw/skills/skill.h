@@ -41,6 +41,9 @@ struct SkillInstallSpec {
     std::string target_dir;
 };
 
+// ✅ 便捷别名，对齐 manager.cc 和 skills.cc 中的使用
+using SkillInstallKind = SkillInstallSpec::Kind;
+
 struct SkillRequirements {
     std::vector<std::string> bins;        // Required binaries
     std::vector<std::string> any_bins;    // Any of these (OR logic)

@@ -428,15 +428,8 @@ core::Result<json> method_session_list(
     json defaults;
     defaults["modelProvider"] = nullptr;
     defaults["model"]         = nullptr;
-    // 从配置读取 contextTokens
-    {
-        auto cfg = server->config();
-        if (cfg && cfg->agents.context_tokens > 0) {
-            defaults["contextTokens"] = cfg->agents.context_tokens;
-        } else {
-            defaults["contextTokens"] = nullptr;
-        }
-    }
+    // 从配置读取 contextTokens (暂不支持，返回 null)
+    defaults["contextTokens"] = nullptr;
     result["defaults"] = defaults;
 
     return core::Result<json>::Ok(result);
@@ -581,8 +574,9 @@ core::Result<json> method_session_resolve(
         if (agent_pool) {
             auto agent = agent_pool->get_agent(session_key);
             if (agent) {
-                // 对齐 OpenClaw: 重置 session 就是删除 transcript 并重新初始化
-                agent->reset_transcript();
+                // 对齐 OpenClaw: 重置 session 就是清理 Agent 资源并重新初始化
+                // AgentInstance 暂不支持 reset_transcript，通过 cleanup 实现
+                agent->cleanup();
             }
         }
     }

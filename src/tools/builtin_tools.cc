@@ -347,7 +347,7 @@ private:
         ToolResultContent img_content;
         img_content.type = ToolResultContent::Type::Image;
         img_content.data = encoded;
-        img_content.media_type = mime_type;
+        img_content.mime_type = mime_type;
         result.content.push_back(img_content);
         return result;
         }
@@ -673,6 +673,19 @@ std::shared_ptr<Tool> BuiltinTools::create_search_files_tool(const ToolContext& 
         std::string name() const override { return "search_files"; }
         std::string description() const override {
             return "Search for files by name pattern in the workspace";
+        }
+        Tool::Schema parameters() const override {
+            Tool::Schema schema;
+            schema.type = "object";
+            schema.description = "Search for files by name pattern";
+            schema.properties["pattern"] = core::JsonValue::object({
+                {"type", "string"}, {"description", "File name pattern (e.g. '*.cc')"}
+            });
+            schema.properties["path"] = core::JsonValue::object({
+                {"type", "string"}, {"description", "Directory to search in (default: workspace root)"}
+            });
+            schema.required = {"pattern"};
+            return schema;
         }
         ToolResult execute(const core::JsonValue& params) override {
             ToolParams reader(params);

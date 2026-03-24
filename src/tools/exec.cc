@@ -350,11 +350,11 @@ std::unique_ptr<ExecProcessHandle> run_exec_process(
         return outcome;
     });
 
-    handle->kill_fn = [handle]() {
+    handle->kill_fn = [raw_handle = handle.get()]() {
         // ✅ 对齐 OpenClaw: 通过 session tracking 终止进程
         // 使用 SIGTERM 发送给进程组
-        if (handle && handle->pid > 0) {
-            ::kill(-handle->pid, SIGTERM);
+        if (raw_handle && raw_handle->pid > 0) {
+            ::kill(-raw_handle->pid, SIGTERM);
         }
     };
 

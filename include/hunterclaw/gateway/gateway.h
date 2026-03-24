@@ -28,6 +28,12 @@ class AgentPool;
 }
 
 namespace hunterclaw {
+namespace cron {
+class CronService;
+}
+}
+
+namespace hunterclaw {
 namespace gateway {
 
 // ============================================================================
@@ -359,6 +365,7 @@ public:
     std::shared_ptr<channels::ChannelManager> channel_manager() const;
     std::shared_ptr<skills::SkillManager> skill_manager() const;
     std::shared_ptr<plugins::PluginManager> plugin_manager() const;
+    std::shared_ptr<cron::CronService> cron_service() const;
 
     // Config access
     std::shared_ptr<core::Config> config() const;

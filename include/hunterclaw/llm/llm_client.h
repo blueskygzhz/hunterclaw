@@ -194,6 +194,9 @@ private:
 // Anthropic LLM Client
 // ============================================================================
 
+// Forward declaration
+class Provider;
+
 class AnthropicClient : public LLMClient {
 public:
     static Ptr create(const LLMConfig& config);
@@ -230,9 +233,6 @@ private:
 // ============================================================================
 // LLM Client Factory
 // ============================================================================
-
-// Forward declaration
-class Provider;
 
 class LLMClientFactory {
 public:

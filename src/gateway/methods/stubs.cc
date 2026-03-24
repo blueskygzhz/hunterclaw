@@ -9,6 +9,8 @@
 #include "hunterclaw/core/utils.h"
 #include <nlohmann/json.hpp>
 #include <chrono>
+#include <fstream>
+#include <filesystem>
 
 using json = nlohmann::json;
 

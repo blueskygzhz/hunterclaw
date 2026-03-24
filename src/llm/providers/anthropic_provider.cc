@@ -97,13 +97,23 @@ public:
                             if (delta.value("type", "") == "text_delta") {
                                 std::string text = delta.value("text", "");
                                 accumulated_text += text;
-                                if (callback) callback(text, false);
+                                if (callback) {
+                                    StreamChunk chunk;
+                                    chunk.delta = text;
+                                    chunk.is_final = false;
+                                    callback(chunk);
+                                }
                             }
                         } else if (event_type == "message_stop") {
-                            if (callback) callback("", true);
+                            if (callback) {
+                                StreamChunk final_chunk;
+                                final_chunk.delta = "";
+                                final_chunk.is_final = true;
+                                callback(final_chunk);
+                            }
                         } else if (event_type == "message_delta") {
                             if (j.contains("usage")) {
-                                final_response.usage.output_tokens = j["usage"].value("output_tokens", 0);
+                                final_response.output_tokens = j["usage"].value("output_tokens", 0);
                             }
                         }
                     } catch (...) {}
@@ -155,7 +165,6 @@ public:
         }
         
         final_response.content = accumulated_text;
-        final_response.finish_reason = "stop";
         return core::Result<GenerateResponse>::Ok(final_response);
     }
     

@@ -849,12 +849,11 @@ core::Result<json> method_chat_update_params(
                     std::string level = params["thinkingLevel"];
                     if (level == "none" || level == "off") {
                         new_cfg.reasoning_mode = react::ReactConfig::ReasoningMode::Off;
-                    } else if (level == "low") {
-                        new_cfg.reasoning_mode = react::ReactConfig::ReasoningMode::Low;
-                    } else if (level == "high" || level == "max") {
-                        new_cfg.reasoning_mode = react::ReactConfig::ReasoningMode::High;
+                    } else if (level == "stream") {
+                        new_cfg.reasoning_mode = react::ReactConfig::ReasoningMode::Stream;
                     } else {
-                        new_cfg.reasoning_mode = react::ReactConfig::ReasoningMode::Auto;
+                        // "low", "high", "max", "auto", "on" → On
+                        new_cfg.reasoning_mode = react::ReactConfig::ReasoningMode::On;
                     }
                 }
 
@@ -863,7 +862,7 @@ core::Result<json> method_chat_update_params(
                     new_cfg.max_steps = params["maxSteps"].get<int>();
                 }
 
-                re->update_config(new_cfg);
+                re->mutable_config() = new_cfg;
                 updated = true;
                 get_logger()->info("[chat.update_params] Updated agent config: session={}", session_id);
             }

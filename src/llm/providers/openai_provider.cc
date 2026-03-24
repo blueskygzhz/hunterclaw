@@ -169,7 +169,12 @@ public:
                 if (line.substr(0, 6) == "data: ") {
                     std::string data = line.substr(6);
                     if (data == "[DONE]") {
-                        if (callback) callback("", true);
+                        if (callback) {
+                            StreamChunk final_chunk;
+                            final_chunk.delta = "";
+                            final_chunk.is_final = true;
+                            callback(final_chunk);
+                        }
                         break;
                     }
                     try {
@@ -183,13 +188,18 @@ public:
                                 if (delta.isMember("content") && delta["content"].isString()) {
                                     std::string text = delta["content"].asString();
                                     accumulated_text += text;
-                                    if (callback) callback(text, false);
+                                    if (callback) {
+                                        StreamChunk chunk;
+                                        chunk.delta = text;
+                                        chunk.is_final = false;
+                                        callback(chunk);
+                                    }
                                 }
                             }
                             // 使用统计
                             if (j.isMember("usage")) {
-                                final_response.usage.input_tokens = j["usage"].get("prompt_tokens", 0).asInt();
-                                final_response.usage.output_tokens = j["usage"].get("completion_tokens", 0).asInt();
+                                final_response.input_tokens = j["usage"].get("prompt_tokens", 0).asInt();
+                                final_response.output_tokens = j["usage"].get("completion_tokens", 0).asInt();
                             }
                         }
                     } catch (...) {}
@@ -240,7 +250,6 @@ public:
         }
         
         final_response.content = accumulated_text;
-        final_response.finish_reason = "stop";
         return core::Result<GenerateResponse>::Ok(final_response);
     }
     
