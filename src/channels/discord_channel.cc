@@ -1,4 +1,7 @@
 #include "hunterclaw/channels/plugin.h"
+#include "hunterclaw/channels/discord_listener.h"
+#include "hunterclaw/channels/discord_message_handler.h"
+#include "hunterclaw/channels/discord_monitor.h"
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -636,50 +639,305 @@ ChannelPlugin make_discord_plugin() {
             return core::Result<void>::Err("no bot token configured");
         }
 
-        // Aligned with openclaw: validate token via GET /users/@me
+        // Aligned with openclaw: startAccount → probeDiscord(token, 2500, { includeApplication: true })
+        // Probe bot identity and application info; set status with bot/application fields.
+        std::string discord_bot_label;
         {
             httplib::Client cli("https://discord.com");
-            cli.set_connection_timeout(10);
-            cli.set_read_timeout(10);
+            cli.set_connection_timeout(3);
+            cli.set_read_timeout(3);
             httplib::Headers headers = {{"Authorization", "Bot " + token}};
-            auto res = cli.Get("/api/v10/users/@me", headers);
-            if (!res || res->status != 200) {
-                std::string err = res ? ("Discord token validation failed: " + res->body) : "connection failed";
-                ctx.log->error("[discord] " + err);
-                ChannelAccountSnapshot snap = ctx.get_status();
-                snap.running    = false;
-                snap.configured = false;
-                snap.last_error = err;
-                ctx.set_status(snap);
-                return core::Result<void>::Err(err);
+
+            // Fetch bot user identity (/users/@me)
+            nlohmann::json bot_json;
+            auto res_user = cli.Get("/api/v10/users/@me", headers);
+            if (res_user && res_user->status == 200) {
+                try { bot_json = nlohmann::json::parse(res_user->body); } catch (...) {}
             }
-            ctx.log->info("[discord] token validated via /users/@me");
+
+            // Fetch application info (/applications/@me) — for intents.messageContent
+            nlohmann::json app_json;
+            auto res_app = cli.Get("/api/v10/applications/@me", headers);
+            if (res_app && res_app->status == 200) {
+                try { app_json = nlohmann::json::parse(res_app->body); } catch (...) {}
+            }
+
+            // Aligned with openclaw: ctx.setStatus({ accountId, bot, application })
+            {
+                ChannelAccountSnapshot snap = ctx.get_status();
+                const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                if (!bot_json.is_null() && !bot_json.empty()) snap.bot = bot_json;
+                if (!app_json.is_null() && !app_json.empty()) snap.application = app_json;
+                snap.last_start_at = now_ms;
+                ctx.set_status(snap);
+            }
+
+            // Aligned with openclaw: extract bot username for log label
+            if (!bot_json.is_null() && bot_json.contains("username") && bot_json["username"].is_string()) {
+                std::string username = bot_json["username"].get<std::string>();
+                while (!username.empty() && std::isspace((unsigned char)username.front())) username.erase(username.begin());
+                while (!username.empty() && std::isspace((unsigned char)username.back()))  username.pop_back();
+                if (!username.empty()) discord_bot_label = " (@" + username + ")";
+            }
+
+            // Aligned with openclaw: check messageContent intent and warn
+            // probe.application?.intents?.messageContent === "disabled" → warn
+            // probe.application?.intents?.messageContent === "limited"  → info
+            if (!app_json.is_null() && app_json.contains("intents") && app_json["intents"].is_object()) {
+                const auto& intents = app_json["intents"];
+                if (intents.contains("messageContent") && intents["messageContent"].is_string()) {
+                    const std::string mc = intents["messageContent"].get<std::string>();
+                    if (mc == "disabled") {
+                        ctx.log->warn("[" + ctx.account_id + "] Discord Message Content Intent is disabled; "
+                            "bot may not respond to channel messages. Enable it in Discord Dev Portal "
+                            "(Bot → Privileged Gateway Intents) or require mentions.");
+                    } else if (mc == "limited") {
+                        ctx.log->info("[" + ctx.account_id + "] Discord Message Content Intent is limited; "
+                            "bots under 100 servers can use it without verification.");
+                    }
+                }
+            }
         }
 
-        // Update status: running (Gateway WebSocket not yet implemented — polling mode)
+        // Aligned with openclaw: ctx.log.info("[accountId] starting provider@botLabel")
+        ctx.log->info("[" + ctx.account_id + "] starting provider" + discord_bot_label);
+
+        // Aligned with openclaw: registerDiscordListener(client.listeners, new DiscordReactionListener(...))
+        // registerDiscordListener(client.listeners, new DiscordReactionRemoveListener(...))
+        // registerDiscordListener(client.listeners, new DiscordThreadUpdateListener(...))
+        // registerDiscordListener(client.listeners, new DiscordPresenceListener(...))
+        // Build listener params from ctx (bot_user_id extracted from probe above)
+        // Aligned with openclaw: client.listeners = [DiscordMessageListener, DiscordReactionListener, ...]
+        // listeners_base: typed listeners dispatched by run_discord_gateway_lifecycle
+        // deactivate_guards: RAII guards for lifecycle cleanup (e.g. DiscordInboundWorker.deactivate)
+        std::vector<std::shared_ptr<DiscordListenerBase>> listeners_base;
+        std::vector<std::shared_ptr<void>> deactivate_guards;
+        {
+            // Aligned with openclaw: reactionListenerOptions
+            DiscordListenerParams reaction_params;
+            reaction_params.cfg    = ctx.cfg;
+            reaction_params.logger = get_logger();
+
+            // Aligned with openclaw: trackInboundEvent → opts.setStatus?.({ lastEventAt, lastInboundAt })
+            reaction_params.on_event = [&ctx]() {
+                const int64_t at = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                ChannelAccountSnapshot snap = ctx.get_status();
+                snap.last_event_at   = at;
+                snap.last_inbound_at = at;
+                ctx.set_status(snap);
+            };
+
+            // Aligned with openclaw: routing params from account config
+            DiscordReactionRoutingParams routing;
+            routing.account_id = ctx.account_id;
+
+            // bot_user_id: extracted from /users/@me probe above (stored in snap.bot)
+            {
+                const ChannelAccountSnapshot snap = ctx.get_status();
+                if (snap.bot.has_value() && snap.bot->contains("id") && (*snap.bot)["id"].is_string()) {
+                    routing.bot_user_id = (*snap.bot)["id"].get<std::string>();
+                }
+            }
+
+            // Aligned with openclaw: reactionListenerOptions fields from resolveDiscordAccount
+            const auto& ac = ctx.account;
+
+            // Aligned with openclaw: dmConfig = rawDiscordCfg.dm
+            // dmEnabled  = dmConfig?.enabled ?? true
+            // groupDmEnabled = dmConfig?.groupEnabled ?? false
+            // groupDmChannels = dmConfig?.groupChannels ?? []
+            const nlohmann::json& dm_cfg = ac.contains("dm") && ac["dm"].is_object()
+                ? ac["dm"] : nlohmann::json::object();
+            routing.dm_enabled       = dm_cfg.value("enabled", true);
+            routing.group_dm_enabled = dm_cfg.value("groupEnabled", false);
+
+            // Aligned with openclaw: dmPolicy = discordCfg.dmPolicy ?? dmConfig?.policy ?? "pairing"
+            if (ac.contains("dmPolicy") && ac["dmPolicy"].is_string()) {
+                routing.dm_policy = ac["dmPolicy"].get<std::string>();
+            } else if (dm_cfg.contains("policy") && dm_cfg["policy"].is_string()) {
+                routing.dm_policy = dm_cfg["policy"].get<std::string>();
+            } else {
+                routing.dm_policy = "pairing";  // Aligned with openclaw default
+            }
+
+            // Aligned with openclaw: groupPolicy = discordCfg.groupPolicy (resolved via resolveOpenProviderRuntimeGroupPolicy)
+            routing.group_policy = ac.value("groupPolicy", std::string("open"));
+
+            // Aligned with openclaw: allowNameMatching = isDangerousNameMatchingEnabled(discordCfg)
+            // isDangerousNameMatchingEnabled: discordCfg.dangerousNameMatching?.enabled === true
+            {
+                bool name_matching = false;
+                if (ac.contains("dangerousNameMatching") && ac["dangerousNameMatching"].is_object()) {
+                    name_matching = ac["dangerousNameMatching"].value("enabled", false);
+                }
+                routing.allow_name_matching = name_matching;
+            }
+
+            // Aligned with openclaw: groupDmChannels = dmConfig?.groupChannels ?? []
+            if (dm_cfg.contains("groupChannels") && dm_cfg["groupChannels"].is_array()) {
+                for (const auto& ch : dm_cfg["groupChannels"]) {
+                    if (ch.is_string()) routing.group_dm_channels.push_back(ch.get<std::string>());
+                }
+            }
+
+            // Aligned with openclaw: allowFrom = discordCfg.allowFrom ?? dmConfig?.allowFrom
+            if (ac.contains("allowFrom") && ac["allowFrom"].is_array()) {
+                for (const auto& e : ac["allowFrom"]) {
+                    if (e.is_string()) routing.allow_from.push_back(e.get<std::string>());
+                    else if (e.is_number()) routing.allow_from.push_back(std::to_string(e.get<int64_t>()));
+                }
+            } else if (dm_cfg.contains("allowFrom") && dm_cfg["allowFrom"].is_array()) {
+                for (const auto& e : dm_cfg["allowFrom"]) {
+                    if (e.is_string()) routing.allow_from.push_back(e.get<std::string>());
+                    else if (e.is_number()) routing.allow_from.push_back(std::to_string(e.get<int64_t>()));
+                }
+            }
+
+            // Aligned with openclaw: guildEntries = allowlistResolved.guildEntries (from resolveDiscordAllowlistConfig)
+            // HunterClaw: read from account config directly (allowlist resolution not yet ported)
+            if (ac.contains("guilds") && ac["guilds"].is_object()) {
+                routing.guild_entries = ac["guilds"];
+            }
+
+            reaction_params.routing = routing;
+
+            // Aligned with openclaw: messageHandler = createDiscordMessageHandler({ cfg, accountId, ... })
+            // deactivateMessageHandler = messageHandler.deactivate
+            DiscordMessageHandlerParams msg_handler_params;
+            msg_handler_params.cfg              = ctx.cfg;
+            msg_handler_params.logger           = reaction_params.logger;
+            msg_handler_params.account_id       = ctx.account_id;
+            msg_handler_params.bot_user_id      = routing.bot_user_id;
+            msg_handler_params.abort_signal     = ctx.abort_signal;
+            msg_handler_params.dm_enabled       = routing.dm_enabled;
+            msg_handler_params.group_dm_enabled = routing.group_dm_enabled;
+            msg_handler_params.dm_policy        = routing.dm_policy;
+            msg_handler_params.group_policy     = routing.group_policy;
+            msg_handler_params.allow_from       = routing.allow_from;
+            msg_handler_params.group_dm_channels = routing.group_dm_channels;
+            msg_handler_params.allow_name_matching = routing.allow_name_matching;
+            msg_handler_params.guild_entries    = routing.guild_entries;
+            msg_handler_params.dispatch_inbound = ctx.dispatch_inbound;
+            // Aligned with openclaw: setStatus → trackInboundEvent updates lastEventAt/lastInboundAt
+            // (status updates are handled by reaction_params.on_event closure above)
+
+            auto msg_handler_lifecycle = create_discord_message_handler(msg_handler_params);
+
+            // Aligned with openclaw: deactivateMessageHandler = messageHandler.deactivate
+            // Keep the deactivate functor alive for the duration of start_account.
+            {
+                struct DeactivateGuard {
+                    std::function<void()> deactivate;
+                    ~DeactivateGuard() { if (deactivate) deactivate(); }
+                };
+                deactivate_guards.push_back(std::make_shared<DeactivateGuard>(
+                    DeactivateGuard{msg_handler_lifecycle.deactivate}));
+            }
+
+            // Aligned with openclaw:
+            //   registerDiscordListener(client.listeners,
+            //     new DiscordMessageListener(messageHandler, logger, trackInboundEvent, { timeoutMs }))
+            auto track_inbound_event = reaction_params.on_event;  // same trackInboundEvent
+            listeners_base.push_back(
+                std::make_shared<DiscordMessageListener>(
+                    msg_handler_lifecycle.handler,
+                    reaction_params.logger,
+                    track_inbound_event));
+
+            // Aligned with openclaw: registerDiscordListener(client.listeners, new DiscordReactionListener(...))
+            listeners_base.push_back(
+                std::make_shared<DiscordReactionListener>(reaction_params));
+
+            // Aligned with openclaw: registerDiscordListener(client.listeners, new DiscordReactionRemoveListener(...))
+            listeners_base.push_back(
+                std::make_shared<DiscordReactionRemoveListener>(reaction_params));
+
+            // Aligned with openclaw: registerDiscordListener(client.listeners, new DiscordThreadUpdateListener(...))
+            listeners_base.push_back(
+                std::make_shared<DiscordThreadUpdateListener>(
+                    ctx.cfg, ctx.account_id,
+                    reaction_params.logger));
+
+            // Aligned with openclaw: if (discordCfg.intents?.presence)
+            //   registerDiscordListener(client.listeners, new DiscordPresenceListener(...))
+            bool presence_enabled = false;
+            {
+                const auto& j = ctx.cfg.data;
+                if (j.contains("channels") && j["channels"].contains("discord")) {
+                    const auto& dc = j["channels"]["discord"];
+                    if (dc.contains("intents") && dc["intents"].is_object()) {
+                        presence_enabled = dc["intents"].value("presence", false);
+                    }
+                }
+            }
+            if (presence_enabled) {
+                listeners_base.push_back(
+                    std::make_shared<DiscordPresenceListener>(
+                        reaction_params.logger, ctx.account_id));
+                ctx.log->info("[" + ctx.account_id + "] discord: GuildPresences intent enabled — presence listener registered");
+            }
+        }
+
+        // Aligned with openclaw: monitorDiscordProvider({ token, accountId, config, abortSignal, setStatus })
+        // runDiscordGatewayLifecycle: real WebSocket Gateway lifecycle
+        {
+            // Resolve intents from config
+            nlohmann::json intents_cfg;
+            {
+                const auto& j = ctx.cfg.data;
+                if (j.contains("channels") && j["channels"].contains("discord")) {
+                    const auto& dc = j["channels"]["discord"];
+                    if (dc.contains("intents") && dc["intents"].is_object()) {
+                        intents_cfg = dc["intents"];
+                    }
+                }
+            }
+
+            DiscordGatewayLifecycleParams lifecycle_params;
+            lifecycle_params.account_id   = ctx.account_id;
+            lifecycle_params.token        = token;
+            lifecycle_params.intents      = resolve_discord_gateway_intents(intents_cfg);
+            lifecycle_params.logger       = get_logger();
+            lifecycle_params.abort_signal = ctx.abort_signal;
+            lifecycle_params.listeners    = listeners_base;
+
+            // Aligned with openclaw: statusSink → ctx.set_status
+            lifecycle_params.set_status = [&ctx](
+                bool connected,
+                std::optional<int64_t> last_connected_at,
+                std::optional<int64_t> last_event_at,
+                std::optional<nlohmann::json> last_disconnect,
+                std::optional<std::string> last_error)
+            {
+                ChannelAccountSnapshot snap = ctx.get_status();
+                snap.connected = connected;
+                if (last_connected_at) snap.last_connected_at = *last_connected_at;
+                if (last_event_at)     snap.last_event_at     = *last_event_at;
+                if (last_disconnect)   snap.last_disconnect   = *last_disconnect;
+                if (last_error)        snap.last_error        = *last_error;
+                ctx.set_status(snap);
+            };
+
+            // Aligned with openclaw: isDisallowedIntentsError
+            lifecycle_params.is_disallowed_intents_error = [](const std::string& err) -> bool {
+                return err.find("4014") != std::string::npos
+                    || err.find("DisallowedIntents") != std::string::npos;
+            };
+
+            // Blocks until abort_signal fires or fatal error
+            run_discord_gateway_lifecycle(std::move(lifecycle_params));
+        }
+
+        // Aligned with openclaw: finally → opts.setStatus?.({ connected: false })
         {
             ChannelAccountSnapshot snap = ctx.get_status();
-            snap.running   = true;
-            snap.connected = true;  // Mark connected after token validation
-            ctx.set_status(snap);
-        }
-
-        ctx.log->info("[discord] account started (Gateway WebSocket pending full implementation)");
-
-        // Block until abortSignal
-        // Aligned with openclaw: abortSignal.addEventListener("abort", shutdown)
-        while (!ctx.abort_signal->load()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        }
-
-        // Shutdown
-        {
-            ChannelAccountSnapshot snap = ctx.get_status();
-            snap.running   = false;
             snap.connected = false;
             ctx.set_status(snap);
         }
-        ctx.log->info("[discord] account stopped for account=" + ctx.account_id);
+
+        ctx.log->info("[" + ctx.account_id + "] account stopped for account=" + ctx.account_id);
         return core::Result<void>::Ok();
     };
 
