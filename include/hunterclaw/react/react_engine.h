@@ -97,6 +97,12 @@ struct StreamCallbacks {
     // 🎯 OpenClaw 对齐: 用于直连推送的 session_id
     std::string session_id;
 
+    // 🎯 OpenClaw 对齐: run_id (aligned with openclaw: runId in runEmbeddedPiAgent)
+    // Generated per-run via generate_uuid(); used to correlate events across channels.
+    // In HTTP API path: generated in chat.cc and passed via SSE events.
+    // In Discord/channel path: generated in run_prepared_reply and stored in GenerateResult.
+    std::string run_id;
+
     // 🎯 OpenClaw 对齐: transcript 路径 (用于 tool_result_persist hook)
     // 如果非空，工具结果将通过 append_tool_result_to_transcript 写入
     std::string transcript_path;

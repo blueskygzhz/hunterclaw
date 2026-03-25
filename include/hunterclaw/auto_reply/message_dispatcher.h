@@ -244,6 +244,11 @@ public:
         react::ReactResult react_result;
         std::string error;
 
+        // Aligned with openclaw: runId (generated per-run in runEmbeddedPiAgent)
+        // Generated via generate_uuid() in run_prepared_reply.
+        // Allows callers (e.g. channel inbound path) to correlate events.
+        std::string run_id;
+
         // Aligned with openclaw: ctx.AcpDispatchTailAfterReset
         // Set to true when command handling prepared a trailing prompt after ACP in-place reset.
         bool acp_dispatch_tail_after_reset = false;

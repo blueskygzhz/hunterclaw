@@ -18,6 +18,7 @@
 #include "hunterclaw/outbound/deliver.h"
 #include "hunterclaw/tools/tool_manager.h"
 #include "hunterclaw/llm/llm_client.h"
+#include "hunterclaw/core/utils.h"
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
@@ -551,6 +552,10 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
                          captured_message.session_key);
             return inner_result;
         }
+
+        // Aligned with openclaw: runId propagated from runEmbeddedPiAgent → caller
+        log()->debug("dispatch_reply_from_config: run_id={} session={}",
+                     gen_result.run_id, captured_message.session_key);
 
         inner_result.react_result = gen_result.react_result;
         inner_result.total_tokens = gen_result.react_result.usage.total_tokens;
@@ -1254,9 +1259,15 @@ ReplyGenerator::GenerateResult ReplyGenerator::run_prepared_reply(
 
     auto engine = react::ReactEngine::create(tool_manager, llm_client, react_config);
 
+    // Aligned with openclaw: generateSecureUuid() in runEmbeddedPiAgent (pi-embedded-runner/run.ts)
+    // runId is generated per-run and used to correlate events across the channel inbound path.
+    const std::string run_id = core::utils::generate_uuid();
+    log()->debug("run_prepared_reply: session={} run_id={}", config.session_key, run_id);
+
     // Aligned with openclaw: stream callbacks for block replies and tool results
     react::StreamCallbacks callbacks;
     callbacks.session_id = config.session_key;
+    callbacks.run_id     = run_id;
     callbacks.on_block_reply = [&](const std::string& block) {
         // Aligned with openclaw: onBlockReply — forward to caller's on_block_reply callback
         // The caller (dispatch_reply_from_config) accumulates block text for TTS and delivers.
@@ -1291,6 +1302,7 @@ ReplyGenerator::GenerateResult ReplyGenerator::run_prepared_reply(
     result.react_result = react_result;
     result.success = react_result.success;
     result.response = react_result.final_response;
+    result.run_id   = run_id;  // Aligned with openclaw: runId propagated to caller
     if (!react_result.success) {
         result.error = react_result.error;
     }
