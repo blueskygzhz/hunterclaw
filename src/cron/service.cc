@@ -1,4 +1,5 @@
 #include "hunterclaw/cron/service.h"
+#include "hunterclaw/cron/schedule.h"
 
 #include <algorithm>
 #include <atomic>
@@ -6,6 +7,7 @@
 #include <ctime>
 #include <iomanip>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <thread>
 
@@ -13,62 +15,110 @@ namespace hunterclaw {
 namespace cron {
 
 namespace {
+
+// ============================================================================
+// Constants (对齐 OpenClaw timer.ts)
+// ============================================================================
+
+// 最大定时器延迟，防止调度漂移
+constexpr int64_t MAX_TIMER_DELAY_MS = 60'000;
+
+// 同一 cron job 两次触发的最小间隔，防止热循环 (#17821)
+constexpr int64_t MIN_REFIRE_GAP_MS = 2'000;
+
+// 默认启动补跑最大任务数
+constexpr int DEFAULT_MAX_MISSED_JOBS_PER_RESTART = 5;
+
+// 默认错过任务错峰间隔
+constexpr int64_t DEFAULT_MISSED_JOB_STAGGER_MS = 5'000;
+
+// 默认失败告警触发阈值
+constexpr int DEFAULT_FAILURE_ALERT_AFTER = 2;
+
+// 默认失败告警冷却时间 (1小时)
+constexpr int64_t DEFAULT_FAILURE_ALERT_COOLDOWN_MS = 60 * 60'000;
+
+// stuck run 超时 (2小时)
+constexpr int64_t STUCK_RUN_MS = 2 * 60 * 60'000;
+
+// 指数退避表 (对齐 OpenClaw DEFAULT_BACKOFF_SCHEDULE_MS)
+const std::vector<int64_t> DEFAULT_BACKOFF_SCHEDULE_MS = {
+    30'000,       // 1st error  → 30s
+    60'000,       // 2nd error  →  1min
+    5 * 60'000,   // 3rd error  →  5min
+    15 * 60'000,  // 4th error  → 15min
+    60 * 60'000,  // 5th+ error → 60min
+};
+
+// one-shot 任务最大重试次数
+constexpr int DEFAULT_MAX_TRANSIENT_RETRIES = 3;
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
 std::string generate_uuid() {
+  // 简单 UUID 生成
+  static std::atomic<uint64_t> counter{0};
   std::stringstream ss;
-  ss << std::chrono::system_clock::now().time_since_epoch().count()
-     << "-" << rand();
+  auto now = std::chrono::system_clock::now().time_since_epoch().count();
+  ss << std::hex << now << "-" << counter.fetch_add(1);
   return ss.str();
 }
 
-int64_t now_ms() {
-  return std::chrono::duration_cast<std::chrono::milliseconds>(
-      std::chrono::system_clock::now().time_since_epoch()).count();
+int64_t error_backoff_ms(int consecutive_errors) {
+  int idx = std::min(consecutive_errors - 1,
+                     static_cast<int>(DEFAULT_BACKOFF_SCHEDULE_MS.size()) - 1);
+  idx = std::max(0, idx);
+  return DEFAULT_BACKOFF_SCHEDULE_MS[idx];
 }
+
+// 判断是否为瞬态错误（可重试）
+bool is_transient_cron_error(const std::string& error) {
+  if (error.empty()) return false;
+  // 简单关键词匹配
+  static const std::vector<std::string> patterns = {
+      "rate_limit", "rate limit", "too many requests", "429",
+      "overloaded", "529", "high demand",
+      "network", "econnreset", "econnrefused", "fetch failed",
+      "timeout", "etimedout",
+  };
+  std::string lower = error;
+  std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+  for (const auto& p : patterns) {
+    if (lower.find(p) != std::string::npos) return true;
+  }
+  return false;
+}
+
 }  // namespace
 
 // ============================================================================
 // CronScheduleCalculator Implementation
-// 对齐 OpenClaw cron/schedule.ts
 // ============================================================================
 
 std::optional<int64_t> CronScheduleCalculator::compute_next_run(
     const CronSchedule& schedule,
     int64_t now_ms,
-    std::optional<int64_t> last_run_ms) {
+    std::optional<int64_t> /*last_run_ms*/) {
   switch (schedule.kind) {
     case CronSchedule::Kind::AT: {
-      // Parse ISO 8601 timestamp
-      // Simplified: assume timestamp in milliseconds
       int64_t at_ms = std::stoll(schedule.at);
       return (at_ms > now_ms) ? std::optional<int64_t>(at_ms) : std::nullopt;
     }
-    
     case CronSchedule::Kind::EVERY: {
-      if (schedule.every_ms <= 0) {
-        return std::nullopt;
-      }
-      
+      if (schedule.every_ms <= 0) return std::nullopt;
       int64_t anchor = schedule.anchor_ms.value_or(now_ms);
-      if (now_ms < anchor) {
-        return anchor;
-      }
-      
+      if (now_ms < anchor) return anchor;
       int64_t elapsed = now_ms - anchor;
-      int64_t steps = (elapsed + schedule.every_ms - 1) / schedule.every_ms;
-      if (steps < 1) steps = 1;
-      
+      int64_t steps = std::max<int64_t>(1, (elapsed + schedule.every_ms - 1) / schedule.every_ms);
       return anchor + steps * schedule.every_ms;
     }
-    
     case CronSchedule::Kind::CRON: {
-      // Simplified cron expression parsing
-      // In production, use a proper cron library (e.g., ccronexpr)
-      // For now, return next hour as placeholder
-      int64_t next_hour = ((now_ms / 3600000) + 1) * 3600000;
-      return next_hour;
+      // 委托给 schedule.cc 的 parse_cron_next_ms
+      return parse_cron_next_ms(schedule.expr, now_ms, schedule.tz);
     }
   }
-  
   return std::nullopt;
 }
 
@@ -76,105 +126,113 @@ bool CronScheduleCalculator::is_overdue(int64_t next_run_at_ms, int64_t now_ms, 
   return now_ms >= (next_run_at_ms + grace_ms);
 }
 
-bool CronScheduleCalculator::should_skip(int64_t next_run_at_ms, int64_t now_ms, int64_t skip_threshold_ms) {
+bool CronScheduleCalculator::should_skip(int64_t next_run_at_ms, int64_t now_ms,
+                                          int64_t skip_threshold_ms) {
   return (now_ms - next_run_at_ms) > skip_threshold_ms;
 }
 
 // ============================================================================
 // Memory Cron Store Implementation
-// 对齐 OpenClaw cron/store.ts
 // ============================================================================
 
 class MemoryCronStore : public CronStore {
  public:
   MemoryCronStore() = default;
   ~MemoryCronStore() override = default;
-  
+
   std::vector<CronJob> list() override {
     std::lock_guard<std::mutex> lock(mutex_);
     return jobs_;
   }
-  
+
   std::optional<CronJob> get(const std::string& job_id) override {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = std::find_if(jobs_.begin(), jobs_.end(),
                            [&](const CronJob& job) { return job.id == job_id; });
-    if (it == jobs_.end()) {
-      return std::nullopt;
-    }
+    if (it == jobs_.end()) return std::nullopt;
     return *it;
   }
-  
+
   CronJob add(const CronJobCreate& create) override {
     std::lock_guard<std::mutex> lock(mutex_);
-    
     CronJob job;
     job.id = generate_uuid();
     job.name = create.name;
+    job.description = create.description;
     job.session_target = create.session_target;
     job.wake_mode = create.wake_mode;
     job.schedule = create.schedule;
     job.payload = create.payload;
     job.delivery = create.delivery;
     job.failure_alert = create.failure_alert;
+    job.failure_alert_disabled = create.failure_alert_disabled;
     job.enabled = create.enabled;
-    job.created_at_ms = now_ms();
-    job.updated_at_ms = now_ms();
+    job.delete_after_run = create.delete_after_run;
+    job.agent_id = create.agent_id;
+    job.session_key = create.session_key;
+    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    job.created_at_ms = now;
+    job.updated_at_ms = now;
     job.state = create.state.value_or(CronJobState{});
-    
     jobs_.push_back(job);
     return job;
   }
-  
+
   std::optional<CronJob> update(const std::string& job_id, const CronJobPatch& patch) override {
     std::lock_guard<std::mutex> lock(mutex_);
-    
     auto it = std::find_if(jobs_.begin(), jobs_.end(),
                            [&](const CronJob& job) { return job.id == job_id; });
-    if (it == jobs_.end()) {
-      return std::nullopt;
-    }
-    
+    if (it == jobs_.end()) return std::nullopt;
+
     if (patch.name) it->name = *patch.name;
+    if (patch.description) it->description = *patch.description;
     if (patch.enabled) it->enabled = *patch.enabled;
+    if (patch.delete_after_run) it->delete_after_run = *patch.delete_after_run;
     if (patch.schedule) it->schedule = *patch.schedule;
     if (patch.payload) it->payload = *patch.payload;
     if (patch.delivery) it->delivery = *patch.delivery;
     if (patch.failure_alert) it->failure_alert = *patch.failure_alert;
+    if (patch.failure_alert_disabled) it->failure_alert_disabled = *patch.failure_alert_disabled;
+    if (patch.agent_id) it->agent_id = *patch.agent_id;
+    if (patch.session_key) it->session_key = *patch.session_key;
     if (patch.state) {
-      // Merge state
-      auto& state = it->state;
-      auto& new_state = *patch.state;
-      if (new_state.next_run_at_ms) state.next_run_at_ms = new_state.next_run_at_ms;
-      if (new_state.running_at_ms) state.running_at_ms = new_state.running_at_ms;
-      if (new_state.last_run_at_ms) state.last_run_at_ms = new_state.last_run_at_ms;
-      if (new_state.last_run_status) state.last_run_status = new_state.last_run_status;
-      if (new_state.last_error) state.last_error = new_state.last_error;
-      if (new_state.last_duration_ms) state.last_duration_ms = new_state.last_duration_ms;
-      state.consecutive_errors = new_state.consecutive_errors;
-      state.schedule_error_count = new_state.schedule_error_count;
-      state.last_delivered = new_state.last_delivered;
+      auto& s = it->state;
+      const auto& ns = *patch.state;
+      if (ns.next_run_at_ms) s.next_run_at_ms = ns.next_run_at_ms;
+      if (ns.running_at_ms) s.running_at_ms = ns.running_at_ms;
+      if (ns.last_run_at_ms) s.last_run_at_ms = ns.last_run_at_ms;
+      if (ns.last_run_status) s.last_run_status = ns.last_run_status;
+      if (ns.last_error) s.last_error = ns.last_error;
+      if (ns.last_duration_ms) s.last_duration_ms = ns.last_duration_ms;
+      s.consecutive_errors = ns.consecutive_errors;
+      s.schedule_error_count = ns.schedule_error_count;
+      s.last_delivered = ns.last_delivered;
+      if (ns.last_failure_alert_at_ms) s.last_failure_alert_at_ms = ns.last_failure_alert_at_ms;
+      if (ns.last_delivery_status) s.last_delivery_status = ns.last_delivery_status;
+      if (ns.last_delivery_error) s.last_delivery_error = ns.last_delivery_error;
     }
-    
-    it->updated_at_ms = now_ms();
+    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    it->updated_at_ms = now;
     return *it;
   }
-  
+
   bool remove(const std::string& job_id) override {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = std::find_if(jobs_.begin(), jobs_.end(),
                            [&](const CronJob& job) { return job.id == job_id; });
-    if (it == jobs_.end()) {
-      return false;
-    }
+    if (it == jobs_.end()) return false;
     jobs_.erase(it);
     return true;
   }
-  
-  void save() override {
-    // Memory store doesn't need to save
-  }
-  
+
+  void save() override {}
+
+  // 直接访问 jobs（供 CronService 内部使用）
+  std::vector<CronJob>& jobs_ref() { return jobs_; }
+  std::mutex& mutex_ref() { return mutex_; }
+
  private:
   std::vector<CronJob> jobs_;
   std::mutex mutex_;
@@ -182,75 +240,105 @@ class MemoryCronStore : public CronStore {
 
 // ============================================================================
 // CronService Implementation
-// 对齐 OpenClaw cron/service.ts
 // ============================================================================
 
-CronService::CronService(std::shared_ptr<CronStore> store)
-    : store_(std::move(store)) {}
+CronService::CronService(std::shared_ptr<CronStore> store, CronServiceDeps deps)
+    : store_(std::move(store)), deps_(std::move(deps)) {}
 
 CronService::~CronService() {
   stop();
 }
 
 void CronService::start() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (running_) {
+  if (!deps_.cron_enabled) {
     return;
   }
-  
-  running_ = true;
+
+  // Phase 1: 清理 stale running 标记
+  std::set<std::string> startup_interrupted_ids;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto jobs = store_->list();
+    for (auto& job : jobs) {
+      if (job.state.running_at_ms.has_value()) {
+        job.state.running_at_ms = std::nullopt;
+        startup_interrupted_ids.insert(job.id);
+        CronJobPatch patch;
+        patch.state = job.state;
+        store_->update(job.id, patch);
+      }
+    }
+  }
+
+  // Phase 2: 补跑错过的任务
+  run_missed_jobs(startup_interrupted_ids);
+
+  // Phase 3: 重新计算 nextRunAtMs，启动调度线程
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    int64_t now = deps_.now_ms();
+    recompute_next_runs(now);
+    running_ = true;
+  }
+
   scheduler_thread_ = std::thread(&CronService::scheduler_loop, this);
 }
 
 void CronService::stop() {
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!running_) {
-      return;
-    }
+    if (!running_) return;
     running_ = false;
+    cv_.notify_all();
   }
-  
   if (scheduler_thread_.joinable()) {
     scheduler_thread_.join();
   }
 }
 
 CronJob CronService::add_job(const CronJobCreate& create) {
+  std::lock_guard<std::mutex> lock(mutex_);
   auto job = store_->add(create);
-  
-  // Compute next run time
-  int64_t now = now_ms();
-  auto next_run = CronScheduleCalculator::compute_next_run(job.schedule, now);
-  if (next_run) {
-    CronJobState state = job.state;
-    state.next_run_at_ms = *next_run;
-    
+  int64_t now = deps_.now_ms();
+  auto next = compute_job_next_run_at_ms(job, now);
+  if (next.has_value()) {
+    job.state.next_run_at_ms = next;
     CronJobPatch patch;
-    patch.state = state;
+    patch.state = job.state;
     store_->update(job.id, patch);
-    
-    std::lock_guard<std::mutex> lock(mutex_);
-    next_run_times_[job.id] = *next_run;
   }
-  
   rearm_timer();
   return job;
 }
 
-std::optional<CronJob> CronService::update_job(const std::string& job_id, const CronJobPatch& patch) {
+std::optional<CronJob> CronService::update_job(const std::string& job_id,
+                                                const CronJobPatch& patch) {
+  std::lock_guard<std::mutex> lock(mutex_);
   auto result = store_->update(job_id, patch);
-  if (result) {
+  if (result.has_value()) {
+    int64_t now = deps_.now_ms();
+    bool schedule_changed = patch.schedule.has_value();
+    bool enabled_changed = patch.enabled.has_value();
+    if (schedule_changed || enabled_changed) {
+      if (result->enabled) {
+        result->state.next_run_at_ms = compute_job_next_run_at_ms(*result, now);
+      } else {
+        result->state.next_run_at_ms = std::nullopt;
+        result->state.running_at_ms = std::nullopt;
+      }
+      CronJobPatch state_patch;
+      state_patch.state = result->state;
+      store_->update(job_id, state_patch);
+    }
     rearm_timer();
   }
   return result;
 }
 
 bool CronService::delete_job(const std::string& job_id) {
+  std::lock_guard<std::mutex> lock(mutex_);
   bool removed = store_->remove(job_id);
   if (removed) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    next_run_times_.erase(job_id);
     rearm_timer();
   }
   return removed;
@@ -262,10 +350,7 @@ std::optional<CronJob> CronService::get_job(const std::string& job_id) {
 
 std::vector<CronJob> CronService::list_jobs(bool enabled_only) {
   auto jobs = store_->list();
-  if (!enabled_only) {
-    return jobs;
-  }
-  
+  if (!enabled_only) return jobs;
   std::vector<CronJob> result;
   std::copy_if(jobs.begin(), jobs.end(), std::back_inserter(result),
                [](const CronJob& job) { return job.enabled; });
@@ -274,11 +359,33 @@ std::vector<CronJob> CronService::list_jobs(bool enabled_only) {
 
 void CronService::force_run(const std::string& job_id) {
   auto job = store_->get(job_id);
-  if (!job) {
-    return;
+  if (!job) return;
+  int64_t now = deps_.now_ms();
+  job->state.running_at_ms = now;
+  job->state.last_error = std::nullopt;
+  CronJobPatch patch;
+  patch.state = job->state;
+  store_->update(job_id, patch);
+
+  auto outcome = execute_job_core(*job);
+  int64_t end = deps_.now_ms();
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto stored = store_->get(job_id);
+    if (stored.has_value()) {
+      bool should_delete = apply_job_result(*stored, outcome.status, outcome.error,
+                                            outcome.delivered, now, end,
+                                            /*preserve_schedule=*/true);
+      CronJobPatch sp;
+      sp.state = stored->state;
+      sp.enabled = stored->enabled;
+      store_->update(job_id, sp);
+      if (should_delete) {
+        store_->remove(job_id);
+      }
+    }
+    rearm_timer();
   }
-  
-  execute_job(*job);
 }
 
 void CronService::set_executor(std::function<void(const CronJob&)> executor) {
@@ -286,77 +393,390 @@ void CronService::set_executor(std::function<void(const CronJob&)> executor) {
   executor_ = std::move(executor);
 }
 
-void CronService::scheduler_loop() {
-  while (running_) {
-    int64_t now = now_ms();
-    
-    // Find jobs that need to run
-    std::vector<CronJob> jobs_to_run;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      for (const auto& pair : next_run_times_) {
-        if (pair.second <= now) {
-          auto job = store_->get(pair.first);
-          if (job && job->enabled) {
-            jobs_to_run.push_back(*job);
-          }
-        }
-      }
+// ============================================================================
+// compute_job_next_run_at_ms (对齐 OpenClaw computeJobNextRunAtMs + stagger)
+// ============================================================================
+
+std::optional<int64_t> CronService::compute_job_next_run_at_ms(const CronJob& job,
+                                                                  int64_t now_ms) {
+  if (!job.enabled) return std::nullopt;
+
+  if (job.schedule.kind == CronSchedule::Kind::EVERY) {
+    int64_t every_ms = std::max<int64_t>(1, job.schedule.every_ms);
+    // 优先从 lastRunAtMs 计算
+    if (job.state.last_run_at_ms.has_value()) {
+      int64_t next_from_last = *job.state.last_run_at_ms + every_ms;
+      if (next_from_last > now_ms) return next_from_last;
     }
-    
-    // Execute jobs
-    for (const auto& job : jobs_to_run) {
-      execute_job(job);
-      
-      // Compute next run time
-      auto next_run = CronScheduleCalculator::compute_next_run(job.schedule, now_ms());
-      if (next_run) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        next_run_times_[job.id] = *next_run;
-      }
+    int64_t anchor = job.schedule.anchor_ms.value_or(job.created_at_ms > 0 ? job.created_at_ms : now_ms);
+    int64_t elapsed = now_ms - anchor;
+    int64_t steps = std::max<int64_t>(1, (elapsed + every_ms - 1) / every_ms);
+    return anchor + steps * every_ms;
+  }
+
+  if (job.schedule.kind == CronSchedule::Kind::AT) {
+    auto at_ms_opt = parse_absolute_time_ms(job.schedule.at);
+    if (!at_ms_opt.has_value()) return std::nullopt;
+    int64_t at_ms = *at_ms_opt;
+    // one-shot: 已成功执行过则不再触发
+    if (job.state.last_run_status.has_value() &&
+        *job.state.last_run_status == CronRunStatus::OK &&
+        job.state.last_run_at_ms.has_value()) {
+      if (at_ms > *job.state.last_run_at_ms) return at_ms;
+      return std::nullopt;
     }
-    
-    // Sleep for 1 second
-    std::this_thread::sleep_for(std::chrono::seconds(1));
+    return (at_ms > 0) ? std::optional<int64_t>(at_ms) : std::nullopt;
+  }
+
+  // CRON: 应用 stagger
+  int64_t stagger_ms = job.schedule.stagger_ms;
+  if (stagger_ms <= 0) {
+    // 检查是否为整点表达式，自动加 5 分钟 stagger
+    auto default_stagger = get_default_stagger_ms(job.schedule.expr);
+    if (default_stagger.has_value()) {
+      stagger_ms = *default_stagger;
+    }
+  }
+
+  if (stagger_ms > 0 && !job.id.empty()) {
+    int64_t offset = compute_stable_stagger_offset(job.id, stagger_ms);
+    // 向前移动 cursor 以找到当前 stagger 窗口
+    int64_t cursor = std::max<int64_t>(0, now_ms - offset);
+    for (int attempt = 0; attempt < 4; ++attempt) {
+      auto base_next = parse_cron_next_ms(job.schedule.expr, cursor, job.schedule.tz);
+      if (!base_next.has_value()) return std::nullopt;
+      int64_t shifted = *base_next + offset;
+      if (shifted > now_ms) return shifted;
+      cursor = std::max(cursor + 1, *base_next + 1000);
+    }
+    return std::nullopt;
+  }
+
+  // 无 stagger
+  auto next = parse_cron_next_ms(job.schedule.expr, now_ms, job.schedule.tz);
+  if (!next.has_value()) {
+    // croner 边界情况：从下一秒重试
+    int64_t next_sec = (now_ms / 1000) * 1000 + 1000;
+    next = parse_cron_next_ms(job.schedule.expr, next_sec, job.schedule.tz);
+  }
+  return next;
+}
+
+// ============================================================================
+// recompute_next_runs / recompute_next_runs_for_maintenance
+// ============================================================================
+
+void CronService::recompute_next_runs(int64_t now_ms) {
+  auto jobs = store_->list();
+  for (auto& job : jobs) {
+    if (!job.enabled) {
+      if (job.state.next_run_at_ms.has_value() || job.state.running_at_ms.has_value()) {
+        job.state.next_run_at_ms = std::nullopt;
+        job.state.running_at_ms = std::nullopt;
+        CronJobPatch p;
+        p.state = job.state;
+        store_->update(job.id, p);
+      }
+      continue;
+    }
+    // 清理 stuck running 标记
+    if (job.state.running_at_ms.has_value() &&
+        now_ms - *job.state.running_at_ms > STUCK_RUN_MS) {
+      job.state.running_at_ms = std::nullopt;
+    }
+    // 只有 nextRunAtMs 缺失或已过期才重新计算
+    bool is_due_or_missing = !job.state.next_run_at_ms.has_value() ||
+                             now_ms >= *job.state.next_run_at_ms;
+    if (is_due_or_missing) {
+      job.state.next_run_at_ms = compute_job_next_run_at_ms(job, now_ms);
+      CronJobPatch p;
+      p.state = job.state;
+      store_->update(job.id, p);
+    }
   }
 }
 
-void CronService::execute_job(const CronJob& job) {
-  int64_t start_ms = now_ms();
-  
-  // Update running state
-  CronJobState state = job.state;
-  state.running_at_ms = start_ms;
-  update_job_state(job.id, state);
-  
-  try {
-    // Call executor
-    if (executor_) {
-      executor_(job);
+bool CronService::recompute_next_runs_for_maintenance(int64_t now_ms, bool recompute_expired) {
+  bool changed = false;
+  auto jobs = store_->list();
+  for (auto& job : jobs) {
+    if (!job.enabled) {
+      if (job.state.next_run_at_ms.has_value() || job.state.running_at_ms.has_value()) {
+        job.state.next_run_at_ms = std::nullopt;
+        job.state.running_at_ms = std::nullopt;
+        CronJobPatch p;
+        p.state = job.state;
+        store_->update(job.id, p);
+        changed = true;
+      }
+      continue;
     }
-    
-    // Update success state
-    int64_t end_ms = now_ms();
-    state.running_at_ms = std::nullopt;
-    state.last_run_at_ms = start_ms;
-    state.last_run_status = CronRunStatus::OK;
-    state.last_duration_ms = end_ms - start_ms;
-    state.consecutive_errors = 0;
-    state.last_error = std::nullopt;
-    
-  } catch (const std::exception& e) {
-    // Update error state
-    int64_t end_ms = now_ms();
-    state.running_at_ms = std::nullopt;
-    state.last_run_at_ms = start_ms;
-    state.last_run_status = CronRunStatus::ERROR;
-    state.last_duration_ms = end_ms - start_ms;
-    state.consecutive_errors++;
-    state.last_error = e.what();
+    // 清理 stuck running 标记
+    if (job.state.running_at_ms.has_value() &&
+        now_ms - *job.state.running_at_ms > STUCK_RUN_MS) {
+      job.state.running_at_ms = std::nullopt;
+      CronJobPatch p;
+      p.state = job.state;
+      store_->update(job.id, p);
+      changed = true;
+    }
+    if (!job.state.next_run_at_ms.has_value()) {
+      // 缺失时修复
+      job.state.next_run_at_ms = compute_job_next_run_at_ms(job, now_ms);
+      CronJobPatch p;
+      p.state = job.state;
+      store_->update(job.id, p);
+      changed = true;
+    } else if (recompute_expired && now_ms >= *job.state.next_run_at_ms &&
+               !job.state.running_at_ms.has_value()) {
+      // 只有已执行过该 slot 才推进
+      bool already_executed = job.state.last_run_at_ms.has_value() &&
+                              *job.state.last_run_at_ms >= *job.state.next_run_at_ms;
+      if (already_executed) {
+        job.state.next_run_at_ms = compute_job_next_run_at_ms(job, now_ms);
+        CronJobPatch p;
+        p.state = job.state;
+        store_->update(job.id, p);
+        changed = true;
+      }
+    }
   }
-  
-  update_job_state(job.id, state);
+  return changed;
 }
+
+// ============================================================================
+// rearm_timer (对齐 OpenClaw armTimer)
+// ============================================================================
+
+void CronService::rearm_timer() {
+  // 找到最近的 nextRunAtMs
+  auto jobs = store_->list();
+  std::optional<int64_t> next_wake;
+  for (const auto& job : jobs) {
+    if (job.enabled && job.state.next_run_at_ms.has_value()) {
+      if (!next_wake.has_value() || *job.state.next_run_at_ms < *next_wake) {
+        next_wake = job.state.next_run_at_ms;
+      }
+    }
+  }
+  next_wake_at_ms_ = next_wake;
+  cv_.notify_all();
+}
+
+// ============================================================================
+// executeJobCore (对齐 OpenClaw executeJobCore)
+// ============================================================================
+
+CronRunOutcome CronService::execute_job_core(const CronJob& job) {
+  // main session 路径
+  if (job.session_target == "main") {
+    if (job.payload.kind != CronPayload::Kind::SYSTEM_EVENT) {
+      return {CronRunStatus::SKIPPED, "main job requires payload.kind=systemEvent"};
+    }
+    const std::string& text = job.payload.text;
+    if (text.empty()) {
+      return {CronRunStatus::SKIPPED, "main job requires non-empty systemEvent text"};
+    }
+
+    if (deps_.enqueue_system_event) {
+      deps_.enqueue_system_event(text, job.agent_id, job.session_key,
+                                  "cron:" + job.id);
+    }
+
+    if (job.wake_mode == "now" && deps_.request_heartbeat_now) {
+      deps_.request_heartbeat_now("cron:" + job.id, job.agent_id, job.session_key);
+    } else if (deps_.request_heartbeat_now) {
+      deps_.request_heartbeat_now("cron:" + job.id, job.agent_id, job.session_key);
+    }
+
+    return {CronRunStatus::OK, std::nullopt, text};
+  }
+
+  // isolated 路径
+  if (job.payload.kind != CronPayload::Kind::AGENT_TURN) {
+    return {CronRunStatus::SKIPPED, "isolated job requires payload.kind=agentTurn"};
+  }
+
+  if (deps_.run_isolated_agent_job) {
+    return deps_.run_isolated_agent_job(job, job.payload.message);
+  }
+
+  // 兼容旧 executor_ 接口
+  if (executor_) {
+    try {
+      executor_(job);
+      return {CronRunStatus::OK};
+    } catch (const std::exception& e) {
+      return {CronRunStatus::ERROR, std::string(e.what())};
+    }
+  }
+
+  return {CronRunStatus::SKIPPED, "no executor configured"};
+}
+
+// ============================================================================
+// emit_failure_alert (对齐 OpenClaw emitFailureAlert)
+// ============================================================================
+
+void CronService::emit_failure_alert(const CronJob& job, const std::string& error,
+                                      int consecutive_errors) {
+  std::string job_name = job.name.empty() ? job.id : job.name;
+  std::string truncated_error = error.size() > 200 ? error.substr(0, 200) : error;
+  std::string text = "Cron job \"" + job_name + "\" failed " +
+                     std::to_string(consecutive_errors) + " times\n" +
+                     "Last error: " + truncated_error;
+
+  if (deps_.send_cron_failure_alert) {
+    std::string channel = "last";
+    std::optional<std::string> to;
+    std::optional<std::string> mode;
+    std::optional<std::string> account_id;
+    if (job.failure_alert.has_value()) {
+      if (job.failure_alert->channel.has_value()) channel = *job.failure_alert->channel;
+      to = job.failure_alert->to;
+      mode = job.failure_alert->mode;
+      account_id = job.failure_alert->account_id;
+    }
+    deps_.send_cron_failure_alert(job, text, channel, to, mode, account_id);
+    return;
+  }
+
+  // 回退到 enqueue_system_event
+  if (deps_.enqueue_system_event) {
+    deps_.enqueue_system_event(text, job.agent_id, job.session_key,
+                                "cron:" + job.id + ":failure-alert");
+  }
+  if (job.wake_mode == "now" && deps_.request_heartbeat_now) {
+    deps_.request_heartbeat_now("cron:" + job.id + ":failure-alert",
+                                 job.agent_id, job.session_key);
+  }
+}
+
+// ============================================================================
+// apply_job_result (对齐 OpenClaw applyJobResult)
+// ============================================================================
+
+bool CronService::apply_job_result(
+    CronJob& job,
+    CronRunStatus status,
+    const std::optional<std::string>& error,
+    const std::optional<bool>& delivered,
+    int64_t started_at,
+    int64_t ended_at,
+    bool preserve_schedule) {
+
+  int64_t prev_last_run_at_ms = job.state.last_run_at_ms.value_or(0);
+
+  job.state.running_at_ms = std::nullopt;
+  job.state.last_run_at_ms = started_at;
+  job.state.last_run_status = status;
+  job.state.last_duration_ms = std::max<int64_t>(0, ended_at - started_at);
+  job.state.last_error = error;
+  job.state.last_delivered = delivered.value_or(false);
+  job.state.last_delivery_status =
+      delivered.has_value() ? (delivered.value() ? std::string("delivered")
+                                                  : std::string("not-delivered"))
+                            : std::string("not-requested");
+  job.updated_at_ms = ended_at;
+
+  // 连续错误计数
+  if (status == CronRunStatus::ERROR) {
+    job.state.consecutive_errors++;
+
+    // 失败告警
+    if (!job.failure_alert_disabled) {
+      int after = DEFAULT_FAILURE_ALERT_AFTER;
+      int64_t cooldown_ms = DEFAULT_FAILURE_ALERT_COOLDOWN_MS;
+      if (job.failure_alert.has_value()) {
+        after = job.failure_alert->after;
+        if (job.failure_alert->cooldown_ms > 0) cooldown_ms = job.failure_alert->cooldown_ms;
+      }
+      if (job.state.consecutive_errors >= after) {
+        int64_t now = deps_.now_ms();
+        bool in_cooldown = job.state.last_failure_alert_at_ms.has_value() &&
+                           now - *job.state.last_failure_alert_at_ms < cooldown_ms;
+        if (!in_cooldown) {
+          emit_failure_alert(job, error.value_or(""), job.state.consecutive_errors);
+          job.state.last_failure_alert_at_ms = now;
+        }
+      }
+    }
+  } else {
+    job.state.consecutive_errors = 0;
+    job.state.last_failure_alert_at_ms = std::nullopt;
+  }
+
+  // deleteAfterRun: at 类型成功后删除
+  bool should_delete = (job.schedule.kind == CronSchedule::Kind::AT &&
+                        job.delete_after_run && status == CronRunStatus::OK);
+
+  if (!should_delete) {
+    if (job.schedule.kind == CronSchedule::Kind::AT) {
+      if (status == CronRunStatus::OK || status == CronRunStatus::SKIPPED) {
+        // one-shot 完成：禁用
+        job.enabled = false;
+        job.state.next_run_at_ms = std::nullopt;
+      } else {
+        // one-shot 错误：判断是否可重试
+        bool transient = is_transient_cron_error(error.value_or(""));
+        int consecutive = job.state.consecutive_errors;
+        if (transient && consecutive <= DEFAULT_MAX_TRANSIENT_RETRIES) {
+          int64_t backoff = error_backoff_ms(consecutive);
+          job.state.next_run_at_ms = ended_at + backoff;
+        } else {
+          // 永久错误或超出重试次数：禁用
+          job.enabled = false;
+          job.state.next_run_at_ms = std::nullopt;
+        }
+      }
+    } else if (status == CronRunStatus::ERROR && job.enabled) {
+      // recurring 任务错误：指数退避
+      int64_t backoff = error_backoff_ms(job.state.consecutive_errors);
+      std::optional<int64_t> normal_next;
+      if (preserve_schedule && job.schedule.kind == CronSchedule::Kind::EVERY) {
+        // 保留 anchor 计算
+        CronJob tmp = job;
+        tmp.state.last_run_at_ms = prev_last_run_at_ms > 0
+                                       ? std::optional<int64_t>(prev_last_run_at_ms)
+                                       : std::nullopt;
+        normal_next = compute_job_next_run_at_ms(tmp, ended_at);
+      } else {
+        normal_next = compute_job_next_run_at_ms(job, ended_at);
+      }
+      int64_t backoff_next = ended_at + backoff;
+      job.state.next_run_at_ms =
+          normal_next.has_value() ? std::max(*normal_next, backoff_next) : backoff_next;
+    } else if (job.enabled) {
+      // 正常完成：计算下次运行时间
+      std::optional<int64_t> natural_next;
+      if (preserve_schedule && job.schedule.kind == CronSchedule::Kind::EVERY) {
+        CronJob tmp = job;
+        tmp.state.last_run_at_ms = prev_last_run_at_ms > 0
+                                       ? std::optional<int64_t>(prev_last_run_at_ms)
+                                       : std::nullopt;
+        natural_next = compute_job_next_run_at_ms(tmp, ended_at);
+      } else {
+        natural_next = compute_job_next_run_at_ms(job, ended_at);
+      }
+      if (job.schedule.kind == CronSchedule::Kind::CRON) {
+        // 防止热循环：至少间隔 MIN_REFIRE_GAP_MS
+        int64_t min_next = ended_at + MIN_REFIRE_GAP_MS;
+        job.state.next_run_at_ms =
+            natural_next.has_value() ? std::max(*natural_next, min_next) : min_next;
+      } else {
+        job.state.next_run_at_ms = natural_next;
+      }
+    } else {
+      job.state.next_run_at_ms = std::nullopt;
+    }
+  }
+
+  return should_delete;
+}
+
+// ============================================================================
+// update_job_state
+// ============================================================================
 
 void CronService::update_job_state(const std::string& job_id, const CronJobState& state) {
   CronJobPatch patch;
@@ -364,17 +784,252 @@ void CronService::update_job_state(const std::string& job_id, const CronJobState
   store_->update(job_id, patch);
 }
 
-void CronService::rearm_timer() {
-  // Wake up scheduler thread
-  // In a real implementation, use condition variable
+// ============================================================================
+// run_missed_jobs (对齐 OpenClaw runMissedJobs)
+// ============================================================================
+
+void CronService::run_missed_jobs(const std::set<std::string>& skip_job_ids) {
+  int64_t now = deps_.now_ms();
+  int max_immediate = std::max(0, deps_.max_missed_jobs_per_restart > 0
+                                      ? deps_.max_missed_jobs_per_restart
+                                      : DEFAULT_MAX_MISSED_JOBS_PER_RESTART);
+  int64_t stagger_ms = deps_.missed_job_stagger_ms > 0 ? deps_.missed_job_stagger_ms
+                                                        : DEFAULT_MISSED_JOB_STAGGER_MS;
+
+  // 收集错过的任务
+  std::vector<CronJob> missed;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto jobs = store_->list();
+    for (auto& job : jobs) {
+      if (!job.enabled) continue;
+      if (skip_job_ids.count(job.id)) continue;
+      if (job.state.running_at_ms.has_value()) continue;
+
+      bool is_due = job.state.next_run_at_ms.has_value() && now >= *job.state.next_run_at_ms;
+      if (!is_due) continue;
+
+      // 跳过已有 terminal 状态的 one-shot（除非是重试）
+      if (job.schedule.kind == CronSchedule::Kind::AT &&
+          job.state.last_run_status.has_value()) {
+        if (*job.state.last_run_status == CronRunStatus::OK ||
+            *job.state.last_run_status == CronRunStatus::SKIPPED) {
+          continue;
+        }
+        // error 状态：检查是否有 nextRunAtMs > lastRunAtMs（重试）
+        if (*job.state.last_run_status == CronRunStatus::ERROR &&
+            job.state.next_run_at_ms.has_value() &&
+            job.state.last_run_at_ms.has_value() &&
+            *job.state.next_run_at_ms <= *job.state.last_run_at_ms) {
+          continue;
+        }
+      }
+
+      missed.push_back(job);
+    }
+  }
+
+  if (missed.empty()) return;
+
+  // 按 nextRunAtMs 排序
+  std::sort(missed.begin(), missed.end(), [](const CronJob& a, const CronJob& b) {
+    return a.state.next_run_at_ms.value_or(0) < b.state.next_run_at_ms.value_or(0);
+  });
+
+  // 分割：立即执行 vs 延迟执行
+  std::vector<CronJob> immediate(missed.begin(),
+                                  missed.begin() + std::min((int)missed.size(), max_immediate));
+  std::vector<CronJob> deferred(missed.begin() + std::min((int)missed.size(), max_immediate),
+                                 missed.end());
+
+  // 标记立即执行的任务为 running
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto& job : immediate) {
+      job.state.running_at_ms = now;
+      job.state.last_error = std::nullopt;
+      CronJobPatch p;
+      p.state = job.state;
+      store_->update(job.id, p);
+    }
+  }
+
+  // 执行立即任务
+  struct RunResult {
+    std::string job_id;
+    CronRunStatus status;
+    std::optional<std::string> error;
+    std::optional<bool> delivered;
+    int64_t started_at;
+    int64_t ended_at;
+  };
+  std::vector<RunResult> results;
+  for (auto& job : immediate) {
+    int64_t started_at = deps_.now_ms();
+    auto outcome = execute_job_core(job);
+    int64_t ended_at = deps_.now_ms();
+    results.push_back({job.id, outcome.status, outcome.error, outcome.delivered,
+                       started_at, ended_at});
+  }
+
+  // 应用结果 + 处理延迟任务
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto& r : results) {
+      auto stored = store_->get(r.job_id);
+      if (!stored.has_value()) continue;
+      bool should_delete = apply_job_result(*stored, r.status, r.error, r.delivered,
+                                            r.started_at, r.ended_at);
+      CronJobPatch p;
+      p.state = stored->state;
+      p.enabled = stored->enabled;
+      store_->update(r.job_id, p);
+      if (should_delete) {
+        store_->remove(r.job_id);
+      }
+    }
+
+    // 延迟任务：错峰调度
+    int64_t base_now = deps_.now_ms();
+    int64_t offset = stagger_ms;
+    for (auto& job : deferred) {
+      auto stored = store_->get(job.id);
+      if (!stored.has_value() || !stored->enabled) continue;
+      stored->state.next_run_at_ms = base_now + offset;
+      offset += stagger_ms;
+      CronJobPatch p;
+      p.state = stored->state;
+      store_->update(job.id, p);
+    }
+
+    recompute_next_runs_for_maintenance(deps_.now_ms());
+  }
+}
+
+// ============================================================================
+// scheduler_loop (对齐 OpenClaw onTimer)
+// ============================================================================
+
+void CronService::scheduler_loop() {
+  while (running_) {
+    // 等待到下次唤醒时间
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      int64_t now = deps_.now_ms();
+      int64_t delay_ms = MAX_TIMER_DELAY_MS;
+      if (next_wake_at_ms_.has_value()) {
+        int64_t d = *next_wake_at_ms_ - now;
+        if (d <= 0) {
+          delay_ms = MIN_REFIRE_GAP_MS;  // 防热循环
+        } else {
+          delay_ms = std::min(d, MAX_TIMER_DELAY_MS);
+        }
+      }
+      cv_.wait_for(lock, std::chrono::milliseconds(delay_ms),
+                   [this] { return !running_.load(); });
+      if (!running_) break;
+    }
+
+    // 防并发 tick (对齐 OpenClaw state.running)
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (tick_running_) {
+        // 已有 tick 在执行，重新 arm 后继续等待
+        continue;
+      }
+      tick_running_ = true;
+    }
+
+    // 执行 tick
+    try {
+      int64_t now = deps_.now_ms();
+
+      // 收集到期任务
+      std::vector<CronJob> due_jobs;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto jobs = store_->list();
+        for (auto& job : jobs) {
+          if (!job.enabled) continue;
+          if (job.state.running_at_ms.has_value()) continue;
+          if (!job.state.next_run_at_ms.has_value()) continue;
+          if (now < *job.state.next_run_at_ms) continue;
+          due_jobs.push_back(job);
+        }
+
+        if (due_jobs.empty()) {
+          recompute_next_runs_for_maintenance(now, /*recompute_expired=*/true);
+          rearm_timer();
+          tick_running_ = false;
+          continue;
+        }
+
+        // 标记为 running
+        for (auto& job : due_jobs) {
+          job.state.running_at_ms = now;
+          job.state.last_error = std::nullopt;
+          CronJobPatch p;
+          p.state = job.state;
+          store_->update(job.id, p);
+        }
+        rearm_timer();
+      }
+
+      // 执行任务（在锁外执行，避免阻塞）
+      struct TickResult {
+        std::string job_id;
+        CronRunStatus status;
+        std::optional<std::string> error;
+        std::optional<bool> delivered;
+        int64_t started_at;
+        int64_t ended_at;
+      };
+      std::vector<TickResult> tick_results;
+      for (auto& job : due_jobs) {
+        int64_t started_at = deps_.now_ms();
+        auto outcome = execute_job_core(job);
+        int64_t ended_at = deps_.now_ms();
+        tick_results.push_back({job.id, outcome.status, outcome.error, outcome.delivered,
+                                 started_at, ended_at});
+      }
+
+      // 应用结果
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& r : tick_results) {
+          auto stored = store_->get(r.job_id);
+          if (!stored.has_value()) continue;
+          bool should_delete = apply_job_result(*stored, r.status, r.error, r.delivered,
+                                                r.started_at, r.ended_at);
+          CronJobPatch p;
+          p.state = stored->state;
+          p.enabled = stored->enabled;
+          store_->update(r.job_id, p);
+          if (should_delete) {
+            store_->remove(r.job_id);
+          }
+        }
+        recompute_next_runs_for_maintenance(deps_.now_ms());
+        rearm_timer();
+      }
+    } catch (const std::exception& e) {
+      // tick 异常不应终止调度器
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      tick_running_ = false;
+    }
+  }
 }
 
 // ============================================================================
 // Factory Functions
 // ============================================================================
 
-std::shared_ptr<CronService> createCronService(std::shared_ptr<CronStore> store) {
-  return std::make_shared<CronService>(std::move(store));
+std::shared_ptr<CronService> createCronService(std::shared_ptr<CronStore> store,
+                                                CronServiceDeps deps) {
+  return std::make_shared<CronService>(std::move(store), std::move(deps));
 }
 
 std::shared_ptr<CronStore> createMemoryCronStore() {

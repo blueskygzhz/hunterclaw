@@ -1,13 +1,13 @@
 // 🎯 严格对齐 OpenClaw: src/agents/skills-install.ts
 // HunterClaw Skills 安装执行逻辑实现
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
-#include <regex>
 #include <chrono>
-#include <thread>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <sys/types.h>
@@ -41,6 +41,7 @@ struct CommandResult {
 
 // 🎯 对齐 OpenClaw: SkillsInstallPreferences (config.skills.install)
 struct SkillsInstallPreferences {
+    bool prefer_brew = true;   // 对齐 OpenClaw: preferBrew (default: true)
     std::string node_manager;  // npm, pnpm, yarn, bun
 };
 
@@ -150,13 +151,88 @@ static SkillInstallResult create_install_failure(
     return result;
 }
 
+// 🎯 对齐 OpenClaw: summarizeInstallOutput (skills-install-output.ts)
+static std::string summarize_install_output(const std::string& text) {
+    // trim
+    std::string raw = text;
+    raw.erase(0, raw.find_first_not_of(" \t\n\r"));
+    if (!raw.empty()) raw.erase(raw.find_last_not_of(" \t\n\r") + 1);
+    if (raw.empty()) return "";
+    
+    // 按行分割
+    std::vector<std::string> lines;
+    std::istringstream ss(raw);
+    std::string line;
+    while (std::getline(ss, line)) {
+        // trim line
+        line.erase(0, line.find_first_not_of(" \t\r"));
+        if (!line.empty()) line.erase(line.find_last_not_of(" \t\r") + 1);
+        if (!line.empty()) lines.push_back(line);
+    }
+    if (lines.empty()) return "";
+    
+    // 优先找 error: 行 (对齐 OpenClaw: /^error\b/i)
+    std::string preferred;
+    for (const auto& l : lines) {
+        std::string lower = l;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        if (lower.rfind("error", 0) == 0) { preferred = l; break; }
+    }
+    // 次选: err!/error:/failed
+    if (preferred.empty()) {
+        for (const auto& l : lines) {
+            std::string lower = l;
+            std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+            if (lower.find("err!") != std::string::npos ||
+                lower.find("error:") != std::string::npos ||
+                lower.find("failed") != std::string::npos) {
+                preferred = l; break;
+            }
+        }
+    }
+    // 最后一行
+    if (preferred.empty()) preferred = lines.back();
+    
+    // 规范化空白
+    std::string normalized;
+    bool prev_space = false;
+    for (char c : preferred) {
+        if (std::isspace(c)) {
+            if (!prev_space && !normalized.empty()) { normalized += ' '; prev_space = true; }
+        } else {
+            normalized += c; prev_space = false;
+        }
+    }
+    if (!normalized.empty() && normalized.back() == ' ') normalized.pop_back();
+    
+    // 截断到 200 字符
+    if (normalized.size() > 200) normalized = normalized.substr(0, 199) + "\xe2\x80\xa6";  // …
+    return normalized;
+}
+
+// 🎯 对齐 OpenClaw: formatInstallFailureMessage (skills-install-output.ts)
+static std::string format_install_failure_message(const CommandResult& result) {
+    std::string code_str = (result.code >= 0) ? ("exit " + std::to_string(result.code)) : "unknown exit";
+    std::string summary = summarize_install_output(result.stderr_output);
+    if (summary.empty()) summary = summarize_install_output(result.stdout_output);
+    if (summary.empty()) {
+        return "Install failed (" + code_str + ")";
+    }
+    return "Install failed (" + code_str + "): " + summary;
+}
+
 // 🎯 对齐 OpenClaw: createInstallSuccess (line 210-218)
 static SkillInstallResult create_install_success(const CommandResult& cmd_result) {
     SkillInstallResult result;
     result.ok = true;
     result.message = "Installed";
+    // 对齐 OpenClaw: trim stdout/stderr
     result.stdout_output = cmd_result.stdout_output;
+    result.stdout_output.erase(0, result.stdout_output.find_first_not_of(" \t\n\r"));
+    if (!result.stdout_output.empty()) result.stdout_output.erase(result.stdout_output.find_last_not_of(" \t\n\r") + 1);
     result.stderr_output = cmd_result.stderr_output;
+    result.stderr_output.erase(0, result.stderr_output.find_first_not_of(" \t\n\r"));
+    if (!result.stderr_output.empty()) result.stderr_output.erase(result.stderr_output.find_last_not_of(" \t\n\r") + 1);
     result.code = cmd_result.code;
     return result;
 }
@@ -493,56 +569,149 @@ static SkillInstallResult execute_install_command(
         return create_install_success(result);
     }
     
-    // 🎯 对齐 OpenClaw: formatInstallFailureMessage (line 387-389)
-    std::ostringstream msg;
-    msg << "Installation failed (exit code " << result.code << ")";
-    if (!result.stderr_output.empty()) {
-        msg << ": " << result.stderr_output.substr(0, 200);  // 截断到 200 字符
-    }
-    
+    // 🎯 对齐 OpenClaw: formatInstallFailureMessage (skills-install-output.ts)
     return create_install_failure(
-        msg.str(),
+        format_install_failure_message(result),
         result.stdout_output,
         result.stderr_output,
         result.code
     );
 }
 
-// 🎯 对齐 OpenClaw: collectSkillInstallScanWarnings (line 58-85)
-static std::vector<std::string> collect_skill_install_scan_warnings(
-    const std::string& skill_name,
-    const std::string& skill_dir
+// 🎯 对齐 OpenClaw: formatScanFindingDetail (line 44-52)
+static std::string format_scan_finding_detail(
+    const std::string& root_dir,
+    const std::string& file,
+    int line_num,
+    const std::string& message
 ) {
-    std::vector<std::string> warnings;
+    // 对齐 OpenClaw: path.relative(rootDir, finding.file)
+    std::string relative_path = file;
+    if (!root_dir.empty() && relative_path.rfind(root_dir, 0) == 0) {
+        relative_path = relative_path.substr(root_dir.size());
+        if (!relative_path.empty() && relative_path[0] == '/') {
+            relative_path = relative_path.substr(1);
+        }
+    }
+    // 对齐 OpenClaw: 如果相对路径为空或以 ".." 开头，使用 basename
+    if (relative_path.empty() || relative_path == "." ||
+        relative_path.rfind("..", 0) == 0) {
+        size_t last_slash = file.find_last_of('/');
+        relative_path = (last_slash != std::string::npos) ? file.substr(last_slash + 1) : file;
+    }
+    return message + " (" + relative_path + ":" + std::to_string(line_num) + ")";
+}
+
+// 🎯 对齐 OpenClaw: collectSkillInstallScanWarnings (line 58-85)
+// 对齐 scanDirectoryWithSummary: 区分 critical (危险) 和 warn (可疑)
+struct ScanSummary {
+    int critical = 0;
+    int warn = 0;
+    struct Finding {
+        std::string message;
+        std::string file;
+        int line;
+        std::string severity;  // "critical" | "warn"
+    };
+    std::vector<Finding> findings;
+};
+
+static ScanSummary scan_directory_with_summary(const std::string& skill_dir) {
+    ScanSummary summary;
+    if (skill_dir.empty() || !std::filesystem::exists(skill_dir)) return summary;
     
-    // ✅ 对齐 OpenClaw: scanDirectoryWithSummary()
-    // 扫描危险模式: eval(), exec(), system(), child_process
-    if (!skill_dir.empty() && std::filesystem::exists(skill_dir)) {
-        try {
-            for (const auto& entry : std::filesystem::recursive_directory_iterator(skill_dir)) {
-                if (!entry.is_regular_file()) continue;
-                const auto& path = entry.path();
-                const std::string ext = path.extension().string();
-                // 只扫描文本文件
-                if (ext != ".js" && ext != ".ts" && ext != ".py" && ext != ".sh") continue;
-                std::ifstream f(path);
-                if (!f.is_open()) continue;
-                std::string line;
-                int line_num = 0;
-                while (std::getline(f, line)) {
-                    ++line_num;
-                    // 危险模式检测
-                    if (line.find("eval(") != std::string::npos ||
-                        line.find("child_process") != std::string::npos ||
-                        line.find("__import__('os')") != std::string::npos) {
-                        warnings.push_back("WARNING: Skill \"" + skill_name +
-                            "\" contains potentially dangerous code at " +
-                            path.filename().string() + ":" + std::to_string(line_num));
-                        break;  // 每个文件只报告一次
+    // critical 模式: 直接代码执行
+    static const std::vector<std::pair<std::string, std::string>> critical_patterns = {
+        {"child_process", "uses child_process (arbitrary command execution)"},
+        {"__import__('os')", "uses __import__('os') (arbitrary command execution)"},
+        {"subprocess.call", "uses subprocess.call (arbitrary command execution)"},
+        {"subprocess.run", "uses subprocess.run (arbitrary command execution)"},
+        {"os.system(", "uses os.system (arbitrary command execution)"},
+        {"os.popen(", "uses os.popen (arbitrary command execution)"},
+    };
+    // warn 模式: 可疑但不一定危险
+    static const std::vector<std::pair<std::string, std::string>> warn_patterns = {
+        {"eval(", "uses eval()"},
+        {"exec(", "uses exec()"},
+        {"Function(", "uses Function() constructor"},
+    };
+    
+    try {
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(skill_dir)) {
+            if (!entry.is_regular_file()) continue;
+            const auto& path = entry.path();
+            const std::string ext = path.extension().string();
+            if (ext != ".js" && ext != ".ts" && ext != ".py" && ext != ".sh" &&
+                ext != ".mjs" && ext != ".cjs") continue;
+            
+            std::ifstream f(path);
+            if (!f.is_open()) continue;
+            std::string line;
+            int line_num = 0;
+            while (std::getline(f, line)) {
+                ++line_num;
+                for (const auto& [pattern, msg] : critical_patterns) {
+                    if (line.find(pattern) != std::string::npos) {
+                        summary.critical++;
+                        summary.findings.push_back({msg, path.string(), line_num, "critical"});
+                        goto next_file;  // 每个文件只报告一次
+                    }
+                }
+                for (const auto& [pattern, msg] : warn_patterns) {
+                    if (line.find(pattern) != std::string::npos) {
+                        summary.warn++;
+                        summary.findings.push_back({msg, path.string(), line_num, "warn"});
+                        goto next_file;
                     }
                 }
             }
-        } catch (...) {}
+            next_file:;
+        }
+    } catch (...) {}
+    
+    return summary;
+}
+
+// 🎯 对齐 OpenClaw: collectSkillInstallScanWarnings(entry) — 扫描 entry.skill.baseDir
+static std::vector<std::string> collect_skill_install_scan_warnings(
+    const std::string& skill_name,
+    const std::string& skill_base_dir  // 对齐 OpenClaw: entry.skill.baseDir (非 workspaceDir)
+) {
+    std::vector<std::string> warnings;
+    
+    // 对齐 OpenClaw: const skillDir = path.resolve(entry.skill.baseDir)
+    std::string skill_dir = skill_base_dir;
+    // 规范化路径
+    try {
+        if (!skill_dir.empty() && std::filesystem::exists(skill_dir)) {
+            skill_dir = std::filesystem::canonical(skill_dir).string();
+        }
+    } catch (...) {}
+    
+    try {
+        auto summary = scan_directory_with_summary(skill_dir);
+        if (summary.critical > 0) {
+            // 对齐 OpenClaw: formatScanFindingDetail (line 44-52)
+            std::string details;
+            for (const auto& f : summary.findings) {
+                if (f.severity != "critical") continue;
+                if (!details.empty()) details += "; ";
+                details += format_scan_finding_detail(skill_dir, f.file, f.line, f.message);
+            }
+            warnings.push_back(
+                "WARNING: Skill \"" + skill_name + "\" contains dangerous code patterns: " + details
+            );
+        } else if (summary.warn > 0) {
+            warnings.push_back(
+                "Skill \"" + skill_name + "\" has " + std::to_string(summary.warn) +
+                " suspicious code pattern(s). Run \"hunterclaw security audit --deep\" for details."
+            );
+        }
+    } catch (const std::exception& e) {
+        warnings.push_back(
+            "Skill \"" + skill_name + "\" code safety scan failed (" + std::string(e.what()) +
+            "). Installation continues; run \"hunterclaw security audit --deep\" after install."
+        );
     }
     
     return warnings;
@@ -562,14 +731,13 @@ SkillInstallResult install_skill(
     timeout_ms = std::min(std::max(timeout_ms, 1000), 900000);  // 1秒 到 15分钟
     
     // ✅ 对齐 OpenClaw: 加载技能条目 (line 394-406)
-    // load_workspace_skill_entries + find_entry_by_name
+    // loadWorkspaceSkillEntries + find entry by skill.name
     json entry_spec;
     {
         // 尝试从 workspace_dir 下的 skills.json 或 skill.json 加载
         std::vector<std::string> skill_files = {
             workspace_dir + "/skills.json",
             workspace_dir + "/.hunterclaw/skills.json",
-            workspace_dir + "/" + skill_name + "/skill.json"
         };
         for (const auto& sf : skill_files) {
             if (std::filesystem::exists(sf)) {
@@ -577,18 +745,32 @@ SkillInstallResult install_skill(
                     std::ifstream f(sf);
                     json skills_json;
                     f >> skills_json;
-                    // 在 skills 数组中查找
+                    // 在 skills 数组中查找 (entry.skill.name 对齐 OpenClaw)
                     if (skills_json.is_array()) {
                         for (const auto& s : skills_json) {
-                            if (s.value("name", "") == skill_name || s.value("skillKey", "") == skill_name) {
+                            // 对齐 OpenClaw: entry.skill.name
+                            if (s.value("name", "") == skill_name) {
                                 entry_spec = s;
                                 break;
                             }
                         }
                     } else if (skills_json.is_object()) {
-                        entry_spec = skills_json;
+                        // 单个 skill 文件
+                        if (skills_json.value("name", "") == skill_name) {
+                            entry_spec = skills_json;
+                        }
                     }
                     if (!entry_spec.empty()) break;
+                } catch (...) {}
+            }
+        }
+        // 如果还是找不到，尝试 workspace_dir/<skill_name>/skill.json
+        if (entry_spec.empty()) {
+            std::string single_skill_file = workspace_dir + "/" + skill_name + "/skill.json";
+            if (std::filesystem::exists(single_skill_file)) {
+                try {
+                    std::ifstream f(single_skill_file);
+                    f >> entry_spec;
                 } catch (...) {}
             }
         }
@@ -597,7 +779,41 @@ SkillInstallResult install_skill(
     // ✅ 对齐 OpenClaw: 查找安装规格 (line 407)
     // find_install_spec(entry, install_id)
     json spec;
-    if (!entry_spec.empty() && entry_spec.contains("requirements")) {
+    // 🎯 对齐 OpenClaw: entry not found 时直接返回 (line 394-406)
+    if (entry_spec.empty()) {
+        return SkillInstallResult{
+            false, "Skill not found: " + skill_name, "", "", -1, {}
+        };
+    }
+    
+    // 🎯 对齐 OpenClaw: findInstallSpec (line 407)
+    // 对齐 resolveInstallId: spec.id ?? `${spec.kind}-${index}`
+    if (!entry_spec.empty() && entry_spec.contains("install")) {
+        const auto& install_arr = entry_spec["install"];
+        if (install_arr.is_array()) {
+            int idx = 0;
+            for (const auto& req : install_arr) {
+                // resolveInstallId: spec.id ?? `${spec.kind}-${index}`
+                std::string resolved_id;
+                if (req.contains("id") && req["id"].is_string()) {
+                    resolved_id = req["id"].get<std::string>();
+                    // trim
+                    resolved_id.erase(0, resolved_id.find_first_not_of(" \t\n\r"));
+                    if (!resolved_id.empty()) resolved_id.erase(resolved_id.find_last_not_of(" \t\n\r") + 1);
+                }
+                if (resolved_id.empty()) {
+                    resolved_id = req.value("kind", "") + "-" + std::to_string(idx);
+                }
+                if (resolved_id == install_id) {
+                    spec = req;
+                    break;
+                }
+                ++idx;
+            }
+        }
+    }
+    // 兼容旧 requirements 字段
+    if (spec.empty() && entry_spec.contains("requirements")) {
         const auto& reqs = entry_spec["requirements"];
         if (reqs.is_array()) {
             for (const auto& req : reqs) {
@@ -608,17 +824,16 @@ SkillInstallResult install_skill(
             }
         }
     }
-    // 如果找不到，使用 install_id 作为 kind
-    if (spec.empty()) {
-        spec["kind"] = install_id;
-    }
     
     // 🎯 对齐 OpenClaw: 收集安全警告 (line 408)
-    auto warnings = collect_skill_install_scan_warnings(skill_name, workspace_dir);
+    // 对齐 OpenClaw: collectSkillInstallScanWarnings(entry) — 扫描 entry.skill.baseDir
+    // entry_spec 中的 baseDir 字段 (对应 entry.skill.baseDir)
+    std::string skill_base_dir = entry_spec.value("baseDir", workspace_dir);
+    auto warnings = collect_skill_install_scan_warnings(skill_name, skill_base_dir);
     
     if (spec.empty()) {
         return with_warnings(
-            create_install_failure("Installer not found: " + install_id),
+            SkillInstallResult{false, "Installer not found: " + install_id, "", "", -1, {}},
             warnings
         );
     }
@@ -665,14 +880,28 @@ SkillInstallResult install_skill(
         return with_warnings(result, warnings);
     }
     
-    // 🎯 对齐 OpenClaw: 解析安装偏好 (line 426)
+    // 🎯 对齐 OpenClaw: resolveSkillsInstallPreferences(config) (line 426)
     SkillsInstallPreferences prefs;
-    if (config.contains("skills") && 
-        config["skills"].contains("install") && 
-        config["skills"]["install"].contains("nodeManager")) {
-        prefs.node_manager = config["skills"]["install"]["nodeManager"].get<std::string>();
-    } else {
-        prefs.node_manager = "npm";  // 默认
+    prefs.prefer_brew = true;   // 对齐 OpenClaw: preferBrew default = true
+    prefs.node_manager = "npm"; // 对齐 OpenClaw: nodeManager default = "npm"
+    if (config.contains("skills") && config["skills"].contains("install")) {
+        const auto& install_cfg = config["skills"]["install"];
+        // 对齐 OpenClaw: preferBrew
+        if (install_cfg.contains("preferBrew") && install_cfg["preferBrew"].is_boolean()) {
+            prefs.prefer_brew = install_cfg["preferBrew"].get<bool>();
+        }
+        // 对齐 OpenClaw: nodeManager (trim + lowercase)
+        if (install_cfg.contains("nodeManager") && install_cfg["nodeManager"].is_string()) {
+            std::string mgr = install_cfg["nodeManager"].get<std::string>();
+            // trim
+            mgr.erase(0, mgr.find_first_not_of(" \t\n\r"));
+            if (!mgr.empty()) mgr.erase(mgr.find_last_not_of(" \t\n\r") + 1);
+            // lowercase
+            std::transform(mgr.begin(), mgr.end(), mgr.begin(), ::tolower);
+            if (mgr == "pnpm" || mgr == "yarn" || mgr == "bun" || mgr == "npm") {
+                prefs.node_manager = mgr;
+            }
+        }
     }
     
     // 🎯 对齐 OpenClaw: 构建安装命令 (line 427-439)
@@ -684,12 +913,15 @@ SkillInstallResult install_skill(
         );
     }
     
-    // 🎯 对齐 OpenClaw: 查找 brew 可执行文件 (line 441)
+    // 🎯 对齐 OpenClaw: hasBinary("brew") ? "brew" : resolveBrewExecutable() (line 441)
+    // 对齐 OpenClaw: 仅当 preferBrew=true 时才查找 brew
     std::string brew_exe;
-    if (has_binary("brew")) {
-        brew_exe = "brew";
-    } else {
-        brew_exe = resolve_brew_executable();
+    if (prefs.prefer_brew) {
+        if (has_binary("brew")) {
+            brew_exe = "brew";
+        } else {
+            brew_exe = resolve_brew_executable();
+        }
     }
     
     // 🎯 对齐 OpenClaw: brew 安装器检查 (line 442-444)

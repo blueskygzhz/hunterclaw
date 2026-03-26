@@ -6,8 +6,6 @@
 #include <cstring>
 #include <algorithm>
 #include <fstream>
-#include <memory>
-#include <regex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -258,7 +256,8 @@ DownloadFileResult download_file(
 ) {
     // 🎯 对齐 OpenClaw line 68-76: 准备目录和临时文件
     fs::path dest_path = fs::path(root_dir) / relative_path;
-    fs::path staging_dir = fs::path(root_dir) / ".hunterclaw-download-staging";
+    // 🎯 对齐 OpenClaw: staging 目录名为 .openclaw-download-staging
+    fs::path staging_dir = fs::path(root_dir) / ".openclaw-download-staging";
     
     try {
         fs::create_directories(staging_dir);
@@ -349,6 +348,7 @@ DownloadFileResult download_file(
 }
 
 // 🎯 对齐 OpenClaw line 140-233: extractArchive
+// 前向声明 ExtractResult，供 verifyArchiveHashStable 使用
 struct ExtractResult {
     bool ok;
     int code;
@@ -356,6 +356,42 @@ struct ExtractResult {
     std::string stderr_output;
 };
 
+// 🎯 对齐 OpenClaw: hashFileSha256 (skills-install-extract.ts line 18-30)
+static std::string hash_file_sha256(const std::string& file_path) {
+    std::ifstream f(file_path, std::ios::binary);
+    if (!f.is_open()) return "";
+    
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256_CTX ctx;
+    SHA256_Init(&ctx);
+    
+    char buf[8192];
+    while (f.read(buf, sizeof(buf)) || f.gcount() > 0) {
+        SHA256_Update(&ctx, buf, f.gcount());
+    }
+    SHA256_Final(hash, &ctx);
+    
+    std::ostringstream hex;
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; ++i) {
+        hex << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(hash[i]);
+    }
+    return hex.str();
+}
+
+// 🎯 对齐 OpenClaw: verifyArchiveHashStable (skills-install-extract.ts line 96-107)
+// 防止 TOCTOU 攻击: 确认 preflight 前后归档文件未变
+static bool verify_archive_hash_stable(
+    const std::string& archive_path,
+    const std::string& expected_hash,
+    ExtractResult& out_failure
+) {
+    std::string post_hash = hash_file_sha256(archive_path);
+    if (post_hash == expected_hash) return true;
+    out_failure = {false, 1, "", "tar archive changed during safety preflight; refusing to extract"};
+    return false;
+}
+
+// 🎯 对齐 OpenClaw: extractArchive (skills-install-extract.ts)
 ExtractResult extract_archive(
     const std::string& archive_path,
     const std::string& archive_type,
@@ -443,14 +479,84 @@ ExtractResult extract_archive(
         return {true, 0, output, ""};
     }
     
-    // 🎯 对齐 OpenClaw line 177-226: tar.bz2 解压
+    // 🎯 对齐 OpenClaw: tar.bz2 解压 (含 preflight + TOCTOU 防护)
     if (archive_type == "tar.bz2") {
         // 检查 tar 命令是否存在
         if (system("which tar > /dev/null 2>&1") != 0) {
             return {false, -1, "", "tar not found on PATH"};
         }
         
-        std::string cmd = "tar xjf \"" + archive_path + "\" -C \"" + target_dir + "\"";
+        // 🎯 对齐 OpenClaw: hashFileSha256 在 preflight 前计算哈希
+        std::string preflight_hash = hash_file_sha256(archive_path);
+        
+        // 🎯 对齐 OpenClaw: readTarPreflight — tar tf + tar tvf
+        // Step 1: tar tf 列出所有条目
+        std::vector<std::string> entries;
+        {
+            std::string list_cmd = "tar tf \"" + archive_path + "\" 2>&1";
+            FILE* list_pipe = popen(list_cmd.c_str(), "r");
+            if (!list_pipe) {
+                return {false, -1, "", "tar list failed"};
+            }
+            std::string list_output;
+            char buf[256];
+            while (fgets(buf, sizeof(buf), list_pipe) != nullptr) list_output += buf;
+            int list_code = pclose(list_pipe);
+            if (list_code != 0) {
+                return {false, list_code, list_output, "tar list failed"};
+            }
+            
+            std::istringstream entries_ss(list_output);
+            std::string ep;
+            while (std::getline(entries_ss, ep)) {
+                ep.erase(0, ep.find_first_not_of(" \t\r"));
+                if (!ep.empty()) ep.erase(ep.find_last_not_of(" \t\r") + 1);
+                if (!ep.empty()) entries.push_back(ep);
+            }
+        }
+        
+        // 🎯 对齐 OpenClaw: createTarEntryPreflightChecker — 检查每个条目路径安全
+        for (const auto& entry_path : entries) {
+            // 应用 strip_components
+            std::string check_path = entry_path;
+            if (strip_components > 0) {
+                int slashes = 0;
+                size_t pos = 0;
+                while (pos < check_path.size() && slashes < strip_components) {
+                    if (check_path[pos] == '/') slashes++;
+                    pos++;
+                }
+                check_path = (pos < check_path.size()) ? check_path.substr(pos) : "";
+            }
+            if (check_path.empty()) continue;
+            // 检查路径穿越
+            if (check_path.find("..") != std::string::npos) {
+                return {false, -1, "", "tar entry path traversal detected: " + entry_path};
+            }
+            if (!check_path.empty() && check_path[0] == '/') {
+                return {false, -1, "", "tar entry absolute path detected: " + entry_path};
+            }
+        }
+        
+        // 🎯 对齐 OpenClaw: verifyArchiveHashStable — TOCTOU 防护
+        {
+            ExtractResult hash_failure;
+            if (!verify_archive_hash_stable(archive_path, preflight_hash, hash_failure)) {
+                return hash_failure;
+            }
+        }
+        
+        // 🎯 对齐 OpenClaw: extractTarBz2WithStaging — 使用 staging 目录解压再合并
+        // 创建临时 staging 目录
+        std::string staging_dir = target_dir + "/.tar-bz2-staging-" +
+            std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
+        try {
+            fs::create_directories(staging_dir);
+        } catch (const std::exception& e) {
+            return {false, -1, "", "Failed to create staging dir: " + std::string(e.what())};
+        }
+        
+        std::string cmd = "tar xjf \"" + archive_path + "\" -C \"" + staging_dir + "\"";
         if (strip_components > 0) {
             cmd += " --strip-components=" + std::to_string(strip_components);
         }
@@ -458,6 +564,7 @@ ExtractResult extract_archive(
         
         FILE* pipe = popen(cmd.c_str(), "r");
         if (!pipe) {
+            fs::remove_all(staging_dir);
             return {false, -1, "", "Failed to execute tar"};
         }
         
@@ -469,7 +576,23 @@ ExtractResult extract_archive(
         
         int exit_code = pclose(pipe);
         if (exit_code != 0) {
+            fs::remove_all(staging_dir);
             return {false, exit_code, output, "tar.bz2 extraction failed"};
+        }
+        
+        // 🎯 对齐 OpenClaw: mergeExtractedTreeIntoDestination — 将 staging 内容合并到目标目录
+        try {
+            for (const auto& entry : fs::directory_iterator(staging_dir)) {
+                fs::path dest = fs::path(target_dir) / entry.path().filename();
+                if (fs::exists(dest)) {
+                    fs::remove_all(dest);
+                }
+                fs::rename(entry.path(), dest);
+            }
+            fs::remove_all(staging_dir);
+        } catch (const std::exception& e) {
+            fs::remove_all(staging_dir);
+            return {false, -1, output, "Failed to merge extracted tree: " + std::string(e.what())};
         }
         
         return {true, 0, output, ""};
@@ -586,8 +709,19 @@ DownloadResult install_download_spec(
     }
     
     // 🎯 对齐 OpenClaw line 188-198: 检测归档类型和是否解压
+    // 对齐 OpenClaw: const shouldExtract = spec.extract ?? Boolean(archiveType);
     std::string archive_type = resolve_archive_type(archive_type_explicit, filename);
-    bool should_extract = extract_requested || !archive_type.empty();
+    bool should_extract;
+    if (extract_requested) {
+        // 显式指定 extract=true
+        should_extract = true;
+    } else if (!archive_type_explicit.empty()) {
+        // 显式指定了 archive 类型，默认解压
+        should_extract = !archive_type.empty();
+    } else {
+        // 对齐 OpenClaw: spec.extract 未设置时，根据 archiveType 自动判断
+        should_extract = !archive_type.empty();
+    }
     
     if (!should_extract) {
         std::string msg = "Downloaded to " + archive_path.string();
@@ -601,6 +735,23 @@ DownloadResult install_download_spec(
     }
     
     // 🎯 对齐 OpenClaw line 210-227: 解压归档
+    // 对齐 OpenClaw: 解压前对 targetDir 进行额外安全检查
+    {
+        // assertCanonicalPathWithinBase(canonicalSafeRoot, targetDir)
+        try {
+            fs::path canonical_target = fs::canonical(target_dir);
+            fs::path canonical_root = fs::canonical(safe_root);
+            auto rel = fs::relative(canonical_target, canonical_root);
+            std::string rel_str = rel.string();
+            if (rel.empty() || path_utils::starts_with(rel_str, "..")) {
+                return {false, "target directory outside allowed root (pre-extract check)",
+                        -1, "", "target directory outside allowed root", {}};
+            }
+        } catch (const std::exception& e) {
+            return {false, std::string(e.what()), -1, "", std::string(e.what()), {}};
+        }
+    }
+    
     try {
         auto extract_result = extract_archive(
             archive_path.string(),
@@ -610,16 +761,83 @@ DownloadResult install_download_spec(
             timeout_ms
         );
         
-        if (!extract_result.ok) {
-            return {false, "Extraction failed: " + extract_result.stderr_output,
-                    extract_result.code, extract_result.stdout_output, 
-                    extract_result.stderr_output, {}};
-        }
+        // 🎯 对齐 OpenClaw: const success = extractResult.code === 0
+        bool success = (extract_result.code == 0);
         
         // 🎯 对齐 OpenClaw line 228-237: 成功返回
-        std::string success_msg = "Downloaded and extracted to " + target_dir;
-        return {true, success_msg, 0, extract_result.stdout_output, 
-                extract_result.stderr_output, {}};
+        // 失败时使用 formatInstallFailureMessage
+        std::string out = extract_result.stdout_output;
+        out.erase(0, out.find_first_not_of(" \t\n\r"));
+        if (!out.empty()) out.erase(out.find_last_not_of(" \t\n\r") + 1);
+        std::string err = extract_result.stderr_output;
+        err.erase(0, err.find_first_not_of(" \t\n\r"));
+        if (!err.empty()) err.erase(err.find_last_not_of(" \t\n\r") + 1);
+        
+        if (success) {
+            return {true, "Downloaded and extracted to " + target_dir,
+                    0, out, err, {}};
+        } else {
+            // 🎯 对齐 OpenClaw: formatInstallFailureMessage(extractResult)
+            struct FakeCommandResult {
+                int code;
+                std::string stdout_output;
+                std::string stderr_output;
+            };
+            // 内联调用 format_install_failure_message 等价逻辑
+            std::string code_str = (extract_result.code >= 0)
+                ? ("exit " + std::to_string(extract_result.code))
+                : "unknown exit";
+            // summarize stderr first, then stdout
+            auto summarize = [](const std::string& text) -> std::string {
+                std::string raw = text;
+                raw.erase(0, raw.find_first_not_of(" \t\n\r"));
+                if (!raw.empty()) raw.erase(raw.find_last_not_of(" \t\n\r") + 1);
+                if (raw.empty()) return "";
+                std::vector<std::string> lines;
+                std::istringstream ss(raw);
+                std::string line;
+                while (std::getline(ss, line)) {
+                    line.erase(0, line.find_first_not_of(" \t\r"));
+                    if (!line.empty()) line.erase(line.find_last_not_of(" \t\r") + 1);
+                    if (!line.empty()) lines.push_back(line);
+                }
+                if (lines.empty()) return "";
+                std::string preferred;
+                for (const auto& l : lines) {
+                    std::string lower = l;
+                    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+                    if (lower.rfind("error", 0) == 0) { preferred = l; break; }
+                }
+                if (preferred.empty()) {
+                    for (const auto& l : lines) {
+                        std::string lower = l;
+                        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+                        if (lower.find("err!") != std::string::npos ||
+                            lower.find("error:") != std::string::npos ||
+                            lower.find("failed") != std::string::npos) {
+                            preferred = l; break;
+                        }
+                    }
+                }
+                if (preferred.empty()) preferred = lines.back();
+                std::string normalized;
+                bool prev_space = false;
+                for (char c : preferred) {
+                    if (std::isspace(c)) {
+                        if (!prev_space && !normalized.empty()) { normalized += ' '; prev_space = true; }
+                    } else { normalized += c; prev_space = false; }
+                }
+                if (!normalized.empty() && normalized.back() == ' ') normalized.pop_back();
+                if (normalized.size() > 200) normalized = normalized.substr(0, 199) + "\xe2\x80\xa6";
+                return normalized;
+            };
+            std::string summary = summarize(err);
+            if (summary.empty()) summary = summarize(out);
+            std::string fail_msg = summary.empty()
+                ? "Install failed (" + code_str + ")"
+                : "Install failed (" + code_str + "): " + summary;
+            return {false, fail_msg, extract_result.code, out, err, {}};
+        }
         
     } catch (const std::exception& e) {
         return {false, std::string(e.what()), -1, "", std::string(e.what()), {}};

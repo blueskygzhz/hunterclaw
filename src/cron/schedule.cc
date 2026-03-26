@@ -233,12 +233,25 @@ std::optional<int64_t> compute_next_run_at_ms(
             
             auto next_ms = parse_cron_next_ms(*schedule.expr, now_ms, schedule.tz);
             if (!next_ms.has_value()) {
-                return std::nullopt;
+                // croner 边界情况：从下一秒重试
+                int64_t next_sec = (now_ms / 1000) * 1000 + 1000;
+                next_ms = parse_cron_next_ms(*schedule.expr, next_sec, schedule.tz);
+                if (!next_ms.has_value()) {
+                    return std::nullopt;
+                }
             }
             
-            // 应用错峰偏移
-            // Note: 需要 job_id 才能计算稳定偏移,这里暂不支持
-            // 完整实现应该在 Job 层面计算
+            // 应用错峰偏移 (对齐 OpenClaw computeStaggeredCronNextRunAtMs)
+            int64_t stagger = schedule.stagger_ms.value_or(0);
+            if (stagger <= 0) {
+                // 整点表达式自动加 5 分钟 stagger
+                auto default_stagger = get_default_stagger_ms(*schedule.expr);
+                if (default_stagger.has_value()) {
+                    stagger = *default_stagger;
+                }
+            }
+            // Note: stagger 需要 job_id 才能计算稳定偏移
+            // 无 job_id 时直接返回 next_ms（stagger 在 CronService 层面处理）
             
             return *next_ms;
         }

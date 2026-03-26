@@ -271,27 +271,60 @@ void GatewayCronIntegration::set_context(
 
 nlohmann::json GatewayCronIntegration::job_to_json(const CronJob& job) {
     nlohmann::json j;
-    // ✅ 对齐 OpenClaw: 完整的 CronJob JSON 序列化
     j["id"] = job.id;
     j["name"] = job.name;
+    if (job.description.has_value()) j["description"] = *job.description;
     j["enabled"] = job.enabled;
     j["sessionTarget"] = job.session_target;
     j["wakeMode"] = job.wake_mode;
     j["createdAtMs"] = job.created_at_ms;
     j["updatedAtMs"] = job.updated_at_ms;
+    if (job.agent_id.has_value()) j["agentId"] = *job.agent_id;
+    if (job.session_key.has_value()) j["sessionKey"] = *job.session_key;
+    j["deleteAfterRun"] = job.delete_after_run;
+
     // schedule
     nlohmann::json schedule;
     switch (job.schedule.kind) {
-        case CronSchedule::Kind::AT:   schedule["kind"] = "at"; schedule["at"] = job.schedule.at; break;
-        case CronSchedule::Kind::EVERY: schedule["kind"] = "every"; schedule["everyMs"] = job.schedule.every_ms; break;
-        case CronSchedule::Kind::CRON:  schedule["kind"] = "cron"; schedule["expr"] = job.schedule.expr; break;
+        case CronSchedule::Kind::AT:
+            schedule["kind"] = "at";
+            schedule["at"] = job.schedule.at;
+            break;
+        case CronSchedule::Kind::EVERY:
+            schedule["kind"] = "every";
+            schedule["everyMs"] = job.schedule.every_ms;
+            if (job.schedule.anchor_ms.has_value()) schedule["anchorMs"] = *job.schedule.anchor_ms;
+            break;
+        case CronSchedule::Kind::CRON:
+            schedule["kind"] = "cron";
+            schedule["expr"] = job.schedule.expr;
+            if (job.schedule.tz.has_value()) schedule["tz"] = *job.schedule.tz;
+            if (job.schedule.stagger_ms > 0) schedule["staggerMs"] = job.schedule.stagger_ms;
+            break;
     }
     j["schedule"] = schedule;
+
     // payload
     nlohmann::json payload;
-    payload["kind"] = (job.payload.kind == CronPayload::Kind::AGENT_TURN) ? "agent-turn" : "system-event";
-    payload["text"] = job.payload.text;
+    if (job.payload.kind == CronPayload::Kind::SYSTEM_EVENT) {
+        payload["kind"] = "systemEvent";
+        payload["text"] = job.payload.text;
+    } else {
+        payload["kind"] = "agentTurn";
+        payload["message"] = job.payload.message;
+        if (job.payload.model.has_value()) payload["model"] = *job.payload.model;
+        if (job.payload.thinking.has_value()) payload["thinking"] = *job.payload.thinking;
+        if (job.payload.timeout_seconds > 0) payload["timeoutSeconds"] = job.payload.timeout_seconds;
+        if (job.payload.allow_unsafe_external_content) payload["allowUnsafeExternalContent"] = true;
+        if (job.payload.light_context) payload["lightContext"] = true;
+        if (!job.payload.fallbacks.empty()) {
+            nlohmann::json fallbacks = nlohmann::json::array();
+            for (const auto& f : job.payload.fallbacks) fallbacks.push_back(f);
+            payload["fallbacks"] = fallbacks;
+        }
+    }
     j["payload"] = payload;
+
     // delivery
     nlohmann::json delivery;
     switch (job.delivery.mode) {
@@ -299,9 +332,58 @@ nlohmann::json GatewayCronIntegration::job_to_json(const CronJob& job) {
         case CronDeliveryMode::ANNOUNCE: delivery["mode"] = "announce"; break;
         case CronDeliveryMode::WEBHOOK:  delivery["mode"] = "webhook"; break;
     }
-    if (job.delivery.channel) delivery["channel"] = *job.delivery.channel;
-    if (job.delivery.to) delivery["to"] = *job.delivery.to;
+    if (job.delivery.channel.has_value()) delivery["channel"] = *job.delivery.channel;
+    if (job.delivery.to.has_value()) delivery["to"] = *job.delivery.to;
+    if (job.delivery.account_id.has_value()) delivery["accountId"] = *job.delivery.account_id;
+    if (job.delivery.best_effort) delivery["bestEffort"] = true;
+    if (job.delivery.failure_destination.has_value()) {
+        nlohmann::json fd;
+        const auto& fdd = *job.delivery.failure_destination;
+        if (fdd.channel.has_value()) fd["channel"] = *fdd.channel;
+        if (fdd.to.has_value()) fd["to"] = *fdd.to;
+        if (fdd.account_id.has_value()) fd["accountId"] = *fdd.account_id;
+        if (fdd.mode.has_value()) fd["mode"] = *fdd.mode;
+        delivery["failureDestination"] = fd;
+    }
     j["delivery"] = delivery;
+
+    // failureAlert
+    if (job.failure_alert_disabled) {
+        j["failureAlert"] = false;
+    } else if (job.failure_alert.has_value()) {
+        nlohmann::json fa;
+        fa["after"] = job.failure_alert->after;
+        if (job.failure_alert->channel.has_value()) fa["channel"] = *job.failure_alert->channel;
+        if (job.failure_alert->to.has_value()) fa["to"] = *job.failure_alert->to;
+        if (job.failure_alert->cooldown_ms > 0) fa["cooldownMs"] = job.failure_alert->cooldown_ms;
+        fa["mode"] = job.failure_alert->mode;
+        if (job.failure_alert->account_id.has_value()) fa["accountId"] = *job.failure_alert->account_id;
+        j["failureAlert"] = fa;
+    }
+
+    // state
+    nlohmann::json state;
+    if (job.state.next_run_at_ms.has_value()) state["nextRunAtMs"] = *job.state.next_run_at_ms;
+    if (job.state.running_at_ms.has_value()) state["runningAtMs"] = *job.state.running_at_ms;
+    if (job.state.last_run_at_ms.has_value()) state["lastRunAtMs"] = *job.state.last_run_at_ms;
+    if (job.state.last_run_status.has_value()) {
+        state["lastRunStatus"] = cron_run_status_to_string(*job.state.last_run_status);
+    }
+    if (job.state.last_error.has_value()) state["lastError"] = *job.state.last_error;
+    if (job.state.last_duration_ms.has_value()) state["lastDurationMs"] = *job.state.last_duration_ms;
+    state["consecutiveErrors"] = job.state.consecutive_errors;
+    if (job.state.last_failure_alert_at_ms.has_value()) {
+        state["lastFailureAlertAtMs"] = *job.state.last_failure_alert_at_ms;
+    }
+    if (job.state.last_delivery_status.has_value()) {
+        state["lastDeliveryStatus"] = *job.state.last_delivery_status;
+    }
+    if (job.state.last_delivery_error.has_value()) {
+        state["lastDeliveryError"] = *job.state.last_delivery_error;
+    }
+    state["lastDelivered"] = job.state.last_delivered;
+    j["state"] = state;
+
     return j;
 }
 
@@ -340,9 +422,24 @@ CronJobCreate GatewayCronIntegration::json_to_job_create(const nlohmann::json& j
     }
     if (j.contains("payload")) {
         const auto& p = j["payload"];
-        std::string kind = p.value("kind", "agent-turn");
-        job_create.payload.kind = (kind == "system-event") ? CronPayload::Kind::SYSTEM_EVENT : CronPayload::Kind::AGENT_TURN;
-        job_create.payload.text = p.value("text", "");
+        std::string kind = p.value("kind", "agentTurn");
+        if (kind == "systemEvent") {
+            job_create.payload.kind = CronPayload::Kind::SYSTEM_EVENT;
+            job_create.payload.text = p.value("text", "");
+        } else {
+            job_create.payload.kind = CronPayload::Kind::AGENT_TURN;
+            job_create.payload.message = p.value("message", "");
+            if (p.contains("model")) job_create.payload.model = p["model"].get<std::string>();
+            if (p.contains("thinking")) job_create.payload.thinking = p["thinking"].get<std::string>();
+            if (p.contains("timeoutSeconds")) job_create.payload.timeout_seconds = p["timeoutSeconds"].get<int>();
+            if (p.contains("allowUnsafeExternalContent")) job_create.payload.allow_unsafe_external_content = p["allowUnsafeExternalContent"].get<bool>();
+            if (p.contains("lightContext")) job_create.payload.light_context = p["lightContext"].get<bool>();
+            if (p.contains("fallbacks") && p["fallbacks"].is_array()) {
+                for (const auto& f : p["fallbacks"]) {
+                    job_create.payload.fallbacks.push_back(f.get<std::string>());
+                }
+            }
+        }
     }
     if (j.contains("delivery")) {
         const auto& d = j["delivery"];
@@ -352,7 +449,37 @@ CronJobCreate GatewayCronIntegration::json_to_job_create(const nlohmann::json& j
         else job_create.delivery.mode = CronDeliveryMode::NONE;
         if (d.contains("channel")) job_create.delivery.channel = d["channel"].get<std::string>();
         if (d.contains("to")) job_create.delivery.to = d["to"].get<std::string>();
+        if (d.contains("accountId")) job_create.delivery.account_id = d["accountId"].get<std::string>();
+        if (d.contains("bestEffort")) job_create.delivery.best_effort = d["bestEffort"].get<bool>();
     }
+    if (j.contains("failureAlert")) {
+        if (j["failureAlert"].is_boolean() && !j["failureAlert"].get<bool>()) {
+            job_create.failure_alert_disabled = true;
+        } else if (j["failureAlert"].is_object()) {
+            const auto& fa = j["failureAlert"];
+            CronFailureAlert alert;
+            if (fa.contains("after")) alert.after = fa["after"].get<int>();
+            if (fa.contains("channel")) alert.channel = fa["channel"].get<std::string>();
+            if (fa.contains("to")) alert.to = fa["to"].get<std::string>();
+            if (fa.contains("cooldownMs")) alert.cooldown_ms = fa["cooldownMs"].get<int64_t>();
+            if (fa.contains("mode")) alert.mode = fa["mode"].get<std::string>();
+            if (fa.contains("accountId")) alert.account_id = fa["accountId"].get<std::string>();
+            job_create.failure_alert = alert;
+        }
+    }
+    if (j.contains("deleteAfterRun")) {
+        job_create.delete_after_run = j["deleteAfterRun"].get<bool>();
+    }
+    if (j.contains("description")) {
+        job_create.description = j["description"].get<std::string>();
+    }
+    if (j.contains("agentId")) {
+        job_create.agent_id = j["agentId"].get<std::string>();
+    }
+    if (j.contains("sessionKey")) {
+        job_create.session_key = j["sessionKey"].get<std::string>();
+    }
+    return job_create;
 }
 
 CronJobPatch GatewayCronIntegration::json_to_job_patch(const nlohmann::json& j) {
@@ -385,10 +512,25 @@ CronJobPatch GatewayCronIntegration::json_to_job_patch(const nlohmann::json& j) 
     }
     if (j.contains("payload")) {
         const auto& p = j["payload"];
+        std::string kind = p.value("kind", "agentTurn");
         CronPayload payload;
-        std::string kind = p.value("kind", "agent-turn");
-        payload.kind = (kind == "system-event") ? CronPayload::Kind::SYSTEM_EVENT : CronPayload::Kind::AGENT_TURN;
-        payload.text = p.value("text", "");
+        if (kind == "systemEvent") {
+            payload.kind = CronPayload::Kind::SYSTEM_EVENT;
+            payload.text = p.value("text", "");
+        } else {
+            payload.kind = CronPayload::Kind::AGENT_TURN;
+            payload.message = p.value("message", "");
+            if (p.contains("model")) payload.model = p["model"].get<std::string>();
+            if (p.contains("thinking")) payload.thinking = p["thinking"].get<std::string>();
+            if (p.contains("timeoutSeconds")) payload.timeout_seconds = p["timeoutSeconds"].get<int>();
+            if (p.contains("allowUnsafeExternalContent")) payload.allow_unsafe_external_content = p["allowUnsafeExternalContent"].get<bool>();
+            if (p.contains("lightContext")) payload.light_context = p["lightContext"].get<bool>();
+            if (p.contains("fallbacks") && p["fallbacks"].is_array()) {
+                for (const auto& f : p["fallbacks"]) {
+                    payload.fallbacks.push_back(f.get<std::string>());
+                }
+            }
+        }
         patch.payload = payload;
     }
     if (j.contains("delivery")) {
@@ -399,8 +541,38 @@ CronJobPatch GatewayCronIntegration::json_to_job_patch(const nlohmann::json& j) 
         else if (mode == "webhook") delivery.mode = CronDeliveryMode::WEBHOOK;
         if (d.contains("channel")) delivery.channel = d["channel"].get<std::string>();
         if (d.contains("to")) delivery.to = d["to"].get<std::string>();
+        if (d.contains("accountId")) delivery.account_id = d["accountId"].get<std::string>();
+        if (d.contains("bestEffort")) delivery.best_effort = d["bestEffort"].get<bool>();
         patch.delivery = delivery;
     }
+    if (j.contains("failureAlert")) {
+        if (j["failureAlert"].is_boolean() && !j["failureAlert"].get<bool>()) {
+            patch.failure_alert_disabled = true;
+        } else if (j["failureAlert"].is_object()) {
+            const auto& fa = j["failureAlert"];
+            CronFailureAlert alert;
+            if (fa.contains("after")) alert.after = fa["after"].get<int>();
+            if (fa.contains("channel")) alert.channel = fa["channel"].get<std::string>();
+            if (fa.contains("to")) alert.to = fa["to"].get<std::string>();
+            if (fa.contains("cooldownMs")) alert.cooldown_ms = fa["cooldownMs"].get<int64_t>();
+            if (fa.contains("mode")) alert.mode = fa["mode"].get<std::string>();
+            if (fa.contains("accountId")) alert.account_id = fa["accountId"].get<std::string>();
+            patch.failure_alert = alert;
+        }
+    }
+    if (j.contains("deleteAfterRun")) {
+        patch.delete_after_run = j["deleteAfterRun"].get<bool>();
+    }
+    if (j.contains("description")) {
+        patch.description = j["description"].get<std::string>();
+    }
+    if (j.contains("agentId")) {
+        patch.agent_id = j["agentId"].get<std::string>();
+    }
+    if (j.contains("sessionKey")) {
+        patch.session_key = j["sessionKey"].get<std::string>();
+    }
+    return patch;
 }
 
 } // namespace cron

@@ -64,14 +64,21 @@ core::Result<std::vector<Job>> CronStorage::load_jobs() {
         file >> data;
         file.close();
         
-        if (!data.is_array()) {
+        // 对齐 OpenClaw CronStoreFile: { version: 1, jobs: [] }
+        // 兼容旧格式（直接数组）
+        json jobs_array;
+        if (data.is_object() && data.contains("jobs") && data["jobs"].is_array()) {
+            jobs_array = data["jobs"];
+        } else if (data.is_array()) {
+            jobs_array = data;
+        } else {
             return core::Result<std::vector<Job>>::Err(
-                "Invalid jobs file format: expected array"
+                "Invalid jobs file format: expected {version,jobs} or array"
             );
         }
         
         std::vector<Job> jobs;
-        for (const auto& job_json : data) {
+        for (const auto& job_json : jobs_array) {
             auto job_result = deserialize_job(job_json);
             if (job_result.is_ok()) {
                 jobs.push_back(job_result.unwrap());
@@ -102,11 +109,14 @@ core::Result<void> CronStorage::save_jobs(const std::vector<Job>& jobs) {
             log()->debug("Backed up jobs to: {}", backup_path);
         }
         
-        // 序列化为 JSON
-        json data = json::array();
+        // 序列化为 JSON (对齐 OpenClaw CronStoreFile: { version: 1, jobs: [] })
+        json jobs_array = json::array();
         for (const auto& job : jobs) {
-            data.push_back(serialize_job(job));
+            jobs_array.push_back(serialize_job(job));
         }
+        json data;
+        data["version"] = 1;
+        data["jobs"] = jobs_array;
         
         // 写入文件 (atomic write)
         std::string temp_path = jobs_path + ".tmp";

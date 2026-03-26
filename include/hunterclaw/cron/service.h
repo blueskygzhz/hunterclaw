@@ -2,11 +2,13 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -61,6 +63,17 @@ enum class CronDeliveryMode {
 };
 
 /**
+ * Cron Failure Destination - 失败通知目标
+ * 对齐 OpenClaw cron/types.ts CronFailureDestination
+ */
+struct CronFailureDestination {
+  std::optional<std::string> channel;
+  std::optional<std::string> to;
+  std::optional<std::string> account_id;
+  std::optional<std::string> mode;  // "announce" | "webhook"
+};
+
+/**
  * Cron Delivery - 投递配置
  * 对齐 OpenClaw cron/types.ts CronDelivery
  */
@@ -70,6 +83,7 @@ struct CronDelivery {
   std::optional<std::string> to;  // 目标用户/频道
   std::optional<std::string> account_id;
   bool best_effort = false;
+  std::optional<CronFailureDestination> failure_destination;
 };
 
 /**
@@ -120,10 +134,11 @@ struct CronPayload {
  */
 struct CronJobState {
   std::optional<int64_t> next_run_at_ms;
-  std::optional<int64_t> running_at_ms;
+  std::optional<int64_t> running_at_ms;   // 并发控制：正在运行的时间戳
   std::optional<int64_t> last_run_at_ms;
   std::optional<CronRunStatus> last_run_status;
   std::optional<std::string> last_error;
+  std::optional<std::string> last_error_reason;  // 对齐 lastErrorReason
   std::optional<int64_t> last_duration_ms;
   int consecutive_errors = 0;
   std::optional<int64_t> last_failure_alert_at_ms;
@@ -140,16 +155,23 @@ struct CronJobState {
 struct CronJob {
   std::string id;
   std::string name;
+  std::optional<std::string> description;   // 对齐 description
   std::string session_target = "main";  // "main" or "isolated"
   std::string wake_mode = "next-heartbeat";  // "next-heartbeat" or "now"
   CronSchedule schedule;
   CronPayload payload;
   CronDelivery delivery;
+  // failureAlert: nullopt=未设置, has_value=已设置, disabled_=false 禁用
+  // 用 optional<CronFailureAlert> 表示，通过 failure_alert_disabled 标志表示 false
   std::optional<CronFailureAlert> failure_alert;
+  bool failure_alert_disabled = false;  // 对齐 failureAlert: false
   bool enabled = true;
+  bool delete_after_run = false;  // 对齐 deleteAfterRun
   int64_t created_at_ms = 0;
   int64_t updated_at_ms = 0;
   CronJobState state;
+  std::optional<std::string> agent_id;
+  std::optional<std::string> session_key;
 };
 
 /**
@@ -158,14 +180,19 @@ struct CronJob {
  */
 struct CronJobCreate {
   std::string name;
+  std::optional<std::string> description;
   std::string session_target = "main";
   std::string wake_mode = "next-heartbeat";
   CronSchedule schedule;
   CronPayload payload;
   CronDelivery delivery;
   std::optional<CronFailureAlert> failure_alert;
+  bool failure_alert_disabled = false;
   bool enabled = true;
+  bool delete_after_run = false;
   std::optional<CronJobState> state;
+  std::optional<std::string> agent_id;
+  std::optional<std::string> session_key;
 };
 
 /**
@@ -174,12 +201,17 @@ struct CronJobCreate {
  */
 struct CronJobPatch {
   std::optional<std::string> name;
+  std::optional<std::string> description;
   std::optional<bool> enabled;
+  std::optional<bool> delete_after_run;
   std::optional<CronSchedule> schedule;
   std::optional<CronPayload> payload;
   std::optional<CronDelivery> delivery;
   std::optional<CronFailureAlert> failure_alert;
+  std::optional<bool> failure_alert_disabled;
   std::optional<CronJobState> state;
+  std::optional<std::string> agent_id;
+  std::optional<std::string> session_key;
 };
 
 /**
@@ -196,6 +228,21 @@ struct CronRunLogEntry {
   std::optional<std::string> summary;
   std::optional<std::string> session_id;
   bool delivered = false;
+};
+
+/**
+ * Cron Run Outcome - 执行结果
+ * 对齐 OpenClaw cron/types.ts CronRunOutcome
+ */
+struct CronRunOutcome {
+  CronRunStatus status;
+  std::optional<std::string> error;
+  std::optional<std::string> summary;
+  std::optional<std::string> session_id;
+  std::optional<std::string> session_key;
+  std::optional<bool> delivered;
+  std::optional<bool> delivery_attempted;
+  std::optional<std::string> model;
 };
 
 /**
@@ -220,111 +267,154 @@ class CronStore {
  */
 class CronScheduleCalculator {
  public:
-  /**
-   * computeNextRun - 计算下次执行时间
-   * 
-   * 参数:
-   * - schedule: 调度配置
-   * - now_ms: 当前时间 (毫秒)
-   * - last_run_ms: 上次执行时间 (可选)
-   * 
-   * 返回: 下次执行时间 (毫秒), 如果无法计算返回 nullopt
-   */
   static std::optional<int64_t> compute_next_run(
       const CronSchedule& schedule,
       int64_t now_ms,
       std::optional<int64_t> last_run_ms = std::nullopt);
   
-  /**
-   * isOverdue - 检查是否逾期
-   */
   static bool is_overdue(int64_t next_run_at_ms, int64_t now_ms, int64_t grace_ms = 1000);
-  
-  /**
-   * shouldSkip - 检查是否应跳过
-   */
   static bool should_skip(int64_t next_run_at_ms, int64_t now_ms, int64_t skip_threshold_ms);
+};
+
+/**
+ * Cron Service Deps - 依赖注入
+ * 对齐 OpenClaw cron/service/state.ts CronServiceDeps
+ */
+struct CronServiceDeps {
+  // 时间函数
+  std::function<int64_t()> now_ms = []() -> int64_t {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+  };
+  
+  // 是否启用 cron
+  bool cron_enabled = true;
+  
+  // 默认 agent id
+  std::optional<std::string> default_agent_id;
+  
+  // 启动时最多补跑的错过任务数
+  int max_missed_jobs_per_restart = 5;
+  
+  // 错过任务的错峰间隔 (ms)
+  int64_t missed_job_stagger_ms = 5000;
+  
+  // wakeMode=now 时等待 heartbeat 的最大时间
+  int64_t wake_now_heartbeat_busy_max_wait_ms = 2 * 60 * 1000;
+  
+  // wakeMode=now 时 heartbeat 重试间隔
+  int64_t wake_now_heartbeat_busy_retry_delay_ms = 250;
+  
+  // 注入系统事件 (main session 路径)
+  std::function<void(const std::string& text,
+                     const std::optional<std::string>& agent_id,
+                     const std::optional<std::string>& session_key,
+                     const std::optional<std::string>& context_key)> enqueue_system_event;
+  
+  // 请求立即触发心跳
+  std::function<void(const std::optional<std::string>& reason,
+                     const std::optional<std::string>& agent_id,
+                     const std::optional<std::string>& session_key)> request_heartbeat_now;
+  
+  // 执行 isolated agent job
+  std::function<CronRunOutcome(const CronJob& job,
+                               const std::string& message)> run_isolated_agent_job;
+  
+  // 发送失败告警
+  std::function<void(const CronJob& job,
+                     const std::string& text,
+                     const std::string& channel,
+                     const std::optional<std::string>& to,
+                     const std::optional<std::string>& mode,
+                     const std::optional<std::string>& account_id)> send_cron_failure_alert;
+  
+  // 事件回调
+  std::function<void(const std::string& job_id,
+                     const std::string& action,
+                     const std::optional<int64_t>& next_run_at_ms)> on_event;
 };
 
 /**
  * Cron Service - 定时任务服务
  * 对齐 OpenClaw cron/service.ts
- * 
- * 核心功能:
- * 1. 管理定时任务 (CRUD)
- * 2. 调度执行
- * 3. 状态管理
- * 4. 失败重试
- * 5. 投递管理
  */
 class CronService {
  public:
-  explicit CronService(std::shared_ptr<CronStore> store);
+  explicit CronService(std::shared_ptr<CronStore> store, CronServiceDeps deps = {});
   ~CronService();
   
-  /**
-   * start - 启动服务
-   */
   void start();
-  
-  /**
-   * stop - 停止服务
-   */
   void stop();
   
-  /**
-   * addJob - 添加任务
-   */
   CronJob add_job(const CronJobCreate& create);
-  
-  /**
-   * updateJob - 更新任务
-   */
   std::optional<CronJob> update_job(const std::string& job_id, const CronJobPatch& patch);
-  
-  /**
-   * deleteJob - 删除任务
-   */
   bool delete_job(const std::string& job_id);
-  
-  /**
-   * getJob - 获取任务
-   */
   std::optional<CronJob> get_job(const std::string& job_id);
-  
-  /**
-   * listJobs - 列出任务
-   */
   std::vector<CronJob> list_jobs(bool enabled_only = false);
   
-  /**
-   * forceRun - 强制执行任务
-   */
+  // 手动触发任务 (force=true 忽略 enabled 和 nextRunAtMs)
   void force_run(const std::string& job_id);
   
-  /**
-   * setExecutor - 设置执行器
-   */
+  // 设置执行器 (兼容旧接口)
   void set_executor(std::function<void(const CronJob&)> executor);
 
  private:
+  // 调度主循环 (对齐 OpenClaw onTimer)
   void scheduler_loop();
-  void execute_job(const CronJob& job);
-  void update_job_state(const std::string& job_id, const CronJobState& state);
+  
+  // 执行单个任务核心逻辑 (对齐 OpenClaw executeJobCore)
+  CronRunOutcome execute_job_core(const CronJob& job);
+  
+  // 应用执行结果，更新状态，返回是否应删除任务 (对齐 OpenClaw applyJobResult)
+  bool apply_job_result(
+      CronJob& job,
+      CronRunStatus status,
+      const std::optional<std::string>& error,
+      const std::optional<bool>& delivered,
+      int64_t started_at,
+      int64_t ended_at,
+      bool preserve_schedule = false);
+  
+  // 启动时补跑错过的任务 (对齐 OpenClaw runMissedJobs)
+  void run_missed_jobs(const std::set<std::string>& skip_job_ids = {});
+  
+  // 计算 job 的下次运行时间 (含 stagger)
+  std::optional<int64_t> compute_job_next_run_at_ms(const CronJob& job, int64_t now_ms);
+  
+  // 重新计算所有 job 的 nextRunAtMs
+  void recompute_next_runs(int64_t now_ms);
+  
+  // 维护性重计算 (不推进 past-due nextRunAtMs)
+  bool recompute_next_runs_for_maintenance(int64_t now_ms, bool recompute_expired = false);
+  
+  // 重新 arm 定时器
   void rearm_timer();
   
+  // 发送失败告警
+  void emit_failure_alert(const CronJob& job, const std::string& error, int consecutive_errors);
+  
+  // 更新 job 状态到 store
+  void update_job_state(const std::string& job_id, const CronJobState& state);
+  
   std::shared_ptr<CronStore> store_;
-  std::function<void(const CronJob&)> executor_;
+  CronServiceDeps deps_;
+  std::function<void(const CronJob&)> executor_;  // 兼容旧接口
+  
   std::atomic<bool> running_{false};
+  bool tick_running_ = false;  // 对齐 OpenClaw state.running (防并发 tick)
   std::thread scheduler_thread_;
-  std::map<std::string, int64_t> next_run_times_;
-  mutable std::mutex mutex_;
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  
+  // 下次唤醒时间 (ms)
+  std::optional<int64_t> next_wake_at_ms_;
 };
 
 /**
  * createCronService - 创建 Cron 服务 (工厂函数)
  */
-std::shared_ptr<CronService> createCronService(std::shared_ptr<CronStore> store);
+std::shared_ptr<CronService> createCronService(std::shared_ptr<CronStore> store,
+                                                CronServiceDeps deps = {});
 
 /**
  * createMemoryCronStore - 创建内存存储
