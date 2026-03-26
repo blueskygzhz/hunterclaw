@@ -173,7 +173,7 @@ core::Result<void> MemoryPluginLoader::load_plugin(const std::string& manifest_p
     // dlopen
     void* handle = dlopen(so_path.c_str(), RTLD_LAZY);
     if (!handle) {
-        return core::Result<void>::err(
+        return core::Result<void>::Err(
             std::string("dlopen failed: ") + dlerror());
     }
 
@@ -186,7 +186,7 @@ core::Result<void> MemoryPluginLoader::load_plugin(const std::string& manifest_p
     const char* sym_err = dlerror();
     if (sym_err) {
         dlclose(handle);
-        return core::Result<void>::err(
+        return core::Result<void>::Err(
             std::string("register_memory_plugin not found: ") + sym_err);
     }
 

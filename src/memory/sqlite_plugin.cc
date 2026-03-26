@@ -1,5 +1,6 @@
 #include "hunterclaw/memory/sqlite_plugin.h"
 #include "hunterclaw/memory/provider_registry.h"
+#include "hunterclaw/memory/query_expansion.h"
 #include <spdlog/spdlog.h>
 #include <sqlite3.h>
 #include <filesystem>
@@ -143,132 +144,247 @@ std::vector<MemorySearchResult> SQLiteMemoryManager::search(
     const int limit = opts.max_results.value_or(6);
     const double min_score = opts.min_score.value_or(0.35);
 
-    std::vector<MemorySearchResult> results;
+    // 对齐 manager.ts: cleaned = query.trim()
+    std::string cleaned = query;
+    cleaned.erase(0, cleaned.find_first_not_of(" \t\n\r"));
+    cleaned.erase(cleaned.find_last_not_of(" \t\n\r") + 1);
+    if (cleaned.empty()) return {};
 
-    if (impl_->config.hybrid_search) {
-        // Hybrid: FTS keyword search
-        const char* fts_sql =
-            "SELECT c.path, c.source, c.start_line, c.end_line, c.text "
-            "FROM chunks_fts f "
-            "JOIN chunks c ON c.id = f.id "
-            "WHERE chunks_fts MATCH ? "
-            "ORDER BY rank LIMIT ?";
-        sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(impl_->db, fts_sql, -1, &stmt, nullptr) == SQLITE_OK) {
-            sqlite3_bind_text(stmt, 1, query.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int(stmt, 2, limit * 2);
-            while (sqlite3_step(stmt) == SQLITE_ROW) {
-                MemorySearchResult r;
-                r.path       = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-                r.source     = MemorySource::Memory;
-                r.start_line = sqlite3_column_int(stmt, 2);
-                r.end_line   = sqlite3_column_int(stmt, 3);
-                r.snippet    = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
-                r.score      = impl_->config.text_weight;
-                results.push_back(r);
-            }
-            sqlite3_finalize(stmt);
-        }
+    // 对齐 manager.ts FTS-only 模式:
+    // const keywords = extractKeywords(cleaned);
+    // const searchTerms = keywords.length > 0 ? keywords : [cleaned];
+    // Search with each keyword and merge results (dedup by id, keep highest score)
+    auto keywords = extract_keywords(cleaned);
+    std::vector<std::string> search_terms;
+    if (!keywords.empty()) {
+        search_terms = keywords;
     } else {
-        // FTS-only
-        const char* fts_sql =
-            "SELECT c.path, c.source, c.start_line, c.end_line, c.text "
-            "FROM chunks_fts f "
-            "JOIN chunks c ON c.id = f.id "
-            "WHERE chunks_fts MATCH ? "
-            "ORDER BY rank LIMIT ?";
-        sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(impl_->db, fts_sql, -1, &stmt, nullptr) == SQLITE_OK) {
-            sqlite3_bind_text(stmt, 1, query.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int(stmt, 2, limit);
-            while (sqlite3_step(stmt) == SQLITE_ROW) {
-                MemorySearchResult r;
-                r.path       = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-                r.source     = MemorySource::Memory;
-                r.start_line = sqlite3_column_int(stmt, 2);
-                r.end_line   = sqlite3_column_int(stmt, 3);
-                r.snippet    = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
-                r.score      = 0.8;
-                results.push_back(r);
-            }
-            sqlite3_finalize(stmt);
-        }
+        search_terms.push_back(cleaned);
     }
 
-    // Filter by min_score and truncate
+    // 对齐 manager.ts: const seenIds = new Map<string, ...>()
+    std::map<std::string, MemorySearchResult> seen_ids;
+
+    const char* fts_sql =
+        "SELECT c.id, c.path, c.source, c.start_line, c.end_line, c.text,"
+        "       bm25(chunks_fts) AS rank"
+        "  FROM chunks_fts f"
+        "  JOIN chunks c ON c.id = f.id"
+        " WHERE chunks_fts MATCH ?"
+        " ORDER BY rank ASC"
+        " LIMIT ?";
+
+    for (const auto& term : search_terms) {
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(impl_->db, fts_sql, -1, &stmt, nullptr) != SQLITE_OK) continue;
+        sqlite3_bind_text(stmt, 1, term.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(stmt, 2, limit * 2);
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            std::string id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+            double rank    = sqlite3_column_double(stmt, 6);
+            // 对齐 openclaw: bm25RankToScore(rank) — rank is negative, score = max(0, 1 + rank/10)
+            double score   = std::max(0.0, 1.0 + rank / 10.0);
+
+            MemorySearchResult r;
+            r.path       = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+            std::string src_str = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+            r.source     = (src_str == "sessions") ? MemorySource::Sessions : MemorySource::Memory;
+            r.start_line = sqlite3_column_int(stmt, 3);
+            r.end_line   = sqlite3_column_int(stmt, 4);
+            r.snippet    = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5));
+            r.score      = score;
+
+            // 对齐 manager.ts: keep highest score for each id
+            auto it = seen_ids.find(id);
+            if (it == seen_ids.end() || score > it->second.score) {
+                seen_ids[id] = r;
+            }
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    // 对齐 manager.ts: toSorted + filter(score >= minScore) + slice(0, maxResults)
+    std::vector<MemorySearchResult> results;
+    results.reserve(seen_ids.size());
+    for (auto& [id, r] : seen_ids) results.push_back(std::move(r));
+    std::sort(results.begin(), results.end(),
+              [](const MemorySearchResult& a, const MemorySearchResult& b) {
+                  return a.score > b.score;
+              });
     results.erase(
         std::remove_if(results.begin(), results.end(),
             [min_score](const MemorySearchResult& r) { return r.score < min_score; }),
         results.end());
-    if ((int)results.size() > limit) results.resize(limit);
+    if (static_cast<int>(results.size()) > limit) results.resize(limit);
     return results;
 }
 
 // MemorySearchManager::read_file (对齐 manager.ts:readFile)
 ReadFileResult SQLiteMemoryManager::read_file(const ReadFileParams& params) {
     ReadFileResult result;
-    result.path = params.rel_path;
 
-    // Try to read from filesystem (memory .md files)
-    if (!params.rel_path.empty() && params.rel_path.back() != '/') {
-        std::ifstream f(params.rel_path);
-        if (f.is_open()) {
-            std::string content((std::istreambuf_iterator<char>(f)),
-                                 std::istreambuf_iterator<char>());
-            if (!params.from && !params.lines) {
-                result.text = std::move(content);
-            } else {
-                std::istringstream ss(content);
-                std::string line;
-                std::vector<std::string> lines;
-                while (std::getline(ss, line)) lines.push_back(line);
-                int start = std::max(1, params.from.value_or(1));
-                int count = std::max(1, params.lines.value_or((int)lines.size()));
-                std::string out;
-                for (int i = start - 1; i < start - 1 + count && i < (int)lines.size(); ++i) {
-                    if (!out.empty()) out += '\n';
-                    out += lines[i];
-                }
-                result.text = std::move(out);
-            }
-        }
+    // 对齐 openclaw: rawPath = params.relPath.trim()
+    std::string raw_path = params.rel_path;
+    raw_path.erase(0, raw_path.find_first_not_of(" \t\n\r"));
+    raw_path.erase(raw_path.find_last_not_of(" \t\n\r") + 1);
+
+    if (raw_path.empty()) {
+        result.error = "path required";
+        return result;
     }
+
+    // 对齐 openclaw: only allow .md files
+    if (raw_path.size() < 3 || raw_path.substr(raw_path.size() - 3) != ".md") {
+        result.error = "path required";
+        return result;
+    }
+
+    // 对齐 openclaw: isMemoryPath check (MEMORY.md, memory.md, memory/*)
+    auto is_memory_path = [](const std::string& rel) -> bool {
+        if (rel.empty()) return false;
+        if (rel == "MEMORY.md" || rel == "memory.md") return true;
+        return rel.rfind("memory/", 0) == 0;
+    };
+
+    if (!is_memory_path(raw_path)) {
+        result.error = "path required";
+        return result;
+    }
+
+    // Try to read from filesystem
+    std::ifstream f(raw_path);
+    if (!f.is_open()) {
+        result.path = raw_path;
+        result.text = "";
+        return result;
+    }
+    std::string content((std::istreambuf_iterator<char>(f)),
+                         std::istreambuf_iterator<char>());
+
+    if (!params.from && !params.lines) {
+        result.text = std::move(content);
+        result.path = raw_path;
+        return result;
+    }
+
+    // 按行切片 (对齐 openclaw: lines.slice(start-1, start-1+count).join("\n"))
+    std::istringstream ss(content);
+    std::string line;
+    std::vector<std::string> lines;
+    while (std::getline(ss, line)) lines.push_back(line);
+
+    const int start = std::max(1, params.from.value_or(1));
+    const int count = std::max(1, params.lines.value_or(static_cast<int>(lines.size())));
+    const int begin_idx = start - 1;
+    const int end_idx   = std::min(begin_idx + count, static_cast<int>(lines.size()));
+
+    std::ostringstream out;
+    for (int i = begin_idx; i < end_idx; ++i) {
+        if (i > begin_idx) out << "\n";
+        out << lines[i];
+    }
+    result.text = out.str();
+    result.path = raw_path;
     return result;
 }
 
 // MemorySearchManager::status (对齐 manager.ts:status)
 MemoryProviderStatus SQLiteMemoryManager::status() {
     MemoryProviderStatus s;
-    s.backend  = "builtin";
-    s.provider = "sqlite-memory";
-    s.db_path  = impl_->config.db_path;
+    // 对齐 openclaw: backend = "builtin"
+    s.backend       = "builtin";
+    s.provider      = "none";   // SQLite plugin: FTS-only, no embedding provider
+    s.db_path       = impl_->config.db_path;
+    s.workspace_dir = "";
+    s.dirty         = false;
 
     if (impl_->db) {
         sqlite3_stmt* stmt = nullptr;
+        // files count
         if (sqlite3_prepare_v2(impl_->db,
                 "SELECT COUNT(*) FROM files", -1, &stmt, nullptr) == SQLITE_OK) {
             if (sqlite3_step(stmt) == SQLITE_ROW)
                 s.files = sqlite3_column_int(stmt, 0);
             sqlite3_finalize(stmt);
         }
+        // chunks count
         if (sqlite3_prepare_v2(impl_->db,
                 "SELECT COUNT(*) FROM chunks", -1, &stmt, nullptr) == SQLITE_OK) {
             if (sqlite3_step(stmt) == SQLITE_ROW)
                 s.chunks = sqlite3_column_int(stmt, 0);
             sqlite3_finalize(stmt);
         }
+        // per-source counts (对齐 openclaw: sourceCounts)
+        s.source_counts = std::vector<MemoryProviderStatus::SourceCount>{};
+        for (const char* src : {"memory", "sessions"}) {
+            MemoryProviderStatus::SourceCount sc;
+            sc.source = (std::string(src) == "memory") ? MemorySource::Memory : MemorySource::Sessions;
+            if (sqlite3_prepare_v2(impl_->db,
+                    "SELECT COUNT(*) FROM files WHERE source = ?", -1, &stmt, nullptr) == SQLITE_OK) {
+                sqlite3_bind_text(stmt, 1, src, -1, SQLITE_TRANSIENT);
+                if (sqlite3_step(stmt) == SQLITE_ROW) sc.files = sqlite3_column_int(stmt, 0);
+                sqlite3_finalize(stmt);
+            }
+            if (sqlite3_prepare_v2(impl_->db,
+                    "SELECT COUNT(*) FROM chunks WHERE source = ?", -1, &stmt, nullptr) == SQLITE_OK) {
+                sqlite3_bind_text(stmt, 1, src, -1, SQLITE_TRANSIENT);
+                if (sqlite3_step(stmt) == SQLITE_ROW) sc.chunks = sqlite3_column_int(stmt, 0);
+                sqlite3_finalize(stmt);
+            }
+            s.source_counts->push_back(sc);
+        }
+        // cache status (对齐 openclaw: cache)
+        MemoryProviderStatus::CacheStatus cache;
+        cache.enabled = false;  // SQLite plugin: no embedding cache
+        s.cache = cache;
     }
 
+    // FTS 状态 (对齐 openclaw: fts)
     MemoryProviderStatus::FtsStatus fts;
     fts.enabled   = true;
     fts.available = (impl_->db != nullptr);
     s.fts = fts;
 
+    // Vector 状态 (对齐 openclaw: vector)
+    MemoryProviderStatus::VectorStatus vec;
+    vec.enabled   = impl_->config.hybrid_search;
+    vec.available = false;  // SQLite plugin: no sqlite-vec by default
+    s.vector = vec;
+
+    // Batch 状态 (对齐 openclaw: batch)
+    MemoryProviderStatus::BatchStatus batch;
+    batch.enabled   = false;
+    batch.failures  = 0;
+    batch.limit     = 0;
+    batch.wait      = false;
+    batch.concurrency = 1;
+    batch.poll_interval_ms = 0;
+    batch.timeout_ms = 0;
+    s.batch = batch;
+
+    // Custom 状态 (对齐 openclaw: custom.searchMode)
+    MemoryProviderStatus::CustomStatus custom;
+    custom.search_mode = "fts-only";
+    s.custom = custom;
+
     return s;
 }
 
 // MemorySearchManager::sync (对齐 manager.ts:sync)
+// SQLiteMemoryManager is a lightweight plugin; sync just ensures the DB is ready
+// and reports progress. Full indexing is done via the MemoryIndexManager path.
 void SQLiteMemoryManager::sync(const SyncParams& params) {
+    if (params.progress) {
+        params.progress({0, 1, std::string("Initializing SQLite memory…")});
+    }
+    // Ensure DB is open and schema is valid
+    if (!impl_->db) {
+        auto r = impl_->init_database();
+        if (!r.ok) {
+            log()->warn("SQLiteMemoryManager::sync: DB init failed: {}", r.error);
+        }
+    }
     if (params.progress) {
         params.progress({1, 1, std::string("SQLite memory ready")});
     }

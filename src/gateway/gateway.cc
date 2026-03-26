@@ -5,6 +5,7 @@
 #include "hunterclaw/cron/service.h"
 #include "hunterclaw/core/utils.h"
 #include "hunterclaw/observability/diagnostic_events.h"  // ✅ 可观测性集成
+#include "hunterclaw/auto_reply/message_dispatcher.h"    // ✅ MessageDispatcher (queue mode)
 #include <websocketpp/config/asio_no_tls.hpp>
 #include <websocketpp/server.hpp>
 #include <nlohmann/json.hpp>
@@ -1859,6 +1860,10 @@ struct GatewayServer::Impl {
     std::shared_ptr<skills::SkillManager> skill_mgr;
     std::shared_ptr<plugins::PluginManager> plugin_mgr;
     std::shared_ptr<agents::AgentPool> agent_pool;  // 🏢 Multi-tenant Agent Pool
+    // ✅ MessageDispatcher (对齐 OpenClaw: dispatchInboundMessage)
+    // chat.send 通过 message_dispatcher->run_reply_agent() 调度，
+    // 使四种 queue mode (steer/followup/collect/interrupt) 对 chat.send 生效
+    std::shared_ptr<auto_reply::MessageDispatcher> message_dispatcher;
     std::atomic<bool> running{false};
 };
 
@@ -1880,6 +1885,20 @@ GatewayServer::GatewayServer(std::shared_ptr<core::Config> config)
         impl_->skill_mgr,
         impl_->channel_mgr,
         pool_config
+    );
+
+    // ✅ Initialize MessageDispatcher (对齐 OpenClaw: dispatchInboundMessage)
+    // chat.send 通过 message_dispatcher->run_reply_agent() 调度，
+    // 使四种 queue mode (steer/followup/collect/interrupt) 对 chat.send 生效
+    // Aligned with openclaw: createReplyDispatcher + dispatchInboundMessage
+    auto_reply::DispatchConfig dispatch_config;
+    impl_->message_dispatcher = auto_reply::MessageDispatcher::create(
+        nullptr,  // router: not needed for chat.send path
+        nullptr,  // session_manager: loaded per-request
+        nullptr,  // delivery_queue: not needed for chat.send path
+        nullptr,  // tool_manager: provided by AgentPool
+        nullptr,  // llm_client: provided by AgentPool
+        dispatch_config
     );
     
     // Import create_method_handler from methods.cc

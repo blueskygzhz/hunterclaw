@@ -122,9 +122,6 @@ private:
     
     // 驱逐缓存条目 (对齐 evictCacheEntry)
     void evict_cache_entry();
-    
-    // 处理primary失败
-    void handle_primary_failure(const std::string& error);
 };
 
 // ============================================================================

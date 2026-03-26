@@ -176,9 +176,8 @@ std::vector<QmdQueryResult> parse_qmd_query_result_array(const std::string& raw)
     }
 }
 
-// Returns true if the result is a valid non-null parse (array was found)
-static bool is_valid_parse_result(const std::vector<QmdQueryResult>& results, const std::string& raw) {
-    // We distinguish "null" (parse failure) from "empty array" by trying to parse again
+// Returns true if the raw string is a valid JSON array (not null/parse-failure)
+static bool is_valid_json_array(const std::string& raw) {
     try {
         auto j = json::parse(raw);
         return j.is_array();
@@ -231,7 +230,7 @@ std::vector<QmdQueryResult> parse_qmd_query_json(
     
     try {
         // Try direct parsing
-        if (is_valid_parse_result({}, trimmed_stdout)) {
+        if (is_valid_json_array(trimmed_stdout)) {
             return parse_qmd_query_result_array(trimmed_stdout);
         }
         
@@ -241,7 +240,7 @@ std::vector<QmdQueryResult> parse_qmd_query_json(
             throw std::runtime_error("qmd query JSON response was not an array");
         }
         
-        if (is_valid_parse_result({}, noisy_payload)) {
+        if (is_valid_json_array(noisy_payload)) {
             return parse_qmd_query_result_array(noisy_payload);
         }
         

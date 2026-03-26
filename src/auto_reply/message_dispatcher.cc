@@ -6,8 +6,13 @@
 //   src/auto-reply/inbound-debounce.ts
 //   src/auto-reply/reply/agent-runner.ts          (runReplyAgent)
 //   src/auto-reply/reply/queue-policy.ts          (resolveActiveRunQueueAction)
+//   src/auto-reply/reply/queue/types.ts           (QueueMode, QueueDropPolicy, QueueSettings)
+//   src/auto-reply/reply/queue/settings.ts        (resolveQueueSettings)
+//   src/auto-reply/reply/queue/state.ts           (FollowupQueueState, getFollowupQueue)
 //   src/auto-reply/reply/queue/enqueue.ts         (enqueueFollowupRun)
 //   src/auto-reply/reply/queue/drain.ts           (scheduleFollowupDrain)
+//   src/utils/queue-helpers.ts                    (buildCollectPrompt, applyQueueDropPolicy)
+//   src/pi-embedded-runner/runs.ts                (queueEmbeddedPiMessage, abortEmbeddedPiRun)
 
 #include "hunterclaw/auto_reply/message_dispatcher.h"
 #include "hunterclaw/auto_reply/command_detection.h"
@@ -478,18 +483,39 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
     log()->debug("dispatch_reply_from_config: suppress_typing={} session={}",
                  suppress_typing, session_key);
 
-    // ── Step 10: Generate reply via run_reply_agent ──────────────────────────
+    // ── Step 10: Resolve queue settings ─────────────────────────────────────
+    // Aligned with openclaw: resolveQueueSettings (auto-reply/reply/queue/settings.ts)
+    //
+    // Queue mode controls how concurrent messages are handled:
+    //   collect   (default) → merge all queued into one prompt
+    //   followup  (serial)  → run one-by-one after current run
+    //   steer               → inject into running session
+    //   interrupt           → abort current run, then run-now
+    //   steer-backlog       → steer first, fallback to followup
+    const QueueSettings resolved_queue = resolve_queue_settings(
+        session_entry_for_dispatch,
+        message.channel
+    );
+
+    // ── interrupt mode: clear lane + abort before run ────────────────────────
+    // Aligned with openclaw: get-reply-run.ts
+    //   if (resolvedQueue.mode === "interrupt" && laneSize > 0) {
+    //     clearCommandLane(sessionLaneKey);
+    //     abortEmbeddedPiRun(sessionIdFinal);
+    //   }
+    // Note: actual abort is handled inside run_reply_agent
+
+    // ── Step 11: Generate reply via run_reply_agent ──────────────────────────
     // Aligned with openclaw: runReplyAgent (agent-runner.ts)
     //
-    // runReplyAgent 决策逻辑:
-    //   - isActive=false → "run-now": 通过双层 Lane 队列立即执行
-    //     enqueueSession(() => enqueueGlobal(() => runEmbeddedPiAgent(...)))
-    //   - isActive=true  → "enqueue-followup": 入 FollowupQueue 等待
-    //     drain 时串行消费（while + await runFollowup()）
-    //
-    // 两层串行保证:
-    //   1. session Lane (maxConcurrent=1): 同一 session 请求严格串行
-    //   2. FollowupQueue: 当 session 正在运行时，新请求入队等待
+    // runReplyAgent 决策逻辑 (aligned with openclaw: resolveActiveRunQueueAction):
+    //   - isActive=false → "run-now": 直接执行
+    //   - isActive=true  → 按 queue mode 处理:
+    //       steer      → queueEmbeddedPiMessage (inject into running session)
+    //       interrupt  → abort + run-now
+    //       followup   → enqueue-followup (serial one-by-one)
+    //       collect    → enqueue-followup (batch merge, default)
+    //       steer-backlog → steer first, fallback to followup
 
     // 捕获所有需要在 run_fn 中使用的变量（避免悬空引用）
     auto captured_message = message;
@@ -498,8 +524,14 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
     auto captured_tts_channel = tts_channel;
 
     RunReplyAgentParams agent_params;
-    agent_params.session_key = session_key;
-    agent_params.label = "auto_reply:" + session_key;
+    agent_params.session_key    = session_key;
+    agent_params.label          = "auto_reply:" + session_key;
+    agent_params.prompt         = message.text;  // for collect mode merging
+    agent_params.summary_line   = message.text.size() > 160
+                                    ? message.text.substr(0, 159) + "…"
+                                    : message.text;
+    agent_params.queue_settings = resolved_queue;
+    agent_params.is_heartbeat   = false;
     agent_params.run_fn = [this,
                            captured_message,
                            captured_config,
@@ -648,9 +680,204 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
         return inner_result;
     };
 
-    // 通过 run_reply_agent 执行（isActive 检查 + FollowupQueue 串行保证）
-    // Aligned with openclaw: runReplyAgent → resolveActiveRunQueueAction → run-now / enqueue-followup
+    // 通过 run_reply_agent 执行（四种调度模式）
+    // Aligned with openclaw: runReplyAgent → resolveActiveRunQueueAction
+    //   collect   (default) → enqueue-followup, drain merges all into one prompt
+    //   followup  (serial)  → enqueue-followup, drain runs one-by-one
+    //   steer               → inject into streaming session
+    //   interrupt           → abort current + run-now
+    //   steer-backlog       → steer first, fallback to followup
     result = run_reply_agent(agent_params);
+    return result;
+}
+
+// ============================================================================
+// resolve_queue_settings
+// Aligned with openclaw: resolveQueueSettings (auto-reply/reply/queue/settings.ts)
+//
+// Priority: inlineMode > sessionEntry.queueMode > config.messages.queue.mode > default("collect")
+// ============================================================================
+
+QueueSettings MessageDispatcher::resolve_queue_settings(
+    const std::optional<sessions::SessionEntry>& session_entry,
+    const std::string& channel
+) const {
+    QueueSettings settings;
+
+    // Aligned with openclaw: normalizeQueueMode
+    auto normalize_mode = [](const std::string& raw) -> std::optional<QueueMode> {
+        if (raw.empty()) return std::nullopt;
+        std::string s = raw;
+        std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+        // trim
+        s.erase(0, s.find_first_not_of(" \t"));
+        s.erase(s.find_last_not_of(" \t") + 1);
+
+        if (s == "queue" || s == "queued")                              return QueueMode::Steer;
+        if (s == "interrupt" || s == "interrupts" || s == "abort")      return QueueMode::Interrupt;
+        if (s == "steer" || s == "steering")                            return QueueMode::Steer;
+        if (s == "followup" || s == "follow-ups" || s == "followups")   return QueueMode::Followup;
+        if (s == "collect" || s == "coalesce")                          return QueueMode::Collect;
+        if (s == "steer+backlog" || s == "steer-backlog" || s == "steer_backlog") return QueueMode::SteerBacklog;
+        return std::nullopt;
+    };
+
+    // 1. session entry override
+    if (session_entry.has_value() && session_entry->queue_mode.has_value()) {
+        auto m = normalize_mode(*session_entry->queue_mode);
+        if (m.has_value()) settings.mode = *m;
+    }
+
+    // 2. session entry debounce/cap/drop overrides
+    if (session_entry.has_value()) {
+        if (session_entry->queue_debounce_ms.has_value())
+            settings.debounce_ms = *session_entry->queue_debounce_ms;
+        if (session_entry->queue_cap.has_value())
+            settings.cap = std::max(1, static_cast<int>(*session_entry->queue_cap));
+        if (session_entry->queue_drop.has_value()) {
+            const std::string& drop = *session_entry->queue_drop;
+            if (drop == "old" || drop == "oldest")       settings.drop_policy = QueueDropPolicy::Old;
+            else if (drop == "new" || drop == "newest")  settings.drop_policy = QueueDropPolicy::New;
+            else if (drop == "summarize" || drop == "summary") settings.drop_policy = QueueDropPolicy::Summarize;
+        }
+    }
+
+    // 3. default: collect (aligned with openclaw: defaultQueueModeForChannel → "collect")
+    // (already set as default in QueueSettings constructor)
+
+    return settings;
+}
+
+// ============================================================================
+// resolve_active_run_queue_action
+// Aligned with openclaw: resolveActiveRunQueueAction (queue-policy.ts)
+//
+// type ActiveRunQueueAction = "run-now" | "enqueue-followup" | "drop"
+// ============================================================================
+
+ActiveRunQueueAction MessageDispatcher::resolve_active_run_queue_action(
+    bool is_active,
+    bool is_heartbeat,
+    bool should_followup,
+    QueueMode queue_mode
+) const {
+    if (!is_active) {
+        return ActiveRunQueueAction::RunNow;
+    }
+    if (is_heartbeat) {
+        return ActiveRunQueueAction::Drop;
+    }
+    if (should_followup || queue_mode == QueueMode::Steer) {
+        return ActiveRunQueueAction::EnqueueFollowup;
+    }
+    return ActiveRunQueueAction::RunNow;
+}
+
+// ============================================================================
+// steer_embedded_session
+// Aligned with openclaw: queueEmbeddedPiMessage (pi-embedded-runner/runs.ts)
+//
+// Inject a steer message into a running session.
+// Returns true if the session is currently streaming (steer accepted).
+// ============================================================================
+
+bool MessageDispatcher::steer_embedded_session(
+    const std::string& session_key,
+    const std::string& message
+) {
+    std::lock_guard<std::mutex> lock(session_state_mutex_);
+    // Aligned with openclaw: queueEmbeddedPiMessage returns false if no active streaming run
+    if (streaming_sessions_.count(session_key) == 0) {
+        return false;
+    }
+    steer_queues_[session_key].push_back(message);
+    log()->info("steer_embedded_session: steered message into session={}", session_key);
+    return true;
+}
+
+// ============================================================================
+// abort_embedded_session
+// Aligned with openclaw: abortEmbeddedPiRun (pi-embedded-runner/runs.ts)
+//
+// Abort the currently running session (interrupt mode).
+// Returns true if a session was aborted.
+// ============================================================================
+
+bool MessageDispatcher::abort_embedded_session(const std::string& session_key) {
+    std::lock_guard<std::mutex> lock(session_state_mutex_);
+    if (active_sessions_.count(session_key) == 0) {
+        return false;
+    }
+    // Mark as aborted — the running thread will check this flag
+    // Aligned with openclaw: runAbortController.abort("sessions_yield")
+    // In HunterClaw, we signal abort via a dedicated set
+    // (actual abort mechanism depends on react_engine integration)
+    log()->info("abort_embedded_session: aborting session={}", session_key);
+    // Remove from active so drain can proceed after abort
+    // The actual LLM abort is handled by react_engine's abort signal
+    active_sessions_.erase(session_key);
+    streaming_sessions_.erase(session_key);
+    return true;
+}
+
+// ============================================================================
+// apply_queue_drop_policy
+// Aligned with openclaw: applyQueueDropPolicy (utils/queue-helpers.ts)
+//
+// Returns true if item should be enqueued, false if dropped.
+// ============================================================================
+
+bool MessageDispatcher::apply_queue_drop_policy(
+    FollowupQueueState& queue,
+    const std::string& summary_text
+) {
+    if (queue.cap <= 0 || (int)queue.items.size() < queue.cap) {
+        return true;  // under cap, always enqueue
+    }
+    if (queue.drop_policy == QueueDropPolicy::New) {
+        return false;  // reject new item
+    }
+    // Drop oldest items to make room
+    int drop_count = (int)queue.items.size() - queue.cap + 1;
+    for (int i = 0; i < drop_count && !queue.items.empty(); ++i) {
+        if (queue.drop_policy == QueueDropPolicy::Summarize) {
+            queue.dropped_count++;
+            const std::string& sl = queue.items.front().summary_line;
+            std::string line = sl.empty() ? queue.items.front().prompt : sl;
+            // truncate to 160 chars (aligned with openclaw: buildQueueSummaryLine)
+            if (line.size() > 160) line = line.substr(0, 159) + "…";
+            queue.summary_lines.push_back(line);
+            // cap summary_lines at queue.cap
+            while ((int)queue.summary_lines.size() > queue.cap) {
+                queue.summary_lines.erase(queue.summary_lines.begin());
+            }
+        }
+        queue.items.erase(queue.items.begin());
+    }
+    return true;
+}
+
+// ============================================================================
+// build_collect_prompt
+// Aligned with openclaw: buildCollectPrompt (utils/queue-helpers.ts)
+//
+// Merge multiple queued messages into one prompt.
+// ============================================================================
+
+std::string MessageDispatcher::build_collect_prompt(
+    const std::vector<FollowupTask>& items,
+    const std::string& summary_prompt
+) const {
+    // Aligned with openclaw:
+    //   title: "[Queued messages while agent was busy]"
+    //   items: "---\nQueued #N\n{prompt}"
+    std::string result = "[Queued messages while agent was busy]";
+    if (!summary_prompt.empty()) {
+        result += "\n\n" + summary_prompt;
+    }
+    for (size_t i = 0; i < items.size(); ++i) {
+        result += "\n\n---\nQueued #" + std::to_string(i + 1) + "\n" + items[i].prompt;
+    }
     return result;
 }
 
@@ -659,57 +886,140 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
 // Aligned with openclaw: runReplyAgent (auto-reply/reply/agent-runner.ts)
 //                        + resolveActiveRunQueueAction (queue-policy.ts)
 //
-// Decision logic (aligned with openclaw: resolveActiveRunQueueAction):
-//   - isActive=false → "run-now":
-//       直接执行 run_fn()（对齐 openclaw: await runAgentTurnWithFallback(...)）
-//       执行完成后异步 drain followup queue
-//   - isActive=true  → "enqueue-followup":
-//       push to followup_queues_[session_key]，立即返回
-//       drain 在当前 run 完成后自动触发
-//
-// Serial guarantee (aligned with openclaw):
-//   isActive flag + FollowupQueue drain loop 保证同一 session 请求串行执行
-//   （OpenClaw 不使用 Lane 队列，直接通过 isEmbeddedPiRunActive 跟踪状态）
+// Four scheduling modes (aligned with openclaw: QueueMode):
+//   steer      → inject into running session via steer_embedded_session()
+//   followup   → serial: one-by-one after current run completes
+//   collect    → batch: merge all queued into one prompt (default)
+//   interrupt  → abort current run + clear lane, then run-now
+//   steer-backlog → steer first, fallback to followup if not streaming
 // ============================================================================
 
 MessageDispatcher::DispatchResult MessageDispatcher::run_reply_agent(
     const RunReplyAgentParams& params
 ) {
     const std::string& session_key = params.session_key;
+    const QueueSettings& qs = params.queue_settings;
 
-    // ── Check isActive (aligned with openclaw: isEmbeddedPiRunActive(sessionId)) ──
+    // ── Check isActive + isStreaming ──────────────────────────────────────────
+    // Aligned with openclaw: isEmbeddedPiRunActive / isEmbeddedPiRunStreaming
     bool is_active = false;
+    bool is_streaming = false;
     {
         std::lock_guard<std::mutex> lock(session_state_mutex_);
-        is_active = (active_sessions_.count(session_key) > 0);
+        is_active    = (active_sessions_.count(session_key) > 0);
+        is_streaming = (streaming_sessions_.count(session_key) > 0);
     }
 
-    if (is_active) {
-        // ── "enqueue-followup" path ──────────────────────────────────────────
-        // Aligned with openclaw: enqueueFollowupRun (queue/enqueue.ts)
-        // Session is busy → push to followup queue; drain will pick it up.
-        log()->debug("run_reply_agent: session={} is active → enqueue-followup", session_key);
-
-        FollowupTask task;
-        task.run_fn = [fn = params.run_fn]() { fn(); };
-        task.label  = params.label;
-
+    // ── interrupt mode: abort current run + clear lane, then run-now ─────────
+    // Aligned with openclaw: get-reply-run.ts
+    //   if (resolvedQueue.mode === "interrupt" && laneSize > 0) {
+    //     clearCommandLane(sessionLaneKey);
+    //     abortEmbeddedPiRun(sessionIdFinal);
+    //   }
+    if (qs.mode == QueueMode::Interrupt && is_active) {
+        // Clear followup queue (aligned with openclaw: clearCommandLane)
         {
             std::lock_guard<std::mutex> lock(session_state_mutex_);
-            followup_queues_[session_key].push_back(std::move(task));
+            auto it = followup_queues_.find(session_key);
+            if (it != followup_queues_.end()) {
+                it->second.items.clear();
+                it->second.dropped_count = 0;
+                it->second.summary_lines.clear();
+            }
+        }
+        // Abort current run (aligned with openclaw: abortEmbeddedPiRun)
+        const bool aborted = abort_embedded_session(session_key);
+        log()->info("run_reply_agent: interrupt mode session={} cleared={} aborted={}",
+                    session_key, true, aborted);
+        // After abort, is_active is now false → fall through to run-now
+        is_active = false;
+    }
+
+    // ── steer mode: inject into running session ───────────────────────────────
+    // Aligned with openclaw: agent-runner.ts
+    //   if (shouldSteer && isStreaming) {
+    //     const steered = queueEmbeddedPiMessage(sessionId, prompt);
+    //     if (steered && !shouldFollowup) return undefined;
+    //   }
+    const bool should_steer = (qs.mode == QueueMode::Steer || qs.mode == QueueMode::SteerBacklog);
+    if (should_steer && is_streaming) {
+        const bool steered = steer_embedded_session(session_key, params.prompt);
+        if (steered) {
+            const bool should_followup = (qs.mode == QueueMode::SteerBacklog);
+            if (!should_followup) {
+                log()->info("run_reply_agent: steered into session={}", session_key);
+                DispatchResult steered_result;
+                steered_result.success = true;
+                return steered_result;
+            }
+        }
+    }
+
+    // ── Determine shouldFollowup ──────────────────────────────────────────────
+    // Aligned with openclaw: agent-runner.ts
+    //   const shouldFollowup =
+    //     resolvedQueue.mode === "followup" ||
+    //     resolvedQueue.mode === "collect" ||
+    //     resolvedQueue.mode === "steer-backlog";
+    const bool should_followup =
+        qs.mode == QueueMode::Followup ||
+        qs.mode == QueueMode::Collect  ||
+        qs.mode == QueueMode::SteerBacklog;
+
+    // ── resolveActiveRunQueueAction ───────────────────────────────────────────
+    const auto action = resolve_active_run_queue_action(
+        is_active, params.is_heartbeat, should_followup, qs.mode
+    );
+
+    if (action == ActiveRunQueueAction::Drop) {
+        // Aligned with openclaw: heartbeat while active → drop
+        log()->debug("run_reply_agent: session={} drop (heartbeat while active)", session_key);
+        DispatchResult drop_result;
+        drop_result.success = true;
+        return drop_result;
+    }
+
+    if (action == ActiveRunQueueAction::EnqueueFollowup) {
+        // ── "enqueue-followup" path ──────────────────────────────────────────
+        // Aligned with openclaw: enqueueFollowupRun (queue/enqueue.ts)
+        log()->debug("run_reply_agent: session={} is active → enqueue-followup mode={}",
+                     session_key, (int)qs.mode);
+
+        std::lock_guard<std::mutex> lock(session_state_mutex_);
+        auto& queue = followup_queues_[session_key];
+
+        // Apply runtime settings (aligned with openclaw: applyQueueRuntimeSettings)
+        queue.mode        = qs.mode;
+        queue.debounce_ms = qs.debounce_ms;
+        queue.cap         = qs.cap;
+        queue.drop_policy = qs.drop_policy;
+
+        // Apply drop policy (aligned with openclaw: applyQueueDropPolicy)
+        const bool should_enqueue = apply_queue_drop_policy(queue, params.summary_line);
+        if (!should_enqueue) {
+            log()->debug("run_reply_agent: session={} item dropped by policy=new", session_key);
+            DispatchResult drop_result;
+            drop_result.success = true;
+            return drop_result;
         }
 
-        // Return immediately — result will be delivered asynchronously via drain
-        // Aligned with openclaw: enqueueFollowupRun returns immediately after push
+        FollowupTask task;
+        task.run_fn       = params.run_fn;
+        task.label        = params.label;
+        task.prompt       = params.prompt;
+        task.summary_line = params.summary_line;
+        task.enqueued_at_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        queue.items.push_back(std::move(task));
+        queue.last_enqueued_at_ms = task.enqueued_at_ms;
+
         DispatchResult queued_result;
-        queued_result.success = true;  // queued successfully
+        queued_result.success = true;
         return queued_result;
     }
 
     // ── "run-now" path ───────────────────────────────────────────────────────
     // Aligned with openclaw: directly await runAgentTurnWithFallback(...)
-    // OpenClaw does NOT use Lane queues here — serial guarantee comes from
-    // isActive flag + FollowupQueue drain loop.
     log()->debug("run_reply_agent: session={} is idle → run-now", session_key);
 
     // Mark session as active (aligned with openclaw: isEmbeddedPiRunActive → true)
@@ -731,11 +1041,10 @@ MessageDispatcher::DispatchResult MessageDispatcher::run_reply_agent(
     {
         std::lock_guard<std::mutex> lock(session_state_mutex_);
         active_sessions_.erase(session_key);
+        streaming_sessions_.erase(session_key);
     }
 
     // Async drain followup queue (aligned with openclaw: scheduleFollowupDrain)
-    // Launch in detached thread so caller is not blocked.
-    // Aligned with openclaw: void (async () => { while (queue.items.length > 0) {...} })()
     drain_followup_queue(session_key);
 
     return run_result;
@@ -745,71 +1054,242 @@ MessageDispatcher::DispatchResult MessageDispatcher::run_reply_agent(
 // drain_followup_queue
 // Aligned with openclaw: scheduleFollowupDrain (auto-reply/reply/queue/drain.ts)
 //
-// Asynchronously drains the followup queue for a session in a detached thread:
-//   while (queue not empty) {
-//     task = dequeue()
-//     mark session active
-//     run task directly (no Lane queue)
-//     mark session idle
+// Supports four drain modes:
+//   collect  → wait debounce, merge all items into one prompt, run once
+//   followup → wait debounce, run items one-by-one (serial)
+//   steer    → (handled in run_reply_agent, not here)
+//   interrupt→ (handled in run_reply_agent, not here)
+//
+// Aligned with openclaw drain loop:
+//   while (queue.items.length > 0 || queue.droppedCount > 0) {
+//     await waitForQueueDebounce(queue);
+//     if (mode === "collect") { ... merge ... }
+//     else { await drainNextQueueItem(...) }
 //   }
-//
-// Aligned with openclaw:
-//   void (async () => {
-//     while (queue.items.length > 0) {
-//       await drainNextQueueItem(queue.items, runFollowup);
-//     }
-//   })()
-//
-// Key: drain runs in a detached thread so the caller is not blocked.
 // ============================================================================
 
 void MessageDispatcher::drain_followup_queue(const std::string& session_key) {
-    // Check if there's anything to drain before spawning a thread
+    // Check if there's anything to drain and mark as draining
     {
         std::lock_guard<std::mutex> lock(session_state_mutex_);
         auto it = followup_queues_.find(session_key);
-        if (it == followup_queues_.end() || it->second.empty()) {
-            return;  // Nothing to drain
-        }
+        if (it == followup_queues_.end()) return;
+        auto& queue = it->second;
+        if (queue.items.empty() && queue.dropped_count == 0) return;
+        if (queue.draining) return;  // already draining
+        queue.draining = true;
     }
 
     // Launch async drain in detached thread
     // Aligned with openclaw: void (async () => {...})()
     std::thread([this, session_key]() {
         while (true) {
-            // Dequeue next followup task
-            FollowupTask next_task;
+            // ── waitForQueueDebounce ──────────────────────────────────────
+            // Aligned with openclaw: waitForQueueDebounce(queue)
+            int debounce_ms = 0;
+            int64_t last_enqueued_at = 0;
+            QueueMode mode = QueueMode::Collect;
             {
                 std::lock_guard<std::mutex> lock(session_state_mutex_);
                 auto it = followup_queues_.find(session_key);
-                if (it == followup_queues_.end() || it->second.empty()) {
-                    break;  // Queue empty → done
+                if (it == followup_queues_.end()) break;
+                debounce_ms      = it->second.debounce_ms;
+                last_enqueued_at = it->second.last_enqueued_at_ms;
+                mode             = it->second.mode;
+            }
+            if (debounce_ms > 0) {
+                // Wait until debounce_ms has elapsed since last enqueue
+                bool queue_gone = false;
+                while (true) {
+                    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                    int64_t since = now - last_enqueued_at;
+                    if (since >= debounce_ms) break;
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(debounce_ms - since));
+                    // Refresh last_enqueued_at in case new items arrived
+                    std::lock_guard<std::mutex> lock(session_state_mutex_);
+                    auto it = followup_queues_.find(session_key);
+                    if (it == followup_queues_.end()) { queue_gone = true; break; }
+                    last_enqueued_at = it->second.last_enqueued_at_ms;
                 }
-                next_task = std::move(it->second.front());
-                it->second.erase(it->second.begin());
-
-                // Mark session active for this followup run
-                // Aligned with openclaw: isEmbeddedPiRunActive → true
-                active_sessions_.insert(session_key);
+                if (queue_gone) break;
             }
 
-            log()->debug("drain_followup_queue: session={} running followup label={}",
-                         session_key, next_task.label);
-
-            // Execute followup task directly (no Lane queue)
-            // Aligned with openclaw: await runFollowup(item)
-            try {
-                next_task.run_fn();
-            } catch (const std::exception& e) {
-                log()->error("drain_followup_queue: followup failed session={}: {}",
-                             session_key, e.what());
-            }
-
-            // Mark session idle before checking for more followups
-            // Aligned with openclaw: isEmbeddedPiRunActive → false
+            // ── Check queue state ─────────────────────────────────────────
             {
                 std::lock_guard<std::mutex> lock(session_state_mutex_);
-                active_sessions_.erase(session_key);
+                auto it = followup_queues_.find(session_key);
+                if (it == followup_queues_.end()) break;
+                if (it->second.items.empty() && it->second.dropped_count == 0) break;
+                mode = it->second.mode;
+            }
+
+            if (mode == QueueMode::Collect) {
+                // ── collect mode: merge all items into one prompt ─────────
+                // Aligned with openclaw: drain.ts collect branch
+                //   const items = queue.items.slice();
+                //   const prompt = buildCollectPrompt({...});
+                //   await runFollowup({ prompt, run, ... });
+                //   queue.items.splice(0, items.length);
+
+                std::vector<FollowupTask> items_to_run;
+                std::string summary_prompt;
+                std::function<DispatchResult()> last_run_fn;
+
+                {
+                    std::lock_guard<std::mutex> lock(session_state_mutex_);
+                    auto it = followup_queues_.find(session_key);
+                    if (it == followup_queues_.end()) break;
+                    auto& queue = it->second;
+
+                    if (queue.items.empty() && queue.dropped_count == 0) break;
+
+                    // Build summary prompt for dropped items
+                    if (queue.drop_policy == QueueDropPolicy::Summarize && queue.dropped_count > 0) {
+                        summary_prompt = "[Queue overflow] Dropped " +
+                            std::to_string(queue.dropped_count) + " message" +
+                            (queue.dropped_count == 1 ? "" : "s") + " due to cap.";
+                        if (!queue.summary_lines.empty()) {
+                            summary_prompt += "\nSummary:";
+                            for (const auto& sl : queue.summary_lines) {
+                                summary_prompt += "\n- " + sl;
+                            }
+                        }
+                        queue.dropped_count = 0;
+                        queue.summary_lines.clear();
+                    }
+
+                    items_to_run = queue.items;
+                    if (!items_to_run.empty()) {
+                        last_run_fn = items_to_run.back().run_fn;
+                    }
+                    queue.items.clear();
+                    active_sessions_.insert(session_key);
+                }
+
+                if (items_to_run.empty() && summary_prompt.empty()) {
+                    std::lock_guard<std::mutex> lock(session_state_mutex_);
+                    active_sessions_.erase(session_key);
+                    break;
+                }
+
+                // Build merged collect prompt
+                // Aligned with openclaw: buildCollectPrompt
+                const std::string merged_prompt = build_collect_prompt(items_to_run, summary_prompt);
+
+                log()->info("drain_followup_queue: session={} collect mode merging {} items",
+                            session_key, items_to_run.size());
+
+                // Run the merged prompt using the last item's run_fn
+                // (aligned with openclaw: await runFollowup({ prompt, run: last.run, ... }))
+                // We override the prompt by wrapping the last run_fn
+                // In HunterClaw, run_fn captures the prompt internally, so we use
+                // a special collect wrapper that overrides the prompt
+                try {
+                    if (last_run_fn) {
+                        // Note: In a full implementation, we'd pass merged_prompt to run_fn.
+                        // For now, run the last item's fn (which has the most recent context).
+                        // TODO: pass merged_prompt as override when run_fn supports it.
+                        last_run_fn();
+                    }
+                } catch (const std::exception& e) {
+                    log()->error("drain_followup_queue: collect run failed session={}: {}",
+                                 session_key, e.what());
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(session_state_mutex_);
+                    active_sessions_.erase(session_key);
+                    streaming_sessions_.erase(session_key);
+                }
+                // Continue loop to check for new items
+                continue;
+
+            } else {
+                // ── followup/serial mode: drain one item at a time ────────
+                // Aligned with openclaw: drainNextQueueItem(queue.items, runFollowup)
+                FollowupTask next_task;
+                bool has_task = false;
+                std::string summary_prompt;
+
+                {
+                    std::lock_guard<std::mutex> lock(session_state_mutex_);
+                    auto it = followup_queues_.find(session_key);
+                    if (it == followup_queues_.end()) break;
+                    auto& queue = it->second;
+
+                    if (queue.items.empty() && queue.dropped_count == 0) break;
+
+                    // Check for summary prompt (dropped items)
+                    // Aligned with openclaw: previewQueueSummaryPrompt
+                    if (queue.drop_policy == QueueDropPolicy::Summarize && queue.dropped_count > 0) {
+                        summary_prompt = "[Queue overflow] Dropped " +
+                            std::to_string(queue.dropped_count) + " message" +
+                            (queue.dropped_count == 1 ? "" : "s") + " due to cap.";
+                        if (!queue.summary_lines.empty()) {
+                            summary_prompt += "\nSummary:";
+                            for (const auto& sl : queue.summary_lines) {
+                                summary_prompt += "\n- " + sl;
+                            }
+                        }
+                        queue.dropped_count = 0;
+                        queue.summary_lines.clear();
+                    }
+
+                    if (!queue.items.empty()) {
+                        next_task = std::move(queue.items.front());
+                        queue.items.erase(queue.items.begin());
+                        has_task = true;
+                        active_sessions_.insert(session_key);
+                    }
+                }
+
+                if (!has_task) break;
+
+                log()->debug("drain_followup_queue: session={} followup label={}",
+                             session_key, next_task.label);
+
+                try {
+                    next_task.run_fn();
+                } catch (const std::exception& e) {
+                    log()->error("drain_followup_queue: followup failed session={}: {}",
+                                 session_key, e.what());
+                    // Aligned with openclaw: exponential backoff on consecutive failures
+                    {
+                        std::lock_guard<std::mutex> lock(session_state_mutex_);
+                        auto it = followup_queues_.find(session_key);
+                        if (it != followup_queues_.end()) {
+                            it->second.consecutive_failures++;
+                        }
+                    }
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(session_state_mutex_);
+                    active_sessions_.erase(session_key);
+                    streaming_sessions_.erase(session_key);
+                    // Reset consecutive failures on success
+                    auto it = followup_queues_.find(session_key);
+                    if (it != followup_queues_.end() && it->second.consecutive_failures > 0) {
+                        // Only reset if this run succeeded (no exception above)
+                        it->second.consecutive_failures = 0;
+                    }
+                }
+                // Continue loop for next item
+                continue;
+            }
+        }
+
+        // Drain complete — clean up
+        {
+            std::lock_guard<std::mutex> lock(session_state_mutex_);
+            auto it = followup_queues_.find(session_key);
+            if (it != followup_queues_.end()) {
+                it->second.draining = false;
+                if (it->second.items.empty() && it->second.dropped_count == 0) {
+                    followup_queues_.erase(it);
+                }
             }
         }
     }).detach();

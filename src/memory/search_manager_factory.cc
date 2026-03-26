@@ -2,7 +2,7 @@
 #include "hunterclaw/memory/memory_index_manager.h"
 #include "hunterclaw/memory/qmd_manager.h"
 #include "hunterclaw/logging/subsystem_logger.h"
-#include <json/json.h>
+#include <nlohmann/json.hpp>
 
 namespace hunterclaw {
 namespace memory {
@@ -26,15 +26,23 @@ std::string build_qmd_cache_key(
     const std::string& agent_id,
     const ResolvedQmdConfig& qmd_config
 ) {
-    // 对齐 OpenClaw: agentId + JSON.stringify(config)
-    // 简化实现: agentId + command + collections
-    std::string key = agent_id + ":" + qmd_config.command;
-    
+    // 对齐 OpenClaw: `${agentId}:${JSON.stringify(config)}`
+    // ResolvedQmdConfig 按稳定字段顺序组装，直接序列化整个 config
+    nlohmann::json j;
+    j["command"]               = qmd_config.command;
+    j["searchMode"]            = qmd_config.search_mode;
+    j["includeDefaultMemory"]  = qmd_config.include_default_memory;
+    nlohmann::json cols = nlohmann::json::array();
     for (const auto& col : qmd_config.collections) {
-        key += "|" + col.name + "=" + col.path;
+        nlohmann::json c;
+        c["name"]    = col.name;
+        c["path"]    = col.path;
+        c["pattern"] = col.pattern;
+        c["kind"]    = col.kind;
+        cols.push_back(c);
     }
-    
-    return key;
+    j["collections"] = cols;
+    return agent_id + ":" + j.dump();
 }
 
 void evict_qmd_cache_entry(const std::string& cache_key) {
@@ -63,31 +71,6 @@ FallbackMemoryManager::~FallbackMemoryManager() {
     } catch (...) {
         // 忽略异常
     }
-}
-
-void FallbackMemoryManager::handle_primary_failure(const std::string& error) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    if (primary_failed_) {
-        return;  // 已经失败过
-    }
-    
-    primary_failed_ = true;
-    last_error_ = error;
-    
-    log->warn("qmd memory failed; switching to builtin index: " + error);
-    
-    // 尝试关闭primary
-    if (primary_) {
-        try {
-            primary_->close();
-        } catch (...) {
-            // 忽略关闭错误
-        }
-    }
-    
-    // 驱逐缓存 (对齐 OpenClaw注释: Evict the failed wrapper so the next request can retry QMD with a fresh manager)
-    evict_cache_entry();
 }
 
 void FallbackMemoryManager::evict_cache_entry() {
@@ -133,28 +116,36 @@ std::vector<MemorySearchResult> FallbackMemoryManager::search(
     const std::string& query,
     const SearchOptions& opts
 ) {
-    bool should_fallback = false;
-    
+    // 对齐 openclaw FallbackMemoryManager.search()
+    bool is_failed;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        should_fallback = primary_failed_;
+        is_failed = primary_failed_;
     }
-    
-    if (!should_fallback) {
+
+    if (!is_failed) {
         try {
             return primary_->search(query, opts);
         } catch (const std::exception& e) {
-            handle_primary_failure(e.what());
-            should_fallback = true;
+            // 对齐 openclaw: inline 处理 primary 失败
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                primary_failed_ = true;
+                last_error_ = e.what();
+            }
+            log->warn(std::string("qmd memory failed; switching to builtin index: ") + e.what());
+            // 对齐 openclaw: await this.deps.primary.close?.().catch(() => {})
+            try { primary_->close(); } catch (...) {}
+            // Evict the failed wrapper so the next request can retry QMD with a fresh manager.
+            evict_cache_entry();
         }
     }
-    
-    // 使用fallback
+
+    // 使用 fallback
     auto fallback_res = ensure_fallback();
     if (fallback_res.is_ok() && fallback_res.get()) {
         return fallback_res.get()->search(query, opts);
     }
-    
     std::string error_msg;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -164,23 +155,19 @@ std::vector<MemorySearchResult> FallbackMemoryManager::search(
 }
 
 ReadFileResult FallbackMemoryManager::read_file(const ReadFileParams& params) {
-    bool should_fallback = false;
-    
+    // 对齐 openclaw: !primaryFailed 时直接透传，不做 try/catch
+    bool is_failed;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        should_fallback = primary_failed_;
+        is_failed = primary_failed_;
     }
-    
-    if (!should_fallback) {
+    if (!is_failed) {
         return primary_->read_file(params);
     }
-    
-    // 使用fallback
     auto fallback_res = ensure_fallback();
     if (fallback_res.is_ok() && fallback_res.get()) {
         return fallback_res.get()->read_file(params);
     }
-    
     std::string error_msg;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -196,19 +183,25 @@ MemoryProviderStatus FallbackMemoryManager::status() {
         return primary_->status();
     }
     
-    // Fallback状态 (对齐 OpenClaw status()逻辑)
-    MemoryProviderStatus fallback_status;
-    if (fallback_) {
-        fallback_status = fallback_->status();
-    } else {
-        fallback_status = primary_->status();
+    // 对齐 openclaw FallbackMemoryManager.status():
+    // fallback 状态下在 custom 字段注入 fallback 信息
+    MemoryProviderStatus s = fallback_ ? fallback_->status() : primary_->status();
+    
+    // fallback: { from: "qmd", reason: lastError }
+    MemoryProviderStatus::FallbackInfo fi;
+    fi.from   = "qmd";
+    fi.reason = last_error_;
+    s.fallback = fi;
+    
+    // custom.fallback: { disabled: true, reason }
+    if (!s.custom) {
+        s.custom = MemoryProviderStatus::CustomStatus{};
     }
+    // 对齐 openclaw: custom: { ...custom, fallback: { disabled: true, reason } }
+    // 用 provider_unavailable_reason 字段承载 reason（C++ 无动态 Record）
+    s.custom->provider_unavailable_reason = last_error_;
     
-    // 添加fallback信息
-    // 注: OpenClaw在custom字段添加fallback信息
-    // C++简化实现: 直接在status message中标注
-    
-    return fallback_status;
+    return s;
 }
 
 void FallbackMemoryManager::sync(const SyncParams& params) {
@@ -283,24 +276,19 @@ bool FallbackMemoryManager::probe_vector_availability() {
 }
 
 void FallbackMemoryManager::close() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    if (primary_) {
-        try {
-            primary_->close();
-        } catch (...) {
-            // 忽略错误
-        }
+    // 对齐 openclaw: close primary + fallback + evict cache
+    std::shared_ptr<MemorySearchManager> p, f;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        p = primary_;
+        f = fallback_;
     }
-    
-    if (fallback_) {
-        try {
-            fallback_->close();
-        } catch (...) {
-            // 忽略错误
-        }
+    if (p) {
+        try { p->close(); } catch (...) {}
     }
-    
+    if (f) {
+        try { f->close(); } catch (...) {}
+    }
     evict_cache_entry();
 }
 
@@ -430,7 +418,7 @@ void close_all_memory_search_managers() {
         qmd_manager_cache.clear();
     }
     
-    // 关闭所有manager
+    // 关闭所有 QMD manager
     for (auto& mgr : managers) {
         try {
             mgr->close();
@@ -439,7 +427,9 @@ void close_all_memory_search_managers() {
         }
     }
     
-    // 注: MemoryIndexManager的全局关闭在memory_index_manager.cc中单独管理
+    // 对齐 openclaw closeAllMemorySearchManagers:
+    // 同时关闭所有 MemoryIndexManager (builtin)
+    close_all_memory_index_managers();
 }
 
 } // namespace memory

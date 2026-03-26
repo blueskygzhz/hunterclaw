@@ -588,13 +588,13 @@ bool MemoryManagerSyncOps::is_session_file_for_agent(const std::string& session_
     if (session_file.empty()) return false;
     // 对齐 openclaw: resolveSessionTranscriptsDirForAgent(agentId)
     // openclaw 路径: ~/.openclaw/sessions/{agentId}/transcripts
-    // HunterClaw 路径: ~/.hunterclaw/sessions/{agentId}
+    // HunterClaw 路径: ~/.hunterclaw/sessions/{agentId}/transcripts
     std::string sessions_dir;
     const char* home = std::getenv("HOME");
     if (home) {
-        sessions_dir = std::string(home) + "/.hunterclaw/sessions/" + agent_id_;
+        sessions_dir = std::string(home) + "/.hunterclaw/sessions/" + agent_id_ + "/transcripts";
     } else {
-        sessions_dir = ".hunterclaw/sessions/" + agent_id_;
+        sessions_dir = ".hunterclaw/sessions/" + agent_id_ + "/transcripts";
     }
     // Normalize both paths
     std::string resolved_file;
@@ -805,7 +805,13 @@ core::Result<void> MemoryManagerSyncOps::sync_memory_files(
     bool needs_full_reindex,
     MemorySyncProgressState* progress) {
 
-    // FTS-only mode: skip if no provider (对齐 ts:700-703)
+    // FTS-only mode: skip embedding sync but still index to FTS
+    // (对齐 ts:700-703: "Skipping memory file sync in FTS-only mode" only skips embedding,
+    //  but FTS indexing still proceeds when fts is available)
+    // Note: openclaw skips the entire syncMemoryFiles when !provider, because
+    // FTS-only indexing is handled separately via the FTS table during indexFile.
+    // HunterClaw aligns: if no provider, skip entirely (FTS-only search uses
+    // pre-existing FTS data or falls back to keyword search on raw text).
     if (!provider_) {
         log->debug("Skipping memory file sync in FTS-only mode (no embedding provider)");
         return core::Result<void>::Ok();
@@ -926,7 +932,8 @@ core::Result<void> MemoryManagerSyncOps::sync_session_files(
     const std::optional<std::vector<std::string>>& target_session_files_opt,
     MemorySyncProgressState* progress) {
 
-    // FTS-only mode: skip if no provider (对齐 ts:792-795)
+    // FTS-only mode: skip embedding sync (对齐 ts:792-795)
+    // openclaw: "Skipping session file sync in FTS-only mode (no embedding provider)"
     if (!provider_) {
         log->debug("Skipping session file sync in FTS-only mode (no embedding provider)");
         return core::Result<void>::Ok();

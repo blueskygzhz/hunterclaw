@@ -127,6 +127,13 @@ struct SessionEntry {
     // TTS 配置
     std::optional<std::string> tts_auto;  // "off"|"always"|"inbound"|"tagged"
 
+    // Queue 调度配置 (对齐 OpenClaw: queueMode / queueDebounceMs / queueCap / queueDrop)
+    // Aligned with openclaw: SessionEntry.queueMode / queueDebounceMs / queueCap / queueDrop
+    std::optional<std::string> queue_mode;        // "collect"|"followup"|"steer"|"interrupt"|"steer-backlog"
+    std::optional<int>         queue_debounce_ms; // debounce in ms (default 1000)
+    std::optional<int>         queue_cap;         // max queue depth (default 20)
+    std::optional<std::string> queue_drop;        // "old"|"new"|"summarize"
+
     // 会话历史 (简化版，实际可能需要独立存储)
     std::vector<std::string> messages;
 };

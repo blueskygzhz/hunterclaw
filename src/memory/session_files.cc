@@ -129,13 +129,13 @@ core::Result<std::vector<std::string>> list_session_files_for_agent(
 ) {
     // 对齐 openclaw: resolveSessionTranscriptsDirForAgent(agentId)
     // openclaw 路径: ~/.openclaw/sessions/{agentId}/transcripts
-    // HunterClaw 路径: ~/.hunterclaw/sessions/{agentId}
+    // HunterClaw 路径: ~/.hunterclaw/sessions/{agentId}/transcripts
     std::string dir;
     const char* home = std::getenv("HOME");
     if (home) {
-        dir = std::string(home) + "/.hunterclaw/sessions/" + agent_id;
+        dir = std::string(home) + "/.hunterclaw/sessions/" + agent_id + "/transcripts";
     } else {
-        dir = ".hunterclaw/sessions/" + agent_id;
+        dir = ".hunterclaw/sessions/" + agent_id + "/transcripts";
     }
 
     std::vector<std::string> result;

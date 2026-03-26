@@ -28,6 +28,12 @@ class AgentPool;
 }
 
 namespace hunterclaw {
+namespace auto_reply {
+class MessageDispatcher;
+}
+}
+
+namespace hunterclaw {
 namespace cron {
 class CronService;
 }
@@ -375,6 +381,11 @@ public:
 
     // 🏢 Multi-tenant Agent Pool access (对齐 OpenClaw)
     std::shared_ptr<agents::AgentPool> agent_pool() const;
+
+    // ✅ MessageDispatcher access (对齐 OpenClaw: dispatchInboundMessage)
+    // chat.send 通过 message_dispatcher()->run_reply_agent() 调度，
+    // 使四种 queue mode (steer/followup/collect/interrupt) 对 chat.send 生效
+    std::shared_ptr<auto_reply::MessageDispatcher> message_dispatcher() const;
 
 private:
     struct Impl;

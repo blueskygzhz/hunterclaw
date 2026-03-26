@@ -300,15 +300,36 @@ std::optional<std::u32string> strip_korean_trailing_particle(const std::u32strin
 
 // Check if a Korean stem is a useful keyword
 // (对齐 query-expansion.ts:isUsefulKoreanStem)
+//
+// openclaw logic:
+//   if (/[\uac00-\ud7af]/.test(stem)) return stem.length >= 2;
+//   // Keep stripped ASCII stems for mixed tokens like "API를" -> "api".
+//   return /^[a-z0-9_]+$/i.test(stem);
 bool is_useful_korean_stem(const std::u32string& stem) {
     if (stem.empty()) return false;
-    // Must be at least 2 characters to be useful
-    if (stem.size() < 2) return false;
-    // Must contain at least one Hangul character
+
+    // Check if stem contains any Hangul syllable (U+AC00–U+D7AF)
+    bool has_hangul_syllable = false;
+    bool all_ascii_alnum = true;
     for (char32_t c : stem) {
-        if (is_hangul(c)) return true;
+        if (c >= 0xAC00 && c <= 0xD7AF) {
+            has_hangul_syllable = true;
+        }
+        // Check if all chars are ASCII alphanumeric or underscore
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '_')) {
+            all_ascii_alnum = false;
+        }
     }
-    return false;
+
+    if (has_hangul_syllable) {
+        // Prevent bogus one-syllable stems from words like "논의" -> "논"
+        return stem.size() >= 2;
+    }
+
+    // Keep stripped ASCII stems for mixed tokens like "API를" -> "api"
+    // (对齐 openclaw: /^[a-z0-9_]+$/i.test(stem))
+    return all_ascii_alnum && !stem.empty();
 }
 
 // Check if a UTF-32 codepoint is whitespace or ASCII punctuation

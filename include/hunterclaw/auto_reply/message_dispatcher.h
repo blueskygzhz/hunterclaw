@@ -12,6 +12,7 @@
 #include <unordered_set>
 #include <mutex>
 #include <functional>
+#include <chrono>
 
 namespace hunterclaw {
 namespace auto_reply {
@@ -44,6 +45,49 @@ namespace auto_reply {
 namespace llm = ::hunterclaw::llm;
 namespace tools = ::hunterclaw::tools;
 namespace sessions = ::hunterclaw::sessions;
+
+// ═══════════════════════════════════════════════════════════════
+// ✅ 严格对齐 OpenClaw: src/auto-reply/reply/queue/types.ts
+// Queue mode 类型定义
+// ═══════════════════════════════════════════════════════════════
+
+// Aligned with openclaw: QueueMode (queue/types.ts)
+// "steer"        → inject into running session (queueEmbeddedPiMessage)
+// "followup"     → serial: one-by-one after current run completes
+// "collect"      → batch: merge all queued into one prompt
+// "steer-backlog"→ steer first, fallback to followup if not streaming
+// "interrupt"    → abort current run + clear lane, then run-now
+// "queue"        → alias for "steer" (normalized)
+enum class QueueMode {
+    Steer,
+    Followup,
+    Collect,
+    SteerBacklog,
+    Interrupt,
+    Queue,  // alias → Steer
+};
+
+// Aligned with openclaw: QueueDropPolicy (queue/types.ts)
+enum class QueueDropPolicy {
+    Old,       // drop oldest items
+    New,       // drop newest (reject new enqueue)
+    Summarize, // drop oldest but keep summary lines
+};
+
+// Aligned with openclaw: QueueSettings (queue/types.ts)
+struct QueueSettings {
+    QueueMode mode = QueueMode::Collect;  // default: collect
+    int debounce_ms = 1000;               // DEFAULT_QUEUE_DEBOUNCE_MS
+    int cap = 20;                         // DEFAULT_QUEUE_CAP
+    QueueDropPolicy drop_policy = QueueDropPolicy::Summarize; // DEFAULT_QUEUE_DROP
+};
+
+// Aligned with openclaw: ActiveRunQueueAction (queue-policy.ts)
+enum class ActiveRunQueueAction {
+    RunNow,
+    EnqueueFollowup,
+    Drop,
+};
 
 // ═══════════════════════════════════════════════════════════════
 // ✅ 严格对齐 OpenClaw: src/auto-reply/dispatch.ts
@@ -168,29 +212,92 @@ private:
     // 记录哪些 session 当前正在运行 LLM 推理，用于 run-now vs enqueue-followup 决策
     mutable std::mutex session_state_mutex_;
     std::unordered_set<std::string> active_sessions_;
+    // 记录哪些 session 当前正在 streaming（对齐 openclaw: isEmbeddedPiRunStreaming）
+    std::unordered_set<std::string> streaming_sessions_;
 
-    // ✅ FollowupQueue (aligned with openclaw: queue/enqueue.ts enqueueFollowupRun)
-    // 当 session 正在运行时，新请求入队等待；drain 时串行消费
-    // Key: session_key → queue of pending followup tasks
+    // ✅ FollowupQueue (aligned with openclaw: queue/state.ts FollowupQueueState)
+    // 当 session 正在运行时，新请求入队等待；drain 时按 mode 消费
+    // Key: session_key → queue state
     struct FollowupTask {
-        std::function<void()> run_fn;  // 实际执行函数
+        std::function<DispatchResult()> run_fn;  // 实际执行函数
         std::string label;
+        std::string prompt;          // for collect mode merging
+        std::string summary_line;    // for drop policy summarize
+        int64_t enqueued_at_ms = 0;
     };
-    std::unordered_map<std::string, std::vector<FollowupTask>> followup_queues_;
+    struct FollowupQueueState {
+        std::vector<FollowupTask> items;
+        bool draining = false;
+        int64_t last_enqueued_at_ms = 0;
+        QueueMode mode = QueueMode::Collect;
+        int debounce_ms = 1000;
+        int cap = 20;
+        QueueDropPolicy drop_policy = QueueDropPolicy::Summarize;
+        int dropped_count = 0;
+        std::vector<std::string> summary_lines;
+        int consecutive_failures = 0;
+    };
+    std::unordered_map<std::string, FollowupQueueState> followup_queues_;
+
+    // ✅ Steer queue (aligned with openclaw: queueEmbeddedPiMessage)
+    // 向运行中的 session 注入消息（steer 模式）
+    // Key: session_key → pending steer messages
+    std::unordered_map<std::string, std::vector<std::string>> steer_queues_;
+
+    // ✅ resolve_queue_settings (aligned with openclaw: resolveQueueSettings queue/settings.ts)
+    // 从 session entry 和 config 解析 queue mode
+    QueueSettings resolve_queue_settings(
+        const std::optional<sessions::SessionEntry>& session_entry,
+        const std::string& channel
+    ) const;
+
+    // ✅ resolve_active_run_queue_action (aligned with openclaw: resolveActiveRunQueueAction queue-policy.ts)
+    // 决定 run-now / enqueue-followup / drop
+    ActiveRunQueueAction resolve_active_run_queue_action(
+        bool is_active,
+        bool is_heartbeat,
+        bool should_followup,
+        QueueMode queue_mode
+    ) const;
+
+    // ✅ steer_embedded_session (aligned with openclaw: queueEmbeddedPiMessage)
+    // 向运行中的 session 注入 steer 消息
+    bool steer_embedded_session(const std::string& session_key, const std::string& message);
+
+    // ✅ abort_embedded_session (aligned with openclaw: abortEmbeddedPiRun)
+    // 中止运行中的 session（interrupt 模式）
+    bool abort_embedded_session(const std::string& session_key);
 
     // ✅ run_reply_agent (aligned with openclaw: runReplyAgent agent-runner.ts)
     // 决策: run-now (session 空闲) 或 enqueue-followup (session 忙碌)
-    // 然后通过双层 Lane 队列执行: session lane → global main lane
+    // 支持 steer/interrupt/collect/followup 四种模式
     struct RunReplyAgentParams {
         std::string session_key;
         std::function<DispatchResult()> run_fn;  // 实际执行函数
         std::string label;
+        std::string prompt;          // for collect mode
+        std::string summary_line;    // for drop policy
+        QueueSettings queue_settings;
+        bool is_heartbeat = false;
+        bool is_streaming = false;   // aligned with openclaw: isEmbeddedPiRunStreaming
     };
     DispatchResult run_reply_agent(const RunReplyAgentParams& params);
 
-    // ✅ drain_followup_queue (aligned with openclaw: queue/drain.ts drainFollowupQueue)
-    // 串行消费 followup 队列，直到队列为空
+    // ✅ drain_followup_queue (aligned with openclaw: queue/drain.ts scheduleFollowupDrain)
+    // 按 mode 消费 followup 队列：followup=逐条串行，collect=批量合并
     void drain_followup_queue(const std::string& session_key);
+
+    // ✅ apply_queue_drop_policy (aligned with openclaw: applyQueueDropPolicy queue-helpers.ts)
+    // 当队列超过 cap 时，按 drop_policy 处理
+    // Returns true if item should be enqueued, false if dropped
+    bool apply_queue_drop_policy(FollowupQueueState& queue, const std::string& summary_text);
+
+    // ✅ build_collect_prompt (aligned with openclaw: buildCollectPrompt queue-helpers.ts)
+    // 将多条消息合并为一条 collect prompt
+    std::string build_collect_prompt(
+        const std::vector<FollowupTask>& items,
+        const std::string& summary_prompt
+    ) const;
 
     // 组件依赖
     std::shared_ptr<::hunterclaw::routing::MessageRouter> router_;
