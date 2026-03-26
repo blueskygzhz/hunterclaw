@@ -6,6 +6,7 @@
 #include <cstring>
 #include <algorithm>
 #include <fstream>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -356,7 +357,124 @@ struct ExtractResult {
     std::string stderr_output;
 };
 
-// 🎯 对齐 OpenClaw: hashFileSha256 (skills-install-extract.ts line 18-30)
+// 🎯 对齐 OpenClaw: parseTarVerboseMetadata (skills-install-tar-verbose.ts)
+// 解析 tar tvf 输出，提取每个条目的 type 和 size
+struct TarEntryMeta {
+    std::string type;  // "File", "Directory", "SymbolicLink", "Link", etc.
+    long long size;
+};
+
+static const std::set<std::string> TAR_VERBOSE_MONTHS = {
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+};
+
+static std::string map_tar_verbose_type_char(char c) {
+    switch (c) {
+        case 'l': return "SymbolicLink";
+        case 'h': return "Link";
+        case 'b': return "BlockDevice";
+        case 'c': return "CharacterDevice";
+        case 'p': return "FIFO";
+        case 's': return "Socket";
+        case 'd': return "Directory";
+        default:  return "File";
+    }
+}
+
+static long long parse_tar_verbose_size(const std::string& line) {
+    // 按空格分割 token
+    std::vector<std::string> tokens;
+    std::istringstream ss(line);
+    std::string tok;
+    while (ss >> tok) tokens.push_back(tok);
+    if (tokens.size() < 6) throw std::runtime_error("unable to parse tar verbose metadata: " + line);
+
+    // 查找月份 token (BSD tar 格式)
+    for (size_t i = 1; i < tokens.size(); ++i) {
+        if (TAR_VERBOSE_MONTHS.count(tokens[i])) {
+            if (i == 0) throw std::runtime_error("unable to parse tar entry size: " + line);
+            try { return std::stoll(tokens[i - 1]); } catch (...) {}
+            throw std::runtime_error("unable to parse tar entry size: " + line);
+        }
+    }
+    // 查找 ISO 日期格式 (GNU tar 格式: YYYY-MM-DD)
+    for (size_t i = 1; i < tokens.size(); ++i) {
+        if (tokens[i].size() == 10 &&
+            tokens[i][4] == '-' && tokens[i][7] == '-' &&
+            std::isdigit(tokens[i][0]) && std::isdigit(tokens[i][5])) {
+            if (i == 0) throw std::runtime_error("unable to parse tar entry size: " + line);
+            try { return std::stoll(tokens[i - 1]); } catch (...) {}
+            throw std::runtime_error("unable to parse tar entry size: " + line);
+        }
+    }
+    throw std::runtime_error("unable to parse tar verbose metadata: " + line);
+}
+
+static std::vector<TarEntryMeta> parse_tar_verbose_metadata(const std::string& stdout_str) {
+    std::vector<TarEntryMeta> result;
+    std::istringstream ss(stdout_str);
+    std::string line;
+    while (std::getline(ss, line)) {
+        // trim
+        line.erase(0, line.find_first_not_of(" \t\r"));
+        if (!line.empty()) line.erase(line.find_last_not_of(" \t\r") + 1);
+        if (line.empty()) continue;
+        char type_char = line[0];
+        TarEntryMeta meta;
+        meta.type = map_tar_verbose_type_char(type_char);
+        meta.size = parse_tar_verbose_size(line);
+        result.push_back(meta);
+    }
+    return result;
+}
+
+// 🎯 对齐 OpenClaw: createTarEntryPreflightChecker (infra/archive.js)
+// 检查每个 tar 条目的路径安全性（路径穿越、绝对路径、过大文件等）
+static void check_tar_entry_safety(
+    const std::string& entry_path,
+    const std::string& entry_type,
+    long long entry_size,
+    int strip_components,
+    const std::string& target_dir
+) {
+    // 应用 strip_components
+    std::string check_path = entry_path;
+    if (strip_components > 0) {
+        int slashes = 0;
+        size_t pos = 0;
+        while (pos < check_path.size() && slashes < strip_components) {
+            if (check_path[pos] == '/') slashes++;
+            pos++;
+        }
+        check_path = (pos < check_path.size()) ? check_path.substr(pos) : "";
+    }
+    if (check_path.empty()) return;
+
+    // 检查路径穿越
+    if (check_path.find("..") != std::string::npos) {
+        throw std::runtime_error("tar entry path traversal detected: " + entry_path);
+    }
+    // 检查绝对路径
+    if (!check_path.empty() && check_path[0] == '/') {
+        throw std::runtime_error("tar entry absolute path detected: " + entry_path);
+    }
+    // 检查过大文件 (> 2GB)
+    if (entry_type == "File" && entry_size > 2LL * 1024 * 1024 * 1024) {
+        throw std::runtime_error(
+            "tar entry too large (" + std::to_string(entry_size) + " bytes): " + entry_path
+        );
+    }
+    // 检查目标路径安全性
+    if (!target_dir.empty()) {
+        std::string full_path = target_dir + "/" + check_path;
+        // 简化检查: 确保合并后路径在 target_dir 内
+        // （完整实现需要 realpath，这里用简化版本）
+        if (full_path.find("../") != std::string::npos) {
+            throw std::runtime_error("tar entry resolves outside target dir: " + entry_path);
+        }
+    }
+}
 static std::string hash_file_sha256(const std::string& file_path) {
     std::ifstream f(file_path, std::ios::binary);
     if (!f.is_open()) return "";
@@ -400,59 +518,72 @@ ExtractResult extract_archive(
     int timeout_ms
 ) {
     // 🎯 对齐 OpenClaw line 153-163: zip 解压
+    // 对齐 OpenClaw: extractArchiveSafe({ kind: "zip", stripComponents: strip })
+    // 成功时返回 { stdout: "", stderr: "", code: 0 }
     if (archive_type == "zip") {
-        std::string cmd = "unzip -o -q ";
+        // 先解压到临时目录，再处理 strip_components
+        std::string staging_dir;
+        std::string extract_target;
         if (strip_components > 0) {
-            // unzip 不直接支持 strip-components，需要特殊处理
-            // 这里简化处理: 解压到临时目录然后移动
-            cmd += "\"" + archive_path + "\" -d \"" + target_dir + "\" 2>&1";
+            staging_dir = target_dir + "/.zip-staging-" +
+                std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
+            try { fs::create_directories(staging_dir); } catch (const std::exception& e) {
+                return {false, -1, "", "Failed to create staging dir: " + std::string(e.what())};
+            }
+            extract_target = staging_dir;
         } else {
-            cmd += "\"" + archive_path + "\" -d \"" + target_dir + "\" 2>&1";
+            extract_target = target_dir;
         }
-        
+
+        std::string cmd = "unzip -o -q \"" + archive_path + "\" -d \"" + extract_target + "\" 2>&1";
         FILE* pipe = popen(cmd.c_str(), "r");
         if (!pipe) {
+            if (!staging_dir.empty()) fs::remove_all(staging_dir);
             return {false, -1, "", "Failed to execute unzip"};
         }
-        
         std::string output;
         char buffer[256];
-        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-            output += buffer;
-        }
-        
+        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) output += buffer;
         int exit_code = pclose(pipe);
         if (exit_code != 0) {
+            if (!staging_dir.empty()) fs::remove_all(staging_dir);
             return {false, exit_code, output, "unzip failed"};
         }
-        
-        // ✅ 对齐 OpenClaw: 实现 strip_components 逻辑
-        // 对应 OpenClaw: 移动子目录内容到 target_dir
-        if (strip_components > 0) {
-            // 找到解压后的子目录
-            std::vector<fs::path> subdirs;
+
+        // 处理 strip_components: 将 staging 内容合并到 target_dir
+        if (strip_components > 0 && !staging_dir.empty()) {
             try {
-                for (const auto& entry : fs::directory_iterator(target_dir)) {
-                    if (entry.is_directory()) subdirs.push_back(entry.path());
-                }
-            } catch (...) {}
-            
-            if (!subdirs.empty()) {
-                // 将第一个子目录的内容移动到 target_dir
-                fs::path subdir = subdirs[0];
-                try {
-                    for (const auto& entry : fs::directory_iterator(subdir)) {
-                        fs::rename(entry.path(), fs::path(target_dir) / entry.path().filename());
+                // 找到解压后的顶层目录，跳过 strip_components 层
+                std::vector<fs::path> top_entries;
+                for (const auto& e : fs::directory_iterator(staging_dir)) top_entries.push_back(e.path());
+                // 对每个顶层条目，移动其内容到 target_dir
+                for (const auto& top : top_entries) {
+                    if (fs::is_directory(top)) {
+                        for (const auto& sub : fs::directory_iterator(top)) {
+                            fs::path dest = fs::path(target_dir) / sub.path().filename();
+                            if (fs::exists(dest)) fs::remove_all(dest);
+                            fs::rename(sub.path(), dest);
+                        }
+                    } else {
+                        fs::path dest = fs::path(target_dir) / top.filename();
+                        if (fs::exists(dest)) fs::remove_all(dest);
+                        fs::rename(top, dest);
                     }
-                    fs::remove(subdir);
-                } catch (...) {}
+                }
+                fs::remove_all(staging_dir);
+            } catch (const std::exception& e) {
+                fs::remove_all(staging_dir);
+                return {false, -1, "", "Failed to merge zip tree: " + std::string(e.what())};
             }
         }
-        
-        return {true, 0, output, ""};
+
+        // 🎯 对齐 OpenClaw: 成功时返回空 stdout/stderr
+        return {true, 0, "", ""};
     }
     
     // 🎯 对齐 OpenClaw line 165-175: tar.gz 解压
+    // 对齐 OpenClaw: extractArchiveSafe({ kind: "tar", tarGzip: true, stripComponents: strip })
+    // 成功时返回 { stdout: "", stderr: "", code: 0 }
     if (archive_type == "tar.gz") {
         std::string cmd = "tar xzf \"" + archive_path + "\" -C \"" + target_dir + "\"";
         if (strip_components > 0) {
@@ -476,7 +607,8 @@ ExtractResult extract_archive(
             return {false, exit_code, output, "tar extraction failed"};
         }
         
-        return {true, 0, output, ""};
+        // 🎯 对齐 OpenClaw: 成功时返回空 stdout/stderr
+        return {true, 0, "", ""};
     }
     
     // 🎯 对齐 OpenClaw: tar.bz2 解压 (含 preflight + TOCTOU 防护)
@@ -490,7 +622,7 @@ ExtractResult extract_archive(
         std::string preflight_hash = hash_file_sha256(archive_path);
         
         // 🎯 对齐 OpenClaw: readTarPreflight — tar tf + tar tvf
-        // Step 1: tar tf 列出所有条目
+        // Step 1: tar tf 列出所有条目 (entries)
         std::vector<std::string> entries;
         {
             std::string list_cmd = "tar tf \"" + archive_path + "\" 2>&1";
@@ -505,7 +637,6 @@ ExtractResult extract_archive(
             if (list_code != 0) {
                 return {false, list_code, list_output, "tar list failed"};
             }
-            
             std::istringstream entries_ss(list_output);
             std::string ep;
             while (std::getline(entries_ss, ep)) {
@@ -514,27 +645,64 @@ ExtractResult extract_archive(
                 if (!ep.empty()) entries.push_back(ep);
             }
         }
-        
+
+        // Step 2: tar tvf 获取 verbose metadata (type + size)
+        // 🎯 对齐 OpenClaw: readTarPreflight — tar tvf + parseTarVerboseMetadata
+        std::vector<TarEntryMeta> metadata;
+        {
+            std::string verbose_cmd = "tar tvf \"" + archive_path + "\" 2>&1";
+            FILE* verbose_pipe = popen(verbose_cmd.c_str(), "r");
+            if (!verbose_pipe) {
+                return {false, -1, "", "tar verbose list failed"};
+            }
+            std::string verbose_output;
+            char buf[256];
+            while (fgets(buf, sizeof(buf), verbose_pipe) != nullptr) verbose_output += buf;
+            int verbose_code = pclose(verbose_pipe);
+            if (verbose_code != 0) {
+                return {false, verbose_code, verbose_output, "tar verbose list failed"};
+            }
+            try {
+                metadata = parse_tar_verbose_metadata(verbose_output);
+            } catch (const std::exception& e) {
+                return {false, 1, verbose_output, std::string("tar metadata parse failure: ") + e.what()};
+            }
+            // 🎯 对齐 OpenClaw: 检查 entries 和 metadata 数量是否一致
+            if (metadata.size() != entries.size()) {
+                return {false, 1, verbose_output,
+                    "tar verbose/list entry count mismatch (" +
+                    std::to_string(metadata.size()) + " vs " +
+                    std::to_string(entries.size()) + ")"};
+            }
+        }
+
         // 🎯 对齐 OpenClaw: createTarEntryPreflightChecker — 检查每个条目路径安全
-        for (const auto& entry_path : entries) {
-            // 应用 strip_components
-            std::string check_path = entry_path;
-            if (strip_components > 0) {
-                int slashes = 0;
-                size_t pos = 0;
-                while (pos < check_path.size() && slashes < strip_components) {
-                    if (check_path[pos] == '/') slashes++;
-                    pos++;
+        // 对齐 OpenClaw: for (let i = 0; i < preflight.entries.length; i += 1)
+        // 同时检查 path、type、size
+        {
+            // 对齐 OpenClaw: prepareArchiveDestinationDir(targetDir) → destinationRealDir
+            std::string destination_real_dir;
+            try {
+                fs::create_directories(target_dir);
+                destination_real_dir = fs::canonical(target_dir).string();
+            } catch (...) {
+                destination_real_dir = target_dir;
+            }
+
+            for (size_t i = 0; i < entries.size(); ++i) {
+                const auto& entry_path = entries[i];
+                const auto& entry_meta = (i < metadata.size()) ? metadata[i] : TarEntryMeta{"File", 0};
+                try {
+                    check_tar_entry_safety(
+                        entry_path,
+                        entry_meta.type,
+                        entry_meta.size,
+                        strip_components,
+                        destination_real_dir
+                    );
+                } catch (const std::exception& e) {
+                    return {false, -1, "", std::string(e.what())};
                 }
-                check_path = (pos < check_path.size()) ? check_path.substr(pos) : "";
-            }
-            if (check_path.empty()) continue;
-            // 检查路径穿越
-            if (check_path.find("..") != std::string::npos) {
-                return {false, -1, "", "tar entry path traversal detected: " + entry_path};
-            }
-            if (!check_path.empty() && check_path[0] == '/') {
-                return {false, -1, "", "tar entry absolute path detected: " + entry_path};
             }
         }
         
@@ -709,17 +877,18 @@ DownloadResult install_download_spec(
     }
     
     // 🎯 对齐 OpenClaw line 188-198: 检测归档类型和是否解压
-    // 对齐 OpenClaw: const shouldExtract = spec.extract ?? Boolean(archiveType);
+    // 严格对齐 OpenClaw: const shouldExtract = spec.extract ?? Boolean(archiveType);
+    // extract_requested 对应 spec.extract (三态: true/false/未设置)
+    // archive_type_explicit 对应 spec.archive (是否显式指定)
     std::string archive_type = resolve_archive_type(archive_type_explicit, filename);
+    // 对齐 OpenClaw: spec.extract ?? Boolean(archiveType)
+    // extract_requested=-1 表示未设置 (null/undefined)，0 表示 false，1 表示 true
     bool should_extract;
     if (extract_requested) {
-        // 显式指定 extract=true
+        // spec.extract 显式设置为 true
         should_extract = true;
-    } else if (!archive_type_explicit.empty()) {
-        // 显式指定了 archive 类型，默认解压
-        should_extract = !archive_type.empty();
     } else {
-        // 对齐 OpenClaw: spec.extract 未设置时，根据 archiveType 自动判断
+        // spec.extract 未设置 (null/undefined) → Boolean(archiveType)
         should_extract = !archive_type.empty();
     }
     

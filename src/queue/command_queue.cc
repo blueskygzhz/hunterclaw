@@ -1,4 +1,5 @@
 #include "hunterclaw/queue/command_queue.h"
+#include "hunterclaw/auto_reply/message_dispatcher.h"  // DispatchResult
 #include <queue>
 #include <thread>
 #include <mutex>
@@ -660,6 +661,11 @@ template auto CommandQueue::enqueue_command_in_lane<std::function<int()>>(
 template auto CommandQueue::enqueue_command_in_lane<std::function<std::string()>>(
     const std::string&, std::function<std::string()>&&, const EnqueueOptions&
 ) -> std::future<std::string>;
+
+// DispatchResult 类型（用于 message_dispatcher.cc 中的 main lane 调度）
+template auto CommandQueue::enqueue_command_in_lane<std::function<auto_reply::MessageDispatcher::DispatchResult()>>(
+    const std::string&, std::function<auto_reply::MessageDispatcher::DispatchResult()>&&, const EnqueueOptions&
+) -> std::future<auto_reply::MessageDispatcher::DispatchResult>;
 
 }  // namespace queue
 }  // namespace hunterclaw

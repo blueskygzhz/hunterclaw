@@ -223,6 +223,7 @@ cc_library(
         ":hunterclaw_cron",          # ✅ 添加 cron 依赖
         ":hunterclaw_observability", # ✅ 添加 observability 依赖 (WebhookReceivedEvent vtable)
         ":hunterclaw_queue",         # ✅ 添加 queue 依赖 (CommandQueue)
+        "@ixwebsocket//:ixwebsocket",   # ✅ 添加 ixwebsocket 依赖 (WebSocket)
         "@nlohmann_json//:json",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -241,6 +242,7 @@ cc_library(
         "-lcrypto",    # OpenSSL Crypto
         "-lcurl",      # libcurl
         "-ljsoncpp",   # JSON
+        "-lz",         # zlib (ixwebsocket)
         # ✅ spdlog 是 header-only，不需要链接
         # ✅ fmt 也是 header-only 或已包含在 spdlog 中
     ],
@@ -249,7 +251,7 @@ cc_library(
 )
 
 # ============================================================================
-# MCP Library - MCP Tool Integration
+# MCP Library# MCP Library - MCP Tool Integration
 # ============================================================================
 cc_library(
     name = "hunterclaw_mcp",
@@ -573,6 +575,7 @@ cc_library(
         ":hunterclaw_observability",  # ✅ 添加 observability 依赖
         ":hunterclaw_outbound",  # ✅ 添加 outbound 依赖 (deliver_outbound_payloads)
         ":hunterclaw_queue",     # ✅ 添加 queue 依赖 (CommandQueue)
+        "@ixwebsocket//:ixwebsocket",  # ✅ 添加 ixwebsocket 依赖
         "//:hunterclaw_headers",
         "//third_party:httplib",
         "//third_party:subprocess",  # ✅ 添加 subprocess 依赖

@@ -3,6 +3,7 @@
 #include "hunterclaw/channels/message.h"
 #include "hunterclaw/auto_reply/auto_reply_config.h"
 #include "hunterclaw/react/react_engine.h"
+#include "hunterclaw/sessions/session_manager.h"
 #include <string>
 #include <vector>
 #include <memory>

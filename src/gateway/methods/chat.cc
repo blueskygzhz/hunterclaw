@@ -502,10 +502,32 @@ core::Result<json> method_chat_send(
         agent_params.queue_settings = queue_settings;
         agent_params.is_heartbeat   = false;
 
-        // run_reply_agent 是异步的（enqueue-followup 时立即返回，run-now 时在后台线程执行）
+        // ✅ 对齐 OpenClaw: 通过 session lane 入队 (双层 lane 机制)
+        // OpenClaw: enqueueCommandInLane(resolveEmbeddedSessionLane(sessionKey), async () => {
+        //   await runReplyAgent(...)  // 内部再通过 main lane 执行 LLM 推理
+        // })
+        // HunterClaw: session lane 保证同一 session 的请求串行执行
+        //             main lane 在 run_reply_agent 内部通过 CommandQueue 执行
+        auto& cmd_queue = queue::CommandQueue::Instance();
+        const std::string session_lane = queue::ResolveSessionLane(session_id);
+
+        // run_reply_agent 是同步的（等待 run_fn 完成），所以需要在后台线程中执行
         // 对齐 OpenClaw: void dispatchInboundMessage(...) — fire-and-forget
-        std::thread([msg_dispatcher, agent_params]() {
+        std::function<void()> session_task = [msg_dispatcher, agent_params]() {
             msg_dispatcher->run_reply_agent(agent_params);
+        };
+        std::thread([&cmd_queue, session_lane, session_task = std::move(session_task), agent_params]() mutable {
+            try {
+                auto future = cmd_queue.enqueue_command_in_lane(
+                    session_lane,
+                    std::move(session_task),
+                    queue::EnqueueOptions{.label = agent_params.label, .urgent = false}
+                );
+                future.get();  // wait for session lane to complete
+            } catch (const std::exception& e) {
+                spdlog::get("chat")->error("[chat.send] Session lane error: session={}, error={}",
+                    agent_params.session_key, e.what());
+            }
         }).detach();
     } else {
         // Fallback: 直接在后台线程执行（MessageDispatcher 未初始化时）

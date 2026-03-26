@@ -20,6 +20,8 @@
 #include "hunterclaw/routing/router.h"
 #include "hunterclaw/sessions/session_manager.h"
 #include "hunterclaw/queue/delivery_queue.h"
+#include "hunterclaw/queue/command_queue.h"   // ✅ CommandQueue (session lane + main lane)
+#include "hunterclaw/queue/lanes.h"            // ✅ ResolveSessionLane, ResolveGlobalLane
 #include "hunterclaw/outbound/deliver.h"
 #include "hunterclaw/tools/tool_manager.h"
 #include "hunterclaw/llm/llm_client.h"
@@ -1020,7 +1022,11 @@ MessageDispatcher::DispatchResult MessageDispatcher::run_reply_agent(
 
     // ── "run-now" path ───────────────────────────────────────────────────────
     // Aligned with openclaw: directly await runAgentTurnWithFallback(...)
-    log()->debug("run_reply_agent: session={} is idle → run-now", session_key);
+    // OpenClaw: session lane → main lane (双层 lane 机制)
+    //   resolveEmbeddedSessionLane(sessionKey) → session:<key> lane (串行)
+    //   resolveGlobalLane() → "main" lane (全局并发控制)
+    // HunterClaw: run_fn 在 main lane 中执行，session lane 由调用方负责
+    log()->debug("run_reply_agent: session={} is idle → run-now (main lane)", session_key);
 
     // Mark session as active (aligned with openclaw: isEmbeddedPiRunActive → true)
     {
@@ -1030,7 +1036,20 @@ MessageDispatcher::DispatchResult MessageDispatcher::run_reply_agent(
 
     DispatchResult run_result;
     try {
-        run_result = params.run_fn();
+        // ✅ 对齐 OpenClaw: 通过 main lane 执行 run_fn
+        // OpenClaw: enqueueCommandInLane(resolveGlobalLane(lane), async () => { ... })
+        // HunterClaw: CommandQueue::Instance().enqueue_command_in_lane(CommandLane::Main, run_fn)
+        // 注意: 这里同步等待 main lane 完成（session lane 线程阻塞等待 main lane）
+        // 这与 OpenClaw 的 await 语义一致
+        auto& cmd_queue = queue::CommandQueue::Instance();
+        const std::string global_lane = queue::ResolveGlobalLane();  // "main"
+        std::function<DispatchResult()> run_fn_copy = params.run_fn;
+        auto future = cmd_queue.enqueue_command_in_lane(
+            global_lane,
+            std::move(run_fn_copy),
+            queue::EnqueueOptions{.label = params.label, .urgent = false}
+        );
+        run_result = future.get();
     } catch (const std::exception& e) {
         log()->error("run_reply_agent: run_fn failed session={}: {}", session_key, e.what());
         run_result.success = false;
@@ -1183,15 +1202,19 @@ void MessageDispatcher::drain_followup_queue(const std::string& session_key) {
 
                 // Run the merged prompt using the last item's run_fn
                 // (aligned with openclaw: await runFollowup({ prompt, run: last.run, ... }))
-                // We override the prompt by wrapping the last run_fn
-                // In HunterClaw, run_fn captures the prompt internally, so we use
-                // a special collect wrapper that overrides the prompt
+                // ✅ 对齐 OpenClaw: 通过 main lane 执行 (双层 lane 机制)
+                // OpenClaw: enqueueCommandInLane(resolveGlobalLane(), async () => runFollowup(...))
                 try {
                     if (last_run_fn) {
-                        // Note: In a full implementation, we'd pass merged_prompt to run_fn.
-                        // For now, run the last item's fn (which has the most recent context).
-                        // TODO: pass merged_prompt as override when run_fn supports it.
-                        last_run_fn();
+                        auto& cmd_queue = queue::CommandQueue::Instance();
+                        const std::string global_lane = queue::ResolveGlobalLane();  // "main"
+                        std::function<DispatchResult()> fn_copy = last_run_fn;
+                        auto future = cmd_queue.enqueue_command_in_lane(
+                            global_lane,
+                            std::move(fn_copy),
+                            queue::EnqueueOptions{.label = "drain:collect:" + session_key, .urgent = false}
+                        );
+                        future.get();  // wait for main lane to complete
                     }
                 } catch (const std::exception& e) {
                     log()->error("drain_followup_queue: collect run failed session={}: {}",
@@ -1251,7 +1274,17 @@ void MessageDispatcher::drain_followup_queue(const std::string& session_key) {
                              session_key, next_task.label);
 
                 try {
-                    next_task.run_fn();
+                    // ✅ 对齐 OpenClaw: 通过 main lane 执行 (双层 lane 机制)
+                    // OpenClaw: enqueueCommandInLane(resolveGlobalLane(), async () => runFollowup(...))
+                    auto& cmd_queue = queue::CommandQueue::Instance();
+                    const std::string global_lane = queue::ResolveGlobalLane();  // "main"
+                    std::function<DispatchResult()> fn_copy = next_task.run_fn;
+                    auto future = cmd_queue.enqueue_command_in_lane(
+                        global_lane,
+                        std::move(fn_copy),
+                        queue::EnqueueOptions{.label = "drain:followup:" + next_task.label, .urgent = false}
+                    );
+                    future.get();  // wait for main lane to complete
                 } catch (const std::exception& e) {
                     log()->error("drain_followup_queue: followup failed session={}: {}",
                                  session_key, e.what());

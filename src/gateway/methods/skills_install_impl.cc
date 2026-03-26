@@ -787,9 +787,11 @@ SkillInstallResult install_skill(
     }
     
     // 🎯 对齐 OpenClaw: findInstallSpec (line 407)
-    // 对齐 resolveInstallId: spec.id ?? `${spec.kind}-${index}`
-    if (!entry_spec.empty() && entry_spec.contains("install")) {
-        const auto& install_arr = entry_spec["install"];
+    // 对齐 OpenClaw: entry.metadata?.install ?? []
+    // 注意: OpenClaw 访问 entry.metadata.install，不是 entry.install
+    if (!entry_spec.empty() && entry_spec.contains("metadata") &&
+        entry_spec["metadata"].contains("install")) {
+        const auto& install_arr = entry_spec["metadata"]["install"];
         if (install_arr.is_array()) {
             int idx = 0;
             for (const auto& req : install_arr) {
@@ -812,15 +814,23 @@ SkillInstallResult install_skill(
             }
         }
     }
-    // 兼容旧 requirements 字段
-    if (spec.empty() && entry_spec.contains("requirements")) {
-        const auto& reqs = entry_spec["requirements"];
-        if (reqs.is_array()) {
-            for (const auto& req : reqs) {
-                if (req.value("id", "") == install_id || req.value("kind", "") == install_id) {
-                    spec = req;
-                    break;
+    // 兼容旧格式: 直接在 entry_spec 顶层的 install 字段
+    if (spec.empty() && entry_spec.contains("install")) {
+        const auto& install_arr = entry_spec["install"];
+        if (install_arr.is_array()) {
+            int idx = 0;
+            for (const auto& req : install_arr) {
+                std::string resolved_id;
+                if (req.contains("id") && req["id"].is_string()) {
+                    resolved_id = req["id"].get<std::string>();
+                    resolved_id.erase(0, resolved_id.find_first_not_of(" \t\n\r"));
+                    if (!resolved_id.empty()) resolved_id.erase(resolved_id.find_last_not_of(" \t\n\r") + 1);
                 }
+                if (resolved_id.empty()) {
+                    resolved_id = req.value("kind", "") + "-" + std::to_string(idx);
+                }
+                if (resolved_id == install_id) { spec = req; break; }
+                ++idx;
             }
         }
     }
@@ -914,14 +924,12 @@ SkillInstallResult install_skill(
     }
     
     // 🎯 对齐 OpenClaw: hasBinary("brew") ? "brew" : resolveBrewExecutable() (line 441)
-    // 对齐 OpenClaw: 仅当 preferBrew=true 时才查找 brew
+    // 注意: OpenClaw 不管 preferBrew 都会查找 brewExe，preferBrew 只影响 prefs
     std::string brew_exe;
-    if (prefs.prefer_brew) {
-        if (has_binary("brew")) {
-            brew_exe = "brew";
-        } else {
-            brew_exe = resolve_brew_executable();
-        }
+    if (has_binary("brew")) {
+        brew_exe = "brew";
+    } else {
+        brew_exe = resolve_brew_executable();
     }
     
     // 🎯 对齐 OpenClaw: brew 安装器检查 (line 442-444)
