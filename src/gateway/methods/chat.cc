@@ -10,6 +10,7 @@
 #include "hunterclaw/sessions/transcript_io.h"
 #include "hunterclaw/queue/command_queue.h"
 #include "hunterclaw/queue/lanes.h"
+#include "hunterclaw/auto_reply/message_dispatcher.h"  // ✅ run_reply_agent (queue mode)
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 #include <algorithm>
@@ -390,109 +391,126 @@ core::Result<json> method_chat_send(
     };
     
     // ========================================================================
-    // 双层 Lane 队列入队 (严格对齐 OpenClaw run.ts:263-265)
+    // 通过 MessageDispatcher::run_reply_agent 调度 (严格对齐 OpenClaw)
     //
-    // OpenClaw 原始逻辑:
-    //   return enqueueSession(() =>       // session:xxx Lane, maxConcurrent=1 (串行)
-    //     enqueueGlobal(async () => {     // main Lane, maxConcurrent=N (全局并发控制)
-    //       await runEmbeddedPiAgent(...)
-    //     })
-    //   );
+    // OpenClaw 原始路径:
+    //   chat.send → dispatchInboundMessage → dispatchReplyFromConfig
+    //             → resolveQueueSettings → runReplyAgent
+    //             → resolveActiveRunQueueAction
+    //             → [steer]     queueEmbeddedPiMessage (inject into streaming session)
+    //             → [interrupt] abortEmbeddedPiRun + clearCommandLane → run-now
+    //             → [collect]   enqueue-followup, drain merges all into one prompt
+    //             → [followup]  enqueue-followup, drain runs one-by-one (serial)
+    //             → [run-now]   runEmbeddedPiAgent(...)
     //
-    // 效果:
-    //   - 同一 session 的 n 个请求: 严格串行（session lane maxConcurrent=1）
-    //   - 不同 session 之间: 并行（受 main lane maxConcurrent 限制）
+    // HunterClaw 对齐:
+    //   chat.send → MessageDispatcher::run_reply_agent(params)
+    //             → resolveActiveRunQueueAction (isActive check)
+    //             → [steer/interrupt/collect/followup] 四种 queue mode 统一处理
+    //
+    // 关键: chat.send 和 auto-reply 路径共享同一个 MessageDispatcher 实例，
+    //       因此 active_sessions_ 状态是共享的，queue mode 对两条路径都生效。
     // ========================================================================
 
-    auto& cmd_queue = queue::CommandQueue::Instance();
+    auto msg_dispatcher = server->message_dispatcher();
 
-    // session lane 名称: "session:<session_id>"
-    std::string session_lane = queue::ResolveSessionLane(session_id);
+    // 构造 run_fn: 实际执行 LLM 推理的函数
+    // 捕获所有需要的变量（避免悬空引用）
+    auto captured_react_engine = react_engine;
+    auto captured_message = message;
+    auto captured_callbacks = callbacks;
+    auto captured_run_id = run_id;
+    auto captured_session_id = session_id;
+    auto captured_transcript_path = transcript_path;
 
-    // 第一层: 入队到 session lane（串行，保证同一 session 请求不并发）
-    cmd_queue.enqueue_command_in_lane(
-        session_lane,
-        std::function<void()>([&cmd_queue, react_engine, message, callbacks, run_id, session_id, transcript_path]() {
-            // 第二层: 在 session lane 内部，再入队到 global main lane（全局并发控制）
-            // 对齐 OpenClaw: enqueueGlobal(() => runEmbeddedPiAgent(...))
-            auto global_future = cmd_queue.enqueue_command_in_lane(
-                queue::CommandLane::Main,
-                std::function<void()>([react_engine, message, callbacks, run_id, session_id, transcript_path]() {
-                    try {
-                        // ✅ 对齐 OpenClaw: 从 transcript 加载历史消息
-                        // OpenClaw: transcriptIO.load(sessionKey) → messages[] → 传给 ReactEngine::run()
-                        auto history = sessions::read_transcript_messages(transcript_path, 200);
-                        // 去掉最后一条（刚写入的用户消息），避免 ReactEngine 重复添加
-                        if (!history.empty() && history.back().role == llm::LLMMessageRole::User) {
-                            history.pop_back();
-                        }
-                        auto result = react_engine->run(message, history, callbacks);
-
-                        // 写入 assistant 消息到 Transcript (对齐 OpenClaw)
-                        sessions::AppendTranscriptOptions opts;
-                        opts.message = result.final_response;
-                        opts.create_if_missing = false;
-
-                        auto append_result = sessions::append_assistant_message_to_transcript(
-                            transcript_path,
-                            opts
-                        );
-
-                        if (!append_result.ok) {
-                            get_logger()->warn("[chat.send] Failed to write assistant message to transcript: {}",
-                                append_result.error);
-                        }
-
-                        get_logger()->info("[chat.send] Agent completed: session={}, run_id={}, steps={}",
-                            session_id, run_id, result.total_steps);
-
-                        // =============================================================
-                        // Hook: session_end
-                        // Aligned with OpenClaw sessions/session-manager.ts — fire-and-forget
-                        // Fires when the agent run completes (success or error).
-                        // =============================================================
-                        auto* end_hook_mgr = tools::get_global_hook_manager();
-                        if (end_hook_mgr && end_hook_mgr->has_hooks(plugins::PluginHookName::SESSION_END)) {
-                            tools::PluginHookSessionEndEvent se_event;
-                            se_event.session_id    = session_id;
-                            se_event.session_key   = session_id;
-                            se_event.message_count = static_cast<int>(result.total_steps);
-                            se_event.duration_ms   = static_cast<int>(result.duration_ms);
-                            tools::PluginHookSessionContext se_ctx;
-                            se_ctx.session_id  = session_id;
-                            se_ctx.session_key = session_id;
-                            try {
-                                end_hook_mgr->run_session_end(se_event, se_ctx);
-                            } catch (const std::exception& e) {
-                                get_logger()->warn("[chat.send] session_end hook failed: {}", e.what());
-                            }
-                        }
-
-                    } catch (const std::exception& e) {
-                        get_logger()->error("[chat.send] Agent exception: session={}, run_id={}, error={}",
-                            session_id, run_id, e.what());
-                    }
-                }),
-                queue::EnqueueOptions{
-                    .label = "chat.send:" + session_id + ":" + run_id,
-                    .urgent = false
-                }
-            );
-
-            // session lane 内等待 global lane 任务完成，保证串行语义
-            // 对齐 OpenClaw: session lane 的 task 是 enqueueGlobal 的 promise
-            try {
-                global_future.get();
-            } catch (const std::exception& e) {
-                get_logger()->error("[chat.send] Global lane task failed: session={}, run_id={}, error={}",
-                    session_id, run_id, e.what());
+    auto run_fn = [captured_react_engine, captured_message, captured_callbacks,
+                   captured_run_id, captured_session_id, captured_transcript_path,
+                   server]() -> auto_reply::MessageDispatcher::DispatchResult {
+        auto_reply::MessageDispatcher::DispatchResult dispatch_result;
+        try {
+            // ✅ 对齐 OpenClaw: 从 transcript 加载历史消息
+            auto history = sessions::read_transcript_messages(captured_transcript_path, 200);
+            // 去掉最后一条（刚写入的用户消息），避免 ReactEngine 重复添加
+            if (!history.empty() && history.back().role == llm::LLMMessageRole::User) {
+                history.pop_back();
             }
-        }),
-        queue::EnqueueOptions{
-            .label = "session:" + session_id + ":" + run_id,
-            .urgent = false
+            auto result = captured_react_engine->run(captured_message, history, captured_callbacks);
+
+            // 写入 assistant 消息到 Transcript (对齐 OpenClaw)
+            sessions::AppendTranscriptOptions opts;
+            opts.message = result.final_response;
+            opts.create_if_missing = false;
+            auto append_result = sessions::append_assistant_message_to_transcript(
+                captured_transcript_path, opts);
+            if (!append_result.ok) {
+                get_logger()->warn("[chat.send] Failed to write assistant message: {}",
+                    append_result.error);
+            }
+
+            get_logger()->info("[chat.send] Agent completed: session={}, run_id={}, steps={}",
+                captured_session_id, captured_run_id, result.total_steps);
+
+            // Hook: session_end
+            auto* end_hook_mgr = tools::get_global_hook_manager();
+            if (end_hook_mgr && end_hook_mgr->has_hooks(plugins::PluginHookName::SESSION_END)) {
+                tools::PluginHookSessionEndEvent se_event;
+                se_event.session_id    = captured_session_id;
+                se_event.session_key   = captured_session_id;
+                se_event.message_count = static_cast<int>(result.total_steps);
+                se_event.duration_ms   = static_cast<int>(result.duration_ms);
+                tools::PluginHookSessionContext se_ctx;
+                se_ctx.session_id  = captured_session_id;
+                se_ctx.session_key = captured_session_id;
+                try {
+                    end_hook_mgr->run_session_end(se_event, se_ctx);
+                } catch (const std::exception& e) {
+                    get_logger()->warn("[chat.send] session_end hook failed: {}", e.what());
+                }
+            }
+
+            dispatch_result.success = true;
+            dispatch_result.react_result = result;
+        } catch (const std::exception& e) {
+            get_logger()->error("[chat.send] Agent exception: session={}, run_id={}, error={}",
+                captured_session_id, captured_run_id, e.what());
+            dispatch_result.success = false;
+            dispatch_result.error = e.what();
         }
-    );
+        return dispatch_result;
+    };
+
+    // ✅ 解析 queue settings (对齐 OpenClaw: resolveQueueSettings)
+    // 从 session entry 读取 queue_mode/debounce_ms/cap/drop
+    // 默认 mode = collect (对齐 OpenClaw: defaultQueueModeForChannel → "collect")
+    auto_reply::QueueSettings queue_settings;
+    // TODO: load session entry and pass to resolve_queue_settings
+    // For now, use defaults (collect mode, debounce=1000ms, cap=20)
+    // Aligned with openclaw: resolveQueueSettings defaults
+
+    // ✅ 通过 run_reply_agent 调度 (对齐 OpenClaw: runReplyAgent)
+    // 决策: run-now (session 空闲) 或 enqueue-followup (session 忙碌)
+    // 支持 steer/interrupt/collect/followup 四种 queue mode
+    if (msg_dispatcher) {
+        auto_reply::MessageDispatcher::RunReplyAgentParams agent_params;
+        agent_params.session_key    = session_id;
+        agent_params.run_fn         = run_fn;
+        agent_params.label          = "chat.send:" + session_id + ":" + run_id;
+        agent_params.prompt         = message;
+        agent_params.summary_line   = message.size() > 160
+                                        ? message.substr(0, 159) + "…"
+                                        : message;
+        agent_params.queue_settings = queue_settings;
+        agent_params.is_heartbeat   = false;
+
+        // run_reply_agent 是异步的（enqueue-followup 时立即返回，run-now 时在后台线程执行）
+        // 对齐 OpenClaw: void dispatchInboundMessage(...) — fire-and-forget
+        std::thread([msg_dispatcher, agent_params]() {
+            msg_dispatcher->run_reply_agent(agent_params);
+        }).detach();
+    } else {
+        // Fallback: 直接在后台线程执行（MessageDispatcher 未初始化时）
+        std::thread([run_fn]() { run_fn(); }).detach();
+    }
     
     // ========================================================================
     // Step 7: 立即返回 (不等待执行完成，对齐 OpenClaw)

@@ -2015,6 +2015,13 @@ std::shared_ptr<agents::AgentPool> GatewayServer::agent_pool() const {
     return impl_->agent_pool;
 }
 
+// ✅ MessageDispatcher access (对齐 OpenClaw: dispatchInboundMessage)
+// chat.send 通过 message_dispatcher()->run_reply_agent() 调度，
+// 使四种 queue mode (steer/followup/collect/interrupt) 对 chat.send 生效
+std::shared_ptr<auto_reply::MessageDispatcher> GatewayServer::message_dispatcher() const {
+    return impl_->message_dispatcher;
+}
+
 std::shared_ptr<core::Config> GatewayServer::config() const {
     return impl_->config;
 }

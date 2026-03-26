@@ -139,7 +139,23 @@ public:
         const channels::InboundMessage& message,
         const AutoReplyConfig& config
     );
-    
+
+    // ✅ run_reply_agent (aligned with openclaw: runReplyAgent agent-runner.ts)
+    // 决策: run-now (session 空闲) 或 enqueue-followup (session 忙碌)
+    // 支持 steer/interrupt/collect/followup 四种模式
+    // PUBLIC: 供 chat.send 路径直接调用，与 auto-reply 路径共享同一套 active_sessions_ 状态
+    struct RunReplyAgentParams {
+        std::string session_key;
+        std::function<DispatchResult()> run_fn;  // 实际执行函数
+        std::string label;
+        std::string prompt;          // for collect mode
+        std::string summary_line;    // for drop policy
+        QueueSettings queue_settings;
+        bool is_heartbeat = false;
+        bool is_streaming = false;   // aligned with openclaw: isEmbeddedPiRunStreaming
+    };
+    DispatchResult run_reply_agent(const RunReplyAgentParams& params);
+
 private:
     MessageDispatcher(
         std::shared_ptr<::hunterclaw::routing::MessageRouter> router,
@@ -268,22 +284,7 @@ private:
     // 中止运行中的 session（interrupt 模式）
     bool abort_embedded_session(const std::string& session_key);
 
-    // ✅ run_reply_agent (aligned with openclaw: runReplyAgent agent-runner.ts)
-    // 决策: run-now (session 空闲) 或 enqueue-followup (session 忙碌)
-    // 支持 steer/interrupt/collect/followup 四种模式
-    struct RunReplyAgentParams {
-        std::string session_key;
-        std::function<DispatchResult()> run_fn;  // 实际执行函数
-        std::string label;
-        std::string prompt;          // for collect mode
-        std::string summary_line;    // for drop policy
-        QueueSettings queue_settings;
-        bool is_heartbeat = false;
-        bool is_streaming = false;   // aligned with openclaw: isEmbeddedPiRunStreaming
-    };
-    DispatchResult run_reply_agent(const RunReplyAgentParams& params);
-
-    // ✅ drain_followup_queue (aligned with openclaw: queue/drain.ts scheduleFollowupDrain)
+private:
     // 按 mode 消费 followup 队列：followup=逐条串行，collect=批量合并
     void drain_followup_queue(const std::string& session_key);
 
