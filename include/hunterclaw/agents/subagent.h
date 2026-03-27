@@ -160,6 +160,13 @@ struct SubagentEntry {
     // ✅ OpenClaw对齐: archiveAtMs (run 模式下的归档时间)
     uint64_t archive_at_ms = 0;             // Archive timestamp (0 = no archive)
 
+    // ✅ OpenClaw对齐: schedulePendingLifecycleError (LIFECYCLE_ERROR_RETRY_GRACE_MS=15s)
+    // lifecycle error 事件不立即标记失败，等待 15s 宽限期
+    // 如果期间收到 start/end 事件则取消，避免 provider 重试期间误判
+    bool pending_lifecycle_error = false;           // 是否有待处理的 lifecycle error
+    uint64_t pending_lifecycle_error_at = 0;        // error 事件时间戳
+    std::string pending_lifecycle_error_msg;        // error 消息
+
     // Notifications
     std::vector<std::string> pending_notifications;  // Queued events
     
@@ -189,7 +196,7 @@ struct SubagentEntry {
 // Subagent Registry
 // ============================================================================
 
-class SubagentRegistry {
+class SubagentRegistry : public std::enable_shared_from_this<SubagentRegistry> {
 public:
     using Ptr = std::shared_ptr<SubagentRegistry>;
     
@@ -247,7 +254,19 @@ public:
 
     // ✅ OpenClaw对齐: 判断 requester 是否是 subagent (isInternalAnnounceRequesterSession)
     // depth >= 1 的 session 是 subagent，deliver=false；depth=0 是用户，deliver=true
+    // 同时检查 cron session（对齐 OpenClaw: isCronSessionKey）
     bool is_requester_subagent(const std::string& requester_run_id);
+
+    // ✅ OpenClaw对齐: 清除 pending lifecycle error (clearPendingLifecycleError)
+    void clear_pending_lifecycle_error(const std::string& run_id);
+
+    // ✅ OpenClaw对齐: 调度 pending lifecycle error (schedulePendingLifecycleError)
+    // 15s 后若未收到 start/end 则触发失败
+    void schedule_pending_lifecycle_error(
+        const std::string& run_id,
+        uint64_t ended_at,
+        const std::string& error_msg
+    );
 
     // ✅ OpenClaw对齐: 列出某个 session 下所有子 subagent 的完成结果
     // 用于 buildChildCompletionFindings

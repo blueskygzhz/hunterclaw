@@ -350,6 +350,8 @@ cc_library(
         ":hunterclaw_memory",
         ":hunterclaw_sessions",
         ":hunterclaw_observability",  # ✅ 添加 observability 依赖
+        ":hunterclaw_queue",          # ✅ 添加 queue 依赖 (CommandQueue)
+        "@ixwebsocket//:ixwebsocket", # ✅ sessions_tool.cc 需要 gateway/client.h
         "@nlohmann_json//:json",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",

@@ -367,11 +367,20 @@ int SubagentRegistry::count_pending_descendant_runs(const std::string& child_ses
 }
 
 // ✅ 对齐 OpenClaw: isInternalAnnounceRequesterSession
-// 判断 requester 是否是 subagent（depth >= 1）
-// 对齐 openclaw: getSubagentDepthFromSessionStore(sessionKey) >= 1
+// 判断 requester 是否是 subagent（depth >= 1）或 cron session
+// 对齐 openclaw: getSubagentDepthFromSessionStore(sessionKey) >= 1 || isCronSessionKey(sessionKey)
 // HunterClaw 简化实现: 检查 requester_run_id 是否在 registry 中作为某个 subagent 的 child
+// 同时检查 cron session（以 "cron_" 或 "cron:" 开头的 run_id）
 bool SubagentRegistry::is_requester_subagent(const std::string& requester_run_id) {
     std::lock_guard<std::mutex> lock(mutex_);
+    
+    // ✅ 对齐 OpenClaw: isCronSessionKey
+    // Cron session 也视为内部 session（deliver=false）
+    // 对齐 openclaw: isCronSessionKey(sessionKey) → key.startsWith("cron:")
+    if (requester_run_id.find("cron:") == 0 || 
+        requester_run_id.find("cron_") == 0) {
+        return true;
+    }
     
     // 方法 1: requester_run_id 本身就是某个 subagent 的 subagent_run_id
     // 这意味着它是一个已注册的 subagent，depth >= 1
@@ -435,6 +444,84 @@ std::vector<std::shared_ptr<SubagentEntry>> SubagentRegistry::list_completed_chi
     });
     
     return result;
+}
+
+// ✅ 对齐 OpenClaw: clearPendingLifecycleError
+// 清除 pending lifecycle error 状态（收到 start/end 时调用）
+void SubagentRegistry::clear_pending_lifecycle_error(const std::string& run_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = entries_.find(run_id);
+    if (it == entries_.end()) return;
+    if (it->second->pending_lifecycle_error) {
+        it->second->pending_lifecycle_error = false;
+        it->second->pending_lifecycle_error_at = 0;
+        it->second->pending_lifecycle_error_msg.clear();
+        log()->debug("[SubagentRegistry] Cleared pending lifecycle error for run: {}", run_id);
+    }
+}
+
+// ✅ 对齐 OpenClaw: schedulePendingLifecycleError
+// 收到 lifecycle error 事件时，不立即标记失败，等 LIFECYCLE_ERROR_RETRY_GRACE_MS=15s 宽限期
+// 如果期间收到 start/end 事件则取消（provider 重试场景）
+void SubagentRegistry::schedule_pending_lifecycle_error(
+    const std::string& run_id,
+    uint64_t ended_at,
+    const std::string& error_msg
+) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = entries_.find(run_id);
+        if (it == entries_.end()) return;
+        // 如果已经有 pending error，先清除旧的
+        it->second->pending_lifecycle_error = true;
+        it->second->pending_lifecycle_error_at = ended_at;
+        it->second->pending_lifecycle_error_msg = error_msg;
+    }
+    log()->debug("[SubagentRegistry] Scheduled pending lifecycle error for run: {} (grace={}ms)",
+                run_id, LIFECYCLE_ERROR_RETRY_GRACE_MS);
+
+    // 启动宽限期定时器（detach 线程模拟 setTimeout）
+    // 对齐 OpenClaw: setTimeout(() => { ... }, LIFECYCLE_ERROR_RETRY_GRACE_MS)
+    auto weak_registry = std::weak_ptr<SubagentRegistry>(shared_from_this());
+    std::thread([weak_registry, run_id, ended_at, error_msg]() {
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(LIFECYCLE_ERROR_RETRY_GRACE_MS)
+        );
+        auto registry = weak_registry.lock();
+        if (!registry) return;
+
+        std::lock_guard<std::mutex> lock(registry->mutex_);
+        auto it = registry->entries_.find(run_id);
+        if (it == registry->entries_.end()) return;
+        auto& entry = it->second;
+
+        // 对齐 OpenClaw: 如果宽限期内已经收到 start/end（pending_lifecycle_error 被清除），则跳过
+        if (!entry->pending_lifecycle_error) {
+            log()->debug("[SubagentRegistry] Lifecycle error grace period cancelled for run: {}", run_id);
+            return;
+        }
+        // 对齐 OpenClaw: 如果已经是 complete/ok 状态，跳过
+        if (entry->ended_reason == "complete" || 
+            (entry->state == SubagentState::Completed && !entry->has_error)) {
+            return;
+        }
+
+        // 宽限期结束，正式标记为失败
+        entry->pending_lifecycle_error = false;
+        entry->has_error = true;
+        entry->error_message = error_msg.empty() ? "lifecycle error" : error_msg;
+        entry->ended_reason = "error";
+        if (entry->completed_at == 0) {
+            entry->completed_at = ended_at > 0 ? ended_at : static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()
+                ).count()
+            );
+        }
+        entry->state = SubagentState::Failed;
+        log()->warn("[SubagentRegistry] Lifecycle error grace period expired for run: {} - {}",
+                   run_id, error_msg);
+    }).detach();
 }
 
 // ✅ 对齐 OpenClaw: retryDeferredCompletedAnnounces
@@ -665,6 +752,8 @@ void SubagentSpawner::setup_event_handlers(
                 if (phase_str == "start" || 
                     data["phase"].as_number() == static_cast<double>(AgentLifecyclePhase::Start)) {
                     // Subagent 开始执行
+                    // ✅ 对齐 OpenClaw: clearPendingLifecycleError (收到 start 时取消宽限期 error)
+                    registry->clear_pending_lifecycle_error(subagent_run_id);
                     registry->update_state(subagent_run_id, SubagentState::Running);
                     log()->info("[SubagentSpawner] Subagent started: {}", subagent_run_id);
                     return;
@@ -673,7 +762,8 @@ void SubagentSpawner::setup_event_handlers(
                 // 对齐 OpenClaw: phase === "end"
                 if (phase_str == "end" ||
                     data["phase"].as_number() == static_cast<double>(AgentLifecyclePhase::End)) {
-                    // Subagent 执行完成，提取结果
+                    // ✅ 对齐 OpenClaw: clearPendingLifecycleError (收到 end 时取消宽限期 error)
+                    registry->clear_pending_lifecycle_error(subagent_run_id);
                     std::string result_text;
                     bool has_error = false;
                     std::string error_msg;
@@ -713,7 +803,9 @@ void SubagentSpawner::setup_event_handlers(
                     return;
                 }
                 
-                // 对齐 OpenClaw: phase === "error"
+                // ✅ 对齐 OpenClaw: phase === "error" → schedulePendingLifecycleError
+                // 不立即标记失败，等 LIFECYCLE_ERROR_RETRY_GRACE_MS=15s 宽限期
+                // 如果期间收到 start/end 事件则取消（provider 重试场景）
                 if (phase_str == "error" ||
                     data["phase"].as_number() == static_cast<double>(AgentLifecyclePhase::ToolExecution)) {
                     std::string error_msg = "Unknown error";
@@ -721,18 +813,18 @@ void SubagentSpawner::setup_event_handlers(
                         try { error_msg = data["error"].as_string(); } catch (...) {}
                     }
                     
-                    registry->set_result(subagent_run_id, "", true, error_msg);
+                    auto now_ms = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()
+                        ).count()
+                    );
                     
-                    log()->error("[SubagentSpawner] Subagent error: {} - {}",
-                                subagent_run_id, error_msg);
+                    // ✅ 对齐 OpenClaw: schedulePendingLifecycleError
+                    // 15s 宽限期后若未收到 start/end 则正式标记失败
+                    registry->schedule_pending_lifecycle_error(subagent_run_id, now_ms, error_msg);
                     
-                    // 通知等待线程
-                    auto spawner = weak_spawner.lock();
-                    if (spawner) {
-                        std::lock_guard<std::mutex> lock(spawner->mutex_);
-                        spawner->completion_flags_[subagent_run_id] = true;
-                        spawner->cv_.notify_all();
-                    }
+                    log()->warn("[SubagentSpawner] Subagent lifecycle error (grace period started): {} - {}",
+                               subagent_run_id, error_msg);
                     return;
                 }
             }
@@ -1206,6 +1298,32 @@ void SubagentAnnouncer::stop() {
 void SubagentAnnouncer::worker_loop() {
     while (running_) {
         try {
+            // ✅ 对齐 OpenClaw: sweepSubagentRuns
+            // 检查 archive_at_ms，归档过期的 run 模式 subagent
+            // 对齐 openclaw: setInterval(() => sweepSubagentRuns(), 60_000)
+            {
+                auto now_ms = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()
+                    ).count()
+                );
+                auto all_entries = registry_->list_active();
+                for (const auto& entry : all_entries) {
+                    if (entry->archive_at_ms > 0 && entry->archive_at_ms <= now_ms) {
+                        // ✅ 对齐 OpenClaw: sweepSubagentRuns → sessions.delete
+                        // 归档时间到，清理 session（run 模式下）
+                        log()->info("[SubagentAnnouncer] Sweeping archived run: {} (archive_at={})",
+                                   entry->subagent_run_id, entry->archive_at_ms);
+                        // 标记为已完成 cleanup，避免重复处理
+                        entry->cleanup_completed_at = now_ms;
+                        // 清理 AgentPool 中的 Agent 实例
+                        if (agent_manager_) {
+                            agent_manager_->remove_agent(entry->subagent_run_id);
+                        }
+                    }
+                }
+            }
+
             // ✅ 对齐 OpenClaw: 获取所有需要投递的 entry
             std::vector<std::shared_ptr<SubagentEntry>> to_deliver;
             {

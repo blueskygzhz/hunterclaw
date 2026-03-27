@@ -188,15 +188,15 @@ core::Result<T> GatewayClient::request(const std::string& method,
     auto result = future.get();
     
     if (!result.is_ok()) {
-        return core::Result<T>::err(result.error());
+        return core::Result<T>::err(result.error);
     }
     
     if constexpr (std::is_same_v<T, nlohmann::json>) {
-        return core::Result<T>::ok(result.value);
+        return core::Result<T>::Ok(result.value.value());
     } else {
         try {
-            T value = result.value.get<T>();
-            return core::Result<T>::ok(std::move(value));
+            T value = result.value.value().get<T>();
+            return core::Result<T>::Ok(std::move(value));
         } catch (const std::exception& e) {
             return core::Result<T>::err("Failed to parse response: " + std::string(e.what()));
         }
