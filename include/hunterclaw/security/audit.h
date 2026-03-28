@@ -3,6 +3,8 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <memory>
+#include <unordered_set>
 #include <functional>
 #include <optional>
 #include <nlohmann/json.hpp>
@@ -101,11 +103,13 @@ struct GatewayProbeResult {
  * }
  */
 struct SecurityAuditReport {
-    int64_t timestamp;                          // 审计时间戳 (Unix 毫秒)
+    // 🎯 对齐 OpenClaw: ts: number (Unix ms timestamp)
+    int64_t ts = 0;                             // 审计时间戳 (Unix 毫秒) — 对齐 OpenClaw 字段名 "ts"
     SecurityAuditSummary summary;               // 摘要统计
     std::vector<SecurityAuditFinding> findings; // 所有发现
     
     // Deep audit results (optional)
+    // 🎯 对齐 OpenClaw: deep?: { gateway?: { attempted, url, ok, error, close } }
     struct DeepResults {
         std::optional<GatewayProbeResult> gateway;
     };
@@ -126,27 +130,47 @@ struct SecurityAuditReport {
  */
 struct SecurityAuditOptions {
     // Core config (required)
+    // 🎯 对齐 OpenClaw: config: OpenClawConfig
     nlohmann::json config;              // OpenClaw 配置
+    // 🎯 对齐 OpenClaw: sourceConfig?: OpenClawConfig
     std::optional<nlohmann::json> source_config;  // 原始配置 (用于对比)
     
     // Environment
+    // 🎯 对齐 OpenClaw: env?: NodeJS.ProcessEnv
     std::map<std::string, std::string> env;  // 环境变量
+    // 🎯 对齐 OpenClaw: platform?: NodeJS.Platform
     std::string platform = "linux";          // 平台 (linux, darwin, win32)
     
     // Audit depth control
+    // 🎯 对齐 OpenClaw: deep?: boolean
     bool deep = false;                  // 是否执行深度审计 (包括 Gateway 探测)
+    // 🎯 对齐 OpenClaw: includeFilesystem?: boolean
     bool include_filesystem = true;     // 是否检查文件系统权限
+    // 🎯 对齐 OpenClaw: includeChannelSecurity?: boolean
     bool include_channel_security = true;  // 是否检查 Channel 安全性
     
     // Path overrides
+    // 🎯 对齐 OpenClaw: stateDir?: string
     std::optional<std::string> state_dir;   // State 目录路径 (默认: ~/.openclaw/state)
+    // 🎯 对齐 OpenClaw: configPath?: string
     std::optional<std::string> config_path; // Config 文件路径
     
     // Timeouts
+    // 🎯 对齐 OpenClaw: deepTimeoutMs?: number (default 5000)
     int deep_timeout_ms = 5000;  // Deep audit 超时时间 (毫秒)
     
     // Caching (optional)
+    // 🎯 对齐 OpenClaw: configSnapshot?: ConfigFileSnapshot | null
     std::optional<nlohmann::json> config_snapshot;  // 预加载的配置快照
+    
+    // 🎯 对齐 OpenClaw: codeSafetySummaryCache?: Map<string, Promise<unknown>>
+    // In C++: optional shared cache for code-safety summaries across repeated deep audits
+    // (DI for testing; nullptr = use internal cache)
+    std::shared_ptr<std::map<std::string, std::string>> code_safety_summary_cache;
+    
+    // 🎯 对齐 OpenClaw: plugins?: ReturnType<typeof listChannelPlugins>
+    // Dependency injection for tests — override channel plugin list
+    std::optional<std::vector<std::string>> plugins_override;
 };
 
 // ============================================================================
@@ -336,7 +360,7 @@ private:
 /**
  * DEFAULT_GATEWAY_HTTP_TOOL_DENY - 默认的 HTTP Gateway 工具黑名单
  * 
- * 对齐 OpenClaw: dangerous-tools.ts
+ * 对齐 OpenClaw: dangerous-tools.ts DEFAULT_GATEWAY_HTTP_TOOL_DENY
  * 
  * 这些工具不应通过 HTTP Gateway 暴露,因为:
  * - sessions_spawn: 远程会话创建 (RCE 风险)
@@ -345,32 +369,40 @@ private:
  * - gateway: Gateway 配置修改
  * - whatsapp_login: 交互式登录 (需要终端)
  */
-const std::vector<std::string> DEFAULT_GATEWAY_HTTP_TOOL_DENY = {
-    "sessions_spawn",
-    "sessions_send",
-    "cron",
-    "gateway",
-    "whatsapp_login"
+// 🎯 对齐 OpenClaw: export const DEFAULT_GATEWAY_HTTP_TOOL_DENY = [...] as const
+inline const std::vector<std::string> DEFAULT_GATEWAY_HTTP_TOOL_DENY = {
+    "sessions_spawn",   // Session orchestration — spawning agents remotely is RCE
+    "sessions_send",    // Cross-session injection — message injection across sessions
+    "cron",             // Persistent automation control plane
+    "gateway",          // Gateway control plane — prevents gateway reconfiguration via HTTP
+    "whatsapp_login"    // Interactive setup — requires terminal QR scan, hangs on HTTP
 };
 
 /**
- * DANGEROUS_ACP_TOOLS - ACP (Automation Control Plane) 危险工具
+ * DANGEROUS_ACP_TOOL_NAMES - ACP 危险工具名称列表
  * 
- * 对齐 OpenClaw: DANGEROUS_ACP_TOOLS
- * 
- * 这些工具在自动化场景下需要显式用户批准:
- * - exec, spawn, shell: 命令执行
- * - sessions_spawn, sessions_send: 会话操作
- * - fs_write, fs_delete, fs_move: 文件系统修改
- * - apply_patch: 代码修改
+ * 对齐 OpenClaw: DANGEROUS_ACP_TOOL_NAMES (array)
  */
-const std::vector<std::string> DANGEROUS_ACP_TOOLS = {
+// 🎯 对齐 OpenClaw: export const DANGEROUS_ACP_TOOL_NAMES = [...] as const
+inline const std::vector<std::string> DANGEROUS_ACP_TOOL_NAMES = {
     "exec", "spawn", "shell",
     "sessions_spawn", "sessions_send",
     "gateway",
     "fs_write", "fs_delete", "fs_move",
     "apply_patch"
 };
+
+/**
+ * DANGEROUS_ACP_TOOLS - ACP (Automation Control Plane) 危险工具集合
+ * 
+ * 对齐 OpenClaw: DANGEROUS_ACP_TOOLS = new Set<string>(DANGEROUS_ACP_TOOL_NAMES)
+ * 
+ * 这些工具在自动化场景下需要显式用户批准
+ */
+// 🎯 对齐 OpenClaw: export const DANGEROUS_ACP_TOOLS = new Set<string>(DANGEROUS_ACP_TOOL_NAMES)
+inline const std::unordered_set<std::string> DANGEROUS_ACP_TOOLS(
+    DANGEROUS_ACP_TOOL_NAMES.begin(), DANGEROUS_ACP_TOOL_NAMES.end()
+);
 
 // ============================================================================
 // External Content Security - 外部内容安全
