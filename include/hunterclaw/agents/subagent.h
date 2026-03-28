@@ -277,6 +277,24 @@ public:
     // ✅ OpenClaw对齐: 重试所有延迟的 announce (retryDeferredCompletedAnnounces)
     void retry_deferred_completed_announces(const std::string& exclude_run_id = "");
 
+    // ✅ OpenClaw对齐: markSubagentRunTerminated
+    // 标记 subagent 为已终止（killed），抑制 announce
+    // 对齐 openclaw: markSubagentRunTerminated({ runId, childSessionKey, reason })
+    int mark_subagent_run_terminated(
+        const std::string& run_id,
+        const std::string& child_session_key = "",
+        const std::string& reason = "killed"
+    );
+
+    // ✅ OpenClaw对齐: markSubagentRunForSteerRestart
+    // 标记 subagent 为 steer-restart，抑制 announce（重启期间）
+    bool mark_subagent_run_for_steer_restart(const std::string& run_id);
+
+    // ✅ OpenClaw对齐: clearSubagentRunSteerRestart
+    // 清除 steer-restart 标记，允许 announce 继续
+    // 如果 run 已完成，立即触发 cleanup
+    bool clear_subagent_run_steer_restart(const std::string& run_id);
+
 private:
     mutable std::mutex mutex_;
     std::map<std::string, std::shared_ptr<SubagentEntry>> entries_;

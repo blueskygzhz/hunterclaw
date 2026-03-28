@@ -147,14 +147,36 @@ core::Result<void> SubagentRegistry::set_result(
         return core::Result<void>::Err("Subagent not found: " + subagent_run_id);
     }
     
+    // ✅ 对齐 OpenClaw: completeSubagentRun 中 late completion 覆盖 killed 的逻辑
+    // If a late lifecycle completion arrives after an earlier kill marker, allow
+    // completion cleanup/announce to run instead of staying permanently suppressed.
+    // 对齐 openclaw:
+    //   if (reason === COMPLETE && entry.suppressAnnounceReason === "killed"
+    //       && (entry.cleanupHandled || entry.cleanupCompletedAt)) {
+    //     entry.suppressAnnounceReason = undefined;
+    //     entry.cleanupHandled = false;
+    //     entry.cleanupCompletedAt = undefined;
+    //   }
+    if (!has_error &&
+        it->second->suppress_announce_reason == "killed" &&
+        (it->second->cleanup_handled || it->second->cleanup_completed_at > 0)) {
+        it->second->suppress_announce_reason.clear();
+        it->second->cleanup_handled = false;
+        it->second->cleanup_completed_at = 0;
+        log()->info("[SubagentRegistry] Late completion overrides killed state for run: {}",
+                   subagent_run_id);
+    }
+
     it->second->result_text = result_text;
     it->second->has_error = has_error;
     it->second->error_message = error_message;
     
     if (has_error) {
         it->second->state = SubagentState::Failed;
+        it->second->ended_reason = "error";
     } else {
         it->second->state = SubagentState::Completing;
+        it->second->ended_reason = "complete";
     }
     
     auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -343,12 +365,11 @@ int SubagentRegistry::count_pending_descendant_runs(const std::string& child_ses
             const auto& entry = pair.second;
             if (entry->requester_run_id != requester) continue;
 
-            // 对齐 openclaw: !runEnded || !cleanupCompleted
-            bool run_ended = (entry->completed_at > 0 &&
-                              (entry->state == SubagentState::Completed ||
-                               entry->state == SubagentState::Failed ||
-                               entry->state == SubagentState::Killed ||
-                               entry->state == SubagentState::TimedOut));
+            // ✅ 对齐 openclaw countPendingDescendantRunsInternal:
+            // const runEnded = typeof entry.endedAt === "number";
+            // const cleanupCompleted = typeof entry.cleanupCompletedAt === "number";
+            // if (!runEnded || !cleanupCompleted) count++
+            bool run_ended = (entry->completed_at > 0);
             bool cleanup_completed = (entry->cleanup_completed_at > 0);
             if (!run_ended || !cleanup_completed) {
                 count++;
@@ -524,9 +545,117 @@ void SubagentRegistry::schedule_pending_lifecycle_error(
     }).detach();
 }
 
+// ✅ 对齐 OpenClaw: markSubagentRunTerminated
+// 标记 subagent 为已终止（killed），抑制 announce
+// 对齐 openclaw: markSubagentRunTerminated({ runId, childSessionKey, reason })
+int SubagentRegistry::mark_subagent_run_terminated(
+    const std::string& run_id,
+    const std::string& child_session_key,
+    const std::string& reason
+) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    auto now = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count()
+    );
+    
+    int updated = 0;
+    
+    // 收集需要终止的 run_id 集合
+    std::vector<std::string> target_run_ids;
+    if (!run_id.empty()) {
+        target_run_ids.push_back(run_id);
+    }
+    // 如果指定了 child_session_key，找到所有对应的 run
+    if (!child_session_key.empty()) {
+        for (const auto& pair : entries_) {
+            if (pair.second->subagent_run_id == child_session_key) {
+                target_run_ids.push_back(pair.first);
+            }
+        }
+    }
+    
+    for (const auto& target_id : target_run_ids) {
+        auto it = entries_.find(target_id);
+        if (it == entries_.end()) continue;
+        auto& entry = it->second;
+        
+        // 对齐 openclaw: 跳过已完成的 run
+        if (entry->completed_at > 0) continue;
+        
+        entry->completed_at = now;
+        entry->has_error = true;
+        entry->error_message = reason.empty() ? "killed" : reason;
+        entry->ended_reason = "killed";
+        entry->state = SubagentState::Killed;
+        entry->cleanup_handled = true;
+        entry->cleanup_completed_at = now;
+        entry->suppress_announce_reason = "killed";
+        updated++;
+        
+        log()->info("[SubagentRegistry] Terminated run: {} (reason={})", target_id, reason);
+    }
+    
+    return updated;
+}
+
+// ✅ 对齐 OpenClaw: markSubagentRunForSteerRestart
+// 标记 subagent 为 steer-restart，抑制 announce（重启期间）
+bool SubagentRegistry::mark_subagent_run_for_steer_restart(const std::string& run_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    const std::string key = run_id;
+    if (key.empty()) return false;
+    
+    auto it = entries_.find(key);
+    if (it == entries_.end()) return false;
+    
+    if (it->second->suppress_announce_reason == "steer-restart") {
+        return true;  // 已经是 steer-restart，幂等
+    }
+    
+    it->second->suppress_announce_reason = "steer-restart";
+    log()->info("[SubagentRegistry] Marked for steer-restart: {}", key);
+    return true;
+}
+
+// ✅ 对齐 OpenClaw: clearSubagentRunSteerRestart
+// 清除 steer-restart 标记，允许 announce 继续
+// 如果 run 已完成，立即触发 cleanup（通过重置 cleanup_handled）
+bool SubagentRegistry::clear_subagent_run_steer_restart(const std::string& run_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    const std::string key = run_id;
+    if (key.empty()) return false;
+    
+    auto it = entries_.find(key);
+    if (it == entries_.end()) return false;
+    
+    if (it->second->suppress_announce_reason != "steer-restart") {
+        return true;  // 已经不是 steer-restart，幂等
+    }
+    
+    it->second->suppress_announce_reason.clear();
+    
+    // ✅ 对齐 OpenClaw: clearSubagentRunSteerRestart
+    // If the interrupted run already finished while suppression was active, retry
+    // cleanup now so completion output is not lost when restart dispatch fails.
+    // 对齐 openclaw: if (entry.endedAt && !entry.cleanupCompletedAt) resumeSubagentRun(key)
+    if (it->second->completed_at > 0 && it->second->cleanup_completed_at == 0) {
+        // 重置 cleanup_handled，允许 worker_loop 重新处理
+        it->second->cleanup_handled = false;
+        log()->info("[SubagentRegistry] Cleared steer-restart, resuming cleanup for run: {}", key);
+    } else {
+        log()->info("[SubagentRegistry] Cleared steer-restart for run: {}", key);
+    }
+    
+    return true;
+}
+
 // ✅ 对齐 OpenClaw: retryDeferredCompletedAnnounces
 // 当某个 subagent 完成后，重试所有等待中的 announce
-// 对齐 openclaw retryDeferredCompletedAnnounces: 直接重置 resumedRuns 并调用 resumeSubagentRun
 // HunterClaw 简化实现: 重置 cleanup_handled 并清除 suppress_announce_reason
 void SubagentRegistry::retry_deferred_completed_announces(const std::string& exclude_run_id) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -1037,12 +1166,81 @@ core::Result<std::string> SubagentSpawner::spawn(
     // HunterClaw: 通过 AgentInstance::process_message() 异步执行
     if (subagent_instance) {
         // 构建子 Agent 的任务消息
-        // 对齐 OpenClaw: childTaskMessage
-        std::string child_task_message = 
-            "[Subagent Context] You are running as a subagent (depth " +
-            std::to_string(child_depth.depth) + "/" +
-            std::to_string(child_depth.max_depth) + "). " +
-            "Results auto-announce to your requester; do not busy-poll for status.\n\n" +
+        // ✅ 对齐 OpenClaw: buildSubagentSystemPrompt
+        // 严格对齐 openclaw subagent-announce.ts:buildSubagentSystemPrompt
+        // 包含: # Subagent Context, ## Your Role, ## Rules, ## Output Format,
+        //       ## What You DON'T Do, ## Sub-Agent Spawning (if canSpawn), ## Session Context
+        bool can_spawn = child_depth.can_spawn_child();
+        std::string parent_label = child_depth.depth >= 2 ? "parent orchestrator" : "main agent";
+        std::string task_text = options.prompt.empty() ? "{{TASK_DESCRIPTION}}" : options.prompt;
+        // trim task_text
+        {
+            auto s = task_text.find_first_not_of(" \t\n\r");
+            auto e = task_text.find_last_not_of(" \t\n\r");
+            if (s != std::string::npos) task_text = task_text.substr(s, e - s + 1);
+        }
+        // replace multiple spaces with single space
+        {
+            std::string tmp;
+            bool prev_space = false;
+            for (char c : task_text) {
+                if (c == ' ' || c == '\t') {
+                    if (!prev_space) tmp += ' ';
+                    prev_space = true;
+                } else {
+                    tmp += c;
+                    prev_space = false;
+                }
+            }
+            task_text = tmp;
+        }
+
+        std::string child_task_message =
+            "# Subagent Context\n\n"
+            "You are a **subagent** spawned by the " + parent_label + " for a specific task.\n\n"
+            "## Your Role\n"
+            "- You were created to handle: " + task_text + "\n"
+            "- Complete this task. That's your entire purpose.\n"
+            "- You are NOT the " + parent_label + ". Don't try to be.\n\n"
+            "## Rules\n"
+            "1. **Stay focused** - Do your assigned task, nothing else\n"
+            "2. **Complete the task** - Your final message will be automatically reported to the " + parent_label + "\n"
+            "3. **Don't initiate** - No heartbeats, no proactive actions, no side quests\n"
+            "4. **Be ephemeral** - You may be terminated after task completion. That's fine.\n"
+            "5. **Trust push-based completion** - Descendant results are auto-announced back to you; do not busy-poll for status.\n"
+            "6. **Recover from compacted/truncated tool output** - If you see `[compacted: tool output removed to free context]` or `[truncated: output exceeded context limit]`, assume prior output was reduced. Re-read only what you need using smaller chunks (`read` with offset/limit, or targeted `rg`/`head`/`tail`) instead of full-file `cat`.\n\n"
+            "## Output Format\n"
+            "When complete, your final response should include:\n"
+            "- What you accomplished or found\n"
+            "- Any relevant details the " + parent_label + " should know\n"
+            "- Keep it concise but informative\n\n"
+            "## What You DON'T Do\n"
+            "- NO user conversations (that's " + parent_label + "'s job)\n"
+            "- NO external messages (email, tweets, etc.) unless explicitly tasked with a specific recipient/channel\n"
+            "- NO cron jobs or persistent state\n"
+            "- NO pretending to be the " + parent_label + "\n"
+            "- Only use the `message` tool when explicitly instructed to contact a specific external recipient; otherwise return plain text and let the " + parent_label + " deliver it\n\n" +
+            (can_spawn ?
+                "## Sub-Agent Spawning\n"
+                "You CAN spawn your own sub-agents for parallel or complex work using `sessions_spawn`.\n"
+                "Use the `subagents` tool to steer, kill, or do an on-demand status check for your spawned sub-agents.\n"
+                "Your sub-agents will announce their results back to you automatically (not to the main agent).\n"
+                "Default workflow: spawn work, continue orchestrating, and wait for auto-announced completions.\n"
+                "Auto-announce is push-based. After spawning children, do NOT call sessions_list, sessions_history, exec sleep, or any polling tool.\n"
+                "Wait for completion events to arrive as user messages.\n"
+                "Track expected child session keys and only send your final answer after completion events for ALL expected children arrive.\n"
+                "If a child completion event arrives AFTER you already sent your final answer, reply ONLY with NO_REPLY.\n"
+                "Do NOT repeatedly poll `subagents list` in a loop unless you are actively debugging or intervening.\n"
+                "Coordinate their work and synthesize results before reporting back.\n\n"
+                :
+                "## Sub-Agent Spawning\n"
+                "You are a leaf worker and CANNOT spawn further sub-agents. Focus on your assigned task.\n\n"
+            ) +
+            "## Session Context\n" +
+            (!options.label.empty() ? "- Label: " + options.label + "\n" : "") +
+            "- Requester session: " + requester_run_id + ".\n"
+            "- Your session: " + subagent_run_id + ".\n"
+            "\n"
             "[Subagent Task]: " + options.prompt;
         
         // 准备运行选项
