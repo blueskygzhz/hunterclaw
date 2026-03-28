@@ -14,6 +14,7 @@
 #include <regex>
 #include <algorithm>
 #include <cstdlib>
+#include <chrono>
 
 namespace hunterclaw {
 namespace tools {
@@ -193,11 +194,17 @@ static Result<DecodedMedia> decode_data_url(const std::string& data_url) {
             "Unsupported data URL type: " + (mime_type.empty() ? "unknown" : mime_type)
         );
     }
+    // 🎯 对齐 OpenClaw: const b64 = (match[2] ?? "").trim()
     std::string b64 = m[2].str();
-    // 🎯 对齐 OpenClaw: Buffer.from(b64, "base64") — strip whitespace
-    b64.erase(std::remove_if(b64.begin(), b64.end(), [](char c) {
-        return c == '\r' || c == '\n' || c == ' ' || c == '\t';
-    }), b64.end());
+    {
+        auto bs = b64.find_first_not_of(" \t\r\n");
+        if (bs != std::string::npos) {
+            auto be = b64.find_last_not_of(" \t\r\n");
+            b64 = b64.substr(bs, be - bs + 1);
+        } else {
+            b64 = "";
+        }
+    }
     // 🎯 对齐 OpenClaw: if (buffer.length === 0) throw new Error("Invalid data URL: empty payload.")
     if (b64.empty()) {
         return Result<DecodedMedia>::Err("Invalid data URL: empty payload.");
@@ -339,12 +346,16 @@ static nlohmann::json build_image_context(
             {"mimeType", img.mime_type}
         });
     }
+    // 🎯 对齐 OpenClaw: timestamp: Date.now()
+    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count();
     return nlohmann::json{
         {"messages", nlohmann::json::array({
             {
                 {"role", "user"},
                 {"content", content},
-                {"timestamp", 0}
+                {"timestamp", now_ms}
             }
         })}
     };
@@ -364,7 +375,12 @@ static Result<std::string> coerce_image_assistant_text(
     // 🎯 对齐 OpenClaw: const stop = params.message.stopReason
     std::string stop_reason = response_json.value("stop_reason", "");
     // Normalize: OpenAI uses "stop", Anthropic uses "end_turn"/"error"
-    std::string error_message = response_json.value("error_message", "");
+    // 🎯 对齐 OpenClaw: params.message.errorMessage?.trim() — camelCase field
+    std::string error_message = response_json.value("errorMessage", "");
+    if (error_message.empty()) {
+        // Also check snake_case for compatibility
+        error_message = response_json.value("error_message", "");
+    }
     // Trim errorMessage
     {
         auto s = error_message.find_first_not_of(" \t\r\n");
@@ -606,23 +622,25 @@ static Result<nlohmann::json> call_vision_provider(
 // resolveImageModelConfigForTool (对齐 OpenClaw image-tool.ts)
 // ============================================================================
 
-// 🎯 对齐 OpenClaw: export function resolveImageModelConfigForTool({ cfg, agentDir }): ImageModelConfig | null
-// Simplified version for HunterClaw: reads from context/env
+// 🎯 对齐 OpenClaw: resolveImageModelConfigForTool({ cfg, agentDir }): ImageModelConfig | null
+// Key logic:
+//   1. Explicit config (imageModel.primary / imageModel.fallbacks) takes priority
+//   2. providerVisionFromConfig: check context metadata for provider-specific vision model
+//   3. Primary provider pairing: same-provider vision model preferred
+//   4. Cross-provider fallback: openai/gpt-5-mini > anthropic > google
 static ImageModelConfig resolve_image_model_config_for_tool(
     const ToolContext& context
 ) {
-    // 🎯 对齐 OpenClaw: const explicit = coerceImageModelConfig(params.cfg)
-    // In HunterClaw, check metadata for explicit imageModel config
     ImageModelConfig config;
 
-    // Check context metadata for explicit imageModel
+    // 🎯 对齐 OpenClaw: const explicit = coerceImageModelConfig(params.cfg)
+    // Check context metadata for explicit imageModel config
     auto it = context.metadata.find("imageModel.primary");
     if (it != context.metadata.end() && !it->second.empty()) {
         config.primary = it->second;
     }
     auto it2 = context.metadata.find("imageModel.fallbacks");
     if (it2 != context.metadata.end() && !it2->second.empty()) {
-        // Parse comma-separated fallbacks
         std::istringstream ss(it2->second);
         std::string tok;
         while (std::getline(ss, tok, ',')) {
@@ -634,29 +652,85 @@ static ImageModelConfig resolve_image_model_config_for_tool(
             if (!tok.empty()) config.fallbacks.push_back(tok);
         }
     }
-
+    // 🎯 对齐 OpenClaw: if (explicit.primary?.trim() || explicit.fallbacks?.length > 0) return explicit
     if (!config.primary.empty() || !config.fallbacks.empty()) {
         return config;
     }
 
-    // 🎯 对齐 OpenClaw: cross-provider fallback based on available API keys
+    // 🎯 对齐 OpenClaw: resolve primary provider and check auth
     bool openai_ok = (std::getenv("OPENAI_API_KEY") != nullptr);
     bool anthropic_ok = (std::getenv("ANTHROPIC_API_KEY") != nullptr);
     bool google_ok = (std::getenv("GOOGLE_API_KEY") != nullptr ||
                       std::getenv("GEMINI_API_KEY") != nullptr);
 
-    // 🎯 对齐 OpenClaw: if (openaiOk) { primary = "openai/gpt-5-mini", fallbacks = [anthropic_fallback] }
-    if (openai_ok) {
-        config.primary = "openai/gpt-4o";
-        if (anthropic_ok) {
-            config.fallbacks.push_back(ANTHROPIC_IMAGE_FALLBACK);
+    // 🎯 对齐 OpenClaw: providerVisionFromConfig — check context metadata for provider-specific vision model
+    // e.g. context.metadata["providerVisionModel"] = "openai/gpt-4o"
+    std::string provider_vision_from_config;
+    {
+        auto pv = context.metadata.find("providerVisionModel");
+        if (pv != context.metadata.end() && !pv->second.empty()) {
+            provider_vision_from_config = pv->second;
         }
+    }
+
+    // 🎯 对齐 OpenClaw: resolve primary provider from context
+    std::string primary_provider;
+    {
+        auto pp = context.metadata.find("primaryProvider");
+        if (pp != context.metadata.end() && !pp->second.empty()) {
+            primary_provider = pp->second;
+        }
+    }
+    bool provider_ok = false;
+    if (primary_provider == "openai") provider_ok = openai_ok;
+    else if (primary_provider == "anthropic") provider_ok = anthropic_ok;
+    else if (primary_provider == "google") provider_ok = google_ok;
+
+    // 🎯 对齐 OpenClaw: preferred model selection
+    std::string preferred;
+    auto add_fallback = [&](const std::string& ref) {
+        if (ref.empty()) return;
+        for (const auto& f : config.fallbacks) {
+            if (f == ref) return;  // dedupe
+        }
+        config.fallbacks.push_back(ref);
+    };
+
+    if (provider_ok && !provider_vision_from_config.empty()) {
+        // 🎯 对齐 OpenClaw: providerOk && providerVisionFromConfig
+        preferred = provider_vision_from_config;
+    } else if (primary_provider == "openai" && openai_ok) {
+        // 🎯 对齐 OpenClaw: primary.provider === "openai" && openaiOk => "openai/gpt-5-mini"
+        preferred = "openai/gpt-5-mini";
+    } else if (primary_provider == "anthropic" && anthropic_ok) {
+        // 🎯 对齐 OpenClaw: primary.provider === "anthropic" && anthropicOk => ANTHROPIC_IMAGE_PRIMARY
+        preferred = ANTHROPIC_IMAGE_PRIMARY;
+    }
+
+    if (!preferred.empty()) {
+        // 🎯 对齐 OpenClaw: add openai/anthropic fallbacks, then prune primary from fallbacks
+        if (openai_ok) add_fallback("openai/gpt-5-mini");
+        if (anthropic_ok) add_fallback(ANTHROPIC_IMAGE_FALLBACK);
+        // Don't duplicate primary in fallbacks
+        config.fallbacks.erase(
+            std::remove(config.fallbacks.begin(), config.fallbacks.end(), preferred),
+            config.fallbacks.end()
+        );
+        config.primary = preferred;
         return config;
     }
-    // 🎯 对齐 OpenClaw: if (anthropicOk) { primary = ANTHROPIC_IMAGE_PRIMARY, fallbacks = [ANTHROPIC_IMAGE_FALLBACK] }
+
+    // 🎯 对齐 OpenClaw: cross-provider fallback
+    if (openai_ok) {
+        if (anthropic_ok) {
+            add_fallback(ANTHROPIC_IMAGE_FALLBACK);
+        }
+        config.primary = "openai/gpt-5-mini";
+        return config;
+    }
     if (anthropic_ok) {
         config.primary = ANTHROPIC_IMAGE_PRIMARY;
-        config.fallbacks.push_back(ANTHROPIC_IMAGE_FALLBACK);
+        config.fallbacks = {ANTHROPIC_IMAGE_FALLBACK};
         return config;
     }
     if (google_ok) {
@@ -679,6 +753,7 @@ struct ImageRunResult {
         std::string provider;
         std::string model;
         std::string error;
+        std::string reason;  // 🎯 对齐 OpenClaw: FallbackAttempt.reason (optional)
     };
     std::vector<Attempt> attempts;
 };
@@ -751,7 +826,7 @@ static ImageRunResult run_with_image_model_fallback(
         std::string api_key = resolve_api_key(candidate.provider);
         if (api_key.empty()) {
             std::string err = "No API key for provider '" + candidate.provider + "'";
-            result.attempts.push_back({candidate.provider, candidate.model, err});
+            result.attempts.push_back({candidate.provider, candidate.model, err, "auth"});
             last_error = err;
             continue;
         }
@@ -764,7 +839,7 @@ static ImageRunResult run_with_image_model_fallback(
         );
 
         if (!resp.ok) {
-            result.attempts.push_back({candidate.provider, candidate.model, resp.error});
+            result.attempts.push_back({candidate.provider, candidate.model, resp.error, ""});
             last_error = resp.error;
             continue;
         }
@@ -775,7 +850,7 @@ static ImageRunResult run_with_image_model_fallback(
         );
 
         if (!text_result.ok) {
-            result.attempts.push_back({candidate.provider, candidate.model, text_result.error});
+            result.attempts.push_back({candidate.provider, candidate.model, text_result.error, ""});
             last_error = text_result.error;
             continue;
         }
@@ -787,7 +862,11 @@ static ImageRunResult run_with_image_model_fallback(
         return result;
     }
 
-    // 🎯 对齐 OpenClaw: throwFallbackFailureSummary(...)
+    // 🎯 对齐 OpenClaw: throwFallbackFailureSummary({ attempts, candidates, lastError, label: "image models" })
+    // if (attempts.length <= 1 && lastError) throw lastError  (single failure: rethrow original)
+    if (result.attempts.size() <= 1 && !last_error.empty()) {
+        throw std::runtime_error(last_error);
+    }
     // "All image models failed (N): provider/model: error | ..."
     std::string summary;
     for (const auto& att : result.attempts) {
@@ -816,14 +895,19 @@ static ToolResult build_text_tool_result(
     for (auto it = extra_details.begin(); it != extra_details.end(); ++it) {
         details[it.key()] = it.value();
     }
-    // 🎯 对齐 OpenClaw: attempts: result.attempts (array of {provider, model, error})
+    // 🎯 对齐 OpenClaw: attempts: result.attempts (array of {provider, model, error, reason?})
     nlohmann::json attempts_arr = nlohmann::json::array();
     for (const auto& att : result.attempts) {
-        attempts_arr.push_back({
+        nlohmann::json attempt_obj = {
             {"provider", att.provider},
             {"model", att.model},
             {"error", att.error}
-        });
+        };
+        // 🎯 对齐 OpenClaw: reason is optional — only include when non-empty
+        if (!att.reason.empty()) {
+            attempt_obj["reason"] = att.reason;
+        }
+        attempts_arr.push_back(attempt_obj);
     }
     details["attempts"] = attempts_arr;
 
