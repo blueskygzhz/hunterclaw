@@ -430,27 +430,45 @@ std::vector<std::shared_ptr<SubagentEntry>> SubagentRegistry::list_completed_chi
 ) {
     std::lock_guard<std::mutex> lock(mutex_);
     
-    // 对齐 openclaw: 找到 parent_run_id 对应的 entry，获取时间窗口
-    // parent_run_id 是某个 subagent 的 subagent_run_id
+    // ✅ 对齐 openclaw listRunsForRequesterFromRuns:
+    // requesterRunId 对应的 entry 的 childSessionKey 就是 requesterSessionKey
+    // lowerBound = requesterRun.startedAt ?? requesterRun.createdAt
+    // upperBound = requesterRun.endedAt
+    //
+    // HunterClaw 映射:
+    // - parent_run_id 是某个 subagent 的 subagent_run_id（即 childSessionKey）
+    // - 找到以 parent_run_id 为 subagent_run_id 的 entry，获取其时间窗口
+    // - 然后找所有 requester_run_id == parent_run_id 的 entry（即直接子 subagent）
     uint64_t lower_bound = 0;
     uint64_t upper_bound = UINT64_MAX;
-    auto parent_it = entries_.find(parent_run_id);
-    if (parent_it != entries_.end()) {
-        lower_bound = parent_it->second->started_at > 0
-            ? parent_it->second->started_at
-            : parent_it->second->spawned_at;
-        if (parent_it->second->completed_at > 0) {
-            upper_bound = parent_it->second->completed_at;
+    
+    // 找到 parent_run_id 对应的 entry（作为 requesterRunId）
+    // 对齐 openclaw: requesterRun = runs.get(requesterRunId)
+    // 对齐 openclaw: requesterRunMatchesScope = requesterRun.childSessionKey === key
+    // HunterClaw: parent_run_id 就是 childSessionKey，直接查找
+    for (const auto& pair : entries_) {
+        if (pair.second->subagent_run_id == parent_run_id) {
+            // 找到了 parent entry
+            // 对齐 openclaw: lowerBound = requesterRun.startedAt ?? requesterRun.createdAt
+            lower_bound = pair.second->started_at > 0
+                ? pair.second->started_at
+                : pair.second->spawned_at;
+            // 对齐 openclaw: upperBound = requesterRun.endedAt
+            if (pair.second->completed_at > 0) {
+                upper_bound = pair.second->completed_at;
+            }
+            break;
         }
     }
 
     std::vector<std::shared_ptr<SubagentEntry>> result;
     for (const auto& pair : entries_) {
         const auto& entry = pair.second;
-        // 对齐 openclaw: requesterSessionKey 匹配
+        // 对齐 openclaw: entry.requesterSessionKey === key
         if (entry->requester_run_id != parent_run_id) continue;
-        // 对齐 openclaw: 时间窗口过滤
+        // 对齐 openclaw: entry.createdAt >= lowerBound
         if (lower_bound > 0 && entry->spawned_at < lower_bound) continue;
+        // 对齐 openclaw: entry.createdAt <= upperBound
         if (upper_bound < UINT64_MAX && entry->spawned_at > upper_bound) continue;
         result.push_back(entry);
     }
@@ -1760,7 +1778,11 @@ core::Result<void> SubagentAnnouncer::attempt_delivery(
     
     // ✅ 对齐 OpenClaw: buildAnnounceReplyInstruction
     // 对齐 openclaw 三个分支: requesterIsSubagent / expectsCompletionMessage / 默认
+    // 对齐 openclaw: announceType = "subagent task" | "cron job"
     static const std::string SILENT_REPLY_TOKEN = "NO_REPLY";
+    // ✅ 对齐 OpenClaw: announceType
+    // HunterClaw 目前只支持 "subagent task"，cron 场景通过 is_requester_subagent 的 cron 判断处理
+    const std::string announce_type = "subagent task";
     std::string reply_instruction;
     if (requester_is_subagent) {
         // 父是 subagent：内部编排更新，不发给用户
@@ -1770,19 +1792,19 @@ core::Result<void> SubagentAnnouncer::attempt_delivery(
             "If this result is duplicate or no update is needed, reply ONLY: " + SILENT_REPLY_TOKEN + ".";
     } else if (entry->expects_completion_message) {
         // 父是顶层用户，且期望 completion message：用户友好回复
-        reply_instruction = "A completed subagent task is ready for user delivery. "
+        reply_instruction = "A completed " + announce_type + " is ready for user delivery. "
             "Convert the result above into your normal assistant voice and send that "
             "user-facing update now. Keep this internal context private "
             "(don't mention system/log/stats/session details or announce type).";
     } else {
         // 父是顶层用户，普通 run 模式
-        reply_instruction = "A completed subagent task is ready for user delivery. "
+        reply_instruction = "A completed " + announce_type + " is ready for user delivery. "
             "Convert the result above into your normal assistant voice and send that "
             "user-facing update now. Keep this internal context private "
             "(don't mention system/log/stats/session details or announce type), "
             "and do not copy the internal event text verbatim. "
             "Reply ONLY: " + SILENT_REPLY_TOKEN + " if this exact result was already delivered to the user in this same turn.";
-    }    
+    }
     // ✅ 对齐 OpenClaw: 构建 internalEvents
     // 对齐 openclaw buildAnnounceSteerMessage(internalEvents) + formatAgentInternalEventsForPrompt
     std::string task_label = entry->label.empty()
@@ -2154,7 +2176,19 @@ core::Result<SubagentEntry> SubagentManager::get_status(
 }
 
 core::Result<void> SubagentManager::kill(const std::string& subagent_run_id) {
-    return registry_->kill_subagent_tree(subagent_run_id);
+    // ✅ 对齐 OpenClaw: markSubagentRunTerminated
+    // 使用 mark_subagent_run_terminated 而非 kill_subagent_tree
+    // 确保设置 suppressAnnounceReason = "killed" 并触发 subagent_ended hook
+    int updated = registry_->mark_subagent_run_terminated(subagent_run_id, "", "killed");
+    if (updated == 0) {
+        // 尝试通过 child_session_key 查找
+        updated = registry_->mark_subagent_run_terminated("", subagent_run_id, "killed");
+    }
+    if (updated == 0) {
+        // fallback: 使用原来的 kill_subagent_tree
+        return registry_->kill_subagent_tree(subagent_run_id);
+    }
+    return core::Result<void>::Ok();
 }
 
 std::vector<SubagentEntry> SubagentManager::list(const std::string& requester_run_id) {

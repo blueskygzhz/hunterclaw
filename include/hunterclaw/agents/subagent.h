@@ -458,6 +458,18 @@ public:
     /// Kill subagent and all descendants
     core::Result<void> kill(const std::string& subagent_run_id);
     
+    /// ✅ OpenClaw对齐: markSubagentRunForSteerRestart
+    /// 标记 subagent 为 steer-restart，抑制 announce（重启期间）
+    bool mark_for_steer_restart(const std::string& run_id) {
+        return registry_->mark_subagent_run_for_steer_restart(run_id);
+    }
+    
+    /// ✅ OpenClaw对齐: clearSubagentRunSteerRestart
+    /// 清除 steer-restart 标记，允许 announce 继续
+    bool clear_steer_restart(const std::string& run_id) {
+        return registry_->clear_subagent_run_steer_restart(run_id);
+    }
+    
     /// List subagents for a run
     std::vector<SubagentEntry> list(const std::string& requester_run_id);
     
