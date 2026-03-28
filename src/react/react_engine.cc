@@ -329,13 +329,12 @@ ReactResult ReactEngine::execute_loop(
     (void)effective_model_override;
     (void)effective_provider_override;
 
-    // 🎯 OpenClaw 对齐: 重置流式状态
+    // 🎯 OpenClaw 对齐: 重置流式状态 (pi-embedded-subscribe.ts: state init)
     streaming_state_.reset();
-    
-    // ✅ OpenClaw 对齐: 重置 reasoning stream 累积状态
+    // accumulated_reasoning_raw_/formatted_ are part of streaming_state_ now
     accumulated_reasoning_raw_.clear();
     accumulated_reasoning_formatted_.clear();
-    
+
     // 构建消息列表
     std::vector<llm::LLMMessage> messages = history;
     
@@ -344,7 +343,12 @@ ReactResult ReactEngine::execute_loop(
     user_msg.role = llm::LLMMessageRole::User;
     user_msg.content = user_input;
     messages.push_back(user_msg);
-    
+
+    // 🎯 对齐 OpenClaw: handleAgentStart — emit lifecycle start event
+    if (callbacks.on_start) {
+        callbacks.on_start();
+    }
+
     ReactStep observe_step;
     observe_step.type = StepType::Observe;
     observe_step.content = user_input;
@@ -352,10 +356,12 @@ ReactResult ReactEngine::execute_loop(
         std::chrono::steady_clock::now().time_since_epoch()
     ).count();
     result.steps.push_back(observe_step);
-    
+
     // ReAct 循环: Reason → Act → Observe → ...
     int step_count = 0;
     std::string accumulated_response;
+    // 🎯 对齐 OpenClaw: assistantTexts accumulator (mirrors state.assistantTexts)
+    std::vector<std::string> assistant_texts;
     
     while (step_count < config_.max_steps && !cancelled_) {
         // ✅ 新增: Token Overflow 检查 (对齐 OpenClaw)
@@ -406,6 +412,16 @@ ReactResult ReactEngine::execute_loop(
             break;
         }
         
+        // 🎯 对齐 OpenClaw: handleMessageStart — reset state at message boundary
+        // ASSUME: message_start is the only reliable boundary for "new assistant message begins".
+        // Resetting at text_end is unsafe (late/duplicate end events).
+        streaming_state_.reset_assistant_message_state(
+            static_cast<int>(assistant_texts.size()));
+        // Emit onAssistantMessageStart (earliest "writing" signal)
+        if (callbacks.on_assistant_message_start) {
+            callbacks.on_assistant_message_start();
+        }
+
         // 步骤 1: Reason (推理)
         auto llm_response = call_llm(messages, callbacks);
         
@@ -540,7 +556,7 @@ ReactResult ReactEngine::execute_loop(
         // 没有工具调用 - 这是最终响应
         reason_step.is_final = true;
         result.steps.push_back(reason_step);
-        
+
         // 步骤 3: Respond (响应)
         // 🎯 OpenClaw 对齐: 根据 reasoning_mode 决定 final_response 内容
         switch (config_.reasoning_mode) {
@@ -554,12 +570,30 @@ ReactResult ReactEngine::execute_loop(
                 result.final_response = streaming_state_.delta_buffer;
                 break;
         }
-        
-        // ✅ 严格对齐 OpenClaw: flush 最终块回复 (带去重和冲突检测)
+
+        // 🎯 对齐 OpenClaw: handleAgentEnd — flush block reply buffer
+        // Called at agent_end, not just at loop end, to ensure delivery before compaction.
         if (config_.block_reply.enabled) {
             flush_block_reply_buffer(callbacks);
         }
-        
+        // 🎯 对齐 OpenClaw: onBlockReplyFlush — called at agent_end (#35074)
+        // Ensures buffered block replies reach the channel before compaction wait blocks the run.
+        if (callbacks.on_block_reply_flush) {
+            callbacks.on_block_reply_flush();
+        }
+
+        // 🎯 对齐 OpenClaw: finalizeAssistantTexts
+        // If includeReasoning=true and no onBlockReply, replace streamed chunks with final text.
+        if (config_.reasoning_mode != ReactConfig::ReasoningMode::Off &&
+            !callbacks.on_block_reply && !llm_response.text.empty()) {
+            // Replace all chunks added during this message with the final text
+            if (static_cast<int>(assistant_texts.size()) > streaming_state_.assistant_text_baseline) {
+                assistant_texts.resize(streaming_state_.assistant_text_baseline);
+            }
+            assistant_texts.push_back(llm_response.text);
+            streaming_state_.suppress_block_chunks = true;
+        }
+
         break;  // 完成
     }
     
@@ -570,6 +604,9 @@ ReactResult ReactEngine::execute_loop(
         result.success = false;
         result.error = "ReAct loop exceeded max steps";
     }
+
+    // 🎯 对齐 OpenClaw: store assistantTexts in result
+    result.assistant_texts = std::move(assistant_texts);
 
     result.total_steps = result.steps.size();
     result.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -625,102 +662,84 @@ ReactEngine::LLMResponseData ReactEngine::call_llm(
     // 使用流式接口 (对齐 OpenClaw)
     std::string accumulated_text;
     std::string accumulated_reasoning;
-    std::string current_chunk_buffer;  // 用于 block_reply 分块
-    std::vector<llm::ToolCall> accumulated_tool_calls_;  // ✅ 收集 tool_calls
-    
+    std::vector<llm::ToolCall> accumulated_tool_calls_;
+
     // ✅ 向后兼容: 使用 LLMClient 接口
+    // 🎯 对齐 OpenClaw: handleMessageUpdate — text_delta / text_end / thinking_delta / thinking_end
+    // The stream_callback here simulates the text_delta path (most common).
+    // text_end monotonicity is handled by the LLM client layer (or approximated below).
     auto stream_callback = [&](const std::string& delta) {
         if (delta.empty()) return;
-        
-        // 🎯 OpenClaw 对齐: 累积原始内容
+
+        // 🎯 对齐 OpenClaw: deltaBuffer accumulation (text_delta path)
         streaming_state_.delta_buffer += delta;
-        
+
         // 1. 提取推理内容 (thinking tags)
         auto extraction = extract_reasoning(delta);
-        
-        // ✅ 严格对齐 OpenClaw: Reasoning Stream 增量处理
-        // 参考: openclaw-analysis/src/agents/pi-embedded-subscribe.ts:556-586
+
+        // 🎯 对齐 OpenClaw: thinking_delta / thinking_end handling
+        // emitReasoningStream: compute delta vs lastStreamedReasoning
         if (extraction.has_reasoning && callbacks.on_reasoning_stream) {
-            // 累积原始 reasoning
             accumulated_reasoning_raw_ += extraction.reasoning;
-            
-            // 格式化累积内容 (由回调层处理格式化，这里只发送原始内容)
             std::string formatted = format_reasoning_text(accumulated_reasoning_raw_);
-            
-            // 计算相对于上次的增量
+
+            // Compute delta: new text since last emitted reasoning.
+            // Guard against non-prefix changes (e.g. trim/format altering earlier content).
+            const std::string& prior = streaming_state_.last_streamed_reasoning;
             std::string delta_reasoning;
-            if (!accumulated_reasoning_formatted_.empty() &&
-                formatted.find(accumulated_reasoning_formatted_) == 0) {
-                // 新内容是旧内容的前缀扩展 → 只发送增量
-                delta_reasoning = formatted.substr(accumulated_reasoning_formatted_.length());
+            if (!prior.empty() && formatted.find(prior) == 0) {
+                delta_reasoning = formatted.substr(prior.length());
             } else {
-                // 非前缀或首次 → 发送全量
                 delta_reasoning = formatted;
             }
-            
-            accumulated_reasoning_formatted_ = formatted;
-            
-            // 只在有增量时发送
+            streaming_state_.last_streamed_reasoning = formatted;
+
             if (!delta_reasoning.empty()) {
+                streaming_state_.reasoning_stream_open = true;
                 callbacks.on_reasoning_stream(delta_reasoning);
             }
-            
             accumulated_reasoning += extraction.reasoning;
         }
-        
-        // 2. 发送助手输出流 (on_assistant_delta)
-        if (!extraction.remaining_text.empty() && callbacks.on_assistant_delta) {
-            callbacks.on_assistant_delta(extraction.remaining_text);
-            
-            if (!callbacks.session_id.empty()) {
+
+        // 2. 发送助手输出流 (on_assistant_delta / onPartialReply)
+        if (!extraction.remaining_text.empty()) {
+            if (callbacks.on_assistant_delta) {
+                callbacks.on_assistant_delta(extraction.remaining_text);
             }
         }
-        
+
         // 3. 累积文本用于最终响应
         accumulated_text += extraction.remaining_text;
-        current_chunk_buffer += extraction.remaining_text;
-        
-        // 🎯 OpenClaw 对齐: 同步更新 block_buffer (过滤后的内容)
+
+        // 🎯 对齐 OpenClaw: blockBuffer accumulation (filtered, no <think> tags)
         streaming_state_.block_buffer += extraction.remaining_text;
-        
-        // 4. 块回复逻辑 (block_reply) - 仅在 BreakMode::MessageEnd 时使用
-        // 注意: TextEnd 模式在工具调用前处理，这里只处理流式分块
-        if (config_.block_reply.enabled && 
-            config_.block_reply.break_mode == ReactConfig::BlockReply::BreakMode::MessageEnd &&
-            callbacks.on_block_reply) {
-            
-            bool should_send_block = false;
-            
-            if (current_chunk_buffer.size() >= config_.block_reply.max_chars) {
-                should_send_block = true;
-            } else if (current_chunk_buffer.size() >= config_.block_reply.min_chars) {
-                // 检查是否在合适的断点
+
+        // 4. 🎯 对齐 OpenClaw: blockReplyBreak="text_end" — flush at each text_end
+        // In the streaming callback we approximate text_end as each delta chunk.
+        // For blockReplyBreak="message_end", flushing happens at message_end (after call_llm).
+        if (config_.block_reply.enabled &&
+            config_.block_reply.break_mode == ReactConfig::BlockReply::BreakMode::TextEnd &&
+            callbacks.on_block_reply &&
+            !streaming_state_.block_buffer.empty()) {
+            // Flush on paragraph/sentence boundaries (approximate text_end behavior)
+            bool should_flush = false;
+            const auto& buf = streaming_state_.block_buffer;
+            if ((int)buf.size() >= config_.block_reply.max_chars) {
+                should_flush = true;
+            } else if ((int)buf.size() >= config_.block_reply.min_chars) {
                 switch (config_.block_reply.break_preference) {
                     case ReactConfig::BlockReply::BreakPreference::Paragraph:
-                        if (current_chunk_buffer.back() == '\n') {
-                            should_send_block = true;
-                        }
+                    case ReactConfig::BlockReply::BreakPreference::Newline:
+                        should_flush = (buf.back() == '\n');
                         break;
                     case ReactConfig::BlockReply::BreakPreference::Sentence:
-                        if (is_sentence_boundary(current_chunk_buffer, current_chunk_buffer.size() - 1)) {
-                            should_send_block = true;
-                        }
-                        break;
-                    case ReactConfig::BlockReply::BreakPreference::Newline:
-                        if (current_chunk_buffer.back() == '\n') {
-                            should_send_block = true;
-                        }
+                        should_flush = is_sentence_boundary(buf, buf.size() - 1);
                         break;
                 }
             }
-            
-            if (should_send_block) {
-                callbacks.on_block_reply(current_chunk_buffer);
-                
-                if (!callbacks.session_id.empty()) {
-                }
-                
-                current_chunk_buffer.clear();
+            if (should_flush) {
+                emit_block_chunk(streaming_state_.block_buffer, callbacks);
+                streaming_state_.block_buffer.clear();
             }
         }
     };
@@ -760,14 +779,21 @@ ReactEngine::LLMResponseData ReactEngine::call_llm(
         return response;
     }
     
-    // 发送剩余的 buffer (如果有)
-    if (!current_chunk_buffer.empty() && 
-        config_.block_reply.enabled && 
+    // 🎯 对齐 OpenClaw: message_end — flush blockBuffer for message_end break mode
+    if (config_.block_reply.enabled &&
         config_.block_reply.break_mode == ReactConfig::BlockReply::BreakMode::MessageEnd &&
-        callbacks.on_block_reply) {
-        callbacks.on_block_reply(current_chunk_buffer);
+        callbacks.on_block_reply &&
+        !streaming_state_.block_buffer.empty()) {
+        emit_block_chunk(streaming_state_.block_buffer, callbacks);
+        streaming_state_.block_buffer.clear();
     }
-    
+
+    // 🎯 对齐 OpenClaw: reasoning stream end
+    if (streaming_state_.reasoning_stream_open && callbacks.on_reasoning_end) {
+        streaming_state_.reasoning_stream_open = false;
+        callbacks.on_reasoning_end();
+    }
+
     response.text = accumulated_text;
     response.reasoning = accumulated_reasoning;
     // ✅ 对齐 OpenClaw: 解析 tool_calls 和 usage
@@ -844,7 +870,39 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
     const StreamCallbacks& callbacks
 ) {
     std::map<std::string, tools::ToolResult> results;
-    
+
+    // 🎯 对齐 OpenClaw: serial execution path (default)
+    // OpenClaw executes tools via pi-agent-core which handles them one by one
+    // unless the model requests parallel tool calls.
+    if (!config_.parallel_tool_calls || tool_calls.size() <= 1) {
+        for (const auto& tool_call : tool_calls) {
+            if (callbacks.on_tool_start) {
+                callbacks.on_tool_start(tool_call.name, tool_call.input);
+            }
+            std::unique_ptr<observability::Span> span;
+            try {
+                span = observability::Tracer::instance().start_span(
+                    "tool.execute", observability::SpanKind::Client);
+                span->set_attribute("tool_name", tool_call.name);
+                span->set_attribute("tool_call_id", tool_call.id);
+            } catch (...) {}
+            try {
+                auto result = tool_manager_->execute_tool(tool_call.name, tool_call.input);
+                if (span) span->set_status(result.success, result.error);
+                if (callbacks.on_tool_end) callbacks.on_tool_end(tool_call.name, result);
+                results[tool_call.id] = result;
+            } catch (const std::exception& e) {
+                if (span) { span->set_status(false, e.what()); }
+                tools::ToolResult error_result;
+                error_result.success = false;
+                error_result.error = std::string("Tool execution failed: ") + e.what();
+                if (callbacks.on_tool_end) callbacks.on_tool_end(tool_call.name, error_result);
+                results[tool_call.id] = error_result;
+            }
+        }
+        return results;
+    }
+
     if (config_.parallel_tool_calls && tool_calls.size() > 1) {
         // ✅ 并行执行 (使用全局线程池)
         log()->info("Executing {} tools in parallel using thread pool", tool_calls.size());
@@ -915,24 +973,12 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
         // 收集所有结果 (保持原始顺序)
         for (size_t i = 0; i < futures.size(); ++i) {
             const auto& tool_call = tool_calls[i];
-            
             try {
-                // 等待任务完成
                 auto [call_id, result] = futures[i].get();
-                
-                // 发送工具完成事件
-                if (callbacks.on_tool_end) {
-                    callbacks.on_tool_end(tool_call.name, result);
-                }
-                
-                // 记录结果
+                if (callbacks.on_tool_end) callbacks.on_tool_end(tool_call.name, result);
                 results[call_id] = result;
-                
             } catch (const std::exception& e) {
-                // 处理异常 (例如线程抛出的异常)
                 log()->error("Failed to get tool execution result: {}", e.what());
-                
-                // 记录错误结果
                 tools::ToolResult error_result;
                 error_result.success = false;
                 error_result.error = std::string("Tool execution failed: ") + e.what();
@@ -940,7 +986,7 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
             }
         }
     }
-    
+
     return results;
 }
 
@@ -1056,41 +1102,62 @@ std::vector<std::string> ReactEngine::chunk_text(const std::string& text) {
 // ═══════════════════════════════════════════════════════════════
 
 // 发送块回复 (带智能去重和冲突检测)
-// 对齐 OpenClaw: emitBlockChunk
+// 🎯 对齐 OpenClaw: emitBlockChunk (pi-embedded-subscribe.ts)
 void ReactEngine::emit_block_chunk(const std::string& text, const StreamCallbacks& callbacks) {
-    // ✅ 1. 动态抑制检测 (对齐 OpenClaw:478)
+    // 🎯 1. 动态抑制检测 (对齐 OpenClaw: suppressBlockChunks)
+    // Set by finalizeAssistantTexts when includeReasoning=true and no onBlockReply.
     if (streaming_state_.suppress_block_chunks) {
         return;
     }
-    
-    // ✅ 2. 过滤和修剪 (对齐 OpenClaw:483)
+
+    // 🎯 2. 过滤 thinking/final 标签 + trim (对齐 OpenClaw: stripBlockTags + trimEnd)
     std::string chunk = strip_thinking_tags(text);
     chunk = trim_end(chunk);
     if (chunk.empty()) {
         return;
     }
-    
-    // ✅ 3. 智能去重 (对齐 OpenClaw:487-489)
+
+    // 🎯 3. 智能去重 (对齐 OpenClaw: chunk === state.lastBlockReplyText)
     if (chunk == streaming_state_.last_block_reply_text) {
-        return;  // 与上次发送内容完全相同，跳过
-    }
-    
-    // ✅ 4. Messaging Tool 冲突检测 (对齐 OpenClaw:493-497)
-    std::string normalized_chunk = normalize_text_for_comparison(chunk);
-    if (is_messaging_tool_duplicate(normalized_chunk)) {
-        // log.debug("Skipping block reply - already sent via messaging tool");
         return;
     }
-    
-    // ✅ 5. 记录发送内容 (对齐 OpenClaw:503)
+
+    // 🎯 4. Messaging Tool 冲突检测 (对齐 OpenClaw: isMessagingToolDuplicateNormalized)
+    // Only check committed (successful) messaging tool texts — checking pending texts
+    // is risky because if the tool fails after suppression, the user gets no response.
+    std::string normalized_chunk = normalize_text_for_comparison(chunk);
+    if (is_messaging_tool_duplicate(normalized_chunk)) {
+        log()->debug("Skipping block reply - already sent via messaging tool: {}...",
+                     chunk.substr(0, std::min((size_t)50, chunk.size())));
+        return;
+    }
+
+    // 🎯 5. shouldSkipAssistantText check (对齐 OpenClaw: emitBlockChunk calls shouldSkipAssistantText)
+    // Prevents emitting a chunk that duplicates a previously-emitted assistant text.
+    if (streaming_state_.last_assistant_text_message_index == streaming_state_.assistant_message_index) {
+        const std::string trimmed = trim_end(chunk);
+        if (!trimmed.empty() && trimmed == streaming_state_.last_assistant_text_trimmed) {
+            return;
+        }
+        const std::string norm = normalize_text_for_comparison(chunk);
+        if (!norm.empty() && norm == streaming_state_.last_assistant_text_normalized) {
+            return;
+        }
+    }
+
+    // 🎯 6. 记录发送内容 (对齐 OpenClaw: state.lastBlockReplyText = chunk)
     streaming_state_.last_block_reply_text = chunk;
-    
-    // ✅ 6. 零开销检测 (对齐 OpenClaw:506-507)
+    // Also track in lastAssistantText for future shouldSkipAssistantText checks
+    streaming_state_.last_assistant_text_message_index = streaming_state_.assistant_message_index;
+    streaming_state_.last_assistant_text_trimmed = trim_end(chunk);
+    streaming_state_.last_assistant_text_normalized = normalize_text_for_comparison(chunk);
+
+    // 🎯 7. 零开销检测
     if (!callbacks.on_block_reply) {
         return;
     }
-    
-    // ✅ 7. 发送回调
+
+    // 🎯 8. 发送回调
     callbacks.on_block_reply(chunk);
 }
 

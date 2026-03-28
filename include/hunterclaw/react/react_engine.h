@@ -53,12 +53,16 @@ struct ReactResult {
     std::string final_response;               // 最终响应
     std::vector<ReactStep> steps;             // 执行步骤
     std::string error;                        // 错误信息
-    
+
+    // 🎯 对齐 OpenClaw: assistantTexts — all text chunks emitted during the run
+    // Mirrors subscribeEmbeddedPiSession().assistantTexts
+    std::vector<std::string> assistant_texts;
+
     // 统计信息
     int total_steps = 0;
     int tool_calls = 0;
     int64_t duration_ms = 0;
-    
+
     // Token 使用统计
     struct Usage {
         int64_t input_tokens = 0;
@@ -72,28 +76,48 @@ struct ReactResult {
 // 流式回调
 struct StreamCallbacks {
     // 推理流 (reasoning stream)
+    // 🎯 对齐 OpenClaw: onReasoningStream — called with { text, delta }
     std::function<void(const std::string& reasoning)> on_reasoning_stream;
-    
+
+    // 推理结束
+    // 🎯 对齐 OpenClaw: onReasoningEnd
+    std::function<void()> on_reasoning_end;
+
     // 助手输出流 (assistant delta)
+    // 🎯 对齐 OpenClaw: onPartialReply / onAgentEvent stream="assistant"
     std::function<void(const std::string& text)> on_assistant_delta;
-    
-    // 块回复 (block reply) - 在工具执行前刷新
+
+    // 助手消息开始
+    // 🎯 对齐 OpenClaw: onAssistantMessageStart — earliest "writing" signal
+    std::function<void()> on_assistant_message_start;
+
+    // 块回复 (block reply)
+    // 🎯 对齐 OpenClaw: onBlockReply — called at text_end or message_end
     std::function<void(const std::string& block)> on_block_reply;
-    
+
+    // 块回复 flush
+    // 🎯 对齐 OpenClaw: onBlockReplyFlush — called at agent_end and before compaction wait
+    // Ensures buffered block replies reach the channel before compaction blocks the run.
+    std::function<void()> on_block_reply_flush;
+
+    // 工具结果
+    // 🎯 对齐 OpenClaw: onToolResult — verbose tool output
+    std::function<void(const std::string& text)> on_tool_result;
+
     // 工具调用开始
     std::function<void(const std::string& tool_name, const core::JsonValue& args)> on_tool_start;
-    
+
     // 工具调用完成
     std::function<void(const std::string& tool_name, const tools::ToolResult& result)> on_tool_end;
-    
+
     // 步骤完成
     std::function<void(const ReactStep& step)> on_step;
-    
+
     // 生命周期事件
     std::function<void()> on_start;
     std::function<void()> on_end;
     std::function<void(const std::string& error)> on_error;
-    
+
     // 🎯 OpenClaw 对齐: 用于直连推送的 session_id
     std::string session_id;
 
@@ -283,22 +307,84 @@ private:
     // ✅ 严格对齐 OpenClaw 的流式处理机制
     // 参考: openclaw-analysis/src/agents/pi-embedded-subscribe.ts
     
-    // 双缓冲区状态 (对齐 OpenClaw)
+    // 双缓冲区状态 (对齐 OpenClaw pi-embedded-subscribe.ts)
     struct StreamingState {
-        std::string delta_buffer;           // 原始累积 (含 <thinking>)
-        std::string block_buffer;           // 过滤后累积 (发送用)
-        std::string last_block_reply_text;  // 上次发送的块 (去重)
-        bool suppress_block_chunks = false; // 动态抑制标志
-        
+        // 🎯 对齐 OpenClaw: deltaBuffer — raw accumulated text (including <think> tags)
+        std::string delta_buffer;
+        // 🎯 对齐 OpenClaw: blockBuffer — filtered text for block reply emission
+        std::string block_buffer;
+        // 🎯 对齐 OpenClaw: lastBlockReplyText — dedup guard
+        std::string last_block_reply_text;
+        // 🎯 对齐 OpenClaw: suppressBlockChunks — set by finalizeAssistantTexts
+        bool suppress_block_chunks = false;
+        // 🎯 对齐 OpenClaw: reasoningStreamOpen
+        bool reasoning_stream_open = false;
+        // 🎯 对齐 OpenClaw: emittedAssistantUpdate
+        bool emitted_assistant_update = false;
+        // 🎯 对齐 OpenClaw: lastStreamedAssistant / lastStreamedAssistantCleaned
+        std::string last_streamed_assistant;
+        std::string last_streamed_assistant_cleaned;
+        // 🎯 对齐 OpenClaw: lastStreamedReasoning / lastReasoningSent
+        std::string last_streamed_reasoning;
+        std::string last_reasoning_sent;
+        // 🎯 对齐 OpenClaw: assistantMessageIndex — incremented at message_start
+        int assistant_message_index = 0;
+        // 🎯 对齐 OpenClaw: lastAssistantTextMessageIndex / lastAssistantTextNormalized
+        int last_assistant_text_message_index = -1;
+        std::string last_assistant_text_normalized;
+        std::string last_assistant_text_trimmed;
+        // 🎯 对齐 OpenClaw: assistantTextBaseline
+        int assistant_text_baseline = 0;
+        // 🎯 对齐 OpenClaw: partialBlockState (thinking/final stateful tracking)
+        struct BlockState {
+            bool thinking = false;
+            bool final_tag = false;
+        } block_state, partial_block_state;
+
         // Messaging tool 冲突检测
+        // 🎯 对齐 OpenClaw: messagingToolSentTexts / messagingToolSentTextsNormalized
         std::vector<std::string> messaging_tool_sent_texts;
         std::vector<std::string> messaging_tool_sent_texts_normalized;
-        
+
+        // 🎯 对齐 OpenClaw: resetAssistantMessageState(nextAssistantTextBaseline)
+        void reset_assistant_message_state(int next_baseline) {
+            delta_buffer.clear();
+            block_buffer.clear();
+            last_block_reply_text.clear();
+            suppress_block_chunks = false;
+            reasoning_stream_open = false;
+            emitted_assistant_update = false;
+            last_streamed_assistant.clear();
+            last_streamed_assistant_cleaned.clear();
+            last_streamed_reasoning.clear();
+            last_reasoning_sent.clear();
+            block_state = {};
+            partial_block_state = {};
+            assistant_message_index += 1;
+            last_assistant_text_message_index = -1;
+            last_assistant_text_normalized.clear();
+            last_assistant_text_trimmed.clear();
+            assistant_text_baseline = next_baseline;
+        }
+
         void reset() {
             delta_buffer.clear();
             block_buffer.clear();
             last_block_reply_text.clear();
             suppress_block_chunks = false;
+            reasoning_stream_open = false;
+            emitted_assistant_update = false;
+            last_streamed_assistant.clear();
+            last_streamed_assistant_cleaned.clear();
+            last_streamed_reasoning.clear();
+            last_reasoning_sent.clear();
+            assistant_message_index = 0;
+            last_assistant_text_message_index = -1;
+            last_assistant_text_normalized.clear();
+            last_assistant_text_trimmed.clear();
+            assistant_text_baseline = 0;
+            block_state = {};
+            partial_block_state = {};
             messaging_tool_sent_texts.clear();
             messaging_tool_sent_texts_normalized.clear();
         }
