@@ -966,17 +966,6 @@ core::Result<json> method_send(
 // 🎯 OpenClaw 对齐: agentHandlers["agent"] (AgentParams)
 // ============================================================================
 
-// agent
-core::Result<json> method_agent(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("agent");
-}
-
 // ============================================================================
 // Node pending drain/enqueue + node.invoke.result (nodes.ts)
 // 🎯 OpenClaw 对齐: nodeHandlers

@@ -2,6 +2,7 @@
 
 #include "hunterclaw/core/types.h"
 #include "hunterclaw/agents/types.h"
+#include "hunterclaw/gateway/gateway.h"  // GatewayServer, GatewayRuntimeState
 #include <string>
 #include <vector>
 #include <map>
@@ -403,9 +404,17 @@ public:
     /// Immediately attempt to deliver result
     core::Result<void> deliver_now(const std::string& subagent_run_id);
 
+    /// ✅ 对齐 OpenClaw: 注入 GatewayServer，用于通过 Gateway 通知父 agent
+    /// attempt_delivery 通过 state->method_handler("agent", params, ctx) 调用
+    void set_gateway_server(std::shared_ptr<gateway::GatewayServer> server) {
+        gateway_server_ = server;
+    }
+
 private:
     std::shared_ptr<SubagentRegistry> registry_;
     std::shared_ptr<AgentManager> agent_manager_;
+    // ✅ 对齐 OpenClaw: GatewayServer 引用，用于通过 Gateway 通知父 agent
+    std::shared_ptr<gateway::GatewayServer> gateway_server_;
     
     // Background worker
     std::unique_ptr<std::thread> worker_thread_;

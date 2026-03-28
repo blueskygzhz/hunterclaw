@@ -4,6 +4,7 @@
 #include "hunterclaw/tools/tool_hooks.h"   // get_global_hook_manager(), run_subagent_* hooks
 #include "hunterclaw/agents/agent_pool.h"   // AgentPool (AgentManager)
 #include "hunterclaw/agents/agent_instance.h" // AgentInstance
+#include "hunterclaw/gateway/gateway.h"    // GatewayServer, GatewayRuntimeState, ClientContext
 #include <spdlog/spdlog.h>
 #include <iostream>
 #include <algorithm>
@@ -1904,6 +1905,23 @@ core::Result<void> SubagentAnnouncer::attempt_delivery(
     // 这是解决 C++ 多线程并发冲突的关键：
     // OpenClaw 依赖 Node.js 单线程事件循环天然串行，
     // HunterClaw 通过 is_processing_ + pending_messages_ 队列模拟相同语义。
+    // ✅ 对齐 OpenClaw: buildAnnounceIdempotencyKey
+    // announce-idempotency.ts:
+    //   buildAnnounceIdFromChildRun({ childSessionKey, childRunId })
+    //     = "v1:{childSessionKey}:{childRunId}"
+    //   buildAnnounceIdempotencyKey(announceId)
+    //     = "announce:{announceId}"
+    //     = "announce:v1:{childSessionKey}:{childRunId}"
+    //
+    // Gateway agent.ts: const runId = idem;
+    // agent-runner-execution.ts: const runId = params.opts?.runId ?? crypto.randomUUID();
+    //
+    // 这保证了：
+    // 1. 幂等性：相同子 run 的 announce 重试时 run_id 相同，可去重
+    // 2. 生命周期事件正确：phase=start/end 事件携带正确的 run_id
+    // 3. 可追踪性：父 agent 的这次执行可以被 abort 或监控
+    std::string announce_run_id = "announce:v1:" + entry->subagent_run_id + ":" + entry->subagent_run_id;
+
     bool delivered = false;
     if (agent_manager_) {
         auto requester_agent = agent_manager_->get_agent(entry->requester_run_id);
@@ -1920,32 +1938,66 @@ core::Result<void> SubagentAnnouncer::attempt_delivery(
                 // ✅ 对齐 OpenClaw: inputProvenance.kind = "inter_session"
                 {"input_provenance_kind", "inter_session"},
                 {"input_provenance_source_session_key", entry->subagent_run_id},
-                {"input_provenance_source_tool", "subagent_announce"}
+                {"input_provenance_source_tool", "subagent_announce"},
+                // ✅ 对齐 OpenClaw: runId = idempotencyKey（确定性 run_id）
+                // Gateway agent.ts: const runId = idem;
+                // 父 agent 被唤醒时使用此确定性 run_id，而非随机 UUID
+                {"run_id", announce_run_id}
             };
 
-            if (requester_agent->is_processing()) {
-                // ✅ 路径 2: 父 Agent 正在运行 → 入队（对齐 OpenClaw: maybeQueueSubagentAnnounce）
-                // 消息会在父 Agent 当前轮次完成后，两轮推理之间的间隙串行执行
-                // 完全避免并发冲突，与 Node.js 事件循环语义一致
-                requester_agent->enqueue_message(trigger_message, inject_options);
-                delivered = true;
-                log()->info(
-                    "[SubagentAnnouncer] Queued to busy requester: {} (deliver={}, queue mode)",
-                    entry->requester_run_id, requester_is_subagent ? "false" : "true"
-                );
-            } else {
-                // ✅ 路径 1: 父 Agent 空闲 → 直接调用（对齐 OpenClaw: sendSubagentAnnounceDirectly）
-                // 对齐 OpenClaw: callGateway("agent", { sessionKey, message, deliver, inputProvenance })
-                auto deliver_result = requester_agent->process_message(
-                    trigger_message, inject_options
-                );
+            // ✅ 对齐 OpenClaw: sendSubagentAnnounceDirectly → callGateway("agent", { idempotencyKey })
+            //
+            // OpenClaw 完整链路:
+            //   sendSubagentAnnounceDirectly
+            //     → callGateway("agent", { sessionKey, message, deliver, idempotencyKey, inputProvenance })
+            //     → Gateway agent handler: const runId = idem
+            //     → dispatchAgentRunFromGateway
+            //     → agentCommandFromIngress → 父 agent 执行
+            //
+            // HunterClaw 对齐:
+            //   优先路径: gateway_server_->runtime_state()->method_handler("agent", params, ctx)
+            //     → method_agent → 幂等去重 + runId = idem + 异步 dispatch
+            //   Fallback 路径（Gateway 未注入时）: 直接调用 process_message
+            //
+            // 两条路径都支持:
+            //   - 父 Agent 空闲 → 直接执行（对齐 sendSubagentAnnounceDirectly）
+            //   - 父 Agent 忙碌 → 入队等待（对齐 maybeQueueSubagentAnnounce）
 
-                if (deliver_result.is_err()) {
-                    // process_message 返回 "queued" 也算成功（Agent 在检查后变为忙碌）
-                    if (deliver_result.error != "queued") {
-                        log()->warn("[SubagentAnnouncer] Failed to inject to requester: {} - {}",
-                                   entry->requester_run_id, deliver_result.error);
-                        // ✅ 对齐 OpenClaw: 传递失败时重置 cleanup_handled，允许重试
+            bool use_gateway = (gateway_server_ != nullptr);
+
+            if (use_gateway) {
+                // ✅ 主路径: 通过 Gateway method_handler("agent") 调用
+                // 对齐 OpenClaw: callGateway("agent", { sessionKey, message, deliver, idempotencyKey })
+                auto state = gateway_server_->runtime_state();
+                if (state && state->method_handler) {
+                    // 构建 Gateway agent 参数（对齐 OpenClaw agent.ts AgentParams）
+                    nlohmann::json agent_params;
+                    agent_params["session_key"] = entry->requester_run_id;
+                    agent_params["message"] = trigger_message;
+                    agent_params["deliver"] = !requester_is_subagent;
+                    agent_params["idempotency_key"] = announce_run_id;
+                    agent_params["run_id"] = announce_run_id;
+                    agent_params["input_provenance"] = {
+                        {"kind", "inter_session"},
+                        {"source_session_key", entry->subagent_run_id},
+                        {"source_tool", "subagent_announce"}
+                    };
+                    // 传递 internal_events（对齐 OpenClaw: internalEvents 字段）
+                    // 这些已经在 trigger_message 中编码，此处也传递结构化版本
+                    agent_params["source_session_key"] = entry->subagent_run_id;
+                    agent_params["source_tool"] = "subagent_announce";
+
+                    // 构建内部 ClientContext（无真实连接，仅用于内部调用）
+                    gateway::ClientContext internal_ctx;
+                    internal_ctx.authenticated = true;
+                    internal_ctx.conn_id = "internal:subagent_announcer";
+                    internal_ctx.connect.role = "operator";
+                    internal_ctx.connect.scopes = {"admin"};
+
+                    auto gw_result = state->method_handler("agent", agent_params, internal_ctx);
+                    if (gw_result.is_err()) {
+                        log()->warn("[SubagentAnnouncer] Gateway agent call failed: {} - {}",
+                                   entry->requester_run_id, gw_result.error);
                         entry->cleanup_handled = false;
                         entry->announce_retry_count++;
                         entry->last_announce_retry_at = static_cast<uint64_t>(
@@ -1953,12 +2005,54 @@ core::Result<void> SubagentAnnouncer::attempt_delivery(
                                 std::chrono::system_clock::now().time_since_epoch()
                             ).count()
                         );
-                        return core::Result<void>::Err("Delivery failed: " + deliver_result.error);
+                        return core::Result<void>::Err("Gateway delivery failed: " + gw_result.error);
                     }
+                    delivered = true;
+                    log()->info("[SubagentAnnouncer] Delivered via Gateway: {} -> {} (deliver={}, run_id={})",
+                               entry->subagent_run_id, entry->requester_run_id,
+                               !requester_is_subagent, announce_run_id);
+                } else {
+                    // Gateway state 不可用，fallback 到直接调用
+                    use_gateway = false;
                 }
-                delivered = true;
-                log()->info("[SubagentAnnouncer] Delivered to requester: {} (deliver={}, direct mode)",
-                           entry->requester_run_id, requester_is_subagent ? "false" : "true");
+            }
+
+            if (!use_gateway) {
+                // ✅ Fallback 路径: 直接调用 process_message（Gateway 未注入时）
+                // 保持向后兼容，行为与之前相同
+                if (requester_agent->is_processing()) {
+                    // 父 Agent 正在运行 → 入队（对齐 OpenClaw: maybeQueueSubagentAnnounce）
+                    requester_agent->enqueue_message(trigger_message, inject_options);
+                    delivered = true;
+                    log()->info(
+                        "[SubagentAnnouncer] Queued to busy requester (fallback): {} (deliver={}, queue mode)",
+                        entry->requester_run_id, requester_is_subagent ? "false" : "true"
+                    );
+                } else {
+                    // 父 Agent 空闲 → 直接调用（对齐 OpenClaw: sendSubagentAnnounceDirectly）
+                    auto deliver_result = requester_agent->process_message(
+                        trigger_message, inject_options
+                    );
+
+                    if (deliver_result.is_err()) {
+                        // process_message 返回 "queued" 也算成功（Agent 在检查后变为忙碌）
+                        if (deliver_result.error != "queued") {
+                            log()->warn("[SubagentAnnouncer] Failed to inject to requester (fallback): {} - {}",
+                                       entry->requester_run_id, deliver_result.error);
+                            entry->cleanup_handled = false;
+                            entry->announce_retry_count++;
+                            entry->last_announce_retry_at = static_cast<uint64_t>(
+                                std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::system_clock::now().time_since_epoch()
+                                ).count()
+                            );
+                            return core::Result<void>::Err("Delivery failed: " + deliver_result.error);
+                        }
+                    }
+                    delivered = true;
+                    log()->info("[SubagentAnnouncer] Delivered to requester (fallback): {} (deliver={}, direct mode)",
+                               entry->requester_run_id, requester_is_subagent ? "false" : "true");
+                }
             }
         } else {
             log()->warn("[SubagentAnnouncer] Requester agent not found: {} (marking delivered anyway)",

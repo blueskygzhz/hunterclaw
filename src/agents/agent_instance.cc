@@ -523,9 +523,26 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
     const std::map<std::string, std::string>& options
 ) {
     touch();
+
+    // ✅ 对齐 OpenClaw: agent-runner-execution.ts
+    // const runId = params.opts?.runId ?? crypto.randomUUID();
+    // 优先使用调用方传入的 run_id（来自 subagent announce 的幂等键），
+    // 否则生成新的随机 UUID。
+    // 这保证了：
+    // 1. 幂等性：相同子 run 的 announce 重试时 run_id 相同，可去重
+    // 2. 生命周期事件正确：phase=start/end 事件携带正确的 run_id
+    // 3. 可追踪性：父 agent 的这次执行可以被 abort 或监控
+    {
+        auto it = options.find("run_id");
+        if (it != options.end() && !it->second.empty()) {
+            ctx_.current_run_id = it->second;
+        } else {
+            ctx_.current_run_id = core::utils::generate_uuid();
+        }
+    }
     
-    spdlog::get("default")->info("[AgentInstance] Processing message: session={}, message='{}'",
-        ctx_.session_id, message);
+    spdlog::get("default")->info("[AgentInstance] Processing message: session={}, run_id={}, message='{}'",
+        ctx_.session_id, ctx_.current_run_id.value_or(""), message);
     
     if (!react_engine_) {
         return core::Result<std::string>::Err("ReactEngine not initialized");
