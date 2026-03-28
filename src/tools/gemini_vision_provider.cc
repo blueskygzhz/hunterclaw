@@ -71,7 +71,8 @@ core::JsonValue GeminiVisionProvider::analyze_images(
     return call_gemini_api(model, core::JsonValue(request_body));
 }
 
-std::vector<std::string> GeminiVisionProvider::list_models()    std::vector<std::string> models;
+std::vector<std::string> GeminiVisionProvider::list_models() {
+    std::vector<std::string> models;
     for (const auto& m : GEMINI_MODELS) {
         models.push_back(m.name);
     }

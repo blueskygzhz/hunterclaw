@@ -122,7 +122,7 @@ Schema TerminalTool::parameters() const {
         core::JsonValue p = core::JsonValue::object();
         p["type"] = "object";
         p["description"] = "Environment variables (key-value pairs)";
-        p["additionalProperties"] = core::JsonValue::from_json(json{{"type", "string"}});
+        p["additionalProperties"] = core::JsonValue(json{{"type", "string"}});
         schema.properties["env"] = p;
     }
 

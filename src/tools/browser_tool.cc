@@ -709,17 +709,17 @@ ToolResult BrowserTool::action_dialog(
 core::JsonValue BrowserTool::http_get(const std::string& url) const {
     // TODO: use real HTTP client
     (void)url;
-    return core::JsonValue::from_json(json{{"ok", true}, {"stub", true}, {"url", url}});
+    return core::JsonValue(json{{"ok", true}, {"stub", true}, {"url", url}});
 }
 
 core::JsonValue BrowserTool::http_post(const std::string& url, const core::JsonValue& body) const {
     (void)url; (void)body;
-    return core::JsonValue::from_json(json{{"ok", true}, {"stub", true}});
+    return core::JsonValue(json{{"ok", true}, {"stub", true}});
 }
 
 core::JsonValue BrowserTool::http_delete(const std::string& url) const {
     (void)url;
-    return core::JsonValue::from_json(json{{"ok", true}, {"stub", true}});
+    return core::JsonValue(json{{"ok", true}, {"stub", true}});
 }
 
 core::JsonValue BrowserTool::call_node_browser_proxy(
@@ -732,7 +732,7 @@ core::JsonValue BrowserTool::call_node_browser_proxy(
 ) const {
     // TODO: call gateway "node.invoke" with browser.proxy command
     (void)node_id; (void)method; (void)path; (void)query; (void)body; (void)timeout_ms;
-    return core::JsonValue::from_json(json{{"ok", true}, {"stub", true}});
+    return core::JsonValue(json{{"ok", true}, {"stub", true}});
 }
 
 // ============================================================================

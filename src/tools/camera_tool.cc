@@ -119,10 +119,10 @@ ToolResult CameraTool::action_camera_snap(const ToolParams& params) {
     if (params.has("delayMs"))  cmd_params["delayMs"]  = params.read_number("delayMs");
     if (params.has("deviceId")) cmd_params["deviceId"] = params.read_string("deviceId");
 
-    auto result = invoke_node_command(node_id, "camera.snap", core::JsonValue::from_json(cmd_params));
-    if (!result.ok()) return make_error(result.error());
+    auto result = invoke_node_command(node_id, "camera.snap", core::JsonValue(cmd_params));
+    if (!result.ok) return make_error(result.error);
 
-    const auto& payload = result.value();
+    const auto& payload = result.get();
     json payload_json = payload.to_json();
     if (payload_json.contains("base64") && payload_json["base64"].is_string()) {
         ToolResult tr;
@@ -149,16 +149,16 @@ ToolResult CameraTool::action_camera_clip(const ToolParams& params) {
         {"includeAudio", params.read_bool("includeAudio", false, true)},
         {"format",       "mp4"},
     };
-    auto result = invoke_node_command(node_id, "camera.clip", core::JsonValue::from_json(cmd_params));
-    if (!result.ok()) return make_error(result.error());
-    return make_json_result(result.value().to_json());
+    auto result = invoke_node_command(node_id, "camera.clip", core::JsonValue(cmd_params));
+    if (!result.ok) return make_error(result.error);
+    return make_json_result(result.get().to_json());
 }
 
 ToolResult CameraTool::action_camera_list(const ToolParams& /*params*/) {
     std::string node_id = select_camera_node();
     auto result = invoke_node_command(node_id, "camera.list", core::JsonValue::object());
-    if (!result.ok()) return make_error(result.error());
-    return make_json_result(result.value().to_json());
+    if (!result.ok) return make_error(result.error);
+    return make_json_result(result.get().to_json());
 }
 
 ToolResult CameraTool::action_photos_latest(const ToolParams& params) {
@@ -169,9 +169,9 @@ ToolResult CameraTool::action_photos_latest(const ToolParams& params) {
         {"maxWidth", params.read_number("maxWidth", false, 1600.0)},
         {"quality",  params.read_number("quality",  false, 0.85)},
     };
-    auto result = invoke_node_command(node_id, "photos.latest", core::JsonValue::from_json(cmd_params));
-    if (!result.ok()) return make_error(result.error());
-    return make_json_result(result.value().to_json());
+    auto result = invoke_node_command(node_id, "photos.latest", core::JsonValue(cmd_params));
+    if (!result.ok) return make_error(result.error);
+    return make_json_result(result.get().to_json());
 }
 
 std::string CameraTool::select_camera_node() {
@@ -192,7 +192,7 @@ core::Result<core::JsonValue> CameraTool::invoke_node_command(
     if (node_registry_) {
         return node_registry_->invoke(node_id, command, command_params);
     }
-    return core::Result<core::JsonValue>::error("No node registry available");
+    return core::Result<core::JsonValue>::Err("No node registry available");
 }
 
 ToolResult CameraTool::make_error(const std::string& msg) const {
