@@ -1,4 +1,7 @@
-#include "hunterclaw/tools/tool.h"
+#include "hunterclaw/tools/agents_list_tool.h"
+#include "hunterclaw/tools/gateway_tool.h"
+#include "hunterclaw/tools/canvas_tool.h"
+#include "hunterclaw/tools/nodes_tool.h"
 #include "hunterclaw/tools/tool_manager.h"
 #include "hunterclaw/sandbox/sandbox.h"
 #include "hunterclaw/core/utils.h"
@@ -741,11 +744,43 @@ void BuiltinTools::register_all(ToolManager& manager, const ToolContext& context
     manager.register_tool(create_write_file_tool(context));
     manager.register_tool(create_list_dir_tool(context));
     manager.register_tool(create_search_content_tool(context));
-    
+
     // Web搜索工具(可选)
     auto web_search = create_web_search_tool(context);
     if (web_search) {
         manager.register_tool(web_search);
+    }
+
+    // ✅ 对齐 OpenClaw: agents_list 工具 (agents-list-tool.ts)
+    // 列出当前 agent 可以 spawn 的 subagent IDs
+    {
+        AgentsListToolOptions opts;
+        opts.agent_session_key = context.session_key;
+        // config 由调用方通过 ToolContext 扩展注入，此处暂为 nullptr
+        manager.register_tool(create_agents_list_tool(opts));
+    }
+
+    // ✅ 对齐 OpenClaw: gateway 工具 (gateway-tool.ts)
+    // ownerOnly: true，提供 restart/config.get/config.apply/config.patch/update.run
+    {
+        GatewayToolOptions opts;
+        opts.agent_session_key = context.session_key;
+        manager.register_tool(create_gateway_tool(opts));
+    }
+
+    // ✅ 对齐 OpenClaw: canvas 工具 (canvas-tool.ts)
+    // 提供 present/hide/navigate/eval/snapshot/a2ui_push/a2ui_reset
+    {
+        CanvasToolOptions opts;
+        manager.register_tool(create_canvas_tool(opts));
+    }
+
+    // ✅ 对齐 OpenClaw: nodes 工具 (nodes-tool.ts)
+    // ownerOnly: true，提供 status/describe/pairing/notify/camera/photos/screen/location/run/invoke
+    {
+        NodesToolOptions opts;
+        opts.agent_session_key = context.session_key;
+        manager.register_tool(create_nodes_tool(opts));
     }
 }
 

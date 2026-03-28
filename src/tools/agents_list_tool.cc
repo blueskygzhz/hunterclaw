@@ -50,9 +50,6 @@ public:
     // 🎯 对齐 OpenClaw: name: "agents_list"
     std::string name() const override { return "agents_list"; }
 
-    // 🎯 对齐 OpenClaw: label: "Agents"
-    std::string label() const override { return "Agents"; }
-
     // 🎯 对齐 OpenClaw: description
     std::string description() const override {
         return "List OpenClaw agent ids you can target with `sessions_spawn` when "

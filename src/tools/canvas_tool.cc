@@ -60,9 +60,6 @@ public:
     // 🎯 对齐 OpenClaw: name: "canvas"
     std::string name() const override { return "canvas"; }
 
-    // 🎯 对齐 OpenClaw: label: "Canvas"
-    std::string label() const override { return "Canvas"; }
-
     // 🎯 对齐 OpenClaw: description
     std::string description() const override {
         return "Control node canvases (present/hide/navigate/eval/snapshot/A2UI). "
@@ -137,7 +134,7 @@ public:
     ToolResult execute(const core::JsonValue& params_val) override {
         try {
             json params = params_val.to_json();
-            spdlog::debug("[CanvasTool] execute: {}", params.dump());
+            if (auto log = spdlog::get("default")) log->debug("[CanvasTool] execute: {}", params.dump());
 
             std::string action = read_str(params, "action");
             if (action.empty())
@@ -316,7 +313,7 @@ public:
             return make_error("Unknown action: " + action);
 
         } catch (const std::exception& e) {
-            spdlog::error("[CanvasTool] exception: {}", e.what());
+            if (auto log = spdlog::get("default")) log->error("[CanvasTool] exception: {}", e.what());
             return make_error(std::string(e.what()));
         }
     }
@@ -354,7 +351,7 @@ private:
     ) const {
         // TODO: call gateway "nodes.list" to get first available node
         // For now, return empty string (gateway will use default node)
-        spdlog::debug("[CanvasTool] resolve_node_id: auto-resolving from gateway");
+        if (auto log = spdlog::get("default")) log->debug("[CanvasTool] resolve_node_id: auto-resolving from gateway");
         (void)gw_url; (void)gw_token; (void)timeout_ms;
         return "";
     }
@@ -370,7 +367,7 @@ private:
         int64_t timeout_ms
     ) const {
         // TODO: call gateway "node.invoke" with nodeId, command, params, idempotencyKey
-        spdlog::info("[CanvasTool] invoke_node: nodeId={}, command={}", node_id, command);
+        if (auto log = spdlog::get("default")) log->info("[CanvasTool] invoke_node: nodeId={}, command={}", node_id, command);
         (void)gw_url; (void)gw_token; (void)timeout_ms;
 
         // Return stub response

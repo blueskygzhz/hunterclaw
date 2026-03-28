@@ -64,12 +64,6 @@ public:
     // 🎯 对齐 OpenClaw: name: "gateway"
     std::string name() const override { return "gateway"; }
 
-    // 🎯 对齐 OpenClaw: label: "Gateway"
-    std::string label() const override { return "Gateway"; }
-
-    // 🎯 对齐 OpenClaw: ownerOnly: true
-    bool owner_only() const override { return true; }
-
     // 🎯 对齐 OpenClaw: description
     std::string description() const override {
         return "Restart, inspect a specific config schema path, apply config, or update the "
@@ -130,11 +124,14 @@ public:
         return schema;
     }
 
+    // 🎯 对齐 OpenClaw: ownerOnly: true
+    bool owner_only() const override { return true; }
+
     // 🎯 对齐 OpenClaw: execute
     ToolResult execute(const core::JsonValue& params_val) override {
         try {
             json params = params_val.to_json();
-            spdlog::debug("[GatewayTool] execute: {}", params.dump());
+            if (auto log = spdlog::get("default")) log->debug("[GatewayTool] execute: {}", params.dump());
 
             std::string action = read_str(params, "action");
             if (action.empty())
@@ -165,7 +162,7 @@ public:
 
                 std::string note = read_str(params, "note");
 
-                spdlog::info("[GatewayTool] restart requested (delayMs={}, reason={})",
+                if (auto log = spdlog::get("default")) log->info("[GatewayTool] restart requested (delayMs={}, reason={})",
                     delay_ms.has_value() ? std::to_string(*delay_ms) : "default",
                     reason.empty() ? "none" : reason);
 
@@ -304,12 +301,12 @@ public:
             return make_error("Unknown action: " + action);
 
         } catch (const std::exception& e) {
-            spdlog::error("[GatewayTool] exception: {}", e.what());
+            if (auto log = spdlog::get("default")) log->error("[GatewayTool] exception: {}", e.what());
             return make_error(std::string(e.what()));
         }
     }
 
-    // ownerOnly = true → no user approval needed
+    // ownerOnly = true
     bool requires_approval() const override { return false; }
 
 private:
@@ -389,7 +386,7 @@ private:
         // For now, return a stub response indicating the call was made
         // The actual implementation depends on the GatewayClient being available
         // TODO: inject GatewayClient into GatewayTool for real calls
-        spdlog::info("[GatewayTool] call_gateway: method={}, url={}, timeout={}ms",
+        if (auto log = spdlog::get("default")) log->info("[GatewayTool] call_gateway: method={}, url={}, timeout={}ms",
                      method, gw_url.empty() ? "(default)" : gw_url, timeout_ms);
 
         // Return a stub response
