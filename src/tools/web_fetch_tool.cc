@@ -63,38 +63,36 @@ static std::string to_lower(const std::string& s) {
 // WebFetchTool implementation
 // ============================================================================
 
-WebFetchTool::WebFetchTool(std::shared_ptr<core::HttpClient> http_client)
+WebFetchTool::WebFetchTool(std::shared_ptr<infra::HttpClient> http_client)
     : http_client_(std::move(http_client)) {}
 
-json WebFetchTool::parameters_schema() const {
-    // 🎯 对齐 OpenClaw: WebFetchSchema
-    return json{
-        {"type", "object"},
-        {"properties", {
-            {"url",              {{"type","string"},{"description","URL to fetch"}}},
-            {"extractMode",      {{"type","string"},{"enum",json::array({"markdown","text"})},
-                                  {"description","Content extraction mode: markdown (default) or text"}}},
-            {"maxChars",         {{"type","number"},{"description","Max chars to return (default 50000)"}}},
-            {"maxResponseBytes", {{"type","number"},{"description","Max response bytes (default 2MB)"}}},
-            {"timeoutSeconds",   {{"type","number"},{"description","Request timeout in seconds (default 30)"}}},
-            {"maxRedirects",     {{"type","number"},{"description","Max redirects (default 3)"}}},
-            {"useFirecrawl",     {{"type","boolean"},{"description","Use Firecrawl API if available"}}},
-        }},
-        {"required", json::array({"url"})},
-    };
+Tool::Schema WebFetchTool::parameters() const {
+    Tool::Schema schema;
+    schema.type = "object";
+    schema.description = "Fetch and extract content from a web page";
+    schema.properties["url"] = core::JsonValue(json{{"type","string"},{"description","URL to fetch"}});
+    schema.properties["extractMode"] = core::JsonValue(json{{"type","string"},{"enum",json::array({"markdown","text"})},{"description","Content extraction mode: markdown (default) or text"}});
+    schema.properties["maxChars"] = core::JsonValue(json{{"type","number"},{"description","Max chars to return (default 50000)"}});
+    schema.properties["maxResponseBytes"] = core::JsonValue(json{{"type","number"},{"description","Max response bytes (default 2MB)"}});
+    schema.properties["timeoutSeconds"] = core::JsonValue(json{{"type","number"},{"description","Request timeout in seconds (default 30)"}});
+    schema.properties["maxRedirects"] = core::JsonValue(json{{"type","number"},{"description","Max redirects (default 3)"}});
+    schema.properties["useFirecrawl"] = core::JsonValue(json{{"type","boolean"},{"description","Use Firecrawl API if available"}});
+    schema.required = {"url"};
+    return schema;
 }
 
-core::Result<json> WebFetchTool::execute(const json& params) {
+ToolResult WebFetchTool::execute(const core::JsonValue& params_val) {
+    json params = params_val.to_json();
     // 🎯 对齐 OpenClaw: readStringParam(params, "url", { required: true })
     if (!params.contains("url") || !params["url"].is_string())
-        return core::Result<json>::error("url is required");
+        return tool_result::error("url is required");
     std::string url = trim(params["url"].get<std::string>());
     if (url.empty())
-        return core::Result<json>::error("url must not be empty");
+        return tool_result::error("url must not be empty");
 
     // 🎯 对齐 OpenClaw: SSRF protection
     if (!is_url_safe(url))
-        return core::Result<json>::error("URL is not allowed (private/internal addresses blocked)");
+        return tool_result::error("URL is not allowed (private/internal addresses blocked)");
 
     // Parse params
     std::string mode_str = "markdown";
@@ -109,6 +107,7 @@ core::Result<json> WebFetchTool::execute(const json& params) {
     int max_response_bytes = DEFAULT_MAX_RESPONSE_BYTES;
     if (params.contains("maxResponseBytes") && params["maxResponseBytes"].is_number())
         max_response_bytes = std::max(1, (int)params["maxResponseBytes"].get<double>());
+    (void)max_response_bytes;
 
     int timeout_seconds = DEFAULT_TIMEOUT_SECONDS;
     if (params.contains("timeoutSeconds") && params["timeoutSeconds"].is_number())
@@ -124,7 +123,7 @@ core::Result<json> WebFetchTool::execute(const json& params) {
     std::string ck = cache_key(url, mode, max_chars);
     auto cached = read_cache(ck);
     if (cached.has_value()) {
-        return core::Result<json>::ok(cached.value());
+        return tool_result::json(core::JsonValue(cached.value()));
     }
 
     // 🎯 对齐 OpenClaw: fetch URL
@@ -135,8 +134,8 @@ core::Result<json> WebFetchTool::execute(const json& params) {
         fetch_result = fetch_url(url, timeout_seconds, max_redirects);
     }
 
-    if (!fetch_result.ok())
-        return core::Result<json>::error(fetch_result.error());
+    if (!fetch_result.ok)
+        return tool_result::error(fetch_result.error);
 
     const auto& fetched = fetch_result.get();
 
@@ -153,16 +152,16 @@ core::Result<json> WebFetchTool::execute(const json& params) {
     auto truncated = truncate_text(content, max_chars);
 
     // 🎯 对齐 OpenClaw: wrap_web_content (mark as untrusted)
-    json result = wrap_web_content(truncated.text, fetched.final_url, mode_str);
-    if (truncated.truncated) result["truncated"] = true;
-    result["url"] = fetched.final_url;
-    result["extractMode"] = mode_str;
-    result["statusCode"] = fetched.status_code;
+    json result_json = wrap_web_content(truncated.text, fetched.final_url, mode_str);
+    if (truncated.truncated) result_json["truncated"] = true;
+    result_json["url"] = fetched.final_url;
+    result_json["extractMode"] = mode_str;
+    result_json["statusCode"] = fetched.status_code;
 
     // 🎯 对齐 OpenClaw: write cache
-    write_cache(ck, result, DEFAULT_CACHE_TTL_MINUTES);
+    write_cache(ck, result_json, DEFAULT_CACHE_TTL_MINUTES);
 
-    return core::Result<json>::ok(result);
+    return tool_result::json(core::JsonValue(result_json));
 }
 
 // ============================================================================
@@ -184,7 +183,7 @@ core::Result<WebFetchTool::FetchResult> WebFetchTool::fetch_url(
     int max_redirects
 ) {
     if (!http_client_)
-        return core::Result<FetchResult>::error("HTTP client not available");
+        return core::Result<FetchResult>::Err("HTTP client not available");
 
     auto response = http_client_->get(url, {
         {"User-Agent",      USER_AGENT},
@@ -193,7 +192,7 @@ core::Result<WebFetchTool::FetchResult> WebFetchTool::fetch_url(
     }, timeout_seconds, max_redirects);
 
     if (!response.ok)
-        return core::Result<FetchResult>::error("HTTP fetch failed: " + response.error);
+        return core::Result<FetchResult>::Err("HTTP fetch failed: " + response.error);
 
     // Check response size
     if ((int)response.body.size() > DEFAULT_MAX_RESPONSE_BYTES) {
@@ -206,7 +205,7 @@ core::Result<WebFetchTool::FetchResult> WebFetchTool::fetch_url(
     result.final_url    = response.final_url.empty() ? url : response.final_url;
     result.content_type = response.content_type;
     result.status_code  = response.status_code;
-    return core::Result<FetchResult>::ok(result);
+    return core::Result<FetchResult>::Ok(result);
 }
 
 core::Result<WebFetchTool::FetchResult> WebFetchTool::fetch_firecrawl(
@@ -215,7 +214,7 @@ core::Result<WebFetchTool::FetchResult> WebFetchTool::fetch_firecrawl(
 ) {
     auto api_key = get_firecrawl_api_key();
     if (!api_key.has_value())
-        return core::Result<FetchResult>::error("Firecrawl API key not found");
+        return core::Result<FetchResult>::Err("Firecrawl API key not found");
 
     std::string base_url = get_firecrawl_base_url();
     json body = {
@@ -224,7 +223,7 @@ core::Result<WebFetchTool::FetchResult> WebFetchTool::fetch_firecrawl(
     };
 
     if (!http_client_)
-        return core::Result<FetchResult>::error("HTTP client not available");
+        return core::Result<FetchResult>::Err("HTTP client not available");
 
     auto response = http_client_->post(
         base_url + "/v1/scrape",
@@ -237,7 +236,7 @@ core::Result<WebFetchTool::FetchResult> WebFetchTool::fetch_firecrawl(
     );
 
     if (!response.ok)
-        return core::Result<FetchResult>::error("Firecrawl failed: " + response.error);
+        return core::Result<FetchResult>::Err("Firecrawl failed: " + response.error);
 
     // Parse Firecrawl response
     try {
@@ -253,9 +252,9 @@ core::Result<WebFetchTool::FetchResult> WebFetchTool::fetch_firecrawl(
         result.final_url    = url;
         result.content_type = "text/markdown";
         result.status_code  = 200;
-        return core::Result<FetchResult>::ok(result);
+        return core::Result<FetchResult>::Ok(result);
     } catch (const std::exception& e) {
-        return core::Result<FetchResult>::error(
+        return core::Result<FetchResult>::Err(
             std::string("Firecrawl response parse failed: ") + e.what());
     }
 }
@@ -556,7 +555,7 @@ std::string WebFetchTool::get_firecrawl_base_url() const {
 // ============================================================================
 
 std::shared_ptr<Tool> WebFetchToolFactory::create(
-    std::shared_ptr<core::HttpClient> http_client
+    std::shared_ptr<infra::HttpClient> http_client
 ) {
     return std::make_shared<WebFetchTool>(std::move(http_client));
 }

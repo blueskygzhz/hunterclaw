@@ -35,7 +35,7 @@ using json = nlohmann::json;
 
 class WebFetchTool : public Tool {
 public:
-    explicit WebFetchTool(std::shared_ptr<core::HttpClient> http_client);
+    explicit WebFetchTool(std::shared_ptr<infra::HttpClient> http_client);
     
     std::string name() const override { return "web_fetch"; }
     
@@ -45,14 +45,16 @@ public:
                "Use for reading articles, documentation, or any web content.";
     }
     
-    json parameters_schema() const override;
-    
+    json parameters_schema() const;
+
+    Schema parameters() const override;
+
     // 执行抓取
     // Returns: { content: string, url: string, extract_mode: string, truncated?: bool }
-    core::Result<json> execute(const json& params) override;
+    ToolResult execute(const core::JsonValue& params) override;
     
 private:
-    std::shared_ptr<core::HttpClient> http_client_;
+    std::shared_ptr<infra::HttpClient> http_client_;
     
     // ===== 提取模式 =====
     
@@ -164,7 +166,7 @@ private:
 
 class WebFetchToolFactory {
 public:
-    static std::shared_ptr<Tool> create(std::shared_ptr<core::HttpClient> http_client);
+    static std::shared_ptr<Tool> create(std::shared_ptr<infra::HttpClient> http_client);
 };
 
 } // namespace tools

@@ -163,7 +163,7 @@ ToolResult TerminalTool::execute(const core::JsonValue& params_val) {
             if (params.contains("cols") && params["cols"].is_number())
                 cols = (int)params["cols"].get<double>();
             core::JsonValue env = params.contains("env")
-                ? core::JsonValue::from_json(params["env"]) : core::JsonValue::object();
+                ? core::JsonValue(params["env"]) : core::JsonValue::object();
             return action_start(base_url, node_target, shell, cwd, env, rows, cols);
         }
 
@@ -283,12 +283,12 @@ ToolResult TerminalTool::action_start(
 
     if (node_target.has_value()) {
         auto result = call_node_terminal_proxy(
-            node_target->node_id, "POST", "/start", {}, core::JsonValue::from_json(body),
+            node_target->node_id, "POST", "/start", {}, core::JsonValue(body),
             DEFAULT_TERMINAL_TIMEOUT_MS);
         return make_json_result(result);
     }
     auto result = http_post(base_url.value_or("http://localhost:3001") + "/start",
-                            core::JsonValue::from_json(body));
+                            core::JsonValue(body));
     return make_json_result(result);
 }
 
@@ -302,12 +302,12 @@ ToolResult TerminalTool::action_stop(
 
     if (node_target.has_value()) {
         call_node_terminal_proxy(
-            node_target->node_id, "POST", "/stop", {}, core::JsonValue::from_json(body),
+            node_target->node_id, "POST", "/stop", {}, core::JsonValue(body),
             DEFAULT_TERMINAL_TIMEOUT_MS);
         return make_json_result(json{{"ok", true}});
     }
     http_post(base_url.value_or("http://localhost:3001") + "/stop",
-              core::JsonValue::from_json(body));
+              core::JsonValue(body));
     return make_json_result(json{{"ok", true}});
 }
 
@@ -325,12 +325,12 @@ ToolResult TerminalTool::action_execute(
 
     if (node_target.has_value()) {
         auto result = call_node_terminal_proxy(
-            node_target->node_id, "POST", "/execute", {}, core::JsonValue::from_json(body),
+            node_target->node_id, "POST", "/execute", {}, core::JsonValue(body),
             timeout_ms + 5000);
         return make_json_result(result);
     }
     auto result = http_post(base_url.value_or("http://localhost:3001") + "/execute",
-                            core::JsonValue::from_json(body));
+                            core::JsonValue(body));
     return make_json_result(result);
 }
 
@@ -345,12 +345,12 @@ ToolResult TerminalTool::action_input(
 
     if (node_target.has_value()) {
         auto result = call_node_terminal_proxy(
-            node_target->node_id, "POST", "/input", {}, core::JsonValue::from_json(body),
+            node_target->node_id, "POST", "/input", {}, core::JsonValue(body),
             DEFAULT_TERMINAL_TIMEOUT_MS);
         return make_json_result(result);
     }
     auto result = http_post(base_url.value_or("http://localhost:3001") + "/input",
-                            core::JsonValue::from_json(body));
+                            core::JsonValue(body));
     return make_json_result(result);
 }
 
@@ -366,12 +366,12 @@ ToolResult TerminalTool::action_resize(
 
     if (node_target.has_value()) {
         auto result = call_node_terminal_proxy(
-            node_target->node_id, "POST", "/resize", {}, core::JsonValue::from_json(body),
+            node_target->node_id, "POST", "/resize", {}, core::JsonValue(body),
             DEFAULT_TERMINAL_TIMEOUT_MS);
         return make_json_result(result);
     }
     auto result = http_post(base_url.value_or("http://localhost:3001") + "/resize",
-                            core::JsonValue::from_json(body));
+                            core::JsonValue(body));
     return make_json_result(result);
 }
 
@@ -381,17 +381,17 @@ ToolResult TerminalTool::action_resize(
 
 core::JsonValue TerminalTool::http_get(const std::string& url) const {
     (void)url;
-    return core::JsonValue::from_json(json{{"ok", true}, {"stub", true}});
+    return core::JsonValue(json{{"ok", true}, {"stub", true}});
 }
 
 core::JsonValue TerminalTool::http_post(const std::string& url, const core::JsonValue& body) const {
     (void)url; (void)body;
-    return core::JsonValue::from_json(json{{"ok", true}, {"stub", true}});
+    return core::JsonValue(json{{"ok", true}, {"stub", true}});
 }
 
 core::JsonValue TerminalTool::http_delete(const std::string& url) const {
     (void)url;
-    return core::JsonValue::from_json(json{{"ok", true}, {"stub", true}});
+    return core::JsonValue(json{{"ok", true}, {"stub", true}});
 }
 
 core::JsonValue TerminalTool::call_node_terminal_proxy(
@@ -403,7 +403,7 @@ core::JsonValue TerminalTool::call_node_terminal_proxy(
     int timeout_ms
 ) const {
     (void)node_id; (void)method; (void)path; (void)query; (void)body; (void)timeout_ms;
-    return core::JsonValue::from_json(json{{"ok", true}, {"stub", true}});
+    return core::JsonValue(json{{"ok", true}, {"stub", true}});
 }
 
 // ============================================================================

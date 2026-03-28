@@ -76,39 +76,45 @@ PDFTool::PDFTool(const Config& config) : config_(config) {
     if (config_.primary_model.empty()) config_.primary_model    = "anthropic/claude-opus-4-6";
 }
 
-ToolMetadata PDFTool::get_metadata() const {
-    return ToolMetadata{
-        "pdf",
-        "PDF Tool",
-        "Read, analyze, merge, and split PDF documents. "
-        "Supports native PDF analysis (Anthropic/Gemini) and text extraction (poppler/OCR).",
-        // Schema
-        json{
-            {"type", "object"},
-            {"properties", {
-                {"action",      {{"type","string"},{"enum",json::array({"pdf_read","pdf_analyze","pdf_merge","pdf_split"})}}},
-                {"path",        {{"type","string"},{"description","Path to PDF file"}}},
-                {"pages",       {{"type","string"},{"description","Page range (e.g. '1-5', '1,3,5-10')"}}},
-                {"extractImages",{{"type","boolean"},{"description","Extract images from PDF"}}},
-                {"prompt",      {{"type","string"},{"description","Analysis prompt for pdf_analyze"}}},
-                {"model",       {{"type","string"},{"description","AI model for pdf_analyze"}}},
-                {"maxTokens",   {{"type","number"},{"description","Max output tokens for pdf_analyze"}}},
-                {"inputPaths",  {{"type","array"},{"items",{{"type","string"}}},{"description","Input PDF paths for pdf_merge"}}},
-                {"outputPath",  {{"type","string"},{"description","Output PDF path for pdf_merge/pdf_split"}}},
-                {"outputDir",   {{"type","string"},{"description","Output directory for pdf_split"}}},
-                {"pagesPerFile",{{"type","number"},{"description","Pages per file for pdf_split"}}},
-            }},
-            {"required", json::array({"action"})},
-        }
-    };
+std::string PDFTool::description() const {
+    return "Read, analyze, merge, and split PDF documents. "
+           "Supports native PDF analysis (Anthropic/Gemini) and text extraction (poppler/OCR). "
+           "Actions: pdf_read, pdf_analyze, pdf_merge, pdf_split.";
 }
 
-json PDFTool::execute(const std::string& action, const json& params) {
-    if (action == "pdf_read")    return pdf_read(params);
-    if (action == "pdf_analyze") return pdf_analyze(params);
-    if (action == "pdf_merge")   return pdf_merge(params);
-    if (action == "pdf_split")   return pdf_split(params);
-    return json{{"error", "Unknown action: " + action}};
+Tool::Schema PDFTool::parameters() const {
+    Schema schema;
+    schema.type = "object";
+    schema.description = description();
+    schema.properties["action"] = core::JsonValue(json{{"type","string"},{"enum",json::array({"pdf_read","pdf_analyze","pdf_merge","pdf_split"})},{"description","Action to perform"}});
+    schema.properties["path"]   = core::JsonValue(json{{"type","string"},{"description","Path to PDF file"}});
+    schema.properties["pages"]  = core::JsonValue(json{{"type","string"},{"description","Page range (e.g. '1-5', '1,3,5-10')"}});
+    schema.properties["extractImages"] = core::JsonValue(json{{"type","boolean"},{"description","Extract images from PDF"}});
+    schema.properties["prompt"] = core::JsonValue(json{{"type","string"},{"description","Analysis prompt for pdf_analyze"}});
+    schema.properties["model"]  = core::JsonValue(json{{"type","string"},{"description","AI model for pdf_analyze"}});
+    schema.properties["maxTokens"] = core::JsonValue(json{{"type","number"},{"description","Max output tokens for pdf_analyze"}});
+    schema.properties["inputPaths"] = core::JsonValue(json{{"type","array"},{"items",json{{"type","string"}}},{"description","Input PDF paths for pdf_merge"}});
+    schema.properties["outputPath"] = core::JsonValue(json{{"type","string"},{"description","Output PDF path for pdf_merge/pdf_split"}});
+    schema.properties["outputDir"]  = core::JsonValue(json{{"type","string"},{"description","Output directory for pdf_split"}});
+    schema.properties["pagesPerFile"] = core::JsonValue(json{{"type","number"},{"description","Pages per file for pdf_split"}});
+    schema.required = {"action"};
+    return schema;
+}
+
+ToolResult PDFTool::execute(const core::JsonValue& params_val) {
+    json params = params_val.to_json();
+    if (!params.contains("action") || !params["action"].is_string())
+        return tool_result::error("action is required");
+    std::string action = params["action"].get<std::string>();
+    json result;
+    if (action == "pdf_read")    result = pdf_read(params);
+    else if (action == "pdf_analyze") result = pdf_analyze(params);
+    else if (action == "pdf_merge")   result = pdf_merge(params);
+    else if (action == "pdf_split")   result = pdf_split(params);
+    else return tool_result::error("Unknown action: " + action);
+    if (result.contains("error"))
+        return tool_result::error(result["error"].get<std::string>());
+    return tool_result::json(core::JsonValue(result));
 }
 
 // ============================================================================

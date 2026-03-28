@@ -19,6 +19,18 @@ namespace sandbox {
     class SandboxManager;
     class Sandbox;
 }
+namespace infra {
+    class HttpClient;
+}
+namespace gateway {
+    class GatewayClient;
+}
+namespace nodes {
+    class NodeRegistry;
+}
+namespace llm {
+    class LLMClient;
+}
 }
 
 namespace hunterclaw {
@@ -151,6 +163,12 @@ struct ToolContext {
     std::string account_id;
     std::string current_thread_ts;
     std::string scope_key;
+
+    // ===== 依赖注入 (用于工具注册) =====
+    std::shared_ptr<infra::HttpClient>    http_client;
+    std::shared_ptr<gateway::GatewayClient> gateway_client;
+    std::shared_ptr<nodes::NodeRegistry>  node_registry;
+    std::shared_ptr<llm::LLMClient>       llm_client;
 };
 
 // Forward declarations

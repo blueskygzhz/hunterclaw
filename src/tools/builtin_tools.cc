@@ -2,6 +2,19 @@
 #include "hunterclaw/tools/gateway_tool.h"
 #include "hunterclaw/tools/canvas_tool.h"
 #include "hunterclaw/tools/nodes_tool.h"
+#include "hunterclaw/tools/message_tool.h"
+#include "hunterclaw/tools/sessions_tool.h"
+#include "hunterclaw/tools/tts_tool.h"
+#include "hunterclaw/tools/web_fetch_tool.h"
+#include "hunterclaw/tools/web_search_tool.h"
+#include "hunterclaw/tools/memory_tools.h"
+#include "hunterclaw/tools/cron_tool.h"
+#include "hunterclaw/tools/image_analysis_tool.h"
+#include "hunterclaw/tools/camera_tool.h"
+#include "hunterclaw/tools/audio_transcription_tool.h"
+#include "hunterclaw/tools/terminal_tool.h"
+#include "hunterclaw/tools/browser_tool.h"
+#include "hunterclaw/tools/pdf_tool.h"
 #include "hunterclaw/tools/tool_manager.h"
 #include "hunterclaw/sandbox/sandbox.h"
 #include "hunterclaw/core/utils.h"
@@ -745,12 +758,6 @@ void BuiltinTools::register_all(ToolManager& manager, const ToolContext& context
     manager.register_tool(create_list_dir_tool(context));
     manager.register_tool(create_search_content_tool(context));
 
-    // Web搜索工具(可选)
-    auto web_search = create_web_search_tool(context);
-    if (web_search) {
-        manager.register_tool(web_search);
-    }
-
     // ✅ 对齐 OpenClaw: agents_list 工具 (agents-list-tool.ts)
     // 列出当前 agent 可以 spawn 的 subagent IDs
     {
@@ -781,6 +788,77 @@ void BuiltinTools::register_all(ToolManager& manager, const ToolContext& context
         NodesToolOptions opts;
         opts.agent_session_key = context.session_key;
         manager.register_tool(create_nodes_tool(opts));
+    }
+
+    // ✅ 对齐 OpenClaw: message 工具 (message-tool.ts)
+    // 统一消息工具，支持 telegram/discord/slack/whatsapp 等 channel
+    {
+        MessageToolOptions opts;
+        opts.agent_session_key = context.session_key;
+        opts.agent_account_id  = context.account_id;
+        opts.current_channel_id = context.current_channel_id;
+        opts.current_channel_provider = context.message_provider;
+        opts.current_thread_ts = context.current_thread_ts;
+        manager.register_tool(create_message_tool(opts));
+    }
+
+    // ✅ 对齐 OpenClaw: tts 工具 (tts-tool.ts)
+    if (context.http_client) {
+        manager.register_tool(std::make_shared<TtsTool>(context, context.http_client));
+    }
+
+    // ✅ 对齐 OpenClaw: web_fetch 工具 (web-fetch.ts)
+    if (context.http_client) {
+        manager.register_tool(WebFetchToolFactory::create(context.http_client));
+    }
+
+    // ✅ 对齐 OpenClaw: web_search 工具 (web-search.ts)
+    if (context.http_client) {
+        manager.register_tool(std::make_shared<WebSearchTool>(context.http_client));
+    }
+
+    // ✅ 对齐 OpenClaw: discord/slack 工具已通过 message_tool 统一注册
+    // DiscordTool 和 SlackTool 是 message_tool 的内部 action handler，不独立注册
+
+    // ✅ 对齐 OpenClaw: image_analysis 工具 (image-tool.ts)
+    if (context.llm_client) {
+        manager.register_tool(std::make_shared<ImageAnalysisTool>(context, context.llm_client));
+    }
+
+    // ✅ 对齐 OpenClaw: camera 工具 (nodes-tool.ts camera action)
+    if (context.node_registry) {
+        manager.register_tool(std::make_shared<CameraTool>(context, context.node_registry));
+    }
+
+    // ✅ 对齐 OpenClaw: audio_transcription 工具
+    if (context.http_client) {
+        manager.register_tool(std::make_shared<AudioTranscriptionTool>(context, context.http_client));
+    }
+
+    // ✅ 对齐 OpenClaw: terminal 工具 (terminal-tool.ts)
+    manager.register_tool(std::make_shared<TerminalTool>(context));
+
+    // ✅ 对齐 OpenClaw: browser 工具 (browser-tool.ts)
+    manager.register_tool(BrowserToolFactory::create(context));
+
+    // ✅ 对齐 OpenClaw: pdf 工具 (pdf-tool.ts)
+    {
+        PDFTool::Config pdf_config;
+        pdf_config.workspace_dir = context.workspace_dir;
+        pdf_config.allowed_dir   = context.workspace_dir;
+        auto pdf_tool = create_pdf_tool(pdf_config);
+        if (pdf_tool) manager.register_tool(std::move(pdf_tool));
+    }
+
+    // ✅ 对齐 OpenClaw: sessions 工具 (sessions-*.ts)
+    // 需要 gateway_client，如果可用则注册
+    if (context.gateway_client) {
+        SessionsToolContext sess_ctx;
+        sess_ctx.agent_session_key = context.session_key;
+        sess_ctx.session_id        = context.session_id;
+        sess_ctx.workspace_dir     = context.workspace_dir;
+        auto sess_tools = create_sessions_tools(context.gateway_client, sess_ctx);
+        for (auto& t : sess_tools) manager.register_tool(t);
     }
 }
 

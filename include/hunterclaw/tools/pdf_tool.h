@@ -163,6 +163,7 @@ public:
         std::string cache_dir;                // Cache directory
         std::string temp_dir;                 // Temporary directory
         std::string allowed_dir;              // Allowed directory (sandbox)
+        std::string workspace_dir;            // Workspace directory
         
         // AI model configuration
         std::string primary_model;            // Primary model (e.g., claude-opus-4-6)
@@ -177,24 +178,15 @@ public:
 
     /**
      * @brief Construct PDFTool with configuration
-     * 
-     * @param config Tool configuration
      */
     explicit PDFTool(const Config& config);
 
-    /**
-     * @brief Get tool metadata
-     */
-    ToolMetadata get_metadata() const override;
-
-    /**
-     * @brief Execute tool action
-     * 
-     * @param action Action name (pdf_read, pdf_analyze, etc.)
-     * @param params Action parameters
-     * @return Execution result
-     */
-    json execute(const std::string& action, const json& params) override;
+    // === Tool base class interface ===
+    std::string name() const override { return "pdf"; }
+    std::string description() const override;
+    Schema parameters() const override;
+    ToolResult execute(const core::JsonValue& params) override;
+    bool requires_approval() const override { return false; }
 
 private:
     // PDF Read
