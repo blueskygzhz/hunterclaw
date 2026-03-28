@@ -8,6 +8,7 @@
 //   src/agents/tools/sessions-helpers.ts
 //   src/agents/tools/sessions-access.ts
 //   src/agents/tools/sessions-resolution.ts
+//   src/agents/tools/subagents-tool.ts
 //   src/agents/subagent-spawn.ts (spawnSubagentDirect)
 //   src/agents/acp-spawn.ts (spawnAcpDirect)
 
@@ -1477,7 +1478,21 @@ public:
 
         // Max children check (aligned with OpenClaw)
         int max_children = ctx_.max_children_per_agent > 0 ? ctx_.max_children_per_agent : 5;
+        // ✅ 对齐 OpenClaw: countActiveRunsForSession(requesterInternalKey)
+        // 实时统计活跃子 agent 数量，而非使用静态的 ctx_.active_children_count
         int active_children = ctx_.active_children_count;
+        if (ctx_.registry) {
+            // 从 registry 实时获取活跃子 agent 数量
+            auto children = ctx_.registry->list_by_requester(effective_requester_key);
+            active_children = 0;
+            for (const auto& child : children) {
+                if (child && child->state != agents::SubagentState::Completed
+                    && child->state != agents::SubagentState::Failed
+                    && child->state != agents::SubagentState::Killed) {
+                    active_children++;
+                }
+            }
+        }
         if (active_children >= max_children) {
             return make_json_result(json{
                 {"status", "forbidden"},
@@ -1701,6 +1716,39 @@ public:
             note = SUBAGENT_SPAWN_SESSION_ACCEPTED_NOTE;
         } else if (!is_cron_session) {
             note = SUBAGENT_SPAWN_ACCEPTED_NOTE;
+        }
+
+        // ✅ 对齐 OpenClaw: registerSubagentRun (subagent-registry.ts)
+        // 在 Gateway agent 调用成功后，向 SubagentRegistry 注册此次 spawn
+        // 这是 SubagentAnnouncer 能找到 entry 并通知父 agent 的前提
+        if (ctx_.registry) {
+            agents::SubagentEntry entry;
+            entry.subagent_run_id    = child_run_id;
+            entry.requester_run_id   = effective_requester_key;
+            entry.controller_session_key = effective_requester_key;
+            entry.requester_display_key  = resolve_display_session_key(
+                effective_requester_key, alias, main_key);
+            entry.subagent_name      = target_agent_id;
+            entry.label              = label;
+            entry.task               = task;
+            entry.cleanup            = cleanup;
+            entry.spawn_mode         = spawn_mode;
+            // ✅ 对齐 OpenClaw: expectsCompletionMessage = params.expectsCompletionMessage !== false
+            // sessions_spawn 工具调用时 expectsCompletionMessage 默认为 true
+            entry.expects_completion_message = true;
+            entry.timeout_seconds    = run_timeout_seconds > 0 ? run_timeout_seconds : 900;
+            entry.state              = agents::SubagentState::Running;
+            entry.spawned_at = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()
+                ).count()
+            );
+            // workspace dir 继承
+            if (!ctx_.workspace_dir.empty()) {
+                // 存储在 description 中供 announcer 使用
+                entry.description = ctx_.workspace_dir;
+            }
+            ctx_.registry->register_subagent(entry);
         }
 
         json result_json = {
@@ -2104,6 +2152,326 @@ private:
 };
 
 // ============================================================================
+// subagents Tool (aligned with OpenClaw subagents-tool.ts)
+// ============================================================================
+// OpenClaw: src/agents/tools/subagents-tool.ts
+// Actions: list | kill | steer
+// ============================================================================
+
+class SubagentsTool : public Tool {
+public:
+    explicit SubagentsTool(std::shared_ptr<gateway::GatewayClient> gw,
+                            SessionsToolContext ctx)
+        : gw_(std::move(gw)), ctx_(std::move(ctx)) {}
+
+    std::string name() const override { return "subagents"; }
+
+    std::string description() const override {
+        return "List, kill, or steer spawned sub-agents for this requester session. "
+               "Use this for sub-agent orchestration.";
+    }
+
+    Schema parameters() const override {
+        return Schema{
+            "object", "subagents parameters",
+            {
+                {"action",        json{{"type","string"},{"enum",json::array({"list","kill","steer"})}}},
+                {"target",        json{{"type","string"}}},
+                {"message",       json{{"type","string"}}},
+                {"recentMinutes", json{{"type","number"},{"minimum",1}}},
+            },
+            {}
+        };
+    }
+
+    ToolResult execute(const core::JsonValue& params_val) override {
+        const json params = params_val.to_json();
+
+        std::string main_key, alias, requester_internal_key, effective_requester_key;
+        bool restrict_to_spawned;
+        resolve_sandboxed_session_tool_context(ctx_,
+            main_key, alias, requester_internal_key,
+            effective_requester_key, restrict_to_spawned);
+
+        std::string action = read_string_param(params, "action");
+        if (action.empty()) action = "list";
+
+        // ✅ 对齐 OpenClaw: DEFAULT_RECENT_MINUTES = 60, MAX_RECENT_MINUTES = 1440
+        static constexpr int DEFAULT_RECENT_MINUTES = 60;
+        static constexpr int MAX_RECENT_MINUTES = 1440;
+        static constexpr int MAX_STEER_MESSAGE_CHARS = 2000;
+
+        int recent_minutes = DEFAULT_RECENT_MINUTES;
+        if (params.contains("recentMinutes") && params["recentMinutes"].is_number()) {
+            recent_minutes = std::max(1, std::min(MAX_RECENT_MINUTES,
+                (int)params["recentMinutes"].get<double>()));
+        }
+
+        if (!ctx_.registry) {
+            return make_json_result(json{
+                {"status", "error"},
+                {"error", "Subagent registry not available"}
+            });
+        }
+
+        // ✅ 对齐 OpenClaw: listControlledSubagentRuns(controller.controllerSessionKey)
+        auto all_runs = ctx_.registry->list_by_requester(effective_requester_key);
+
+        // ✅ 对齐 OpenClaw: isActiveSubagentRun()
+        auto is_active = [](const std::shared_ptr<agents::SubagentEntry>& e) -> bool {
+            if (!e) return false;
+            return e->state != agents::SubagentState::Completed
+                && e->state != agents::SubagentState::Failed
+                && e->state != agents::SubagentState::Killed;
+        };
+
+        // ✅ 对齐 OpenClaw: action === "list"
+        if (action == "list") {
+            auto now_ms = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()
+                ).count()
+            );
+            uint64_t recent_cutoff_ms = now_ms - (uint64_t)recent_minutes * 60 * 1000;
+
+            json active_list = json::array();
+            json recent_list = json::array();
+
+            for (const auto& e : all_runs) {
+                if (!e) continue;
+                bool active = is_active(e);
+                bool recent = (e->spawned_at >= recent_cutoff_ms);
+
+                json view = {
+                    {"runId",      e->subagent_run_id},
+                    {"sessionKey", e->subagent_run_id},
+                    {"label",      e->label.empty() ? e->subagent_name : e->label},
+                    {"task",       e->task},
+                    {"spawnMode",  e->spawn_mode},
+                    {"active",     active},
+                };
+                std::string state_str;
+                switch (e->state) {
+                    case agents::SubagentState::Spawning:   state_str = "spawning"; break;
+                    case agents::SubagentState::Listening:  state_str = "listening"; break;
+                    case agents::SubagentState::Running:    state_str = "running"; break;
+                    case agents::SubagentState::Completing: state_str = "completing"; break;
+                    case agents::SubagentState::Announcing: state_str = "announcing"; break;
+                    case agents::SubagentState::Completed:  state_str = "completed"; break;
+                    case agents::SubagentState::Failed:     state_str = "failed"; break;
+                    case agents::SubagentState::TimedOut:   state_str = "timedout"; break;
+                    case agents::SubagentState::Killed:     state_str = "killed"; break;
+                    default:                                state_str = "unknown"; break;
+                }
+                view["state"] = state_str;
+                if (e->spawned_at > 0) view["spawnedAt"] = e->spawned_at;
+                if (e->completed_at > 0) view["completedAt"] = e->completed_at;
+                if (e->has_error) view["error"] = e->error_message;
+
+                if (active) active_list.push_back(view);
+                else if (recent) recent_list.push_back(view);
+            }
+
+            // ✅ 对齐 OpenClaw: buildSubagentList 返回格式
+            return make_json_result(json{
+                {"status",              "ok"},
+                {"action",              "list"},
+                {"requesterSessionKey", effective_requester_key},
+                {"callerSessionKey",    ctx_.agent_session_key},
+                {"callerIsSubagent",    is_subagent_session_key(ctx_.agent_session_key)},
+                {"total",               (int)all_runs.size()},
+                {"active",              active_list},
+                {"recent",              recent_list},
+            });
+        }
+
+        // ✅ 对齐 OpenClaw: action === "kill"
+        if (action == "kill") {
+            std::string target = read_string_param(params, "target", true);
+
+            // Kill all
+            if (target == "all" || target == "*") {
+                int killed = 0;
+                json labels = json::array();
+                for (const auto& e : all_runs) {
+                    if (!e || !is_active(e)) continue;
+                    ctx_.registry->update_state(e->subagent_run_id,
+                        agents::SubagentState::Killed);
+                    // Send kill signal via gateway
+                    if (gw_) {
+                        try {
+                            gw_->request("sessions.delete", json{
+                                {"key", e->subagent_run_id},
+                                {"emitLifecycleHooks", true},
+                                {"deleteTranscript", false}
+                            });
+                        } catch (...) {}
+                    }
+                    killed++;
+                    labels.push_back(e->label.empty() ? e->subagent_name : e->label);
+                }
+                return make_json_result(json{
+                    {"status",  "ok"},
+                    {"action",  "kill"},
+                    {"target",  "all"},
+                    {"killed",  killed},
+                    {"labels",  labels},
+                    {"text",    killed > 0
+                        ? "killed " + std::to_string(killed) + " subagent" + (killed == 1 ? "" : "s") + "."
+                        : "no running subagents to kill."}
+                });
+            }
+
+            // Kill specific target
+            std::shared_ptr<agents::SubagentEntry> found;
+            for (const auto& e : all_runs) {
+                if (!e) continue;
+                if (e->subagent_run_id == target
+                    || e->label == target
+                    || e->subagent_name == target) {
+                    found = e;
+                    break;
+                }
+            }
+            if (!found) {
+                return make_json_result(json{
+                    {"status", "error"},
+                    {"action", "kill"},
+                    {"target", target},
+                    {"error",  "Unknown subagent target."}
+                });
+            }
+            ctx_.registry->update_state(found->subagent_run_id,
+                agents::SubagentState::Killed);
+            if (gw_) {
+                try {
+                    gw_->request("sessions.delete", json{
+                        {"key", found->subagent_run_id},
+                        {"emitLifecycleHooks", true},
+                        {"deleteTranscript", false}
+                    });
+                } catch (...) {}
+            }
+            return make_json_result(json{
+                {"status",     "ok"},
+                {"action",     "kill"},
+                {"target",     target},
+                {"runId",      found->subagent_run_id},
+                {"sessionKey", found->subagent_run_id},
+                {"label",      found->label.empty() ? found->subagent_name : found->label},
+                {"text",       "killed subagent: " + (found->label.empty() ? found->subagent_name : found->label)}
+            });
+        }
+
+        // ✅ 对齐 OpenClaw: action === "steer"
+        if (action == "steer") {
+            std::string target = read_string_param(params, "target", true);
+            std::string message = read_string_param(params, "message", true);
+
+            if ((int)message.size() > MAX_STEER_MESSAGE_CHARS) {
+                return make_json_result(json{
+                    {"status", "error"},
+                    {"action", "steer"},
+                    {"target", target},
+                    {"error",  "Message too long (" + std::to_string(message.size()) +
+                               " chars, max " + std::to_string(MAX_STEER_MESSAGE_CHARS) + ")."}
+                });
+            }
+
+            std::shared_ptr<agents::SubagentEntry> found;
+            for (const auto& e : all_runs) {
+                if (!e) continue;
+                if (e->subagent_run_id == target
+                    || e->label == target
+                    || e->subagent_name == target) {
+                    found = e;
+                    break;
+                }
+            }
+            if (!found) {
+                return make_json_result(json{
+                    {"status", "error"},
+                    {"action", "steer"},
+                    {"target", target},
+                    {"error",  "Unknown subagent target."}
+                });
+            }
+
+            // Send steer message via gateway
+            if (!gw_) {
+                return make_json_result(json{
+                    {"status", "error"},
+                    {"action", "steer"},
+                    {"target", target},
+                    {"error",  "Gateway not available"}
+                });
+            }
+
+            std::string steer_idem = generate_uuid();
+            try {
+                auto resp = gw_->request("agent", json{
+                    {"sessionKey",     found->subagent_run_id},
+                    {"message",        message},
+                    {"idempotencyKey", steer_idem},
+                    {"deliver",        false},
+                    {"lane",           AGENT_LANE_NESTED},
+                    {"inputProvenance", json{
+                        {"kind",             "inter_session"},
+                        {"sourceSessionKey", ctx_.agent_session_key},
+                        {"sourceTool",       "subagents_steer"}
+                    }}
+                });
+                if (!resp.is_ok()) {
+                    return make_json_result(json{
+                        {"status", "error"},
+                        {"action", "steer"},
+                        {"target", target},
+                        {"error",  resp.error}
+                    });
+                }
+                std::string run_id = steer_idem;
+                if (resp.get().contains("runId") && resp.get()["runId"].is_string()) {
+                    run_id = resp.get()["runId"].get<std::string>();
+                }
+                return make_json_result(json{
+                    {"status",     "ok"},
+                    {"action",     "steer"},
+                    {"target",     target},
+                    {"runId",      run_id},
+                    {"sessionKey", found->subagent_run_id},
+                    {"label",      found->label.empty() ? found->subagent_name : found->label},
+                    {"mode",       found->spawn_mode},
+                    {"text",       "steered subagent: " + (found->label.empty() ? found->subagent_name : found->label)}
+                });
+            } catch (const std::exception& e) {
+                return make_json_result(json{
+                    {"status", "error"},
+                    {"action", "steer"},
+                    {"target", target},
+                    {"error",  std::string(e.what())}
+                });
+            }
+        }
+
+        return make_json_result(json{
+            {"status", "error"},
+            {"error",  "Unsupported action."}
+        });
+    }
+
+private:
+    std::shared_ptr<gateway::GatewayClient> gw_;
+    SessionsToolContext ctx_;
+
+    static ToolResult make_json_result(const json& data) {
+        ToolResult result;
+        result.content.push_back({ToolResultContent::Type::Json, data.dump()});
+        result.success = true;
+        return result;
+    }
+};
+
+// ============================================================================
 // Factory functions
 // ============================================================================
 
@@ -2118,6 +2486,11 @@ std::vector<std::shared_ptr<Tool>> create_sessions_tools(
     tools.push_back(std::make_shared<SessionsSpawnTool>(gw, ctx));
     tools.push_back(std::make_shared<SessionsHistoryTool>(gw, ctx));
     tools.push_back(std::make_shared<SessionStatusTool>(gw, ctx));
+    // ✅ 对齐 OpenClaw: createSubagentsTool (subagents-tool.ts)
+    // 提供 list/kill/steer 三个 action，需要 registry 支持
+    if (ctx.registry) {
+        tools.push_back(std::make_shared<SubagentsTool>(gw, ctx));
+    }
     if (on_yield) {
         tools.push_back(std::make_shared<SessionsYieldTool>(ctx, std::move(on_yield)));
     }

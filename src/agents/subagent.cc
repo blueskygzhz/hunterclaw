@@ -5,6 +5,7 @@
 #include "hunterclaw/agents/agent_pool.h"   // AgentPool (AgentManager)
 #include "hunterclaw/agents/agent_instance.h" // AgentInstance
 #include "hunterclaw/gateway/gateway.h"    // GatewayServer, GatewayRuntimeState, ClientContext
+#include "hunterclaw/gateway/client.h"     // GatewayClient (callGateway 对齐)
 #include <spdlog/spdlog.h>
 #include <iostream>
 #include <algorithm>
@@ -1922,11 +1923,34 @@ core::Result<void> SubagentAnnouncer::attempt_delivery(
     // 3. 可追踪性：父 agent 的这次执行可以被 abort 或监控
     std::string announce_run_id = "announce:v1:" + entry->subagent_run_id + ":" + entry->subagent_run_id;
 
+    // ✅ 对齐 OpenClaw: internalEvents 结构化事件数组
+    // sendSubagentAnnounceDirectly 和 sendAnnounce 都传递 internalEvents 给 Gateway
+    // Gateway agent.ts: request.internalEvents → agentCommandFromIngress(internalEvents)
+    nlohmann::json internal_events_json = nlohmann::json::array();
+    {
+        nlohmann::json evt;
+        evt["type"] = "task_completion";
+        evt["source"] = "subagent";
+        evt["childSessionKey"] = entry->subagent_run_id;
+        evt["childSessionId"] = entry->subagent_run_id;
+        evt["announceType"] = "subagent task";
+        evt["taskLabel"] = entry->description.empty() ? entry->subagent_name : entry->description;
+        evt["status"] = entry->has_error ? "error" : "ok";
+        evt["statusLabel"] = entry->has_error
+            ? ("failed: " + (entry->error_message.empty() ? "unknown error" : entry->error_message))
+            : "completed successfully";
+        evt["result"] = entry->frozen_result_text.empty()
+            ? (entry->result_text.empty() ? "(no output)" : entry->result_text)
+            : entry->frozen_result_text;
+        evt["replyInstruction"] = reply_instruction;
+        internal_events_json.push_back(evt);
+    }
+
     bool delivered = false;
     if (agent_manager_) {
         auto requester_agent = agent_manager_->get_agent(entry->requester_run_id);
         if (requester_agent) {
-            // 构建注入选项
+            // 构建注入选项（Fallback 路径使用）
             std::map<std::string, std::string> inject_options = {
                 {"session_key", entry->requester_run_id},
                 // ✅ 关键：对齐 OpenClaw deliver 标志
@@ -1942,7 +1966,9 @@ core::Result<void> SubagentAnnouncer::attempt_delivery(
                 // ✅ 对齐 OpenClaw: runId = idempotencyKey（确定性 run_id）
                 // Gateway agent.ts: const runId = idem;
                 // 父 agent 被唤醒时使用此确定性 run_id，而非随机 UUID
-                {"run_id", announce_run_id}
+                {"run_id", announce_run_id},
+                // ✅ 对齐 OpenClaw: internalEvents 序列化传递
+                {"internal_events", internal_events_json.dump()},
             };
 
             // ✅ 对齐 OpenClaw: sendSubagentAnnounceDirectly → callGateway("agent", { idempotencyKey })
@@ -1954,40 +1980,85 @@ core::Result<void> SubagentAnnouncer::attempt_delivery(
             //     → dispatchAgentRunFromGateway
             //     → agentCommandFromIngress → 父 agent 执行
             //
-            // HunterClaw 对齐:
-            //   优先路径: gateway_server_->runtime_state()->method_handler("agent", params, ctx)
-            //     → method_agent → 幂等去重 + runId = idem + 异步 dispatch
-            //   Fallback 路径（Gateway 未注入时）: 直接调用 process_message
+            // HunterClaw 对齐（三条路径，优先级从高到低）:
             //
-            // 两条路径都支持:
-            //   - 父 Agent 空闲 → 直接执行（对齐 sendSubagentAnnounceDirectly）
-            //   - 父 Agent 忙碌 → 入队等待（对齐 maybeQueueSubagentAnnounce）
+            // 路径 1 (最严格对齐): GatewayClient::request("agent", params)
+            //   对齐 sessions_tool.cc: gw_->request("agent", agent_params)
+            //   通过 WebSocket 调用 Gateway agent handler，完全走 method_agent 逻辑
+            //   包括: 幂等去重 + runId=idem + 异步 dispatch + deliver 路由
+            //
+            // 路径 2 (次级对齐): GatewayServer::method_handler("agent", params, ctx)
+            //   通过进程内直接调用 method_agent，绕过 WebSocket 但保留 Gateway 逻辑
+            //
+            // 路径 3 (Fallback): 直接调用 process_message
+            //   Gateway 未注入时的向后兼容路径
 
-            bool use_gateway = (gateway_server_ != nullptr);
+            bool delivered_via_gateway = false;
 
-            if (use_gateway) {
-                // ✅ 主路径: 通过 Gateway method_handler("agent") 调用
-                // 对齐 OpenClaw: callGateway("agent", { sessionKey, message, deliver, idempotencyKey })
+            // ── 路径 1: GatewayClient (最严格对齐 OpenClaw callGateway) ──
+            if (gateway_client_ && gateway_client_->is_connected()) {
+                // ✅ 对齐 OpenClaw sendSubagentAnnounceDirectly → callGateway("agent", params)
+                // 参数名使用 camelCase（对齐 OpenClaw agent.ts 的 request 字段名）
+                // ✅ 对齐 OpenClaw: internalEvents 字段（sendAnnounce 和 sendSubagentAnnounceDirectly 都传递）
+                nlohmann::json agent_params = {
+                    {"sessionKey",      entry->requester_run_id},
+                    {"message",         trigger_message},
+                    {"deliver",         !requester_is_subagent},
+                    {"idempotencyKey",  announce_run_id},
+                    {"internalEvents",  internal_events_json},
+                    {"inputProvenance", {
+                        {"kind",             "inter_session"},
+                        {"sourceSessionKey", entry->subagent_run_id},
+                        {"sourceChannel",    "internal"},
+                        {"sourceTool",       "subagent_announce"}
+                    }}
+                };
+
+                try {
+                    auto response = gateway_client_->request<nlohmann::json>("agent", agent_params);
+                    if (response.is_err()) {
+                        log()->warn("[SubagentAnnouncer] GatewayClient agent call failed: {} - {}",
+                                   entry->requester_run_id, response.error);
+                        entry->cleanup_handled = false;
+                        entry->announce_retry_count++;
+                        entry->last_announce_retry_at = static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch()
+                            ).count()
+                        );
+                        return core::Result<void>::Err("GatewayClient delivery failed: " + response.error);
+                    }
+                    delivered_via_gateway = true;
+                    delivered = true;
+                    log()->info("[SubagentAnnouncer] Delivered via GatewayClient: {} -> {} (deliver={}, run_id={})",
+                               entry->subagent_run_id, entry->requester_run_id,
+                               !requester_is_subagent, announce_run_id);
+                } catch (const std::exception& e) {
+                    log()->warn("[SubagentAnnouncer] GatewayClient exception: {} - {}",
+                               entry->requester_run_id, e.what());
+                    // fallthrough to path 2
+                }
+            }
+
+            // ── 路径 2: GatewayServer method_handler (进程内调用) ──
+            if (!delivered_via_gateway && gateway_server_) {
                 auto state = gateway_server_->runtime_state();
                 if (state && state->method_handler) {
-                    // 构建 Gateway agent 参数（对齐 OpenClaw agent.ts AgentParams）
+                    // ✅ 统一使用 camelCase 参数名（与 GatewayClient 路径一致，method_agent 已支持双格式）
                     nlohmann::json agent_params;
-                    agent_params["session_key"] = entry->requester_run_id;
+                    agent_params["sessionKey"] = entry->requester_run_id;
                     agent_params["message"] = trigger_message;
                     agent_params["deliver"] = !requester_is_subagent;
-                    agent_params["idempotency_key"] = announce_run_id;
-                    agent_params["run_id"] = announce_run_id;
-                    agent_params["input_provenance"] = {
+                    agent_params["idempotencyKey"] = announce_run_id;
+                    // ✅ 对齐 OpenClaw: internalEvents 字段
+                    agent_params["internalEvents"] = internal_events_json;
+                    agent_params["inputProvenance"] = {
                         {"kind", "inter_session"},
-                        {"source_session_key", entry->subagent_run_id},
-                        {"source_tool", "subagent_announce"}
+                        {"sourceSessionKey", entry->subagent_run_id},
+                        {"sourceChannel", "internal"},
+                        {"sourceTool", "subagent_announce"}
                     };
-                    // 传递 internal_events（对齐 OpenClaw: internalEvents 字段）
-                    // 这些已经在 trigger_message 中编码，此处也传递结构化版本
-                    agent_params["source_session_key"] = entry->subagent_run_id;
-                    agent_params["source_tool"] = "subagent_announce";
 
-                    // 构建内部 ClientContext（无真实连接，仅用于内部调用）
                     gateway::ClientContext internal_ctx;
                     internal_ctx.authenticated = true;
                     internal_ctx.conn_id = "internal:subagent_announcer";
@@ -1996,7 +2067,7 @@ core::Result<void> SubagentAnnouncer::attempt_delivery(
 
                     auto gw_result = state->method_handler("agent", agent_params, internal_ctx);
                     if (gw_result.is_err()) {
-                        log()->warn("[SubagentAnnouncer] Gateway agent call failed: {} - {}",
+                        log()->warn("[SubagentAnnouncer] Gateway method_handler failed: {} - {}",
                                    entry->requester_run_id, gw_result.error);
                         entry->cleanup_handled = false;
                         entry->announce_retry_count++;
@@ -2007,51 +2078,84 @@ core::Result<void> SubagentAnnouncer::attempt_delivery(
                         );
                         return core::Result<void>::Err("Gateway delivery failed: " + gw_result.error);
                     }
+                    delivered_via_gateway = true;
                     delivered = true;
-                    log()->info("[SubagentAnnouncer] Delivered via Gateway: {} -> {} (deliver={}, run_id={})",
+                    log()->info("[SubagentAnnouncer] Delivered via Gateway method_handler: {} -> {} (deliver={}, run_id={})",
                                entry->subagent_run_id, entry->requester_run_id,
                                !requester_is_subagent, announce_run_id);
-                } else {
-                    // Gateway state 不可用，fallback 到直接调用
-                    use_gateway = false;
                 }
             }
 
-            if (!use_gateway) {
-                // ✅ Fallback 路径: 直接调用 process_message（Gateway 未注入时）
-                // 保持向后兼容，行为与之前相同
-                if (requester_agent->is_processing()) {
-                    // 父 Agent 正在运行 → 入队（对齐 OpenClaw: maybeQueueSubagentAnnounce）
-                    requester_agent->enqueue_message(trigger_message, inject_options);
-                    delivered = true;
-                    log()->info(
-                        "[SubagentAnnouncer] Queued to busy requester (fallback): {} (deliver={}, queue mode)",
-                        entry->requester_run_id, requester_is_subagent ? "false" : "true"
-                    );
-                } else {
-                    // 父 Agent 空闲 → 直接调用（对齐 OpenClaw: sendSubagentAnnounceDirectly）
+            // ── 路径 3: Fallback - 直接调用 process_message ──
+            // ✅ 对齐 OpenClaw: runSubagentAnnounceDispatch (subagent-announce-dispatch.ts)
+            //
+            // OpenClaw 调度顺序:
+            //   if (!expectsCompletionMessage):
+            //     先 queue (maybeQueueSubagentAnnounce)，queue 失败再 direct (sendSubagentAnnounceDirectly)
+            //   else (expectsCompletionMessage):
+            //     先 direct，direct 失败再 queue (fallback)
+            //
+            // HunterClaw Fallback 路径对齐:
+            //   - queue = enqueue_message (父 agent 正在运行时入队)
+            //   - direct = process_message (父 agent 空闲时直接调用)
+            if (!delivered_via_gateway) {
+                const bool expects_completion = entry->expects_completion_message;
+
+                // ✅ 对齐 OpenClaw: queue 操作 = maybeQueueSubagentAnnounce
+                auto try_queue = [&]() -> bool {
+                    if (requester_agent->is_processing()) {
+                        requester_agent->enqueue_message(trigger_message, inject_options);
+                        log()->info(
+                            "[SubagentAnnouncer] Queued to busy requester (fallback): {} (deliver={}, queue mode)",
+                            entry->requester_run_id, requester_is_subagent ? "false" : "true"
+                        );
+                        return true;
+                    }
+                    return false;
+                };
+
+                // ✅ 对齐 OpenClaw: direct 操作 = sendSubagentAnnounceDirectly
+                auto try_direct = [&]() -> bool {
                     auto deliver_result = requester_agent->process_message(
                         trigger_message, inject_options
                     );
-
-                    if (deliver_result.is_err()) {
-                        // process_message 返回 "queued" 也算成功（Agent 在检查后变为忙碌）
-                        if (deliver_result.error != "queued") {
-                            log()->warn("[SubagentAnnouncer] Failed to inject to requester (fallback): {} - {}",
-                                       entry->requester_run_id, deliver_result.error);
-                            entry->cleanup_handled = false;
-                            entry->announce_retry_count++;
-                            entry->last_announce_retry_at = static_cast<uint64_t>(
-                                std::chrono::duration_cast<std::chrono::milliseconds>(
-                                    std::chrono::system_clock::now().time_since_epoch()
-                                ).count()
-                            );
-                            return core::Result<void>::Err("Delivery failed: " + deliver_result.error);
-                        }
+                    if (deliver_result.is_err() && deliver_result.error != "queued") {
+                        log()->warn("[SubagentAnnouncer] Failed to inject to requester (fallback): {} - {}",
+                                   entry->requester_run_id, deliver_result.error);
+                        entry->cleanup_handled = false;
+                        entry->announce_retry_count++;
+                        entry->last_announce_retry_at = static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch()
+                            ).count()
+                        );
+                        return false;
                     }
-                    delivered = true;
                     log()->info("[SubagentAnnouncer] Delivered to requester (fallback): {} (deliver={}, direct mode)",
                                entry->requester_run_id, requester_is_subagent ? "false" : "true");
+                    return true;
+                };
+
+                if (!expects_completion) {
+                    // ✅ 对齐 OpenClaw: !expectsCompletionMessage → 先 queue，再 direct
+                    if (!try_queue()) {
+                        delivered = try_direct();
+                        if (!delivered) {
+                            return core::Result<void>::Err("Delivery failed");
+                        }
+                    } else {
+                        delivered = true;
+                    }
+                } else {
+                    // ✅ 对齐 OpenClaw: expectsCompletionMessage → 先 direct，再 queue (fallback)
+                    if (!try_direct()) {
+                        delivered = try_queue();
+                        if (!delivered) {
+                            return core::Result<void>::Err("Delivery failed");
+                        }
+                    } else {
+                        delivered = true;
+                    }
                 }
             }
         } else {

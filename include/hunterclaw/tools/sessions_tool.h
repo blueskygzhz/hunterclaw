@@ -8,8 +8,10 @@
 //   src/agents/tools/sessions-history-tool.ts
 //   src/agents/tools/session-status-tool.ts
 //   src/agents/tools/sessions-yield-tool.ts
+//   src/agents/tools/subagents-tool.ts
 
 #include "hunterclaw/tools/tool.h"
+#include "hunterclaw/agents/subagent.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -92,6 +94,11 @@ struct SessionsToolContext {
 
     // Requester agent ID override (for cron/hook sessions)
     std::string requester_agent_id_override;
+
+    // ✅ 对齐 OpenClaw: SubagentRegistry 引用
+    // sessions_spawn 成功后调用 registry->register_subagent() 注册 subagent run
+    // 对应 OpenClaw: registerSubagentRun() in subagent-registry.ts
+    std::shared_ptr<agents::SubagentRegistry> registry;
 };
 
 /**

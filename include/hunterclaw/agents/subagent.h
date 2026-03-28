@@ -3,6 +3,7 @@
 #include "hunterclaw/core/types.h"
 #include "hunterclaw/agents/types.h"
 #include "hunterclaw/gateway/gateway.h"  // GatewayServer, GatewayRuntimeState
+#include "hunterclaw/gateway/client.h"   // GatewayClient
 #include <string>
 #include <vector>
 #include <map>
@@ -410,11 +411,21 @@ public:
         gateway_server_ = server;
     }
 
+    /// ✅ 对齐 OpenClaw: 注入 GatewayClient，用于通过 WebSocket 调用 Gateway agent handler
+    /// 对齐 sessions_tool.cc: gw_->request("agent", params)
+    /// 这是最严格的对齐方式：与 sessions_spawn 使用相同的 callGateway 路径
+    void set_gateway_client(std::shared_ptr<gateway::GatewayClient> client) {
+        gateway_client_ = client;
+    }
+
 private:
     std::shared_ptr<SubagentRegistry> registry_;
     std::shared_ptr<AgentManager> agent_manager_;
     // ✅ 对齐 OpenClaw: GatewayServer 引用，用于通过 Gateway 通知父 agent
     std::shared_ptr<gateway::GatewayServer> gateway_server_;
+    // ✅ 对齐 OpenClaw: GatewayClient 引用，用于通过 WebSocket 调用 Gateway agent handler
+    // 对齐 sessions_tool.cc: gw_->request("agent", params)
+    std::shared_ptr<gateway::GatewayClient> gateway_client_;
     
     // Background worker
     std::unique_ptr<std::thread> worker_thread_;

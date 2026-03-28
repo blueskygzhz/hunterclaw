@@ -52,13 +52,25 @@ core::Result<json> method_agent(
 
     // ========================================================================
     // Step 1: 参数提取
+    // 同时支持 camelCase（GatewayClient WebSocket 路径）和 snake_case（进程内调用路径）
+    // 对齐 OpenClaw agent.ts: request.sessionKey, request.idempotencyKey, request.inputProvenance
     // ========================================================================
-    std::string session_key;
-    if (params.contains("session_key") && params["session_key"].is_string()) {
-        session_key = params["session_key"].get<std::string>();
-    }
+
+    // helper: 优先取 camelCase，fallback 到 snake_case
+    auto get_str = [&](const char* camel, const char* snake) -> std::string {
+        if (params.contains(camel) && params[camel].is_string()) {
+            return params[camel].get<std::string>();
+        }
+        if (params.contains(snake) && params[snake].is_string()) {
+            return params[snake].get<std::string>();
+        }
+        return {};
+    };
+
+    // ✅ 对齐 OpenClaw: request.sessionKey
+    std::string session_key = get_str("sessionKey", "session_key");
     if (session_key.empty()) {
-        return core::Result<json>::Err("Missing required parameter: session_key");
+        return core::Result<json>::Err("Missing required parameter: sessionKey");
     }
 
     std::string message;
@@ -70,15 +82,9 @@ core::Result<json> method_agent(
     }
 
     // ✅ 对齐 OpenClaw: const idem = request.idempotencyKey
-    std::string idem;
-    if (params.contains("idempotency_key") && params["idempotency_key"].is_string()) {
-        idem = params["idempotency_key"].get<std::string>();
-    }
+    std::string idem = get_str("idempotencyKey", "idempotency_key");
     if (idem.empty()) {
-        // fallback: 使用 run_id 字段
-        if (params.contains("run_id") && params["run_id"].is_string()) {
-            idem = params["run_id"].get<std::string>();
-        }
+        idem = get_str("runId", "run_id");
     }
     if (idem.empty()) {
         idem = core::utils::generate_uuid();
@@ -89,29 +95,45 @@ core::Result<json> method_agent(
         deliver = params["deliver"].get<bool>();
     }
 
-    // input_provenance 字段（对齐 OpenClaw: inputProvenance）
+    // ✅ 对齐 OpenClaw: request.internalEvents
+    // 结构化内部事件，传递给 agentCommandFromIngress
+    json internal_events = json::array();
+    if (params.contains("internalEvents") && params["internalEvents"].is_array()) {
+        internal_events = params["internalEvents"];
+    } else if (params.contains("internal_events") && params["internal_events"].is_array()) {
+        internal_events = params["internal_events"];
+    }
+
+    // ✅ 对齐 OpenClaw: request.inputProvenance
+    // 同时支持 camelCase（inputProvenance）和 snake_case（input_provenance）
     std::string input_provenance_kind;
     std::string input_provenance_source_session_key;
     std::string input_provenance_source_tool;
-    if (params.contains("input_provenance") && params["input_provenance"].is_object()) {
-        const auto& prov = params["input_provenance"];
-        if (prov.contains("kind") && prov["kind"].is_string()) {
+    auto resolve_provenance = [&](const json& prov) {
+        if (!prov.is_object()) return;
+        // camelCase 优先（对齐 OpenClaw）
+        if (prov.contains("kind") && prov["kind"].is_string())
             input_provenance_kind = prov["kind"].get<std::string>();
-        }
-        if (prov.contains("source_session_key") && prov["source_session_key"].is_string()) {
+        // sourceSessionKey (camelCase) or source_session_key (snake_case)
+        if (prov.contains("sourceSessionKey") && prov["sourceSessionKey"].is_string())
+            input_provenance_source_session_key = prov["sourceSessionKey"].get<std::string>();
+        else if (prov.contains("source_session_key") && prov["source_session_key"].is_string())
             input_provenance_source_session_key = prov["source_session_key"].get<std::string>();
-        }
-        if (prov.contains("source_tool") && prov["source_tool"].is_string()) {
+        // sourceTool (camelCase) or source_tool (snake_case)
+        if (prov.contains("sourceTool") && prov["sourceTool"].is_string())
+            input_provenance_source_tool = prov["sourceTool"].get<std::string>();
+        else if (prov.contains("source_tool") && prov["source_tool"].is_string())
             input_provenance_source_tool = prov["source_tool"].get<std::string>();
-        }
-    }
-    // 也支持扁平字段（来自 attempt_delivery 的 inject_options 格式）
-    if (input_provenance_source_session_key.empty() && params.contains("source_session_key")) {
-        input_provenance_source_session_key = params["source_session_key"].get<std::string>();
-    }
-    if (input_provenance_source_tool.empty() && params.contains("source_tool")) {
-        input_provenance_source_tool = params["source_tool"].get<std::string>();
-    }
+    };
+    if (params.contains("inputProvenance"))
+        resolve_provenance(params["inputProvenance"]);
+    else if (params.contains("input_provenance"))
+        resolve_provenance(params["input_provenance"]);
+    // 也支持扁平字段（来自 inject_options 格式）
+    if (input_provenance_source_session_key.empty())
+        input_provenance_source_session_key = get_str("sourceSessionKey", "source_session_key");
+    if (input_provenance_source_tool.empty())
+        input_provenance_source_tool = get_str("sourceTool", "source_tool");
 
     // ========================================================================
     // Step 2: 幂等去重 (对齐 OpenClaw: context.dedupe.get("agent:{idem}"))
@@ -183,7 +205,7 @@ core::Result<json> method_agent(
     // ========================================================================
     // Step 5: 异步 dispatch（对齐 OpenClaw: dispatchAgentRunFromGateway）
     // ========================================================================
-    // 构建 process_message options，传递 run_id 和 deliver 标志
+    // 构建 process_message options，传递 run_id、deliver 标志和 internalEvents
     std::map<std::string, std::string> inject_options = {
         {"run_id", run_id},
         {"deliver", deliver ? "true" : "false"},
@@ -191,6 +213,8 @@ core::Result<json> method_agent(
         {"input_provenance_kind", input_provenance_kind.empty() ? "inter_session" : input_provenance_kind},
         {"input_provenance_source_session_key", input_provenance_source_session_key},
         {"input_provenance_source_tool", input_provenance_source_tool.empty() ? "subagent_announce" : input_provenance_source_tool},
+        // ✅ 对齐 OpenClaw: internalEvents 序列化传递
+        {"internal_events", internal_events.empty() ? "[]" : internal_events.dump()},
     };
 
     // ✅ 对齐 OpenClaw: dispatchAgentRunFromGateway (fire-and-forget)
