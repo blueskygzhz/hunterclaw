@@ -9,7 +9,6 @@
 
 #include "hunterclaw/tools/cron_tool.h"
 #include "hunterclaw/cron/gateway_integration.h"
-#include "hunterclaw/cron/normalize.h"
 #include "hunterclaw/cron/delivery.h"
 #include "hunterclaw/cron/types.h"
 #include "hunterclaw/tools/tool.h"
