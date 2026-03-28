@@ -531,6 +531,28 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
         return core::Result<std::string>::Err("ReactEngine not initialized");
     }
     
+    // ✅ 对齐 OpenClaw: 读取 deliver 选项
+    // OpenClaw: callGateway("agent", { deliver: true/false })
+    // deliver=true  → 父 Agent 是顶层用户 session，LLM 回复需要广播给用户
+    // deliver=false → 父 Agent 是 subagent session，LLM 回复仅内部传递，不广播
+    // 默认 deliver=true（普通 chat.send 路径不传此选项）
+    bool deliver = true;
+    {
+        auto it = options.find("deliver");
+        if (it != options.end()) {
+            deliver = (it->second != "false" && it->second != "0");
+        }
+    }
+    
+    // ✅ 对齐 OpenClaw: NO_REPLY token 检测
+    // 当 LLM 判断结果已经发过（重复），回复 ONLY: NO_REPLY
+    // HunterClaw 通过 suppress_block_chunks_ 抑制广播
+    // 注意：使用局部变量而非 static，避免 lambda 捕获 static 变量的编译错误
+    const std::string SILENT_REPLY_TOKEN = "NO_REPLY";
+    
+    spdlog::get("default")->debug("[AgentInstance] process_message: deliver={}, session={}",
+        deliver, ctx_.session_id);
+    
     // ✅ Overflow 重试配置 (对齐 OpenClaw)
     const int MAX_OVERFLOW_ATTEMPTS = 3;
     
@@ -590,7 +612,12 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
     // 5. 可选: Block Chunking (按段落/代码块切分)
     //
     // 本实现: 简化对齐版本 (带节流机制)
-    callbacks.on_assistant_delta = [this](const std::string& delta) {
+    callbacks.on_assistant_delta = [this, deliver, SILENT_REPLY_TOKEN](const std::string& delta) {
+        // ✅ 对齐 OpenClaw: deliver=false 时不广播 delta
+        if (!deliver) {
+            return;
+        }
+        
         // 1. 累积 delta (对齐 OpenClaw deltaBuffer)
         assistant_buffer_ += delta;
         
@@ -649,10 +676,17 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
     // 5. 发射 WebSocket 事件 (emitBlockReplySafely)
     //
     // 本实现: 核心对齐版本 (简化了 reply directives 解析)
-    callbacks.on_block_reply = [this](const std::string& block) {
+    callbacks.on_block_reply = [this, deliver, SILENT_REPLY_TOKEN](const std::string& block) {
         // 1. 动态抑制检测 (对齐 OpenClaw:478)
         if (suppress_block_chunks_) {
             spdlog::get("default")->trace("[AgentInstance] Block reply suppressed by suppress_block_chunks_");
+            return;
+        }
+        
+        // ✅ 对齐 OpenClaw: deliver=false 时不广播给用户
+        // 这是 subagent announce 注入父 agent 时的路径（内部传递）
+        if (!deliver) {
+            spdlog::get("default")->debug("[AgentInstance] Block reply suppressed: deliver=false (subagent internal)");
             return;
         }
         
@@ -672,6 +706,14 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
         // 3. 去重检查 (对齐 OpenClaw:488-490)
         if (cleaned == last_block_reply_text_) {
             spdlog::get("default")->trace("[AgentInstance] Block reply duplicate: already sent");
+            return;
+        }
+        
+        // ✅ 对齐 OpenClaw: NO_REPLY token 检测
+        // LLM 判断结果已发过时，回复 ONLY: NO_REPLY，此时抑制广播
+        if (cleaned == SILENT_REPLY_TOKEN || cleaned.find(SILENT_REPLY_TOKEN) != std::string::npos) {
+            spdlog::get("default")->debug("[AgentInstance] Block reply suppressed: NO_REPLY token detected");
+            suppress_block_chunks_ = true;  // 后续 delta 也抑制
             return;
         }
         
