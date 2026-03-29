@@ -57,6 +57,9 @@ private:
     /// 保存音频到临时文件
     std::string save_audio_to_temp(const std::string& audio_data, const std::string& format);
     
+    /// 创建错误结果
+    ToolResult make_error(const std::string& msg) const;
+    
     ToolContext context_;
     std::shared_ptr<infra::HttpClient> http_client_;
 };

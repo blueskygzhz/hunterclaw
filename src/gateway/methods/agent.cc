@@ -349,11 +349,13 @@ core::Result<json> method_agent(
 
         std::thread([msg_dispatcher, agent_params, &cmd_queue, session_lane]() mutable {
             try {
+                // ✅ 使用 std::function<void()> 避免 C++11 local type 实例化模板的限制
+                std::function<void()> task = [msg_dispatcher, agent_params]() mutable {
+                    msg_dispatcher->run_reply_agent(agent_params);
+                };
                 auto future = cmd_queue.enqueue_command_in_lane(
                     session_lane,
-                    [msg_dispatcher, agent_params]() mutable {
-                        msg_dispatcher->run_reply_agent(agent_params);
-                    },
+                    std::move(task),
                     queue::EnqueueOptions{.label = agent_params.label, .urgent = false}
                 );
                 future.get();

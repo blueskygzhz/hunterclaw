@@ -27,6 +27,7 @@
 #include "hunterclaw/llm/llm_client.h"
 #include "hunterclaw/core/utils.h"
 #include "hunterclaw/agents/agent_pool.h"      // ✅ 对齐 OpenClaw: ACP dispatch 需要 agent_pool
+#include "hunterclaw/agents/agent_instance.h"  // ✅ 需要完整类型以访问 context().last_channel 等字段
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
@@ -429,7 +430,7 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
     // ── Step 6: ACP dispatch ─────────────────────────────────────────────────
     // Aligned with openclaw: tryDispatchAcpReply (bypassForCommand passed through)
     if (config.dispatch.enable_acp) {
-        auto acp_result = try_dispatch_acp_reply(message);
+        auto acp_result = try_dispatch_acp_reply(message, delivery_to);
         if (acp_result.handled) {
             result.success = true;
             log()->info("dispatch_reply_from_config: handled by ACP");
@@ -556,9 +557,9 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
                 auto& ctx = dispatch_agent->context();
                 ctx.last_channel    = captured_message.channel;
                 ctx.last_to         = captured_delivery_to;
-                ctx.last_account_id = captured_message.account_id;
-                ctx.last_thread_id  = captured_message.thread_id;
-                ctx.last_reply_to_id = captured_message.reply_to_id;
+                ctx.last_account_id = captured_message.account_id.value_or("");
+                ctx.last_thread_id  = captured_message.thread_id.value_or("");
+                ctx.last_reply_to_id = captured_message.reply_to_id.value_or("");
                 log()->debug("dispatch_reply_from_config: updated agent context channel={} to={}",
                              captured_message.channel, captured_delivery_to);
             }
@@ -659,7 +660,7 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
         // ── Step 11: AcpDispatchTailAfterReset ───────────────────────────
         if (gen_result.acp_dispatch_tail_after_reset && captured_config.dispatch.enable_acp) {
             log()->info("dispatch_reply_from_config: AcpDispatchTailAfterReset — routing tail to ACP");
-            auto acp_tail_result = try_dispatch_acp_reply(captured_message);
+            auto acp_tail_result = try_dispatch_acp_reply(captured_message, captured_delivery_to);
             if (acp_tail_result.handled) {
                 inner_result.success = true;
                 log()->debug("dispatch_reply_from_config: markIdle session={} reason=message_completed",
@@ -1477,7 +1478,8 @@ MessageDispatcher::FastAbortResult MessageDispatcher::try_fast_abort_from_messag
 // ============================================================================
 
 MessageDispatcher::AcpDispatchResult MessageDispatcher::try_dispatch_acp_reply(
-    const channels::InboundMessage& message
+    const channels::InboundMessage& message,
+    const std::string& delivery_to
 ) {
     // Aligned with openclaw: tryDispatchAcpReply (dispatch-acp.ts)
     //
@@ -1594,6 +1596,59 @@ MessageDispatcher::AcpDispatchResult MessageDispatcher::try_dispatch_acp_reply(
         {"source_tool", "acp_dispatch"},
     };
 
+    // ✅ 对齐 OpenClaw: 更新 ACP agent context 中的 channel 信息
+    // 用于 on_block_reply 中构建 deliver 函数（通过 method_agent 路径）
+    // 同时直接注入 deliver_fn_（避免依赖 method_agent 路径）
+    {
+        auto& ctx = acp_agent->context();
+        ctx.last_channel    = message.channel;
+        ctx.last_to         = delivery_to.empty() ? message.sender_id : delivery_to;
+        ctx.last_account_id = message.account_id.value_or("");
+        ctx.last_thread_id  = message.thread_id.value_or("");
+        ctx.last_reply_to_id = message.reply_to_id.value_or("");
+    }
+
+    // ✅ 对齐 OpenClaw: 注入 deliver_fn_（channel-specific 发送函数）
+    // 对应 OpenClaw: delivery.deliver("block", payload) → dispatcher.sendBlockReply → options.deliver → channel.send()
+    if (delivery_queue_) {
+        auto captured_delivery_queue = delivery_queue_;
+        auto captured_channel = message.channel;
+        auto captured_to = delivery_to.empty() ? message.sender_id : delivery_to;
+        auto captured_account_id = message.account_id.value_or("");
+        auto captured_thread_id = message.thread_id.value_or("");
+        auto captured_reply_to_id = message.reply_to_id.value_or("");
+
+        acp_agent->set_deliver_fn([captured_delivery_queue,
+                                   captured_channel,
+                                   captured_to,
+                                   captured_account_id,
+                                   captured_thread_id,
+                                   captured_reply_to_id](const std::string& text) {
+            ::hunterclaw::queue::MessagePayload payload;
+            payload.text = text;
+
+            ::hunterclaw::outbound::DeliverOutboundPayloadsParams params;
+            params.channel      = captured_channel;
+            params.to           = captured_to;
+            params.payloads     = {payload};
+            params.delivery_queue = captured_delivery_queue;
+            params.skip_queue   = false;
+            params.best_effort  = true;
+            params.silent       = false;
+            if (!captured_account_id.empty()) params.account_id = captured_account_id;
+            if (!captured_thread_id.empty())  params.thread_id  = captured_thread_id;
+            if (!captured_reply_to_id.empty()) params.reply_to_id = captured_reply_to_id;
+
+            auto deliver_result = ::hunterclaw::outbound::deliver_outbound_payloads(params);
+            if (!deliver_result.is_ok()) {
+                spdlog::get("default")->warn(
+                    "try_dispatch_acp_reply: deliver_fn failed: channel={} to={} error={}",
+                    captured_channel, captured_to, deliver_result.error
+                );
+            }
+        });
+    }
+
     // ✅ 对齐 OpenClaw: 异步执行（fire-and-forget，不阻塞当前线程）
     // OpenClaw: await acpManager.runTurn(...) 是 async，但在 dispatch-acp.ts 中是 await
     // HunterClaw: 在后台线程执行，避免阻塞 dispatch_reply_from_config
@@ -1606,9 +1661,12 @@ MessageDispatcher::AcpDispatchResult MessageDispatcher::try_dispatch_acp_reply(
             } else {
                 log()->info("try_dispatch_acp_reply: ACP turn completed: session={}", session_key);
             }
+            // ✅ 清理 deliver_fn_（避免悬空引用）
+            acp_agent->set_deliver_fn(nullptr);
         } catch (const std::exception& e) {
             log()->error("try_dispatch_acp_reply: ACP process_message exception: session={} error={}",
                          session_key, e.what());
+            acp_agent->set_deliver_fn(nullptr);
         }
     }).detach();
 

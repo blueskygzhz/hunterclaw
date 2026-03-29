@@ -62,8 +62,8 @@ std::string TtsTool::description() const {
            "reply with " + SILENT_REPLY_TOKEN + " after a successful call to avoid duplicate messages.";
 }
 
-Schema TtsTool::parameters() const {
-    Schema schema;
+Tool::Schema TtsTool::parameters() const {
+    Tool::Schema schema;
     schema.type = "object";
 
     auto make_str = [](const std::string& desc) {
@@ -187,17 +187,22 @@ ToolResult TtsTool::provider_openai(const std::string& text, const core::JsonVal
 
     if (!http_client_) return make_error("HTTP client not available");
 
-    auto response = http_client_->post(
+    infra::HttpRequestOptions req_opts;
+    req_opts.headers["Authorization"] = "Bearer " + api_key;
+    req_opts.headers["Content-Type"]  = "application/json";
+    req_opts.body = body.dump();
+    req_opts.timeout_ms = 30000;
+
+    auto response_result = http_client_->post(
         "https://api.openai.com/v1/audio/speech",
-        body.dump(),
-        {
-            {"Authorization", "Bearer " + api_key},
-            {"Content-Type",  "application/json"},
-        }
+        req_opts
     );
 
+    if (!response_result.is_ok())
+        return make_error("OpenAI TTS failed: " + response_result.error);
+    auto& response = response_result.value;
     if (!response.ok)
-        return make_error("OpenAI TTS failed: " + response.error);
+        return make_error("OpenAI TTS failed: HTTP " + std::to_string(response.status_code));
 
     // Save audio to temp file
     std::string audio_path = save_audio_to_temp(response.body, "mp3");
@@ -239,18 +244,23 @@ ToolResult TtsTool::provider_elevenlabs(const std::string& text, const core::Jso
 
     if (!http_client_) return make_error("HTTP client not available");
 
-    auto response = http_client_->post(
+    infra::HttpRequestOptions req_opts;
+    req_opts.headers["xi-api-key"]   = api_key;
+    req_opts.headers["Content-Type"] = "application/json";
+    req_opts.headers["Accept"]       = "audio/mpeg";
+    req_opts.body = body.dump();
+    req_opts.timeout_ms = 30000;
+
+    auto response_result = http_client_->post(
         "https://api.elevenlabs.io/v1/text-to-speech/" + voice_id,
-        body.dump(),
-        {
-            {"xi-api-key",   api_key},
-            {"Content-Type", "application/json"},
-            {"Accept",       "audio/mpeg"},
-        }
+        req_opts
     );
 
+    if (!response_result.is_ok())
+        return make_error("ElevenLabs TTS failed: " + response_result.error);
+    auto& response = response_result.value;
     if (!response.ok)
-        return make_error("ElevenLabs TTS failed: " + response.error);
+        return make_error("ElevenLabs TTS failed: HTTP " + std::to_string(response.status_code));
 
     std::string audio_path = save_audio_to_temp(response.body, "mp3");
     if (audio_path.empty())

@@ -192,7 +192,8 @@ private:
         std::string response;
     };
     AcpDispatchResult try_dispatch_acp_reply(
-        const channels::InboundMessage& message
+        const channels::InboundMessage& message,
+        const std::string& delivery_to = ""
     );
     
     // ✅ 权限检查
