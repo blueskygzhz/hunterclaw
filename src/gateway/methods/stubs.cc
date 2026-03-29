@@ -7,6 +7,8 @@
 #include "hunterclaw/gateway/gateway.h"
 #include "hunterclaw/gateway/method_guard.h"
 #include "hunterclaw/core/utils.h"
+#include "hunterclaw/infra/heartbeat_events.h"
+#include "hunterclaw/infra/heartbeat_wake.h"
 #include <nlohmann/json.hpp>
 #include <chrono>
 #include <fstream>
@@ -1091,6 +1093,9 @@ core::Result<json> method_voicewake_set(
 // ============================================================================
 
 // last-heartbeat
+// 🎯 OpenClaw 对齐: systemHandlers["last-heartbeat"]
+//   respond(true, getLastHeartbeatEvent(), undefined)
+// 返回完整的 HeartbeatEventPayload (ts, status, to, preview, durationMs, hasMedia, reason, channel, ...)
 core::Result<json> method_last_heartbeat(
     std::shared_ptr<GatewayServer> server,
     std::shared_ptr<MethodGuard> method_guard,
@@ -1098,21 +1103,57 @@ core::Result<json> method_last_heartbeat(
     const json& params
 ) {
     (void)server; (void)method_guard; (void)client_ctx; (void)params;
+    // Aligned with openclaw: respond(true, getLastHeartbeatEvent(), undefined)
+    auto last = hunterclaw::infra::get_last_heartbeat_event();
+    if (!last.has_value()) {
+        // Aligned with openclaw: getLastHeartbeatEvent() returns null when no heartbeat has run
+        return core::Result<json>::Ok(json(nullptr));
+    }
+    const auto& evt = last.value();
     json result;
-    result["ts"] = now_ms();
+    result["ts"]     = evt.ts;
+    result["status"] = evt.status;
+    if (evt.to.has_value())           result["to"]         = evt.to.value();
+    if (evt.account_id.has_value())   result["accountId"]  = evt.account_id.value();
+    if (evt.preview.has_value())      result["preview"]    = evt.preview.value();
+    if (evt.duration_ms.has_value())  result["durationMs"] = evt.duration_ms.value();
+    if (evt.has_media.has_value())    result["hasMedia"]   = evt.has_media.value();
+    if (evt.reason.has_value())       result["reason"]     = evt.reason.value();
+    if (evt.channel.has_value())      result["channel"]    = evt.channel.value();
+    if (evt.silent.has_value())       result["silent"]     = evt.silent.value();
+    if (evt.indicator_type.has_value()) {
+        switch (evt.indicator_type.value()) {
+            case hunterclaw::infra::HeartbeatIndicatorType::Ok:    result["indicatorType"] = "ok";    break;
+            case hunterclaw::infra::HeartbeatIndicatorType::Alert: result["indicatorType"] = "alert"; break;
+            case hunterclaw::infra::HeartbeatIndicatorType::Error: result["indicatorType"] = "error"; break;
+        }
+    }
     STUB_METHOD_OK(result);
 }
 
 // set-heartbeats
+// 🎯 OpenClaw 对齐: systemHandlers["set-heartbeats"]
+//   setHeartbeatsEnabled(enabled)
+//   respond(true, { ok: true, enabled }, undefined)
 core::Result<json> method_set_heartbeats(
     std::shared_ptr<GatewayServer> server,
     std::shared_ptr<MethodGuard> method_guard,
     const ClientContext& client_ctx,
     const json& params
 ) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
+    (void)server; (void)method_guard; (void)client_ctx;
+    // Aligned with openclaw: validate enabled (boolean) required
+    if (!params.contains("enabled") || !params["enabled"].is_boolean()) {
+        return core::Result<json>::Err(
+            "invalid set-heartbeats params: enabled (boolean) required"
+        );
+    }
+    bool enabled = params["enabled"].get<bool>();
+    // Aligned with openclaw: setHeartbeatsEnabled(enabled)
+    hunterclaw::infra::set_heartbeats_enabled(enabled);
     json result;
-    result["ok"] = true;
+    result["ok"]      = true;
+    result["enabled"] = enabled;
     STUB_METHOD_OK(result);
 }
 

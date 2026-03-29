@@ -2,11 +2,18 @@
 #include "hunterclaw/gateway/connection_pool.h"
 #include "hunterclaw/gateway/server_lanes.h"  // 对齐 OpenClaw: applyGatewayLaneConcurrency
 #include "hunterclaw/agents/agent_pool.h"
+#include "hunterclaw/agents/agent_instance.h"
 #include "hunterclaw/cron/service.h"
 #include "hunterclaw/core/utils.h"
 #include "hunterclaw/observability/diagnostic_events.h"  // ✅ 可观测性集成
 #include "hunterclaw/auto_reply/message_dispatcher.h"    // ✅ MessageDispatcher (queue mode)
 #include "hunterclaw/queue/delivery_queue.h"             // ✅ DeliveryQueue (deliver 函数)
+#include "hunterclaw/queue/command_queue.h"              // ✅ CommandQueue::Instance().get_queue_size (aligned with openclaw: getQueueSize)
+#include "hunterclaw/queue/lanes.h"                      // ✅ CommandLane::Main
+#include "hunterclaw/infra/heartbeat_events.h"           // ✅ Heartbeat event broadcast (aligned with openclaw)
+#include "hunterclaw/infra/heartbeat_runner.h"           // ✅ startHeartbeatRunner (aligned with openclaw)
+#include "hunterclaw/infra/heartbeat_wake.h"             // ✅ set_heartbeats_enabled (aligned with openclaw)
+#include "hunterclaw/cron/service.h"                     // ✅ CronService (aligned with openclaw: buildGatewayCronService)
 #include <websocketpp/config/asio_no_tls.hpp>
 #include <websocketpp/server.hpp>
 #include <nlohmann/json.hpp>
@@ -1861,6 +1868,15 @@ struct GatewayServer::Impl {
     std::shared_ptr<skills::SkillManager> skill_mgr;
     std::shared_ptr<plugins::PluginManager> plugin_mgr;
     std::shared_ptr<agents::AgentPool> agent_pool;  // 🏢 Multi-tenant Agent Pool
+    // ✅ Heartbeat event listener disposer (aligned with openclaw: onHeartbeatEvent)
+    // Registered in start(), cleared in stop()
+    std::function<void()> heartbeat_event_disposer;
+    // ✅ HeartbeatRunner (aligned with openclaw: startHeartbeatRunner)
+    // Aligned with openclaw server.impl.ts: let heartbeatRunner = startHeartbeatRunner({ cfg })
+    std::shared_ptr<hunterclaw::infra::HeartbeatRunner> heartbeat_runner;
+    // ✅ CronService (aligned with openclaw: buildGatewayCronService)
+    // Aligned with openclaw server.impl.ts: let cronState = buildGatewayCronService({ cfg, deps, broadcast })
+    std::shared_ptr<cron::CronService> cron_service;
     // ✅ MessageDispatcher (对齐 OpenClaw: dispatchInboundMessage)
     // chat.send 通过 message_dispatcher->run_reply_agent() 调度，
     // 使四种 queue mode (steer/followup/collect/interrupt) 对 chat.send 生效
@@ -1948,6 +1964,210 @@ core::Result<bool> GatewayServer::start() {
     auto result = impl_->server_impl->start();
     if (result.is_ok()) {
         impl_->running.store(true);
+
+        // ✅ Aligned with openclaw: server.impl.ts
+        //   onHeartbeatEvent((evt) => {
+        //     broadcast("heartbeat", evt, { dropIfSlow: true });
+        //   });
+        // Register heartbeat event → broadcast("heartbeat") pipeline
+        auto server_impl_weak = std::weak_ptr<GatewayServerImpl>(impl_->server_impl);
+        impl_->heartbeat_event_disposer = hunterclaw::infra::on_heartbeat_event(
+            [server_impl_weak](const hunterclaw::infra::HeartbeatEventPayload& evt) {
+                auto server_impl = server_impl_weak.lock();
+                if (!server_impl) return;
+
+                // Build heartbeat event payload (aligned with openclaw HeartbeatEventPayload)
+                json payload;
+                payload["ts"]     = evt.ts;
+                payload["status"] = evt.status;
+                if (evt.to.has_value())           payload["to"]         = evt.to.value();
+                if (evt.account_id.has_value())   payload["accountId"]  = evt.account_id.value();
+                if (evt.preview.has_value())      payload["preview"]    = evt.preview.value();
+                if (evt.duration_ms.has_value())  payload["durationMs"] = evt.duration_ms.value();
+                if (evt.has_media.has_value())    payload["hasMedia"]   = evt.has_media.value();
+                if (evt.reason.has_value())       payload["reason"]     = evt.reason.value();
+                if (evt.channel.has_value())      payload["channel"]    = evt.channel.value();
+                if (evt.silent.has_value())       payload["silent"]     = evt.silent.value();
+                if (evt.indicator_type.has_value()) {
+                    switch (evt.indicator_type.value()) {
+                        case hunterclaw::infra::HeartbeatIndicatorType::Ok:
+                            payload["indicatorType"] = "ok";    break;
+                        case hunterclaw::infra::HeartbeatIndicatorType::Alert:
+                            payload["indicatorType"] = "alert"; break;
+                        case hunterclaw::infra::HeartbeatIndicatorType::Error:
+                            payload["indicatorType"] = "error"; break;
+                    }
+                }
+
+                // Aligned with openclaw: broadcast("heartbeat", evt, { dropIfSlow: true })
+                core::EventFrame ef;
+                ef.event = "heartbeat";
+                ef.payload = payload;
+                server_impl->broadcast(ef, /*drop_if_slow=*/true, nullptr);
+            }
+        );
+
+        // ✅ Aligned with openclaw: startHeartbeatRunner({ cfg: cfgAtStart })
+        // Aligned with openclaw server.impl.ts:
+        //   let heartbeatRunner = startHeartbeatRunner({ cfg: cfgAtStart });
+        // The runner registers a HeartbeatWakeHandler and schedules timers.
+        // Aligned with openclaw: runHeartbeatOnce is self-contained (calls getReplyFromConfig
+        // internally). In HunterClaw, we inject reply_fn + get_queue_size via run_once_fn
+        // so the timer path has a real LLM callback.
+        {
+            hunterclaw::infra::HeartbeatRunnerConfig runner_cfg;
+            // ── Populate agents from config ──────────────────────────────────
+            // Aligned with openclaw: resolveHeartbeatAgents(cfg) → agents list
+            // Read agents[].heartbeat from config JSON data.
+            if (impl_->config) {
+                const auto& data = impl_->config->data;
+                // Try agents.list[] (openclaw schema)
+                if (data.contains("agents") && data["agents"].is_object()
+                    && data["agents"].contains("list") && data["agents"]["list"].is_array()) {
+                    for (const auto& entry : data["agents"]["list"]) {
+                        if (!entry.is_object()) continue;
+                        if (!entry.contains("heartbeat")) continue;
+                        hunterclaw::infra::HeartbeatAgentConfig agent_cfg;
+                        agent_cfg.agent_id = entry.value("id", "");
+                        if (agent_cfg.agent_id.empty()) continue;
+                        agent_cfg.workspace_path = entry.value("workspace", "");
+                        const auto& hb = entry["heartbeat"];
+                        if (hb.contains("every") && hb["every"].is_string())
+                            agent_cfg.every = hb["every"].get<std::string>();
+                        if (hb.contains("prompt") && hb["prompt"].is_string())
+                            agent_cfg.prompt = hb["prompt"].get<std::string>();
+                        if (hb.contains("model") && hb["model"].is_string())
+                            agent_cfg.model = hb["model"].get<std::string>();
+                        if (hb.contains("session") && hb["session"].is_string())
+                            agent_cfg.session = hb["session"].get<std::string>();
+                        if (hb.contains("target") && hb["target"].is_string())
+                            agent_cfg.target = hb["target"].get<std::string>();
+                        if (hb.contains("accountId") && hb["accountId"].is_string())
+                            agent_cfg.account_id = hb["accountId"].get<std::string>();
+                        if (hb.contains("showOk") && hb["showOk"].is_boolean())
+                            agent_cfg.show_ok = hb["showOk"].get<bool>();
+                        if (hb.contains("showAlerts") && hb["showAlerts"].is_boolean())
+                            agent_cfg.show_alerts = hb["showAlerts"].get<bool>();
+                        if (hb.contains("useIndicator") && hb["useIndicator"].is_boolean())
+                            agent_cfg.use_indicator = hb["useIndicator"].get<bool>();
+                        if (hb.contains("lightContext") && hb["lightContext"].is_boolean())
+                            agent_cfg.light_context = hb["lightContext"].get<bool>();
+                        if (hb.contains("suppressToolErrorWarnings") && hb["suppressToolErrorWarnings"].is_boolean())
+                            agent_cfg.suppress_tool_error_warnings = hb["suppressToolErrorWarnings"].get<bool>();
+                        runner_cfg.agents.push_back(std::move(agent_cfg));
+                    }
+                }
+                // Fallback: use agents[] directly (hunterclaw schema)
+                if (runner_cfg.agents.empty() && !impl_->config->agents.empty()) {
+                    for (const auto& a : impl_->config->agents) {
+                        hunterclaw::infra::HeartbeatAgentConfig agent_cfg;
+                        agent_cfg.agent_id = a.id;
+                        agent_cfg.workspace_path = a.workspace;
+                        // Default 30m interval — will be overridden by config if present
+                        agent_cfg.every = "30m";
+                        runner_cfg.agents.push_back(std::move(agent_cfg));
+                    }
+                }
+                // User timezone
+                if (data.contains("agents") && data["agents"].is_object()
+                    && data["agents"].contains("defaults") && data["agents"]["defaults"].is_object()) {
+                    const auto& defaults = data["agents"]["defaults"];
+                    if (defaults.contains("userTimezone") && defaults["userTimezone"].is_string())
+                        runner_cfg.user_timezone = defaults["userTimezone"].get<std::string>();
+                }
+            }
+
+            // ── Build run_once_fn with injected reply_fn + get_queue_size ────
+            // Aligned with openclaw: runHeartbeatOnce({ cfg, agentId, sessionKey, heartbeat, deps })
+            // deps.getQueueSize → CommandQueue::Instance().get_queue_size(CommandLane::Main)
+            // reply_fn → agent_pool->get_or_create_agent(session_key, agent_id)->process_message(prompt)
+            auto agent_pool_weak = std::weak_ptr<agents::AgentPool>(impl_->agent_pool);
+            auto cfg_weak = std::weak_ptr<core::Config>(impl_->config);
+
+            auto heartbeat_reply_fn = [agent_pool_weak, cfg_weak](
+                const hunterclaw::infra::HeartbeatReplyRequest& req
+            ) -> hunterclaw::infra::HeartbeatReplyResult {
+                // Aligned with openclaw: getReplyFromConfig(ctx, replyOpts, cfg)
+                // ctx.Body = prompt, ctx.SessionKey = session_key, ctx.Provider = provider
+                auto agent_pool = agent_pool_weak.lock();
+                if (!agent_pool) {
+                    return {};  // no-op: pool gone
+                }
+                const std::string& session_key = req.session_key;
+                const std::string& agent_id    = req.agent_id;
+                // Get or create agent for this session
+                auto agent = agent_pool->get_or_create_agent(
+                    session_key.empty() ? agent_id : session_key,
+                    agent_id.empty() ? std::optional<std::string>{} : agent_id
+                );
+                if (!agent) {
+                    return {};
+                }
+                // Build options for process_message
+                std::map<std::string, std::string> opts;
+                opts["is_heartbeat"] = "true";
+                opts["provider"]     = req.provider;
+                if (req.model_override.has_value())
+                    opts["model_override"] = req.model_override.value();
+                if (req.light_context)
+                    opts["bootstrap_context_mode"] = "lightweight";
+                if (req.suppress_tool_error_warnings)
+                    opts["suppress_tool_error_warnings"] = "true";
+                // Delivery target hints (for channel plugins)
+                if (req.originating_channel.has_value())
+                    opts["originating_channel"] = req.originating_channel.value();
+                if (req.originating_to.has_value())
+                    opts["originating_to"] = req.originating_to.value();
+                if (req.account_id.has_value())
+                    opts["account_id"] = req.account_id.value();
+                if (req.thread_id.has_value())
+                    opts["thread_id"] = req.thread_id.value();
+
+                // Invoke the agent
+                auto result = agent->process_message(req.prompt, opts);
+
+                hunterclaw::infra::HeartbeatReplyResult reply;
+                if (result.is_ok()) {
+                    reply.text       = result.get();
+                    reply.has_target = true;
+                    // Delivery target: use originating channel/to if available
+                    if (req.originating_channel.has_value())
+                        reply.channel = req.originating_channel;
+                    if (req.originating_to.has_value())
+                        reply.to = req.originating_to;
+                } else {
+                    // Propagate error as exception so run_heartbeat_once emits "failed"
+                    throw std::runtime_error(result.error);
+                }
+                return reply;
+            };
+
+            // Build run_once_fn: wraps run_heartbeat_once with injected deps
+            // Aligned with openclaw: runOnce = runHeartbeatOnce (self-contained)
+            auto run_once_fn = [runner_cfg, heartbeat_reply_fn](
+                const hunterclaw::infra::HeartbeatAgentConfig& agent,
+                const hunterclaw::infra::HeartbeatRunOnceOptions& base_opts
+            ) -> hunterclaw::infra::HeartbeatRunResult {
+                hunterclaw::infra::HeartbeatRunOnceOptions opts = base_opts;
+                // Inject reply_fn if not already set
+                if (!opts.reply_fn) {
+                    opts.reply_fn = heartbeat_reply_fn;
+                }
+                // Inject get_queue_size (aligned with openclaw: deps.getQueueSize)
+                if (!opts.get_queue_size) {
+                    opts.get_queue_size = [](const std::string& /*lane*/) -> int {
+                        return static_cast<int>(
+                            hunterclaw::queue::CommandQueue::Instance()
+                                .get_queue_size(hunterclaw::queue::CommandLane::Main)
+                        );
+                    };
+                }
+                return hunterclaw::infra::run_heartbeat_once(runner_cfg, agent, opts);
+            };
+
+            impl_->heartbeat_runner = hunterclaw::infra::start_heartbeat_runner(
+                runner_cfg, run_once_fn);
+        }
     }
     return result;
 }
@@ -1955,6 +2175,17 @@ core::Result<bool> GatewayServer::start() {
 core::Result<bool> GatewayServer::stop() {
     if (!impl_->running.load()) {
         return core::Result<bool>::Err("Server not running");
+    }
+    // ✅ Aligned with openclaw: stop heartbeat runner before stopping server
+    // Aligned with openclaw server-close.ts: heartbeatRunner.stop()
+    if (impl_->heartbeat_runner) {
+        impl_->heartbeat_runner->stop();
+        impl_->heartbeat_runner = nullptr;
+    }
+    // ✅ Aligned with openclaw: dispose heartbeat event listener before stopping
+    if (impl_->heartbeat_event_disposer) {
+        impl_->heartbeat_event_disposer();
+        impl_->heartbeat_event_disposer = nullptr;
     }
     auto result = impl_->server_impl->stop();
     if (result.is_ok()) {
@@ -2016,9 +2247,9 @@ std::shared_ptr<plugins::PluginManager> GatewayServer::plugin_manager() const {
 }
 
 std::shared_ptr<cron::CronService> GatewayServer::cron_service() const {
-    // CronService is not yet integrated into GatewayServer::Impl
-    // cron.cc methods handle nullptr gracefully
-    return nullptr;
+    // ✅ Aligned with openclaw: buildGatewayCronService returns { cron, storePath, cronEnabled }
+    // cron.cc methods handle nullptr gracefully when cron_service is not yet initialized
+    return impl_->cron_service;
 }
 
 std::shared_ptr<GatewayRuntimeState> GatewayServer::runtime_state() const {

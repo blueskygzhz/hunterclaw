@@ -2,6 +2,12 @@
 #include "hunterclaw/gateway/method_guard.h"
 #include "hunterclaw/cron/service.h"
 #include "hunterclaw/core/utils.h"
+#include "hunterclaw/infra/heartbeat_runner.h"
+#include "hunterclaw/infra/heartbeat_wake.h"
+#include "hunterclaw/agents/agent_pool.h"     // ✅ reply_fn: agent_pool->get_or_create_agent
+#include "hunterclaw/agents/agent_instance.h" // ✅ reply_fn: agent->process_message
+#include "hunterclaw/queue/command_queue.h"   // ✅ get_queue_size: CommandQueue::Instance()
+#include "hunterclaw/queue/lanes.h"           // ✅ CommandLane::Main
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <filesystem>
@@ -247,6 +253,9 @@ static bool validate_cron_run_log_job_id(const std::string& id) {
 // ---------------------------------------------------------------------------
 // wake - 触发心跳唤醒
 // 对应 OpenClaw server-methods/cron.ts: wake handler
+// Aligned with openclaw:
+//   mode="now"            → runHeartbeatOnce directly (wakeMode=now)
+//   mode="next-heartbeat" → requestHeartbeatNow (schedule-based)
 // ---------------------------------------------------------------------------
 core::Result<json> method_wake(
     std::shared_ptr<GatewayServer> server,
@@ -257,7 +266,9 @@ core::Result<json> method_wake(
     // 🎯 OpenClaw 对齐: validateWakeParams
     // 对应 OpenClaw protocol/schema: WakeParamsSchema
     //   mode?: "now" | "next-heartbeat"
-    //   text?: string
+    //   reason?: string
+    //   agentId?: string
+    //   sessionKey?: string
     if (params.contains("mode") && params["mode"].is_string()) {
         std::string mode = params["mode"].get<std::string>();
         if (mode != "now" && mode != "next-heartbeat") {
@@ -268,16 +279,97 @@ core::Result<json> method_wake(
         return core::Result<json>::Err("invalid wake params: mode must be a string");
     }
 
-    std::string mode = params.value("mode", "next-heartbeat");
-    std::string text = params.value("text", "");
+    const std::string mode     = params.value("mode", "next-heartbeat");
+    const std::string reason   = params.value("reason", "wake");
+    const std::string agent_id = params.value("agentId", "");
+    const std::string session_key = params.value("sessionKey", "");
 
-    // Align with OpenClaw: context.cron.wake({ mode, text })
-    auto cron_svc = server->cron_service();
-    // Note: CronService::wake() not implemented; return default result
-    json result;
-    result["woke"] = (mode == "now");
-    result["mode"] = mode;
-    return core::Result<json>::Ok(result);
+    if (mode == "now") {
+        // Aligned with openclaw: wakeMode=now → runHeartbeatOnce directly
+        // Aligned with openclaw server-cron.ts:
+        //   runHeartbeatOnce({ cfg, agentId, sessionKey, reason, deps })
+        hunterclaw::infra::HeartbeatRunnerConfig runner_cfg;
+        hunterclaw::infra::HeartbeatAgentConfig  agent_cfg;
+        agent_cfg.agent_id = agent_id;
+
+        hunterclaw::infra::HeartbeatRunOnceOptions opts;
+        opts.reason = reason.empty() ? std::optional<std::string>{} : reason;
+        if (!agent_id.empty())    opts.agent_id    = agent_id;
+        if (!session_key.empty()) opts.session_key = session_key;
+
+        // ✅ Aligned with openclaw: inject reply_fn (getReplyFromConfig equivalent)
+        // Aligned with openclaw server-cron.ts: runHeartbeatOnce({ deps: { ...params.deps } })
+        // deps.getQueueSize → CommandQueue::Instance().get_queue_size(CommandLane::Main)
+        // reply_fn → agent_pool->get_or_create_agent(session_key, agent_id)->process_message(prompt)
+        auto agent_pool = server->agent_pool();
+        if (agent_pool) {
+            opts.reply_fn = [agent_pool](const hunterclaw::infra::HeartbeatReplyRequest& req)
+                -> hunterclaw::infra::HeartbeatReplyResult
+            {
+                const std::string& sk = req.session_key;
+                const std::string& aid = req.agent_id;
+                auto agent = agent_pool->get_or_create_agent(
+                    sk.empty() ? aid : sk,
+                    aid.empty() ? std::optional<std::string>{} : aid
+                );
+                if (!agent) return {};
+                std::map<std::string, std::string> msg_opts;
+                msg_opts["is_heartbeat"] = "true";
+                msg_opts["provider"]     = req.provider;
+                if (req.model_override.has_value())
+                    msg_opts["model_override"] = req.model_override.value();
+                if (req.light_context)
+                    msg_opts["bootstrap_context_mode"] = "lightweight";
+                if (req.suppress_tool_error_warnings)
+                    msg_opts["suppress_tool_error_warnings"] = "true";
+                if (req.originating_channel.has_value())
+                    msg_opts["originating_channel"] = req.originating_channel.value();
+                if (req.originating_to.has_value())
+                    msg_opts["originating_to"] = req.originating_to.value();
+                if (req.account_id.has_value())
+                    msg_opts["account_id"] = req.account_id.value();
+                if (req.thread_id.has_value())
+                    msg_opts["thread_id"] = req.thread_id.value();
+                auto result = agent->process_message(req.prompt, msg_opts);
+                hunterclaw::infra::HeartbeatReplyResult reply;
+                if (result.is_ok()) {
+                    reply.text       = result.get();
+                    reply.has_target = true;
+                    if (req.originating_channel.has_value()) reply.channel = req.originating_channel;
+                    if (req.originating_to.has_value())      reply.to      = req.originating_to;
+                } else {
+                    throw std::runtime_error(result.error);
+                }
+                return reply;
+            };
+        }
+        // Inject get_queue_size (aligned with openclaw: deps.getQueueSize)
+        opts.get_queue_size = [](const std::string& /*lane*/) -> int {
+            return static_cast<int>(
+                hunterclaw::queue::CommandQueue::Instance()
+                    .get_queue_size(hunterclaw::queue::CommandLane::Main)
+            );
+        };
+
+        const auto result = hunterclaw::infra::run_heartbeat_once(runner_cfg, agent_cfg, opts);
+        const bool ran = (result.status == hunterclaw::infra::HeartbeatRunResult::Status::Ran);
+        json res;
+        res["status"]     = ran ? "ran" : "skipped";
+        res["reason"]     = result.reason.value_or("");
+        res["durationMs"] = result.duration_ms.value_or(0);
+        return core::Result<json>::Ok(res);
+    }
+
+    // mode="next-heartbeat" → requestHeartbeatNow (let the scheduler handle it)
+    // Aligned with openclaw: requestHeartbeatNow({ reason, agentId, sessionKey })
+    hunterclaw::infra::request_heartbeat_now(
+        reason.empty()      ? std::optional<std::string>{} : reason,
+        agent_id.empty()    ? std::optional<std::string>{} : agent_id,
+        session_key.empty() ? std::optional<std::string>{} : session_key
+    );
+    json res;
+    res["mode"] = "next-heartbeat";
+    return core::Result<json>::Ok(res);
 }
 
 // ---------------------------------------------------------------------------

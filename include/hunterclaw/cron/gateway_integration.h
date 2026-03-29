@@ -3,7 +3,9 @@
 #include "hunterclaw/cron/service.h"
 #include "hunterclaw/cron/types.h"
 #include "hunterclaw/core/types.h"
+#include "hunterclaw/infra/heartbeat_runner.h"
 #include <nlohmann/json.hpp>
+#include <functional>
 #include <memory>
 
 namespace hunterclaw {
@@ -17,6 +19,26 @@ namespace cron {
 class GatewayCronIntegration {
 public:
     explicit GatewayCronIntegration(std::shared_ptr<CronService> service);
+
+    // ========================================================================
+    // Heartbeat reply_fn injection
+    // Aligned with openclaw: server-cron.ts runHeartbeatOnce callback
+    //
+    // The gateway must call set_heartbeat_reply_fn() after construction to
+    // wire up the actual LLM call (ReplyGenerator::get_reply_from_config).
+    // This is the C++ equivalent of the lambda in server-cron.ts that calls
+    // runHeartbeatOnce({ cfg, agentId, sessionKey, heartbeat, deps }).
+    // ========================================================================
+    using HeartbeatReplyFn = std::function<
+        infra::HeartbeatReplyResult(const infra::HeartbeatReplyRequest&)>;
+
+    void set_heartbeat_reply_fn(HeartbeatReplyFn fn) {
+        heartbeat_reply_fn_ = std::move(fn);
+    }
+
+    const HeartbeatReplyFn& heartbeat_reply_fn() const {
+        return heartbeat_reply_fn_;
+    }
     
     // ========================================================================
     // WebSocket Handlers (对齐 OpenClaw gateway/server-methods/cron.ts)
@@ -120,7 +142,8 @@ public:
     
 private:
     std::shared_ptr<CronService> service_;
-    
+    HeartbeatReplyFn heartbeat_reply_fn_;  // injected by gateway; calls ReplyGenerator::get_reply_from_config
+
     // JSON conversion helpers
     static nlohmann::json job_to_json(const CronJob& job);
     static CronJobCreate json_to_job_create(const nlohmann::json& j);

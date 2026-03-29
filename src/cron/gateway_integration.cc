@@ -1,5 +1,7 @@
 #include "hunterclaw/cron/gateway_integration.h"
 #include "hunterclaw/cron/schedule.h"
+#include "hunterclaw/infra/heartbeat_runner.h"
+#include "hunterclaw/infra/heartbeat_wake.h"
 #include <spdlog/spdlog.h>
 
 namespace hunterclaw {
@@ -32,14 +34,55 @@ GatewayCronIntegration::GatewayCronIntegration(std::shared_ptr<CronService> serv
 
 nlohmann::json GatewayCronIntegration::handle_wake(const nlohmann::json& params) {
     log()->debug("handle_wake: {}", params.dump());
-    
-    // TODO: Implement wake functionality when needed
-    log()->warn("Wake functionality not yet implemented in CronService");
-    
-    return {
-        {"success", true},
-        {"message", "Wake not implemented"}
-    };
+
+    // Aligned with openclaw: server-cron.ts requestHeartbeatNow / runHeartbeatOnce
+    // mode="now"            → run_heartbeat_once directly (wakeMode=now)
+    // mode="next-heartbeat" → requestHeartbeatNow (schedule-based)
+
+    const std::string mode = params.value("mode", "next-heartbeat");
+    const std::string reason = params.value("reason", "wake");
+    const std::string agent_id = params.value("agentId", "");
+    const std::string session_key = params.value("sessionKey", "");
+
+    if (mode == "now") {
+        // Aligned with openclaw: wakeMode=now → runHeartbeatOnce directly
+        if (!heartbeat_reply_fn_) {
+            log()->warn("handle_wake: heartbeat_reply_fn not set, cannot run heartbeat now");
+            return {{"success", false}, {"error", "heartbeat reply_fn not configured"}};
+        }
+
+        // Build a minimal HeartbeatRunnerConfig / HeartbeatAgentConfig from params.
+        // The full config is resolved by the gateway when it calls set_heartbeat_reply_fn.
+        infra::HeartbeatRunnerConfig runner_cfg;
+        infra::HeartbeatAgentConfig agent_cfg;
+        agent_cfg.agent_id = agent_id;
+
+        infra::HeartbeatRunOnceOptions opts;
+        opts.reason = reason;
+        if (!agent_id.empty()) opts.agent_id = agent_id;
+        if (!session_key.empty()) opts.session_key = session_key;
+        // Inject the reply_fn so run_heartbeat_once can call the LLM.
+        opts.reply_fn = heartbeat_reply_fn_;
+
+        const auto result = infra::run_heartbeat_once(runner_cfg, agent_cfg, opts);
+
+        const bool ran = (result.status == infra::HeartbeatRunResult::Status::Ran);
+        return {
+            {"success", true},
+            {"status", ran ? "ran" : "skipped"},
+            {"reason", result.reason.value_or("")},
+            {"durationMs", result.duration_ms.value_or(0)},
+        };
+    }
+
+    // mode="next-heartbeat" → requestHeartbeatNow (let the scheduler handle it)
+    // Aligned with openclaw: requestHeartbeatNow({ reason, agentId, sessionKey })
+    infra::request_heartbeat_now(
+        reason.empty()      ? std::optional<std::string>{} : reason,
+        agent_id.empty()    ? std::optional<std::string>{} : agent_id,
+        session_key.empty() ? std::optional<std::string>{} : session_key
+    );
+    return {{"success", true}, {"mode", "next-heartbeat"}};
 }
 
 nlohmann::json GatewayCronIntegration::handle_status(const nlohmann::json& params) {
