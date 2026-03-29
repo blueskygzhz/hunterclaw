@@ -34,6 +34,12 @@ class MessageDispatcher;
 }
 
 namespace hunterclaw {
+namespace queue {
+class DeliveryQueue;  // ✅ 对齐 OpenClaw: deliver 函数
+}
+}
+
+namespace hunterclaw {
 namespace cron {
 class CronService;
 }
@@ -386,6 +392,11 @@ public:
     // chat.send 通过 message_dispatcher()->run_reply_agent() 调度，
     // 使四种 queue mode (steer/followup/collect/interrupt) 对 chat.send 生效
     std::shared_ptr<auto_reply::MessageDispatcher> message_dispatcher() const;
+
+    // ✅ DeliveryQueue access (对齐 OpenClaw: deliver 函数)
+    // method_agent 中 deliver=true 时，通过 delivery_queue 构建 deliver 函数
+    // 对应 OpenClaw: delivery.deliver("block", payload) → dispatcher.sendBlockReply → options.deliver
+    std::shared_ptr<queue::DeliveryQueue> delivery_queue() const;
 
 private:
     struct Impl;

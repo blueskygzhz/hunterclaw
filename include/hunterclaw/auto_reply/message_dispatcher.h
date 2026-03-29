@@ -27,6 +27,7 @@ namespace hunterclaw {
 namespace llm { class LLMClient; }
 namespace tools { class ToolManager; }
 namespace sessions { class SessionManager; }
+namespace agents { class AgentPool; }  // ✅ 对齐 OpenClaw: ACP dispatch 需要 agent_pool
 } // namespace hunterclaw
 
 // 前置声明全局 queue 命名空间
@@ -307,8 +308,17 @@ private:
     std::shared_ptr<::hunterclaw::queue::DeliveryQueue> delivery_queue_;
     std::shared_ptr<tools::ToolManager> tool_manager_;
     std::shared_ptr<llm::LLMClient> llm_client_;
+    // ✅ 对齐 OpenClaw: ACP dispatch 需要 agent_pool（try_dispatch_acp_reply 路由消息到 subagent）
+    std::shared_ptr<::hunterclaw::agents::AgentPool> agent_pool_;
     
     DispatchConfig config_;
+
+public:
+    // ✅ 对齐 OpenClaw: 注入 agent_pool（在 Gateway 初始化后调用）
+    // 用于 try_dispatch_acp_reply 通过 agent_pool 找到 ACP session 对应的 agent
+    void set_agent_pool(std::shared_ptr<::hunterclaw::agents::AgentPool> agent_pool) {
+        agent_pool_ = agent_pool;
+    }
 };
 
 // ═══════════════════════════════════════════════════════════════

@@ -39,13 +39,22 @@ struct AgentInstanceContext {
     
     // 配置
     AgentConfig config;
-    
+
     // 运行时状态
     std::optional<std::string> current_run_id;
     AgentLifecyclePhase phase = AgentLifecyclePhase::INITIALIZING;
     core::Timestamp created_at;
     core::Timestamp last_active_at;
     int event_sequence_ = 0;  // 事件序列号 (递增)
+
+    // ✅ 对齐 OpenClaw: 最后一次消息的 channel 信息
+    // 用于 method_agent 中 deliver=true 时构建 deliver 函数
+    // 对应 OpenClaw: SessionEntry.lastChannel / lastTo / lastAccountId / lastThreadId
+    std::string last_channel;       // 最后一次消息的 channel（如 "discord"、"telegram"）
+    std::string last_to;            // 最后一次消息的目标 ID（如 chat_id）
+    std::string last_account_id;    // 最后一次消息的 account ID
+    std::string last_thread_id;     // 最后一次消息的 thread ID
+    std::string last_reply_to_id;   // 最后一次消息的 reply_to_id
 };
 
 /**
@@ -139,9 +148,18 @@ public:
     }
     
     /**
-     * 获取隔离上下文
+     * 获取隔离上下文（只读）
      */
     const AgentInstanceContext& context() const {
+        return ctx_;
+    }
+
+    /**
+     * 获取隔离上下文（可写）
+     * ✅ 对齐 OpenClaw: 允许 message_dispatcher 更新 last_channel 等字段
+     * 用于 method_agent 中 deliver=true 时构建 deliver 函数
+     */
+    AgentInstanceContext& context() {
         return ctx_;
     }
     
@@ -175,6 +193,15 @@ public:
      */
     using EventCallback = std::function<void(const AgentEvent&)>;
     void on_event(EventCallback callback);
+
+    // ✅ 对齐 OpenClaw: 注入 deliver 函数
+    // 当 deliver=true 时，on_block_reply 调用此函数发送到 channel
+    // 由 method_agent 在 deliver=true 时注入（channel-specific 的发送函数）
+    // 对应 OpenClaw: delivery.deliver("block", payload) → dispatcher.sendBlockReply → options.deliver
+    using DeliverFn = std::function<void(const std::string& text)>;
+    void set_deliver_fn(DeliverFn fn) {
+        deliver_fn_ = std::move(fn);
+    }
     
     /**
      * 获取 ReactEngine (用于 Gateway 集成)
@@ -211,6 +238,11 @@ private:
     
     // ✅ OpenClaw 对齐: 事件回调系统
     std::vector<EventCallback> event_callbacks_;
+
+    // ✅ OpenClaw 对齐: deliver 函数（channel-specific 发送函数）
+    // 由 method_agent 在 deliver=true 时注入，on_block_reply 调用
+    // 对应 OpenClaw: delivery.deliver("block", payload) → dispatcher.sendBlockReply → options.deliver
+    DeliverFn deliver_fn_;
 
     // ✅ OpenClaw 对齐: 消息队列（对齐 Node.js 事件循环串行模型）
     // 参考: openclaw maybeQueueSubagentAnnounce / sendSubagentAnnounceDirectly

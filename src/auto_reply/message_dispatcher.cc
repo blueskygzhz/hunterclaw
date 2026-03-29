@@ -26,6 +26,7 @@
 #include "hunterclaw/tools/tool_manager.h"
 #include "hunterclaw/llm/llm_client.h"
 #include "hunterclaw/core/utils.h"
+#include "hunterclaw/agents/agent_pool.h"      // ✅ 对齐 OpenClaw: ACP dispatch 需要 agent_pool
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
@@ -545,26 +546,87 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
         std::string accumulated_block_text;
         int block_count = 0;
 
+        // ✅ 严格对齐 OpenClaw: 更新 agent context 中的 channel 信息
+        // 对应 OpenClaw: SessionEntry.lastChannel / lastTo / lastAccountId / lastThreadId
+        // 用于 method_agent 中 deliver=true 时构建 deliver 函数
+        // （subagent 完成后通过 method_agent 调用父 agent，父 agent 需要知道 channel 信息）
+        if (agent_pool_) {
+            auto dispatch_agent = agent_pool_->get_agent(captured_message.session_key);
+            if (dispatch_agent) {
+                auto& ctx = dispatch_agent->context();
+                ctx.last_channel    = captured_message.channel;
+                ctx.last_to         = captured_delivery_to;
+                ctx.last_account_id = captured_message.account_id;
+                ctx.last_thread_id  = captured_message.thread_id;
+                ctx.last_reply_to_id = captured_message.reply_to_id;
+                log()->debug("dispatch_reply_from_config: updated agent context channel={} to={}",
+                             captured_message.channel, captured_delivery_to);
+            }
+        }
+
         ReplyGenerator::GenerateConfig gen_config;
         gen_config.agent_id        = captured_config.agent_id;
         gen_config.workspace_path  = captured_config.workspace_path;
         gen_config.user_input      = captured_message.text;
         gen_config.session_key     = captured_message.session_key;
 
-        // Aligned with openclaw: onBlockReply callback
-        gen_config.on_block_reply = [&](const std::string& block_text) {
+        // ✅ 严格对齐 OpenClaw: onBlockReply callback
+        // 参考: dispatch-from-config.ts:onBlockReply → dispatcher.sendBlockReply(ttsPayload)
+        //
+        // OpenClaw 实现:
+        //   onBlockReply: (payload) => {
+        //     if (shouldSuppressReasoningPayload(payload)) return;
+        //     accumulatedBlockText += payload.text;
+        //     blockCount++;
+        //     if (shouldRouteToOriginating) sendPayloadAsync(ttsPayload);
+        //     else dispatcher.sendBlockReply(ttsPayload);  ← 实时发送！
+        //   }
+        //
+        // HunterClaw 对齐:
+        //   - 实时调用 deliver_outbound_payloads（对应 dispatcher.sendBlockReply）
+        //   - 同时累积 accumulated_block_text（用于 TTS 生成）
+        gen_config.on_block_reply = [this, &accumulated_block_text, &block_count,
+                                     captured_message, captured_delivery_to](const std::string& block_text) {
             static const std::string REASONING_PREFIX = "<reasoning>";
             if (block_text.find(REASONING_PREFIX) != std::string::npos) {
                 log()->debug("dispatch_reply_from_config: suppressed reasoning block");
                 return;
             }
-            if (!block_text.empty()) {
-                if (!accumulated_block_text.empty()) accumulated_block_text += "\n";
-                accumulated_block_text += block_text;
-                block_count++;
+            if (block_text.empty()) {
+                return;
             }
-            log()->debug("dispatch_reply_from_config: [block_reply] len={} tts_channel={}",
-                         block_text.size(), captured_tts_channel);
+
+            // ✅ 对齐 OpenClaw: 累积 block text（用于 TTS 生成）
+            if (!accumulated_block_text.empty()) accumulated_block_text += "\n";
+            accumulated_block_text += block_text;
+            block_count++;
+
+            // ✅ 对齐 OpenClaw: 实时发送 block reply（dispatcher.sendBlockReply）
+            // OpenClaw: dispatcher.sendBlockReply(ttsPayload) → enqueue → deliver → channel.send()
+            // HunterClaw: deliver_outbound_payloads(channel, to, payloads, delivery_queue_)
+            ::hunterclaw::queue::MessagePayload block_payload;
+            block_payload.text = block_text;
+
+            outbound::DeliverOutboundPayloadsParams block_deliver_params;
+            block_deliver_params.channel      = captured_message.channel;
+            block_deliver_params.to           = captured_delivery_to;
+            block_deliver_params.payloads     = {block_payload};
+            block_deliver_params.delivery_queue = delivery_queue_;
+            block_deliver_params.skip_queue   = false;
+            block_deliver_params.best_effort  = true;   // block reply 是 best-effort（对齐 OpenClaw）
+            block_deliver_params.silent       = false;
+            block_deliver_params.reply_to_id  = captured_message.reply_to_id;
+            block_deliver_params.thread_id    = captured_message.thread_id;
+            block_deliver_params.account_id   = captured_message.account_id;
+
+            auto block_deliver_result = outbound::deliver_outbound_payloads(block_deliver_params);
+            if (!block_deliver_result.is_ok()) {
+                log()->warn("dispatch_reply_from_config: block_reply delivery failed: {}",
+                            block_deliver_result.error);
+            } else {
+                log()->debug("dispatch_reply_from_config: [block_reply] sent len={} channel={}",
+                             block_text.size(), captured_message.channel);
+            }
         };
 
         // Aligned with openclaw: onToolResult callback
@@ -1481,18 +1543,80 @@ MessageDispatcher::AcpDispatchResult MessageDispatcher::try_dispatch_acp_reply(
         return result;
     }
 
-    // Aligned with openclaw: acpManager.runTurn({ sessionKey, text, mode: "prompt" })
-    // Route the message to the active subagent via the agent pool.
-    // The subagent will process the message and deliver replies via the delivery queue.
+    // ✅ 严格对齐 OpenClaw: acpManager.runTurn({ sessionKey, text, mode: "prompt" })
+    // 参考: dispatch-acp.ts:
+    //   await acpManager.runTurn({
+    //     cfg, sessionKey, text: promptText, attachments, mode: "prompt",
+    //     requestId: resolveAcpRequestId(ctx),
+    //     onEvent: async (event) => await projector.onEvent(event),
+    //   });
+    //   await projector.flush(true);
+    //
+    // OpenClaw 的 acpManager.runTurn 通过 onEvent 回调实时投递每个 block，
+    // projector.onEvent 调用 delivery.deliver("block", payload)，
+    // delivery.deliver 调用 dispatcher.sendBlockReply(payload)，
+    // dispatcher.sendBlockReply 调用 options.deliver(payload)，
+    // options.deliver 调用 channel API（Discord/Telegram/etc.）。
+    //
+    // HunterClaw 对齐:
+    //   - 通过 agent_pool_ 找到 subagent（ACP session 对应的 agent）
+    //   - 调用 subagent.process_message(prompt_text, options)
+    //   - subagent 的 on_block_reply 通过 deliver_outbound_payloads 实时发送
+    //   - 注意: deliver=true（消息来自用户，需要发给用户）
     log()->info("try_dispatch_acp_reply: routing to ACP session={} agent={}",
                 session_key, acp_meta.agent);
+
+    // ✅ 对齐 OpenClaw: 通过 agent_pool 找到 ACP session 对应的 agent
+    // ACP session 的 session_key 就是 agent 的 session_id
+    if (!agent_pool_) {
+        log()->warn("try_dispatch_acp_reply: agent_pool not available, cannot route to ACP session={}",
+                    session_key);
+        return result;  // fall through to normal dispatch
+    }
+
+    auto acp_agent = agent_pool_->get_agent(acp_meta.agent.empty() ? session_key : acp_meta.agent);
+    if (!acp_agent) {
+        // 尝试用 session_key 直接查找
+        acp_agent = agent_pool_->get_agent(session_key);
+    }
+    if (!acp_agent) {
+        log()->warn("try_dispatch_acp_reply: ACP agent not found: session={} agent={}",
+                    session_key, acp_meta.agent);
+        return result;  // fall through to normal dispatch
+    }
+
+    // ✅ 对齐 OpenClaw: 构建 process_message options
+    // deliver=true: 消息来自用户，需要发给用户（通过 on_block_reply → deliver_outbound_payloads）
+    std::map<std::string, std::string> acp_options = {
+        {"deliver", "true"},
+        {"session_key", session_key},
+        {"input_provenance_kind", "user"},
+        {"source_tool", "acp_dispatch"},
+    };
+
+    // ✅ 对齐 OpenClaw: 异步执行（fire-and-forget，不阻塞当前线程）
+    // OpenClaw: await acpManager.runTurn(...) 是 async，但在 dispatch-acp.ts 中是 await
+    // HunterClaw: 在后台线程执行，避免阻塞 dispatch_reply_from_config
+    std::thread([acp_agent, prompt_text, acp_options, session_key, this]() mutable {
+        try {
+            auto res = acp_agent->process_message(prompt_text, acp_options);
+            if (res.is_err()) {
+                log()->warn("try_dispatch_acp_reply: ACP process_message failed: session={} error={}",
+                            session_key, res.error);
+            } else {
+                log()->info("try_dispatch_acp_reply: ACP turn completed: session={}", session_key);
+            }
+        } catch (const std::exception& e) {
+            log()->error("try_dispatch_acp_reply: ACP process_message exception: session={} error={}",
+                         session_key, e.what());
+        }
+    }).detach();
 
     // Mark as handled — the subagent will deliver the reply asynchronously.
     result.handled = true;
     result.response = "";
     return result;
 }
-
 // ============================================================================
 // check_permissions
 // ============================================================================

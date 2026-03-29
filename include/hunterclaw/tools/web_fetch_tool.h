@@ -45,8 +45,6 @@ public:
                "Use for reading articles, documentation, or any web content.";
     }
     
-    json parameters_schema() const;
-
     Schema parameters() const override;
 
     // 执行抓取

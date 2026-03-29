@@ -761,13 +761,28 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
         // 7. 跳过空 payload (对齐 OpenClaw:523-525)
         // (已通过上面的 empty 检查)
         
-        // 8. 发射 WebSocket 事件 (对齐 OpenClaw:526-533)
+        // 8. ✅ 严格对齐 OpenClaw: 发送 block reply
+        // OpenClaw: delivery.deliver("block", payload) → dispatcher.sendBlockReply → options.deliver → channel.send()
+        // HunterClaw:
+        //   - 路径 1: deliver_fn_ 注入（channel-specific，由 method_agent 注入）
+        //   - 路径 2: emit_lifecycle_event（WebSocket 广播，用于 chat.send 路径）
+        if (deliver_fn_) {
+            // ✅ 对齐 OpenClaw: deliver_fn_ 是 channel-specific 的发送函数
+            // 由 method_agent 在 deliver=true 时注入（subagent 完成后通知用户）
+            try {
+                deliver_fn_(cleaned);
+            } catch (const std::exception& e) {
+                spdlog::get("default")->warn("[AgentInstance] deliver_fn_ failed: {}", e.what());
+            }
+        }
+
+        // ✅ 同时广播 WebSocket 事件（用于 chat.send 路径的实时推送）
         core::JsonValue data = core::JsonValue::object();
         data["type"] = "block_reply";
         data["text"] = cleaned;
-        
+
         emit_lifecycle_event(AgentLifecyclePhase::Responding, data);
-        
+
         spdlog::get("default")->debug("[AgentInstance] Block reply sent: len={}", cleaned.length());
     };
     

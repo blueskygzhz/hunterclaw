@@ -6,6 +6,7 @@
 #include "hunterclaw/core/utils.h"
 #include "hunterclaw/observability/diagnostic_events.h"  // ✅ 可观测性集成
 #include "hunterclaw/auto_reply/message_dispatcher.h"    // ✅ MessageDispatcher (queue mode)
+#include "hunterclaw/queue/delivery_queue.h"             // ✅ DeliveryQueue (deliver 函数)
 #include <websocketpp/config/asio_no_tls.hpp>
 #include <websocketpp/server.hpp>
 #include <nlohmann/json.hpp>
@@ -1864,6 +1865,10 @@ struct GatewayServer::Impl {
     // chat.send 通过 message_dispatcher->run_reply_agent() 调度，
     // 使四种 queue mode (steer/followup/collect/interrupt) 对 chat.send 生效
     std::shared_ptr<auto_reply::MessageDispatcher> message_dispatcher;
+    // ✅ DeliveryQueue (对齐 OpenClaw: deliver 函数)
+    // method_agent 中 deliver=true 时，通过 delivery_queue 构建 deliver 函数
+    // 对应 OpenClaw: delivery.deliver("block", payload) → dispatcher.sendBlockReply → options.deliver
+    std::shared_ptr<queue::DeliveryQueue> delivery_queue;
     std::atomic<bool> running{false};
 };
 
@@ -1891,15 +1896,27 @@ GatewayServer::GatewayServer(std::shared_ptr<core::Config> config)
     // chat.send 通过 message_dispatcher->run_reply_agent() 调度，
     // 使四种 queue mode (steer/followup/collect/interrupt) 对 chat.send 生效
     // Aligned with openclaw: createReplyDispatcher + dispatchInboundMessage
+
+    // ✅ Initialize DeliveryQueue (对齐 OpenClaw: deliver 函数)
+    // method_agent 中 deliver=true 时，通过 delivery_queue 构建 deliver 函数
+    // 对应 OpenClaw: delivery.deliver("block", payload) → dispatcher.sendBlockReply → options.deliver
+    std::string queue_dir = "/tmp/hunterclaw_delivery_queue";
+    if (config->data.contains("delivery_queue_dir") && config->data["delivery_queue_dir"].is_string()) {
+        queue_dir = config->data["delivery_queue_dir"].get<std::string>();
+    }
+    impl_->delivery_queue = queue::DeliveryQueue::create(queue_dir);
+
     auto_reply::DispatchConfig dispatch_config;
     impl_->message_dispatcher = auto_reply::MessageDispatcher::create(
         nullptr,  // router: not needed for chat.send path
         nullptr,  // session_manager: loaded per-request
-        nullptr,  // delivery_queue: not needed for chat.send path
+        impl_->delivery_queue,  // ✅ 传入 delivery_queue（用于 method_agent deliver 路径）
         nullptr,  // tool_manager: provided by AgentPool
         nullptr,  // llm_client: provided by AgentPool
         dispatch_config
     );
+    // ✅ 注入 agent_pool（用于 try_dispatch_acp_reply 路由消息到 subagent）
+    impl_->message_dispatcher->set_agent_pool(impl_->agent_pool);
     
     // Import create_method_handler from methods.cc
     extern std::function<core::Result<nlohmann::json>(
@@ -2022,6 +2039,11 @@ std::shared_ptr<auto_reply::MessageDispatcher> GatewayServer::message_dispatcher
     return impl_->message_dispatcher;
 }
 
+// ✅ DeliveryQueue access (对齐 OpenClaw: deliver 函数)
+// method_agent 中 deliver=true 时，通过 delivery_queue 构建 deliver 函数
+std::shared_ptr<queue::DeliveryQueue> GatewayServer::delivery_queue() const {
+    return impl_->delivery_queue;
+}
 std::shared_ptr<core::Config> GatewayServer::config() const {
     return impl_->config;
 }

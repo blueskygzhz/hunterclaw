@@ -101,7 +101,7 @@ GatewayProbeResult GatewayProbeResult::from_json(const nlohmann::json& j) {
 
 nlohmann::json SecurityAuditReport::to_json() const {
     nlohmann::json j;
-    j["ts"] = timestamp;
+    j["ts"] = ts;
     j["summary"] = summary.to_json();
     j["findings"] = nlohmann::json::array();
     for (const auto& finding : findings) {
@@ -118,7 +118,7 @@ nlohmann::json SecurityAuditReport::to_json() const {
 
 SecurityAuditReport SecurityAuditReport::from_json(const nlohmann::json& j) {
     SecurityAuditReport report;
-    report.timestamp = j.at("ts").get<int64_t>();
+    report.ts = j.at("ts").get<int64_t>();
     report.summary = SecurityAuditSummary::from_json(j.at("summary"));
     for (const auto& finding_json : j.at("findings")) {
         report.findings.push_back(SecurityAuditFinding::from_json(finding_json));
@@ -139,7 +139,7 @@ SecurityAuditReport SecurityAuditReport::from_json(const nlohmann::json& j) {
 
 SecurityAuditReport SecurityAuditor::run_audit(const SecurityAuditOptions& options) {
     SecurityAuditReport report;
-    report.timestamp = current_timestamp_ms();
+    report.ts = current_timestamp_ms();
     
     // Collect findings from all audit checks
     std::vector<SecurityAuditFinding> all_findings;

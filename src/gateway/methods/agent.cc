@@ -7,6 +7,8 @@
 #include "hunterclaw/auto_reply/message_dispatcher.h"
 #include "hunterclaw/queue/command_queue.h"
 #include "hunterclaw/queue/lanes.h"
+#include "hunterclaw/queue/delivery_queue.h"   // ✅ DeliveryQueue (deliver 函数)
+#include "hunterclaw/outbound/deliver.h"        // ✅ deliver_outbound_payloads
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 #include <thread>
@@ -220,6 +222,17 @@ core::Result<json> method_agent(
     // ✅ 对齐 OpenClaw: dispatchAgentRunFromGateway (fire-and-forget)
     // 通过 MessageDispatcher 调度（支持 queue mode），或直接调用 process_message
     auto msg_dispatcher = server->message_dispatcher();
+    auto delivery_queue = server->delivery_queue();
+
+    // ✅ 对齐 OpenClaw: deliver=true 时，从 params 中读取 channel 信息
+    // 用于构建 deliver 函数（channel-specific 发送函数）
+    // 对应 OpenClaw: delivery.deliver("block", payload) → dispatcher.sendBlockReply → options.deliver
+    std::string deliver_channel = get_str("deliverChannel", "deliver_channel");
+    std::string deliver_to      = get_str("deliverTo", "deliver_to");
+    std::string deliver_account_id = get_str("deliverAccountId", "deliver_account_id");
+    std::string deliver_thread_id  = get_str("deliverThreadId", "deliver_thread_id");
+    std::string deliver_reply_to_id = get_str("deliverReplyToId", "deliver_reply_to_id");
+
     if (msg_dispatcher) {
         // 通过 MessageDispatcher 调度（对齐 OpenClaw: runReplyAgent）
         auto captured_agent = agent;
@@ -227,20 +240,99 @@ core::Result<json> method_agent(
         auto captured_options = inject_options;
         auto captured_session_key = session_key;
         auto captured_run_id = run_id;
+        auto captured_deliver = deliver;
+        auto captured_delivery_queue = delivery_queue;
+        auto captured_deliver_channel = deliver_channel;
+        auto captured_deliver_to = deliver_to;
+        auto captured_deliver_account_id = deliver_account_id;
+        auto captured_deliver_thread_id = deliver_thread_id;
+        auto captured_deliver_reply_to_id = deliver_reply_to_id;
 
         auto run_fn = [captured_agent, captured_message, captured_options,
-                       captured_session_key, captured_run_id]()
+                       captured_session_key, captured_run_id,
+                       captured_deliver, captured_delivery_queue,
+                       captured_deliver_channel, captured_deliver_to,
+                       captured_deliver_account_id, captured_deliver_thread_id,
+                       captured_deliver_reply_to_id]()
             -> auto_reply::MessageDispatcher::DispatchResult {
             auto_reply::MessageDispatcher::DispatchResult result;
             try {
+                // ✅ 对齐 OpenClaw: deliver=true 时，注入 deliver 函数到 agent
+                // 对应 OpenClaw: delivery.deliver("block", payload) → dispatcher.sendBlockReply → options.deliver → channel.send()
+                // HunterClaw: deliver_fn_ → deliver_outbound_payloads(channel, to, payloads, delivery_queue)
+                //
+                // ✅ Fallback: 如果 params 中没有 channel 信息，从 agent->context() 中读取
+                // 对应 OpenClaw: SessionEntry.lastChannel / lastTo（由 dispatch_reply_from_config 更新）
+                std::string effective_channel = captured_deliver_channel;
+                std::string effective_to      = captured_deliver_to;
+                std::string effective_account_id = captured_deliver_account_id;
+                std::string effective_thread_id  = captured_deliver_thread_id;
+                std::string effective_reply_to_id = captured_deliver_reply_to_id;
+                if (effective_channel.empty() || effective_to.empty()) {
+                    const auto& ctx = captured_agent->context();
+                    if (!ctx.last_channel.empty()) effective_channel   = ctx.last_channel;
+                    if (!ctx.last_to.empty())      effective_to         = ctx.last_to;
+                    if (!ctx.last_account_id.empty()) effective_account_id = ctx.last_account_id;
+                    if (!ctx.last_thread_id.empty())  effective_thread_id  = ctx.last_thread_id;
+                    if (!ctx.last_reply_to_id.empty()) effective_reply_to_id = ctx.last_reply_to_id;
+                }
+
+                if (captured_deliver && captured_delivery_queue &&
+                    !effective_channel.empty() && !effective_to.empty()) {
+                    auto deliver_fn = [captured_delivery_queue,
+                                       effective_channel,
+                                       effective_to,
+                                       effective_account_id,
+                                       effective_thread_id,
+                                       effective_reply_to_id](const std::string& text) {
+                        ::hunterclaw::queue::MessagePayload payload;
+                        payload.text = text;
+
+                        ::hunterclaw::outbound::DeliverOutboundPayloadsParams params;
+                        params.channel      = effective_channel;
+                        params.to           = effective_to;
+                        params.payloads     = {payload};
+                        params.delivery_queue = captured_delivery_queue;
+                        params.skip_queue   = false;
+                        params.best_effort  = true;
+                        params.silent       = false;
+                        if (!effective_account_id.empty()) {
+                            params.account_id = effective_account_id;
+                        }
+                        if (!effective_thread_id.empty()) {
+                            params.thread_id = effective_thread_id;
+                        }
+                        if (!effective_reply_to_id.empty()) {
+                            params.reply_to_id = effective_reply_to_id;
+                        }
+
+                        auto deliver_result = ::hunterclaw::outbound::deliver_outbound_payloads(params);
+                        if (!deliver_result.is_ok()) {
+                            spdlog::get("default")->warn(
+                                "[method_agent] deliver_fn failed: channel={} to={} error={}",
+                                effective_channel, effective_to, deliver_result.error
+                            );
+                        }
+                    };
+                    captured_agent->set_deliver_fn(std::move(deliver_fn));
+                    spdlog::get("default")->debug(
+                        "[method_agent] Injected deliver_fn: channel={} to={}",
+                        effective_channel, effective_to
+                    );
+                }
+
                 auto res = captured_agent->process_message(captured_message, captured_options);
                 result.success = !res.is_err();
                 if (res.is_err()) {
                     result.error = res.error;
                 }
+
+                // ✅ 清理 deliver_fn（避免悬空引用）
+                captured_agent->set_deliver_fn(nullptr);
             } catch (const std::exception& e) {
                 result.success = false;
                 result.error = e.what();
+                captured_agent->set_deliver_fn(nullptr);
             }
             return result;
         };
