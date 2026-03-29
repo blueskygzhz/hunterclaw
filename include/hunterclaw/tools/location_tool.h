@@ -55,7 +55,7 @@ private:
     core::JsonValue route_to_node(const std::string& action, const core::JsonValue& params);
     std::string format_coordinates(double latitude, double longitude);
     std::string get_accuracy_description(const std::string& accuracy);
+    ToolResult make_json_result(const core::JsonValue& data) const;
 };
-
 } // namespace tools
 } // namespace hunterclaw

@@ -70,8 +70,8 @@ std::string TerminalTool::description() const {
 
 bool TerminalTool::requires_approval() const { return false; }
 
-Schema TerminalTool::parameters() const {
-    Schema schema;
+Tool::Schema TerminalTool::parameters() const {
+    Tool::Schema schema;
     schema.type = "object";
 
     auto make_str = [](const std::string& desc) {
@@ -304,11 +304,11 @@ ToolResult TerminalTool::action_stop(
         call_node_terminal_proxy(
             node_target->node_id, "POST", "/stop", {}, core::JsonValue(body),
             DEFAULT_TERMINAL_TIMEOUT_MS);
-        return make_json_result(json{{"ok", true}});
+        return make_json_result(core::JsonValue(json{{"ok", true}}));
     }
     http_post(base_url.value_or("http://localhost:3001") + "/stop",
               core::JsonValue(body));
-    return make_json_result(json{{"ok", true}});
+    return make_json_result(core::JsonValue(json{{"ok", true}}));
 }
 
 ToolResult TerminalTool::action_execute(
@@ -449,12 +449,12 @@ ToolResult TerminalTool::make_error(const std::string& msg) const {
     return result;
 }
 
-ToolResult TerminalTool::make_json_result(const json& data) const {
+ToolResult TerminalTool::make_json_result(const core::JsonValue& data) const {
     ToolResult result;
     result.success = true;
     ToolResultContent content;
     content.type = ToolResultContent::Type::Json;
-    content.text = data.dump();
+    content.text = data.to_json().dump();
     result.content.push_back(content);
     return result;
 }

@@ -162,6 +162,9 @@ private:
         const std::string& cwd,
         int exit_code
     ) const;
+    
+    ToolResult make_error(const std::string& msg) const;
+    ToolResult make_json_result(const core::JsonValue& data) const;
 };
 
 // ===== Terminal Tool Factory =====

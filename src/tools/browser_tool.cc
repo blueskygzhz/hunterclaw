@@ -79,8 +79,8 @@ std::string BrowserTool::description() const {
 
 bool BrowserTool::requires_approval() const { return false; }
 
-Schema BrowserTool::parameters() const {
-    Schema schema;
+Tool::Schema BrowserTool::parameters() const {
+    Tool::Schema schema;
     schema.type = "object";
 
     auto make_str = [](const std::string& desc) {
@@ -487,10 +487,10 @@ ToolResult BrowserTool::action_snapshot(
             node_target->node_id, "POST", "/snapshot", {}, body,
             DEFAULT_BROWSER_PROXY_TIMEOUT_MS);
         // 🎯 对齐 OpenClaw: wrap as untrusted
-        return make_text_result(wrap_external_content(result.dump(), "browser:snapshot", "snapshot"));
+        return make_text_result(wrap_external_content(result.to_json().dump(), "browser:snapshot", "snapshot"));
     }
     auto result = http_post(base_url.value_or("http://localhost:3000") + "/snapshot", body);
-    return make_text_result(wrap_external_content(result.dump(), "browser:snapshot", "snapshot"));
+    return make_text_result(wrap_external_content(result.to_json().dump(), "browser:snapshot", "snapshot"));
 }
 
 ToolResult BrowserTool::action_screenshot(
@@ -558,10 +558,10 @@ ToolResult BrowserTool::action_console(
         auto result = call_node_browser_proxy(
             node_target->node_id, "GET", "/console", {}, body,
             DEFAULT_BROWSER_PROXY_TIMEOUT_MS);
-        return make_text_result(wrap_external_content(result.dump(), "browser:console", "console"));
+        return make_text_result(wrap_external_content(result.to_json().dump(), "browser:console", "console"));
     }
     auto result = http_get(base_url.value_or("http://localhost:3000") + "/console");
-    return make_text_result(wrap_external_content(result.dump(), "browser:console", "console"));
+    return make_text_result(wrap_external_content(result.to_json().dump(), "browser:console", "console"));
 }
 
 ToolResult BrowserTool::action_pdf(
@@ -773,12 +773,12 @@ ToolResult BrowserTool::make_error(const std::string& msg) const {
     return result;
 }
 
-ToolResult BrowserTool::make_json_result(const json& data) const {
+ToolResult BrowserTool::make_json_result(const core::JsonValue& data) const {
     ToolResult result;
     result.success = true;
     ToolResultContent content;
     content.type = ToolResultContent::Type::Json;
-    content.text = data.dump();
+    content.text = data.to_json().dump();
     result.content.push_back(content);
     return result;
 }

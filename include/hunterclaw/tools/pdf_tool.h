@@ -6,6 +6,7 @@
 #include <optional>
 #include "hunterclaw/tools/tool.h"
 #include "hunterclaw/core/json.h"
+#include <nlohmann/json.hpp>
 
 namespace hunterclaw {
 namespace tools {
@@ -190,16 +191,16 @@ public:
 
 private:
     // PDF Read
-    json pdf_read(const json& params);
+    nlohmann::json pdf_read(const nlohmann::json& params);
     
     // PDF Analyze (AI-powered)
-    json pdf_analyze(const json& params);
+    nlohmann::json pdf_analyze(const nlohmann::json& params);
     
     // PDF Merge
-    json pdf_merge(const json& params);
+    nlohmann::json pdf_merge(const nlohmann::json& params);
     
     // PDF Split
-    json pdf_split(const json& params);
+    nlohmann::json pdf_split(const nlohmann::json& params);
     
     // Helper methods
     PdfExtractionResult extract_pdf_content(

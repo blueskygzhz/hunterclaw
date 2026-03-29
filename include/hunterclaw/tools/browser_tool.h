@@ -202,6 +202,15 @@ private:
     
     // 格式化 Tabs 结果 (安全包装)
     ToolResult format_tabs_result(const std::vector<core::JsonValue>& tabs) const;
+    
+    // 创建错误结果
+    ToolResult make_error(const std::string& msg) const;
+    
+    // 创建文本结果
+    ToolResult make_text_result(const std::string& text) const;
+    
+    // 创建 JSON 结果
+    ToolResult make_json_result(const core::JsonValue& data) const;
 };
 
 // ===== Browser Tool Factory =====

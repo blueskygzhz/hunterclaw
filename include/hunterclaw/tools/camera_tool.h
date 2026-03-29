@@ -72,6 +72,7 @@ private:
     
     /// 创建 JSON 结果
     ToolResult make_json_result(const core::JsonValue& data) const;
+};
 
 } // namespace tools
 } // namespace hunterclaw

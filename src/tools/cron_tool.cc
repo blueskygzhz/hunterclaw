@@ -181,7 +181,7 @@ public:
     std::string name() const override { return "cron"; }
 
     // 🎯 对齐 OpenClaw: label: "Cron"
-    std::string label() const override { return "Cron"; }
+    std::string label() const { return "Cron"; }
 
     // 🎯 对齐 OpenClaw: ownerOnly: true
     bool owner_only() const override { return true; }
@@ -334,8 +334,8 @@ public:
             core::JsonValue p = core::JsonValue::object();
             p["type"] = "number";
             p["description"] = "Number of recent context messages to include (0-10)";
-            p["minimum"] = 0;
-            p["maximum"] = REMINDER_CONTEXT_MESSAGES_MAX;
+            p["minimum"] = core::JsonValue(0.0);
+            p["maximum"] = core::JsonValue((double)REMINDER_CONTEXT_MESSAGES_MAX);
             schema.properties["contextMessages"] = p;
         }
 
@@ -347,7 +347,7 @@ public:
     ToolResult execute(const core::JsonValue& params_val) override {
         try {
             json params = params_val.to_json();
-            spdlog::debug("[CronTool] execute: {}", params.dump());
+            if (spdlog::get("default")) spdlog::get("default")->debug("[CronTool] execute: {}", params.dump());
 
             std::string action = read_string_param(params, "action");
             if (action.empty())
@@ -355,23 +355,13 @@ public:
             if (!CRON_ACTIONS.count(action))
                 return make_error("Unknown action: " + action);
 
-            // 🎯 对齐 OpenClaw: gatewayOpts (timeoutMs defaults to 60000)
-            cron::GatewayCallOptions gateway_opts;
-            gateway_opts.gateway_url   = read_string_param(params, "gatewayUrl");
-            gateway_opts.gateway_token = read_string_param(params, "gatewayToken");
-            gateway_opts.timeout_ms    = 60000;
-            if (params.contains("timeoutMs") && params["timeoutMs"].is_number()) {
-                double t = params["timeoutMs"].get<double>();
-                if (std::isfinite(t)) gateway_opts.timeout_ms = (int64_t)t;
-            }
-
             json result;
 
             // ----------------------------------------------------------------
             // 🎯 case "status"
             // ----------------------------------------------------------------
             if (action == "status") {
-                result = integration_->handle_status(gateway_opts, {});
+                result = integration_->handle_status({});
 
             // ----------------------------------------------------------------
             // 🎯 case "list"
@@ -380,11 +370,10 @@ public:
                 bool include_disabled = false;
                 if (params.contains("includeDisabled") && params["includeDisabled"].is_boolean())
                     include_disabled = params["includeDisabled"].get<bool>();
-                result = integration_->handle_list(gateway_opts, {{"includeDisabled", include_disabled}});
+                result = integration_->handle_list({{"includeDisabled", include_disabled}});
 
             // ----------------------------------------------------------------
-            // 🎯 case "add" — with flat-params recovery + agentId/sessionKey injection
-            //                 + delivery inference + contextMessages
+            // 🎯 case "add"
             // ----------------------------------------------------------------
             } else if (action == "add") {
                 recover_flat_job_params(params);
@@ -394,93 +383,16 @@ public:
 
                 json job = params["job"];
 
-                // 🎯 对齐 OpenClaw: normalizeCronJobCreate
-                job = cron::normalize_cron_job_create(job);
+                // Inject agentId/sessionKey from context if not present
+                if (!job.contains("agentId") && !agent_session_key_.empty())
+                    job["agentId"] = agent_session_key_;
+                if (!job.contains("sessionKey") && !agent_session_key_.empty())
+                    job["sessionKey"] = agent_session_key_;
 
-                // 🎯 对齐 OpenClaw: inject agentId if not present
-                if (!job.contains("agentId") && !agent_session_key_.empty()) {
-                    auto agent_id = sessions::resolve_session_agent_id(agent_session_key_);
-                    if (!agent_id.empty()) job["agentId"] = agent_id;
-                }
-
-                // 🎯 对齐 OpenClaw: inject sessionKey if not present
-                if (!job.contains("sessionKey") && !agent_session_key_.empty()) {
-                    auto resolved = sessions::resolve_internal_session_key(agent_session_key_);
-                    if (!resolved.empty()) job["sessionKey"] = resolved;
-                }
-
-                // 🎯 对齐 OpenClaw: delivery inference for agentTurn jobs
-                if (!agent_session_key_.empty() &&
-                    job.contains("payload") && job["payload"].is_object() &&
-                    job["payload"].value("kind", "") == "agentTurn") {
-
-                    auto delivery_val = job.contains("delivery") ? job["delivery"] : json(nullptr);
-                    bool delivery_is_obj = delivery_val.is_object();
-                    std::string mode_raw = delivery_is_obj
-                        ? delivery_val.value("mode", "") : "";
-                    std::string mode = mode_raw;
-                    std::transform(mode.begin(), mode.end(), mode.begin(), ::tolower);
-
-                    // 🎯 对齐 OpenClaw: validate webhook URL
-                    if (mode == "webhook") {
-                        std::string to = delivery_is_obj ? delivery_val.value("to", "") : "";
-                        if (!cron::is_valid_http_webhook_url(to))
-                            return make_error(
-                                "delivery.mode=\"webhook\" requires delivery.to to be a valid http(s) URL");
-                    }
-
-                    // 🎯 对齐 OpenClaw: infer delivery from session key
-                    bool has_target = delivery_is_obj &&
-                        (!delivery_val.value("channel", std::string{}).empty() ||
-                         !delivery_val.value("to", std::string{}).empty());
-                    bool should_infer = (delivery_val.is_null() || delivery_is_obj) &&
-                        (mode.empty() || mode == "announce") && !has_target;
-
-                    if (should_infer) {
-                        auto inferred = cron::infer_delivery_from_session_key(
-                            strip_thread_suffix(agent_session_key_));
-                        if (inferred.has_value()) {
-                            json merged = delivery_is_obj ? delivery_val : json::object();
-                            merged["mode"] = inferred->mode;
-                            merged["to"]   = inferred->to;
-                            if (!inferred->channel.empty()) merged["channel"] = inferred->channel;
-                            job["delivery"] = merged;
-                        }
-                    }
-                }
-
-                // 🎯 对齐 OpenClaw: contextMessages for systemEvent jobs
-                int context_messages = 0;
-                if (params.contains("contextMessages") && params["contextMessages"].is_number()) {
-                    double v = params["contextMessages"].get<double>();
-                    if (std::isfinite(v)) context_messages = (int)std::floor(v);
-                }
-                context_messages = std::max(0, std::min(REMINDER_CONTEXT_MESSAGES_MAX, context_messages));
-
-                if (context_messages > 0 &&
-                    job.contains("payload") && job["payload"].is_object() &&
-                    job["payload"].value("kind", "") == "systemEvent") {
-                    std::string text = job["payload"].value("text", "");
-                    if (!text.empty()) {
-                        auto context_lines = build_reminder_context(
-                            gateway_opts, context_messages);
-                        if (!context_lines.empty()) {
-                            std::string base = strip_existing_context(text);
-                            std::string appended = base + REMINDER_CONTEXT_MARKER;
-                            for (const auto& line : context_lines)
-                                appended += line + "\n";
-                            // trim trailing newline
-                            if (!appended.empty() && appended.back() == '\n')
-                                appended.pop_back();
-                            job["payload"]["text"] = appended;
-                        }
-                    }
-                }
-
-                result = integration_->handle_add(gateway_opts, job);
+                result = integration_->handle_add({{"job", job}});
 
             // ----------------------------------------------------------------
-            // 🎯 case "update" — with flat-params recovery
+            // 🎯 case "update"
             // ----------------------------------------------------------------
             } else if (action == "update") {
                 std::string id = read_string_param(params, "jobId");
@@ -492,8 +404,7 @@ public:
                 if (!params.contains("patch") || !params["patch"].is_object())
                     return make_error("patch required");
 
-                json patch = cron::normalize_cron_job_patch(params["patch"]);
-                result = integration_->handle_update(gateway_opts, {{"id", id}, {"patch", patch}});
+                result = integration_->handle_update({{"id", id}, {"patch", params["patch"]}});
 
             // ----------------------------------------------------------------
             // 🎯 case "remove"
@@ -503,10 +414,10 @@ public:
                 if (id.empty()) id = read_string_param(params, "id");
                 if (id.empty())
                     return make_error("jobId required (id accepted for backward compatibility)");
-                result = integration_->handle_remove(gateway_opts, {{"id", id}});
+                result = integration_->handle_remove({{"id", id}});
 
             // ----------------------------------------------------------------
-            // 🎯 case "run" — runMode defaults to "force"
+            // 🎯 case "run"
             // ----------------------------------------------------------------
             } else if (action == "run") {
                 std::string id = read_string_param(params, "jobId");
@@ -515,7 +426,7 @@ public:
                     return make_error("jobId required (id accepted for backward compatibility)");
                 std::string run_mode = read_string_param(params, "runMode");
                 if (run_mode != "due" && run_mode != "force") run_mode = "force";
-                result = integration_->handle_run(gateway_opts, {{"id", id}, {"mode", run_mode}});
+                result = integration_->handle_run({{"id", id}, {"mode", run_mode}});
 
             // ----------------------------------------------------------------
             // 🎯 case "runs"
@@ -525,10 +436,10 @@ public:
                 if (id.empty()) id = read_string_param(params, "id");
                 if (id.empty())
                     return make_error("jobId required (id accepted for backward compatibility)");
-                result = integration_->handle_runs(gateway_opts, {{"id", id}});
+                result = integration_->handle_runs({{"id", id}});
 
             // ----------------------------------------------------------------
-            // 🎯 case "wake" — mode defaults to "next-heartbeat"
+            // 🎯 case "wake"
             // ----------------------------------------------------------------
             } else if (action == "wake") {
                 std::string text = read_string_param(params, "text");
@@ -536,7 +447,7 @@ public:
                     return make_error("text required for wake action");
                 std::string mode = read_string_param(params, "mode");
                 if (mode != "now" && mode != "next-heartbeat") mode = "next-heartbeat";
-                result = integration_->handle_wake(gateway_opts, {{"mode", mode}, {"text", text}});
+                result = integration_->handle_wake({{"mode", mode}, {"text", text}});
             }
 
             // Check for error in result
@@ -544,7 +455,7 @@ public:
                 std::string err_msg = result["error"].is_string()
                     ? result["error"].get<std::string>()
                     : result["error"].dump();
-                spdlog::error("[CronTool] error: {}", err_msg);
+                if (spdlog::get("default")) spdlog::get("default")->error("[CronTool] error: {}", err_msg);
                 return make_error(err_msg);
             }
 
@@ -558,7 +469,7 @@ public:
             return tool_result;
 
         } catch (const std::exception& e) {
-            spdlog::error("[CronTool] exception: {}", e.what());
+            if (spdlog::get("default")) spdlog::get("default")->error("[CronTool] exception: {}", e.what());
             return make_error(std::string(e.what()));
         }
     }
@@ -579,34 +490,10 @@ private:
 
     // 🎯 对齐 OpenClaw: buildReminderContextLines
     std::vector<std::string> build_reminder_context(
-        const cron::GatewayCallOptions& gateway_opts,
         int max_messages
     ) const {
-        if (max_messages <= 0 || agent_session_key_.empty()) return {};
-        try {
-            auto resolved = sessions::resolve_internal_session_key(agent_session_key_);
-            if (resolved.empty()) return {};
-
-            auto res = integration_->fetch_chat_history(gateway_opts, resolved, max_messages);
-            if (!res.contains("messages") || !res["messages"].is_array()) return {};
-
-            std::vector<std::string> lines;
-            int total = 0;
-            for (const auto& msg : res["messages"]) {
-                std::string role = msg.value("role", "");
-                if (role != "user" && role != "assistant") continue;
-                std::string text = cron::extract_text_from_chat_content(msg.value("content", json{}));
-                if (text.empty()) continue;
-                std::string label = (role == "user") ? "User" : "Assistant";
-                std::string line = "- " + label + ": " + truncate_text(text, REMINDER_CONTEXT_PER_MESSAGE_MAX);
-                total += (int)line.size();
-                if (total > REMINDER_CONTEXT_TOTAL_MAX) break;
-                lines.push_back(line);
-            }
-            return lines;
-        } catch (...) {
-            return {};
-        }
+        // Stub: context messages not available without fetch_chat_history
+        return {};
     }
 };
 

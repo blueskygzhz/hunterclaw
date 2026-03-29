@@ -88,13 +88,21 @@ core::JsonValue GeminiVisionProvider::call_gemini_api(
     }
 
     std::string url = base_url_ + "/" + model + ":generateContent?key=" + api_key_;
-    auto response = http_client_->post_json(url, request_body);
+    infra::HttpRequestOptions opts;
+    opts.headers["Content-Type"] = "application/json";
+    opts.body = request_body.to_json().dump();
+    opts.timeout_ms = 30000;
+    auto response_result = http_client_->post(url, opts);
+    if (!response_result.is_ok()) {
+        return core::JsonValue(json{{"error", response_result.error}});
+    }
+    const auto& response = response_result.get();
     if (!response.ok) {
-        return core::JsonValue(json{{"error", response.error}});
+        return core::JsonValue(json{{"error", "HTTP " + std::to_string(response.status_code)}});
     }
 
     try {
-        json body = json::parse(response.get().body);
+        json body = json::parse(response.body);
         // Extract text from Gemini response
         if (body.contains("candidates") && body["candidates"].is_array() &&
             !body["candidates"].empty()) {
