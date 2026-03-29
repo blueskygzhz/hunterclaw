@@ -52,6 +52,7 @@ private:
     core::JsonValue route_to_node(const std::string& action, const core::JsonValue& params);
     bool validate_duration(int duration);
     std::string get_quality_description(const std::string& quality);
+    ToolResult make_json_result(const core::JsonValue& data) const;
 };
 
 } // namespace tools

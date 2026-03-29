@@ -200,7 +200,7 @@ ToolResult TtsTool::provider_openai(const std::string& text, const core::JsonVal
 
     if (!response_result.is_ok())
         return make_error("OpenAI TTS failed: " + response_result.error);
-    auto& response = response_result.value;
+    auto& response = response_result.get();
     if (!response.ok)
         return make_error("OpenAI TTS failed: HTTP " + std::to_string(response.status_code));
 
@@ -258,7 +258,7 @@ ToolResult TtsTool::provider_elevenlabs(const std::string& text, const core::Jso
 
     if (!response_result.is_ok())
         return make_error("ElevenLabs TTS failed: " + response_result.error);
-    auto& response = response_result.value;
+    auto& response = response_result.get();
     if (!response.ok)
         return make_error("ElevenLabs TTS failed: HTTP " + std::to_string(response.status_code));
 

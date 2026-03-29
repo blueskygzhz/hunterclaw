@@ -69,6 +69,9 @@ private:
     
     ToolContext context_;
     std::shared_ptr<infra::HttpClient> http_client_;
+    
+    /// 创建错误结果
+    ToolResult make_error(const std::string& msg) const;
 };
 
 } // namespace tools

@@ -250,7 +250,41 @@ core::Result<infra::HttpResponse> AudioTranscriptionTool::upload_audio(
 ) {
     if (!http_client_)
         return core::Result<infra::HttpResponse>::Err("No HTTP client available");
-    return http_client_->upload_multipart(url, audio_path, filename, headers, form_fields);
+
+    // Build multipart/form-data body manually
+    const std::string boundary = "----HunterClawBoundary7MA4YWxkTrZu0gW";
+    std::string body;
+
+    // Add form fields
+    for (const auto& kv : form_fields) {
+        body += "--" + boundary + "\r\n";
+        body += "Content-Disposition: form-data; name=\"" + kv.first + "\"\r\n\r\n";
+        body += kv.second + "\r\n";
+    }
+
+    // Add audio file
+    // Read audio file content
+    std::ifstream f(audio_path, std::ios::binary);
+    if (!f.is_open())
+        return core::Result<infra::HttpResponse>::Err("Cannot open audio file: " + audio_path);
+    std::string audio_data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+
+    body += "--" + boundary + "\r\n";
+    body += "Content-Disposition: form-data; name=\"file\"; filename=\"" + filename + "\"\r\n";
+    body += "Content-Type: application/octet-stream\r\n\r\n";
+    body += audio_data + "\r\n";
+    body += "--" + boundary + "--\r\n";
+
+    infra::HttpRequestOptions opts;
+    opts.headers = headers;
+    opts.headers["Content-Type"] = "multipart/form-data; boundary=" + boundary;
+    opts.body = body;
+    opts.timeout_ms = 60000;
+
+    auto result = http_client_->post(url, opts);
+    if (!result.is_ok())
+        return core::Result<infra::HttpResponse>::Err(result.error);
+    return core::Result<infra::HttpResponse>::Ok(result.get());
 }
 
 ToolResult AudioTranscriptionTool::make_error(const std::string& msg) const {

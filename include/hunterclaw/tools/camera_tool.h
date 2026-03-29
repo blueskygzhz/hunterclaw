@@ -66,7 +66,12 @@ private:
     
     ToolContext context_;
     std::shared_ptr<nodes::NodeRegistry> node_registry_;
-};
+    
+    /// 创建错误结果
+    ToolResult make_error(const std::string& msg) const;
+    
+    /// 创建 JSON 结果
+    ToolResult make_json_result(const core::JsonValue& data) const;
 
 } // namespace tools
 } // namespace hunterclaw

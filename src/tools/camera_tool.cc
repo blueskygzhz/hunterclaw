@@ -37,8 +37,8 @@ std::string CameraTool::description() const {
            "Requires a paired iOS/Android node.";
 }
 
-Schema CameraTool::parameters() const {
-    Schema schema;
+Tool::Schema CameraTool::parameters() const {
+    Tool::Schema schema;
     schema.type = "object";
 
     auto make_str = [](const std::string& desc) {
@@ -178,7 +178,10 @@ std::string CameraTool::select_camera_node() {
     if (node_registry_) {
         auto nodes = node_registry_->list_nodes();
         for (const auto& n : nodes) {
-            if (n.has_capability("camera")) return n.id;
+            // Check if node has camera capability
+            for (const auto& cap : n.caps) {
+                if (cap == "camera") return n.node_id;
+            }
         }
     }
     return "";
@@ -190,7 +193,17 @@ core::Result<core::JsonValue> CameraTool::invoke_node_command(
     const core::JsonValue& command_params
 ) {
     if (node_registry_) {
-        return node_registry_->invoke(node_id, command, command_params);
+        auto result = node_registry_->invoke(node_id, command, command_params.to_json().dump());
+        if (!result.is_ok())
+            return core::Result<core::JsonValue>::Err(result.error);
+        const auto& invoke_result = result.get();
+        if (!invoke_result.success)
+            return core::Result<core::JsonValue>::Err(invoke_result.error_message);
+        // Parse result_json back to JsonValue
+        auto parse_result = core::JsonValue::parse(invoke_result.result_json);
+        if (!parse_result.is_ok())
+            return core::Result<core::JsonValue>::Ok(core::JsonValue::object());
+        return core::Result<core::JsonValue>::Ok(parse_result.get());
     }
     return core::Result<core::JsonValue>::Err("No node registry available");
 }
@@ -201,9 +214,9 @@ ToolResult CameraTool::make_error(const std::string& msg) const {
     r.content.push_back(c); return r;
 }
 
-ToolResult CameraTool::make_json_result(const json& data) const {
+ToolResult CameraTool::make_json_result(const core::JsonValue& data) const {
     ToolResult r; r.success = true;
-    ToolResultContent c; c.type = ToolResultContent::Type::Json; c.text = data.dump();
+    ToolResultContent c; c.type = ToolResultContent::Type::Json; c.text = data.to_json().dump();
     r.content.push_back(c); return r;
 }
 
