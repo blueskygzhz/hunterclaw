@@ -51,18 +51,38 @@ nlohmann::json GatewayCronIntegration::handle_wake(const nlohmann::json& params)
             return {{"success", false}, {"error", "heartbeat reply_fn not configured"}};
         }
 
-        // Build a minimal HeartbeatRunnerConfig / HeartbeatAgentConfig from params.
-        // The full config is resolved by the gateway when it calls set_heartbeat_reply_fn.
-        infra::HeartbeatRunnerConfig runner_cfg;
+        // Use the full runner_cfg injected by the gateway (set_heartbeat_runner_cfg).
+        // This ensures agent prompts, model, every, etc. are available.
+        // Aligned with openclaw server-cron.ts: runHeartbeatOnce({ cfg, agentId, sessionKey, reason, deps })
+        const infra::HeartbeatRunnerConfig& runner_cfg = heartbeat_runner_cfg_;
+
+        // Resolve agent_cfg: find matching agent by agent_id, or use first agent as default
         infra::HeartbeatAgentConfig agent_cfg;
-        agent_cfg.agent_id = agent_id;
+        if (!agent_id.empty()) {
+            for (const auto& a : runner_cfg.agents) {
+                if (a.agent_id == agent_id) { agent_cfg = a; break; }
+            }
+            if (agent_cfg.agent_id.empty()) {
+                // Not found in config — use bare agent_id (may be a dynamic agent)
+                agent_cfg.agent_id = agent_id;
+            }
+        } else if (!runner_cfg.agents.empty()) {
+            agent_cfg = runner_cfg.agents.front();
+        }
 
         infra::HeartbeatRunOnceOptions opts;
-        opts.reason = reason;
-        if (!agent_id.empty()) opts.agent_id = agent_id;
+        opts.reason = reason.empty() ? std::optional<std::string>{} : reason;
+        if (!agent_id.empty())    opts.agent_id    = agent_id;
         if (!session_key.empty()) opts.session_key = session_key;
         // Inject the reply_fn so run_heartbeat_once can call the LLM.
         opts.reply_fn = heartbeat_reply_fn_;
+        // ✅ Aligned with openclaw: inject get_queue_size (deps.getQueueSize)
+        // Aligned with openclaw: queueSize > 0 → skipped/requests-in-flight
+        // Without this, the lane check is silently skipped.
+        if (get_queue_size_fn_) {
+            opts.get_queue_size = get_queue_size_fn_;
+        }
+        // If not injected, get_queue_size remains null → lane check skipped (safe fallback)
 
         const auto result = infra::run_heartbeat_once(runner_cfg, agent_cfg, opts);
 

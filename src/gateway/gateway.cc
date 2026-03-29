@@ -14,6 +14,7 @@
 #include "hunterclaw/infra/heartbeat_runner.h"           // ✅ startHeartbeatRunner (aligned with openclaw)
 #include "hunterclaw/infra/heartbeat_wake.h"             // ✅ set_heartbeats_enabled (aligned with openclaw)
 #include "hunterclaw/cron/service.h"                     // ✅ CronService (aligned with openclaw: buildGatewayCronService)
+#include "hunterclaw/cron/gateway_integration.h"          // ✅ GatewayCronIntegration (agent tool path)
 #include <websocketpp/config/asio_no_tls.hpp>
 #include <websocketpp/server.hpp>
 #include <nlohmann/json.hpp>
@@ -1874,9 +1875,16 @@ struct GatewayServer::Impl {
     // ✅ HeartbeatRunner (aligned with openclaw: startHeartbeatRunner)
     // Aligned with openclaw server.impl.ts: let heartbeatRunner = startHeartbeatRunner({ cfg })
     std::shared_ptr<hunterclaw::infra::HeartbeatRunner> heartbeat_runner;
+    // ✅ Cached HeartbeatRunnerConfig (for method_wake mode=now)
+    // Aligned with openclaw: runHeartbeatOnce({ cfg, ... }) needs full cfg
+    hunterclaw::infra::HeartbeatRunnerConfig heartbeat_runner_cfg;
     // ✅ CronService (aligned with openclaw: buildGatewayCronService)
     // Aligned with openclaw server.impl.ts: let cronState = buildGatewayCronService({ cfg, deps, broadcast })
     std::shared_ptr<cron::CronService> cron_service;
+    // ✅ GatewayCronIntegration (agent tool path)
+    // Created in start() with injected heartbeat_runner_cfg + get_queue_size_fn
+    // Used by CronTool (create_cron_tool) to handle wake/cron actions from agents
+    std::shared_ptr<cron::GatewayCronIntegration> cron_integration;
     // ✅ MessageDispatcher (对齐 OpenClaw: dispatchInboundMessage)
     // chat.send 通过 message_dispatcher->run_reply_agent() 调度，
     // 使四种 queue mode (steer/followup/collect/interrupt) 对 chat.send 生效
@@ -2165,8 +2173,30 @@ core::Result<bool> GatewayServer::start() {
                 return hunterclaw::infra::run_heartbeat_once(runner_cfg, agent, opts);
             };
 
+            // Cache runner_cfg for method_wake(mode=now)
+            impl_->heartbeat_runner_cfg = runner_cfg;
             impl_->heartbeat_runner = hunterclaw::infra::start_heartbeat_runner(
                 runner_cfg, run_once_fn);
+
+            // ✅ Aligned with openclaw: create GatewayCronIntegration (agent tool path)
+            // Inject heartbeat_runner_cfg + get_queue_size_fn so CronTool's
+            // handle_wake(mode=now) has the same lane guard as method_wake.
+            if (impl_->cron_service && !impl_->cron_integration) {
+                auto integration = std::make_shared<cron::GatewayCronIntegration>(
+                    impl_->cron_service);
+                // Inject full runner config (agents, model, every, etc.)
+                integration->set_heartbeat_runner_cfg(runner_cfg);
+                // Inject reply_fn (same as heartbeat_reply_fn above)
+                integration->set_heartbeat_reply_fn(heartbeat_reply_fn);
+                // Inject get_queue_size (aligned with openclaw: deps.getQueueSize)
+                integration->set_get_queue_size_fn([](const std::string& /*lane*/) -> int {
+                    return static_cast<int>(
+                        hunterclaw::queue::CommandQueue::Instance()
+                            .get_queue_size(hunterclaw::queue::CommandLane::Main)
+                    );
+                });
+                impl_->cron_integration = std::move(integration);
+            }
         }
     }
     return result;
@@ -2252,6 +2282,13 @@ std::shared_ptr<cron::CronService> GatewayServer::cron_service() const {
     return impl_->cron_service;
 }
 
+std::shared_ptr<cron::GatewayCronIntegration> GatewayServer::cron_integration() const {
+    // ✅ Aligned with openclaw: GatewayCronIntegration (agent tool path)
+    // Created in start() with injected heartbeat_runner_cfg + get_queue_size_fn
+    // Used by CronTool (create_cron_tool) to handle wake/cron actions from agents
+    return impl_->cron_integration;
+}
+
 std::shared_ptr<GatewayRuntimeState> GatewayServer::runtime_state() const {
     if (impl_->server_impl) {
         return impl_->server_impl->runtime_state();
@@ -2277,6 +2314,10 @@ std::shared_ptr<queue::DeliveryQueue> GatewayServer::delivery_queue() const {
 }
 std::shared_ptr<core::Config> GatewayServer::config() const {
     return impl_->config;
+}
+
+hunterclaw::infra::HeartbeatRunnerConfig GatewayServer::heartbeat_runner_config() const {
+    return impl_->heartbeat_runner_cfg;
 }
 
 } // namespace gateway

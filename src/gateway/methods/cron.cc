@@ -288,9 +288,22 @@ core::Result<json> method_wake(
         // Aligned with openclaw: wakeMode=now → runHeartbeatOnce directly
         // Aligned with openclaw server-cron.ts:
         //   runHeartbeatOnce({ cfg, agentId, sessionKey, reason, deps })
-        hunterclaw::infra::HeartbeatRunnerConfig runner_cfg;
-        hunterclaw::infra::HeartbeatAgentConfig  agent_cfg;
-        agent_cfg.agent_id = agent_id;
+        // Use the full runner_cfg cached during start() so agent prompts/model/etc are available
+        hunterclaw::infra::HeartbeatRunnerConfig runner_cfg = server->heartbeat_runner_config();
+
+        // Resolve agent_cfg: find matching agent by agent_id, or use first agent as default
+        hunterclaw::infra::HeartbeatAgentConfig agent_cfg;
+        if (!agent_id.empty()) {
+            for (const auto& a : runner_cfg.agents) {
+                if (a.agent_id == agent_id) { agent_cfg = a; break; }
+            }
+            if (agent_cfg.agent_id.empty()) {
+                // Not found in config — use bare agent_id (may be a dynamic agent)
+                agent_cfg.agent_id = agent_id;
+            }
+        } else if (!runner_cfg.agents.empty()) {
+            agent_cfg = runner_cfg.agents.front();
+        }
 
         hunterclaw::infra::HeartbeatRunOnceOptions opts;
         opts.reason = reason.empty() ? std::optional<std::string>{} : reason;

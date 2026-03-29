@@ -39,6 +39,33 @@ public:
     const HeartbeatReplyFn& heartbeat_reply_fn() const {
         return heartbeat_reply_fn_;
     }
+
+    // ========================================================================
+    // HeartbeatRunnerConfig injection
+    // Aligned with openclaw: full runner config (agents, user_timezone, etc.)
+    // Must be set by the gateway after start() so handle_wake(mode=now) can
+    // use the complete agent config (prompt, model, every, etc.).
+    // ========================================================================
+    void set_heartbeat_runner_cfg(const infra::HeartbeatRunnerConfig& cfg) {
+        heartbeat_runner_cfg_ = cfg;
+    }
+
+    const infra::HeartbeatRunnerConfig& heartbeat_runner_cfg() const {
+        return heartbeat_runner_cfg_;
+    }
+
+    // ========================================================================
+    // get_queue_size injection
+    // Aligned with openclaw: deps.getQueueSize → CommandQueue::Instance().get_queue_size
+    // Must be set by the gateway so handle_wake(mode=now) can check the main
+    // lane queue size before running heartbeat (requests-in-flight guard).
+    // If not set, the lane check is skipped (safe fallback for tests/cron_tool).
+    // ========================================================================
+    using GetQueueSizeFn = std::function<int(const std::string& lane)>;
+
+    void set_get_queue_size_fn(GetQueueSizeFn fn) {
+        get_queue_size_fn_ = std::move(fn);
+    }
     
     // ========================================================================
     // WebSocket Handlers (对齐 OpenClaw gateway/server-methods/cron.ts)
@@ -142,7 +169,9 @@ public:
     
 private:
     std::shared_ptr<CronService> service_;
-    HeartbeatReplyFn heartbeat_reply_fn_;  // injected by gateway; calls ReplyGenerator::get_reply_from_config
+    HeartbeatReplyFn heartbeat_reply_fn_;          // injected by gateway; calls ReplyGenerator::get_reply_from_config
+    infra::HeartbeatRunnerConfig heartbeat_runner_cfg_;  // injected by gateway after start(); full agent config
+    GetQueueSizeFn get_queue_size_fn_;             // injected by gateway; aligned with openclaw: deps.getQueueSize
 
     // JSON conversion helpers
     static nlohmann::json job_to_json(const CronJob& job);

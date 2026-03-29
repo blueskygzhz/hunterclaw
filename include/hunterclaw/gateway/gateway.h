@@ -7,6 +7,7 @@
 #include "hunterclaw/plugins/plugin.h"
 #include "hunterclaw/gateway/todo_types.h"
 #include "hunterclaw/gateway/auth_manager.h"
+#include "hunterclaw/infra/heartbeat_runner.h"
 #include <websocketpp/config/asio_no_tls.hpp>
 #include <websocketpp/server.hpp>
 #include <nlohmann/json.hpp>
@@ -42,6 +43,7 @@ class DeliveryQueue;  // ✅ 对齐 OpenClaw: deliver 函数
 namespace hunterclaw {
 namespace cron {
 class CronService;
+class GatewayCronIntegration;
 }
 }
 
@@ -378,9 +380,16 @@ public:
     std::shared_ptr<skills::SkillManager> skill_manager() const;
     std::shared_ptr<plugins::PluginManager> plugin_manager() const;
     std::shared_ptr<cron::CronService> cron_service() const;
+    // ✅ Aligned with openclaw: GatewayCronIntegration (agent tool path)
+    // Created in start() with injected heartbeat_runner_cfg + get_queue_size_fn
+    std::shared_ptr<cron::GatewayCronIntegration> cron_integration() const;
 
     // Config access
     std::shared_ptr<core::Config> config() const;
+
+    // Heartbeat runner config access (for method_wake mode=now)
+    // Returns the cached HeartbeatRunnerConfig built during start()
+    hunterclaw::infra::HeartbeatRunnerConfig heartbeat_runner_config() const;
 
     // State access
     std::shared_ptr<GatewayRuntimeState> runtime_state() const;
