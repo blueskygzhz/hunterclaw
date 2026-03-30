@@ -13,6 +13,7 @@
 //   src/agents/acp-spawn.ts (spawnAcpDirect)
 
 #include "hunterclaw/tools/sessions_tool.h"
+#include "hunterclaw/agents/acp_spawn.h"
 #include "hunterclaw/sessions/session_key_utils.h"
 #include "hunterclaw/routing/session_key.h"
 #include "hunterclaw/gateway/client.h"
@@ -1400,11 +1401,62 @@ public:
         }
 
         if (runtime == "acp") {
-            // ACP spawn: not fully implemented, return error
-            return make_json_result(json{
-                {"status", "error"},
-                {"error", "runtime=acp is not supported in this build"}
-            });
+            // === ACP spawn (aligned with OpenClaw spawnAcpDirect) ===
+            agents::SpawnAcpParams acp_params;
+            acp_params.task = task;
+            if (!label.empty()) acp_params.label = label;
+            {
+                std::string acp_agent_id = trim(read_string_param(params, "agentId"));
+                if (!acp_agent_id.empty()) acp_params.agent_id = acp_agent_id;
+            }
+            if (!resume_session_id.empty()) acp_params.resume_session_id = resume_session_id;
+            if (!ctx_.workspace_dir.empty()) acp_params.cwd = ctx_.workspace_dir;
+            if (!stream_to.empty()) acp_params.stream_to = stream_to;
+            // mode: "run" (default) or "session" (requires thread=true)
+            bool thread_bind = params.value("thread", false);
+            acp_params.thread = thread_bind;
+            std::string mode_param = read_string_param(params, "mode");
+            if (!mode_param.empty()) acp_params.mode = mode_param;
+            // sandbox
+            std::string sandbox_param = read_string_param(params, "sandbox");
+            if (!sandbox_param.empty()) acp_params.sandbox = sandbox_param;
+
+            agents::SpawnAcpContext acp_ctx;
+            acp_ctx.agent_session_key = ctx_.agent_session_key.empty()
+                ? std::nullopt : std::make_optional(ctx_.agent_session_key);
+            acp_ctx.agent_channel = ctx_.agent_channel.empty()
+                ? std::nullopt : std::make_optional(ctx_.agent_channel);
+            acp_ctx.agent_account_id = ctx_.agent_account_id.empty()
+                ? std::nullopt : std::make_optional(ctx_.agent_account_id);
+            acp_ctx.agent_to = ctx_.agent_to.empty()
+                ? std::nullopt : std::make_optional(ctx_.agent_to);
+            acp_ctx.agent_thread_id = ctx_.agent_thread_id.empty()
+                ? std::nullopt : std::make_optional(ctx_.agent_thread_id);
+            acp_ctx.sandboxed = ctx_.sandboxed;
+
+            agents::AcpSpawnConfig acp_cfg;
+            acp_cfg.enable_acp = ctx_.acp_enabled;
+            acp_cfg.acp_default_agent = ctx_.acp_default_agent;
+            acp_cfg.acp_allowed_agents = ctx_.acp_allowed_agents;
+            acp_cfg.acp_max_concurrent_sessions = ctx_.acp_max_concurrent_sessions;
+
+            auto acp_result = agents::spawn_acp_direct(acp_params, acp_ctx, gw_, acp_cfg);
+
+            json result_json;
+            result_json["status"] = acp_result.status;
+            if (acp_result.child_session_key.has_value())
+                result_json["childSessionKey"] = *acp_result.child_session_key;
+            if (acp_result.run_id.has_value())
+                result_json["runId"] = *acp_result.run_id;
+            if (acp_result.mode.has_value())
+                result_json["mode"] = *acp_result.mode;
+            if (acp_result.stream_log_path.has_value())
+                result_json["streamLogPath"] = *acp_result.stream_log_path;
+            if (acp_result.note.has_value())
+                result_json["note"] = *acp_result.note;
+            if (acp_result.error.has_value())
+                result_json["error"] = *acp_result.error;
+            return make_json_result(result_json);
         }
 
         // === subagent spawn (aligned with OpenClaw spawnSubagentDirect) ===

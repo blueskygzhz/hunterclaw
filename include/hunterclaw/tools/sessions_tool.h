@@ -99,6 +99,13 @@ struct SessionsToolContext {
     // sessions_spawn 成功后调用 registry->register_subagent() 注册 subagent run
     // 对应 OpenClaw: registerSubagentRun() in subagent-registry.ts
     std::shared_ptr<agents::SubagentRegistry> registry;
+
+    // ✅ 对齐 OpenClaw: ACP 配置
+    // Aligned with openclaw: cfg.acp.enabled / cfg.acp.defaultAgent / cfg.acp.allowedAgents
+    bool acp_enabled = true;                          // DispatchConfig.enable_acp
+    std::string acp_default_agent;                    // acp.defaultAgent
+    std::vector<std::string> acp_allowed_agents;      // acp.allowedAgents (empty = all allowed)
+    int acp_max_concurrent_sessions = 10;             // acp.maxConcurrentSessions
 };
 
 /**

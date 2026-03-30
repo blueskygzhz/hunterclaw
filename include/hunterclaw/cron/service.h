@@ -137,6 +137,8 @@ struct CronJobState {
   std::optional<int64_t> running_at_ms;   // 并发控制：正在运行的时间戳
   std::optional<int64_t> last_run_at_ms;
   std::optional<CronRunStatus> last_run_status;
+  // 对齐 OpenClaw lastStatus (back-compat alias for lastRunStatus)
+  std::optional<CronRunStatus> last_status;
   std::optional<std::string> last_error;
   std::optional<std::string> last_error_reason;  // 对齐 lastErrorReason
   std::optional<int64_t> last_duration_ms;
@@ -145,7 +147,7 @@ struct CronJobState {
   int schedule_error_count = 0;
   std::optional<std::string> last_delivery_status;
   std::optional<std::string> last_delivery_error;
-  bool last_delivered = false;
+  std::optional<bool> last_delivered;  // 对齐 OpenClaw: optional<bool> 区分 delivered/not-delivered/unknown
 };
 
 /**
@@ -232,7 +234,7 @@ struct CronRunLogEntry {
 
 /**
  * Cron Run Outcome - 执行结果
- * 对齐 OpenClaw cron/types.ts CronRunOutcome
+ * 对齐 OpenClaw cron/types.ts CronRunOutcome + CronRunTelemetry
  */
 struct CronRunOutcome {
   CronRunStatus status;
@@ -242,7 +244,9 @@ struct CronRunOutcome {
   std::optional<std::string> session_key;
   std::optional<bool> delivered;
   std::optional<bool> delivery_attempted;
+  // CronRunTelemetry 字段 (对齐 OpenClaw)
   std::optional<std::string> model;
+  std::optional<std::string> provider;
 };
 
 /**
@@ -277,6 +281,41 @@ class CronScheduleCalculator {
 };
 
 /**
+ * Heartbeat 运行结果 (对齐 OpenClaw HeartbeatRunResult)
+ */
+struct HeartbeatRunResult {
+  enum class Status { Ran, Skipped, Error };
+  Status status;
+  std::string reason;  // skipped/error 时的原因
+};
+
+/**
+ * Cron 全局配置 (对齐 OpenClaw CronConfig)
+ */
+struct CronConfig {
+  // 最大并发执行数 (对齐 OpenClaw cronConfig.maxConcurrentRuns)
+  int max_concurrent_runs = 1;
+
+  // 失败告警全局配置
+  struct FailureAlertConfig {
+    bool enabled = false;
+    int after = 2;
+    int64_t cooldown_ms = 60 * 60'000;
+    std::optional<std::string> channel;
+    std::optional<std::string> mode;
+    std::optional<std::string> account_id;
+  };
+  std::optional<FailureAlertConfig> failure_alert;
+
+  // 重试配置 (对齐 OpenClaw cronConfig.retry)
+  struct RetryConfig {
+    int max_attempts = 3;
+    std::vector<int64_t> backoff_ms;  // 空则使用默认
+  };
+  std::optional<RetryConfig> retry;
+};
+
+/**
  * Cron Service Deps - 依赖注入
  * 对齐 OpenClaw cron/service/state.ts CronServiceDeps
  */
@@ -286,40 +325,53 @@ struct CronServiceDeps {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
   };
-  
+
   // 是否启用 cron
   bool cron_enabled = true;
-  
+
   // 默认 agent id
   std::optional<std::string> default_agent_id;
-  
+
   // 启动时最多补跑的错过任务数
   int max_missed_jobs_per_restart = 5;
-  
+
   // 错过任务的错峰间隔 (ms)
   int64_t missed_job_stagger_ms = 5000;
-  
+
   // wakeMode=now 时等待 heartbeat 的最大时间
   int64_t wake_now_heartbeat_busy_max_wait_ms = 2 * 60 * 1000;
-  
+
   // wakeMode=now 时 heartbeat 重试间隔
   int64_t wake_now_heartbeat_busy_retry_delay_ms = 250;
-  
+
+  // Cron 全局配置 (对齐 OpenClaw cronConfig)
+  std::optional<CronConfig> cron_config;
+
   // 注入系统事件 (main session 路径)
   std::function<void(const std::string& text,
                      const std::optional<std::string>& agent_id,
                      const std::optional<std::string>& session_key,
                      const std::optional<std::string>& context_key)> enqueue_system_event;
-  
-  // 请求立即触发心跳
+
+  // 请求立即触发心跳 (next-heartbeat 模式)
   std::function<void(const std::optional<std::string>& reason,
                      const std::optional<std::string>& agent_id,
                      const std::optional<std::string>& session_key)> request_heartbeat_now;
-  
+
+  // 同步执行一次 heartbeat 并等待结果 (wakeMode=now 路径)
+  // 对齐 OpenClaw runHeartbeatOnce
+  std::function<HeartbeatRunResult(
+      const std::optional<std::string>& reason,
+      const std::optional<std::string>& agent_id,
+      const std::optional<std::string>& session_key)> run_heartbeat_once;
+
   // 执行 isolated agent job
+  // 对齐 OpenClaw server-cron.ts: runIsolatedAgentJob({ job, message, abortSignal })
+  // lane 参数由调用方注入 ("cron")，内部通过 resolveNestedAgentLane 转换为 "nested" 防死锁
   std::function<CronRunOutcome(const CronJob& job,
-                               const std::string& message)> run_isolated_agent_job;
-  
+                               const std::string& message,
+                               const std::string& lane)> run_isolated_agent_job;
+
   // 发送失败告警
   std::function<void(const CronJob& job,
                      const std::string& text,
@@ -327,7 +379,7 @@ struct CronServiceDeps {
                      const std::optional<std::string>& to,
                      const std::optional<std::string>& mode,
                      const std::optional<std::string>& account_id)> send_cron_failure_alert;
-  
+
   // 事件回调
   std::function<void(const std::string& job_id,
                      const std::string& action,
@@ -338,7 +390,7 @@ struct CronServiceDeps {
  * Cron Service - 定时任务服务
  * 对齐 OpenClaw cron/service.ts
  */
-class CronService {
+class CronService : public std::enable_shared_from_this<CronService> {
  public:
   explicit CronService(std::shared_ptr<CronStore> store, CronServiceDeps deps = {});
   ~CronService();
@@ -354,7 +406,10 @@ class CronService {
   
   // 手动触发任务 (force=true 忽略 enabled 和 nextRunAtMs)
   void force_run(const std::string& job_id);
-  
+
+  // 异步入队手动触发 (对齐 OpenClaw enqueueRun)
+  bool enqueue_run(const std::string& job_id, bool force = false);
+
   // 设置执行器 (兼容旧接口)
   void set_executor(std::function<void(const CronJob&)> executor);
 
@@ -380,6 +435,15 @@ class CronService {
   
   // 计算 job 的下次运行时间 (含 stagger)
   std::optional<int64_t> compute_job_next_run_at_ms(const CronJob& job, int64_t now_ms);
+
+  // 计算 job 的上次应运行时间 (对齐 OpenClaw computeJobPreviousRunAtMs，用于 missed-run 检测)
+  std::optional<int64_t> compute_job_previous_run_at_ms(const CronJob& job, int64_t now_ms);
+
+  // 记录 schedule 计算错误，超过阈值自动禁用 (对齐 OpenClaw recordScheduleComputeError)
+  bool record_schedule_compute_error(CronJob& job, const std::string& err);
+
+  // 解析 delivery 状态 (对齐 OpenClaw resolveDeliveryStatus)
+  std::string resolve_delivery_status(const CronJob& job, const std::optional<bool>& delivered);
   
   // 重新计算所有 job 的 nextRunAtMs
   void recompute_next_runs(int64_t now_ms);
@@ -405,7 +469,7 @@ class CronService {
   std::thread scheduler_thread_;
   std::mutex mutex_;
   std::condition_variable cv_;
-  
+
   // 下次唤醒时间 (ms)
   std::optional<int64_t> next_wake_at_ms_;
 };

@@ -5,6 +5,9 @@
 #include <ctime>
 #include <regex>
 #include <chrono>
+#include <sstream>
+#include <string>
+#include <vector>
 #include <openssl/sha.h>
 
 namespace hunterclaw {
@@ -144,9 +147,25 @@ std::optional<int64_t> parse_cron_next_ms(
 }
 
 bool is_top_of_hour_expression(const std::string& expr) {
-    // 检查是否为整点表达式: "0 * * * *" 或 "0 0 * * * *"
-    std::regex top_regex(R"(^0\s+(\*|0)\s+\*\s+\*\s+\*(\s+\*)?$)");
-    return std::regex_match(expr, top_regex);
+    // 对齐 OpenClaw isRecurringTopOfHourCronExpr (stagger.ts)
+    // 检查是否为周期性整点表达式：minute=0 且 hour 字段含 "*"（周期性）
+    // 5字段: "0 * * * *" / "0 */2 * * *"
+    // 6字段: "0 0 * * * *" / "0 0 */2 * * *"
+    std::vector<std::string> fields;
+    std::istringstream iss(expr);
+    std::string field;
+    while (iss >> field) {
+        fields.push_back(field);
+    }
+    if (fields.size() == 5) {
+        // 5字段: minute hour day month weekday
+        return fields[0] == "0" && fields[1].find('*') != std::string::npos;
+    }
+    if (fields.size() == 6) {
+        // 6字段: second minute hour day month weekday
+        return fields[0] == "0" && fields[1] == "0" && fields[2].find('*') != std::string::npos;
+    }
+    return false;
 }
 
 // ============================================================================

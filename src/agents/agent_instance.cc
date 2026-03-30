@@ -205,9 +205,13 @@ core::Result<std::string> AgentInstance::process_message(
         return core::Result<std::string>::Err("ReactEngine not initialized");
     }
 
-    // 如果当前正在处理，将消息入队（非阻塞）
+    // 原子地尝试将 is_processing_ 从 false 切换到 true（compare_exchange）
     // 对齐 OpenClaw: maybeQueueSubagentAnnounce()
-    if (is_processing_.load()) {
+    // 修复 race condition：load() + store(true) 之间存在窗口，两个线程可能同时通过检查。
+    // compare_exchange_strong 保证只有一个线程能成功将 false→true，其余线程入队。
+    bool expected = false;
+    if (!is_processing_.compare_exchange_strong(expected, true)) {
+        // 已有线程在处理，入队等待
         enqueue_message(message, options);
         spdlog::get("default")->debug(
             "[AgentInstance] Agent busy, message queued: session={}, queue_size={}",
@@ -220,8 +224,7 @@ core::Result<std::string> AgentInstance::process_message(
         return core::Result<std::string>::Ok("queued");
     }
 
-    // 标记为处理中
-    is_processing_.store(true);
+    // compare_exchange 成功：is_processing_ 已被原子地设为 true
     auto result = process_message_with_overflow_retry(message, options);
     is_processing_.store(false);
 

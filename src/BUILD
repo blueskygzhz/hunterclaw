@@ -483,6 +483,7 @@ cc_library(
         ":hunterclaw_skills",
         ":hunterclaw_tools",   # ✅ 添加 tools 依赖 (ToolManager::create)
         ":hunterclaw_react",   # ✅ 添加 react 依赖 (ReactEngine::create)
+        "@ixwebsocket//:ixwebsocket",  # ✅ acp_spawn.cc 需要 gateway/client.h
         "@nlohmann_json//:json",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
