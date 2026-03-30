@@ -35,6 +35,38 @@ cc_library(
 )
 
 # ============================================================================
+# Infra Library - Infrastructure Utilities (heartbeat, http_client, events, etc.)
+# ============================================================================
+cc_library(
+    name = "hunterclaw_infra",
+    srcs = glob(["infra/*.cc"], exclude = [
+        "infra/exec_approvals.cc",  # TODO: 需要更新以匹配新的 API
+    ]),
+    deps = [
+        "//:hunterclaw_headers",
+        "@nlohmann_json//:json",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+    copts = [
+        "-std=c++17",
+        "-Wall",
+        "-Wextra",
+        "-I/usr/include/jsoncpp",
+        "-I/usr/include/spdlog",
+    ],
+    linkopts = [
+        "-lpthread",
+        "-lssl",
+        "-lcrypto",
+        "-lcurl",
+        "-ljsoncpp",
+    ],
+    linkstatic = False,
+    visibility = ["//visibility:public"],
+)
+
+# ============================================================================
 # Cron Library - Cron Job Scheduling and Management
 # ============================================================================
 cc_library(
@@ -42,6 +74,7 @@ cc_library(
     srcs = glob(["cron/*.cc"]),
     deps = [
         "//:hunterclaw_headers",
+        ":hunterclaw_infra",          # ✅ 添加 infra 依赖 (heartbeat_runner 等)
         "@nlohmann_json//:json",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -221,6 +254,7 @@ cc_library(
         ":hunterclaw_tools",         # ✅ 添加 tools 依赖
         ":hunterclaw_react",         # ✅ 添加 react 依赖
         ":hunterclaw_cron",          # ✅ 添加 cron 依赖
+        ":hunterclaw_infra",         # ✅ 添加 infra 依赖 (heartbeat_runner 等)
         ":hunterclaw_observability", # ✅ 添加 observability 依赖 (WebhookReceivedEvent vtable)
         ":hunterclaw_queue",         # ✅ 添加 queue 依赖 (CommandQueue)
         "@ixwebsocket//:ixwebsocket",   # ✅ 添加 ixwebsocket 依赖 (WebSocket)
@@ -553,19 +587,19 @@ cc_library(
         "secrets/*.cc",
         "auto_reply/*.cc",
         # ✅ 移除 observability/*.cc - 已移至独立的 hunterclaw_observability 库
-        "infra/*.cc",
+        # ✅ 移除 infra/*.cc - 已移至独立的 hunterclaw_infra 库
         "markdown/*.cc",
         "shared/*.cc",
         "nodes/*.cc",
     ], exclude = [
         "main.cc",
-        "infra/exec_approvals.cc",  # TODO: 需要更新以匹配新的 API
     ]),
     deps = [
         ":hunterclaw_core_base",  # ✅ 依赖 core_base (core/*.cc)
         ":hunterclaw_logging",   # ✅ 添加 logging 依赖 (create_subsystem_logger)
         ":hunterclaw_agents",    # ✅ 添加 agents 依赖
         ":hunterclaw_cron",      # ✅ 添加 cron 依赖
+        ":hunterclaw_infra",     # ✅ 添加 infra 依赖 (heartbeat_runner 等)
         ":hunterclaw_gateway",   # ✅ 添加 gateway 依赖
         ":hunterclaw_memory",
         ":hunterclaw_llm",

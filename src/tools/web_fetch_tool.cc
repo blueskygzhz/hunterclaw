@@ -185,25 +185,42 @@ core::Result<WebFetchTool::FetchResult> WebFetchTool::fetch_url(
     if (!http_client_)
         return core::Result<FetchResult>::Err("HTTP client not available");
 
-    auto response = http_client_->get(url, {
+    infra::HttpRequestOptions opts;
+    opts.headers = {
         {"User-Agent",      USER_AGENT},
         {"Accept",          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
         {"Accept-Language", "en-US,en;q=0.5"},
-    }, timeout_seconds, max_redirects);
+    };
+    opts.timeout_ms = timeout_seconds * 1000;
+    opts.max_redirects = max_redirects;
 
+    auto resp_result = http_client_->get(url, opts);
+    if (!resp_result.ok)
+        return core::Result<FetchResult>::Err("HTTP fetch failed: " + resp_result.error);
+
+    auto& response = resp_result.get();
     if (!response.ok)
-        return core::Result<FetchResult>::Err("HTTP fetch failed: " + response.error);
+        return core::Result<FetchResult>::Err("HTTP fetch failed: status " + std::to_string(response.status_code));
 
+    std::string body = response.body;
     // Check response size
-    if ((int)response.body.size() > DEFAULT_MAX_RESPONSE_BYTES) {
+    if ((int)body.size() > DEFAULT_MAX_RESPONSE_BYTES) {
         // Truncate to max
-        response.body = response.body.substr(0, DEFAULT_MAX_RESPONSE_BYTES);
+        body = body.substr(0, DEFAULT_MAX_RESPONSE_BYTES);
     }
 
+    // Extract content-type from headers
+    std::string content_type;
+    auto ct_it = response.headers.find("content-type");
+    if (ct_it == response.headers.end())
+        ct_it = response.headers.find("Content-Type");
+    if (ct_it != response.headers.end())
+        content_type = ct_it->second;
+
     FetchResult result;
-    result.content      = response.body;
-    result.final_url    = response.final_url.empty() ? url : response.final_url;
-    result.content_type = response.content_type;
+    result.content      = body;
+    result.final_url    = url;
+    result.content_type = content_type;
     result.status_code  = response.status_code;
     return core::Result<FetchResult>::Ok(result);
 }
@@ -225,19 +242,21 @@ core::Result<WebFetchTool::FetchResult> WebFetchTool::fetch_firecrawl(
     if (!http_client_)
         return core::Result<FetchResult>::Err("HTTP client not available");
 
-    auto response = http_client_->post(
-        base_url + "/v1/scrape",
-        body.dump(),
-        {
-            {"Authorization", "Bearer " + api_key.value()},
-            {"Content-Type",  "application/json"},
-        },
-        timeout_seconds
-    );
+    infra::HttpRequestOptions fc_opts;
+    fc_opts.headers = {
+        {"Authorization", "Bearer " + api_key.value()},
+        {"Content-Type",  "application/json"},
+    };
+    fc_opts.body = body.dump();
+    fc_opts.timeout_ms = timeout_seconds * 1000;
 
+    auto resp_result = http_client_->post(base_url + "/v1/scrape", fc_opts);
+    if (!resp_result.ok)
+        return core::Result<FetchResult>::Err("Firecrawl failed: " + resp_result.error);
+
+    auto& response = resp_result.get();
     if (!response.ok)
-        return core::Result<FetchResult>::Err("Firecrawl failed: " + response.error);
-
+        return core::Result<FetchResult>::Err("Firecrawl failed: status " + std::to_string(response.status_code));
     // Parse Firecrawl response
     try {
         json resp = json::parse(response.body);
@@ -325,15 +344,14 @@ std::string WebFetchTool::html_to_markdown(const std::string& html) const {
     result = std::regex_replace(result, italic_re, "_$2_");
 
     // Links
-    static const std::regex link_re{R"(<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>)",
+    static const std::regex link_re{R"re(<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>)re",
                                      std::regex_constants::icase};
     result = std::regex_replace(result, link_re, "[$2]($1)");
 
     // Images
-    static const std::regex img_re{R"(<img[^>]*alt="([^"]*)"[^>]*src="([^"]*)"[^>]*>)",
+    static const std::regex img_re{R"re(<img[^>]*alt="([^"]*)"[^>]*src="([^"]*)"[^>]*>)re",
                                     std::regex_constants::icase};
     result = std::regex_replace(result, img_re, "![$1]($2)");
-
     // Code blocks
     static const std::regex pre_re{R"(<pre[^>]*><code[^>]*>([\s\S]*?)</code></pre>)",
                                     std::regex_constants::icase};
@@ -413,7 +431,7 @@ std::string WebFetchTool::markdown_to_text(const std::string& markdown) const {
     std::string result = markdown;
     static const std::regex md_re{R"(\*\*([^*]+)\*\*|__([^_]+)__|_([^_]+)_|\*([^*]+)\*|`([^`]+)`)"};
     result = std::regex_replace(result, md_re, "$1$2$3$4$5");
-    static const std::regex link_re{R"(\[([^\]]+)\]\([^)]+\))"};
+    static const std::regex link_re{R"re(\[([^\]]+)\]\([^)]+\))re"};
     result = std::regex_replace(result, link_re, "$1");
     return trim(result);
 }

@@ -444,7 +444,9 @@ nlohmann::json GatewayCronIntegration::job_to_json(const CronJob& job) {
     if (job.state.last_delivery_error.has_value()) {
         state["lastDeliveryError"] = *job.state.last_delivery_error;
     }
-    state["lastDelivered"] = job.state.last_delivered;
+    if (job.state.last_delivered.has_value()) {
+        state["lastDelivered"] = *job.state.last_delivered;
+    }
     j["state"] = state;
 
     return j;

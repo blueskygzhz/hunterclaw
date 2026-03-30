@@ -1011,7 +1011,7 @@ core::Result<json> WebSearchTool::run_brave_web_search(
         return core::Result<json>::Err("Brave Search API request failed: " + response.error);
     }
 
-    auto& http_resp = response.unwrap();
+    auto http_resp = response.unwrap();
     if (http_resp.status_code != 200) {
         return core::Result<json>::Err(
             "Brave Search API error (" + std::to_string(http_resp.status_code) + "): " + http_resp.body
@@ -1108,7 +1108,7 @@ core::Result<json> WebSearchTool::run_brave_llm_context_search(
         return core::Result<json>::Err("Brave LLM Context API request failed: " + response.error);
     }
 
-    auto& http_resp = response.unwrap();
+    auto http_resp = response.unwrap();
     if (http_resp.status_code != 200) {
         return core::Result<json>::Err(
             "Brave LLM Context API error (" + std::to_string(http_resp.status_code) + "): " + http_resp.body
@@ -1210,7 +1210,7 @@ core::Result<json> WebSearchTool::run_gemini_search(
         return core::Result<json>::Err("Gemini API request failed: " + response.error);
     }
 
-    auto& http_resp = response.unwrap();
+    auto http_resp = response.unwrap();
     if (http_resp.status_code != 200) {
         // 🎯 对齐 OpenClaw: strip API key from error detail
         std::string detail = http_resp.body;
@@ -1337,7 +1337,7 @@ core::Result<json> WebSearchTool::run_grok_search(
         return core::Result<json>::Err("xAI API request failed: " + response.error);
     }
 
-    auto& http_resp = response.unwrap();
+    auto http_resp = response.unwrap();
     if (http_resp.status_code != 200) {
         return core::Result<json>::Err(
             "xAI API error (" + std::to_string(http_resp.status_code) + "): " + http_resp.body
@@ -1492,7 +1492,7 @@ core::Result<json> WebSearchTool::run_kimi_search(
             return core::Result<json>::Err("Kimi API request failed: " + response.error);
         }
 
-        auto& http_resp = response.unwrap();
+        auto http_resp = response.unwrap();
         if (http_resp.status_code != 200) {
             return core::Result<json>::Err(
                 "Kimi API error (" + std::to_string(http_resp.status_code) + "): " + http_resp.body
@@ -1744,7 +1744,7 @@ core::Result<json> WebSearchTool::run_perplexity_search(
         return core::Result<json>::Err("Perplexity API request failed: " + response.error);
     }
 
-    auto& http_resp = response.unwrap();
+    auto http_resp = response.unwrap();
     if (http_resp.status_code != 200) {
         return core::Result<json>::Err(
             "Perplexity API error (" + std::to_string(http_resp.status_code) + "): " + http_resp.body
@@ -1889,7 +1889,7 @@ core::Result<json> WebSearchTool::run_perplexity_search_api(
         return core::Result<json>::Err("Perplexity Search API request failed: " + response.error);
     }
 
-    auto& http_resp = response.unwrap();
+    auto http_resp = response.unwrap();
     if (http_resp.status_code != 200) {
         return core::Result<json>::Err(
             "Perplexity Search API error (" + std::to_string(http_resp.status_code) + "): " + http_resp.body

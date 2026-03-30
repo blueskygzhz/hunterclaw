@@ -675,9 +675,8 @@ bool CronService::enqueue_run(const std::string& job_id, bool force) {
   // fire-and-forget: 不等待结果
   auto self = shared_from_this();
   auto& cq = hunterclaw::queue::CommandQueue::Instance();
-  cq.enqueue_command_in_lane(
-    hunterclaw::queue::CommandLane::Cron,
-    [self, job_id, force]() {
+  // 包装为 std::function<void()>，匹配 command_queue.cc 中的显式实例化
+  std::function<void()> task = [self, job_id, force]() {
       // 对齐 OpenClaw: run(state, id, mode) — 在 Cron lane 内串行执行
       // 再次检查是否仍可运行（可能在排队期间已被其他触发执行）
       auto stored = self->store_->get(job_id);
@@ -715,7 +714,10 @@ bool CronService::enqueue_run(const std::string& job_id, bool force) {
         }
         self->rearm_timer();
       }
-    }
+  };
+  cq.enqueue_command_in_lane(
+    hunterclaw::queue::CommandLane::Cron,
+    std::move(task)
   );
   return true;
 }

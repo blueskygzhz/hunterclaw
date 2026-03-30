@@ -1227,8 +1227,8 @@ ToolResult ImageAnalysisTool::execute(const JsonValue& params) {
     // MARK: - Run image prompt with all loaded images
     // 🎯 对齐 OpenClaw: runImagePrompt({ cfg, agentDir, imageModelConfig, modelOverride, prompt, images })
     // =========================================================================
-    Logger::info("[ImageAnalysis] Running vision: " +
-                 image_model_config.primary + " images=" + std::to_string(loaded_images.size()));
+    get_logger()->info("[ImageAnalysis] Running vision: {} images={}", 
+                 image_model_config.primary, loaded_images.size());
 
     // 🎯 对齐 OpenClaw: resolveImageToolMaxTokens(model.maxTokens)
     int max_tokens = resolve_image_tool_max_tokens(0, 4096);
