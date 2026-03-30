@@ -15,6 +15,7 @@
 #include "hunterclaw/infra/heartbeat_wake.h"             // ✅ set_heartbeats_enabled (aligned with openclaw)
 #include "hunterclaw/cron/service.h"                     // ✅ CronService (aligned with openclaw: buildGatewayCronService)
 #include "hunterclaw/cron/gateway_integration.h"          // ✅ GatewayCronIntegration (agent tool path)
+#include "hunterclaw/gateway/exec_approval_manager.h"    // ✅ ExecApprovalManager (对齐 OpenClaw exec-approval-manager.ts)
 #include <websocketpp/config/asio_no_tls.hpp>
 #include <websocketpp/server.hpp>
 #include <nlohmann/json.hpp>
@@ -1893,6 +1894,10 @@ struct GatewayServer::Impl {
     // method_agent 中 deliver=true 时，通过 delivery_queue 构建 deliver 函数
     // 对应 OpenClaw: delivery.deliver("block", payload) → dispatcher.sendBlockReply → options.deliver
     std::shared_ptr<queue::DeliveryQueue> delivery_queue;
+    // ✅ ExecApprovalManager (对齐 OpenClaw: ExecApprovalManager)
+    // 管理 exec.approval.request / waitDecision / resolve 的生命周期
+    // 对应 OpenClaw: createExecApprovalHandlers(manager, { forwarder })
+    std::shared_ptr<ExecApprovalManager> exec_approval_manager;
     std::atomic<bool> running{false};
 };
 
@@ -1929,6 +1934,10 @@ GatewayServer::GatewayServer(std::shared_ptr<core::Config> config)
         queue_dir = config->data["delivery_queue_dir"].get<std::string>();
     }
     impl_->delivery_queue = queue::DeliveryQueue::create(queue_dir);
+
+    // ✅ Initialize ExecApprovalManager (对齐 OpenClaw: ExecApprovalManager)
+    // 对应 OpenClaw: const manager = new ExecApprovalManager()
+    impl_->exec_approval_manager = std::make_shared<ExecApprovalManager>();
 
     auto_reply::DispatchConfig dispatch_config;
     impl_->message_dispatcher = auto_reply::MessageDispatcher::create(
@@ -2311,6 +2320,12 @@ std::shared_ptr<auto_reply::MessageDispatcher> GatewayServer::message_dispatcher
 // method_agent 中 deliver=true 时，通过 delivery_queue 构建 deliver 函数
 std::shared_ptr<queue::DeliveryQueue> GatewayServer::delivery_queue() const {
     return impl_->delivery_queue;
+}
+
+// ✅ ExecApprovalManager access (对齐 OpenClaw: ExecApprovalManager)
+// exec.approval.request/waitDecision/resolve 通过此访问器获取 manager
+std::shared_ptr<ExecApprovalManager> GatewayServer::exec_approval_manager() const {
+    return impl_->exec_approval_manager;
 }
 std::shared_ptr<core::Config> GatewayServer::config() const {
     return impl_->config;

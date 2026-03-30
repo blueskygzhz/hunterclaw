@@ -8,6 +8,7 @@
 #include "hunterclaw/gateway/todo_types.h"
 #include "hunterclaw/gateway/auth_manager.h"
 #include "hunterclaw/infra/heartbeat_runner.h"
+#include "hunterclaw/gateway/exec_approval_manager.h"  // ✅ ExecApprovalManager
 #include <websocketpp/config/asio_no_tls.hpp>
 #include <websocketpp/server.hpp>
 #include <nlohmann/json.hpp>
@@ -406,6 +407,11 @@ public:
     // method_agent 中 deliver=true 时，通过 delivery_queue 构建 deliver 函数
     // 对应 OpenClaw: delivery.deliver("block", payload) → dispatcher.sendBlockReply → options.deliver
     std::shared_ptr<queue::DeliveryQueue> delivery_queue() const;
+
+    // ✅ ExecApprovalManager access (对齐 OpenClaw: ExecApprovalManager)
+    // exec.approval.request/waitDecision/resolve 通过此访问器获取 manager
+    // 对应 OpenClaw: createExecApprovalHandlers(manager, { forwarder })
+    std::shared_ptr<ExecApprovalManager> exec_approval_manager() const;
 
 private:
     struct Impl;
