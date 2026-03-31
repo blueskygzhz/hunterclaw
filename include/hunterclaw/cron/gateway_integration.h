@@ -167,16 +167,16 @@ public:
      */
     void set_context(const std::string& agent_id, const std::optional<std::string>& session_key = std::nullopt);
     
+    // JSON conversion helpers (public static for use in cron.cc methods)
+    static nlohmann::json job_to_json(const CronJob& job);
+    static CronJobCreate json_to_job_create(const nlohmann::json& j);
+    static CronJobPatch json_to_job_patch(const nlohmann::json& j);
+
 private:
     std::shared_ptr<CronService> service_;
     HeartbeatReplyFn heartbeat_reply_fn_;          // injected by gateway; calls ReplyGenerator::get_reply_from_config
     infra::HeartbeatRunnerConfig heartbeat_runner_cfg_;  // injected by gateway after start(); full agent config
     GetQueueSizeFn get_queue_size_fn_;             // injected by gateway; aligned with openclaw: deps.getQueueSize
-
-    // JSON conversion helpers (public static for use in cron.cc methods)
-    static nlohmann::json job_to_json(const CronJob& job);
-    static CronJobCreate json_to_job_create(const nlohmann::json& j);
-    static CronJobPatch json_to_job_patch(const nlohmann::json& j);
 };
 
 } // namespace cron

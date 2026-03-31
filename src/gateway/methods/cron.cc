@@ -628,8 +628,9 @@ core::Result<json> method_cron_add(
         }
     }
 
-    // Fallback: stub path（CronService 未初始化时）    int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        core::utils::now().time_since_epoch()).count();
+    // Fallback: stub path（CronService 未初始化时）
+    std::string job_id = core::utils::generate_uuid();
+    int64_t now_ms = core::utils::current_timestamp_ms();
 
     json job;
     job["id"] = job_id;

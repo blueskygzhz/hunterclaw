@@ -6,7 +6,9 @@
 #include <functional>
 #include <future>
 #include <chrono>
+#include <memory>
 #include <stdexcept>
+#include <type_traits>
 
 namespace hunterclaw {
 namespace queue {
@@ -72,10 +74,12 @@ public:
     // 入队（指定枚举通道）
     template<typename Func>
     auto enqueue_command_in_lane(
-        CommandLane lane, 
-        Func&& task, 
+        CommandLane lane,
+        Func&& task,
         const EnqueueOptions& opts = {}
-    ) -> std::future<typename std::invoke_result<Func>::type>;
+    ) -> std::future<typename std::invoke_result<Func>::type> {
+        return enqueue_impl(lane, std::forward<Func>(task), opts);
+    }
 
     // ── 动态字符串 Lane（对齐 OpenClaw enqueueCommandInLane(lane: string, ...)）──
     // 支持 session:xxx 等动态 lane 名称，每个 lane 默认 maxConcurrent=1（串行）
@@ -84,7 +88,9 @@ public:
         const std::string& lane_name,
         Func&& task,
         const EnqueueOptions& opts = {}
-    ) -> std::future<typename std::invoke_result<Func>::type>;
+    ) -> std::future<typename std::invoke_result<Func>::type> {
+        return enqueue_dynamic_impl(lane_name, std::forward<Func>(task), opts);
+    }
 
     // 设置通道并发度（枚举版本）
     void set_command_lane_concurrency(CommandLane lane, size_t max_concurrent);
@@ -139,7 +145,62 @@ public:
 private:
     CommandQueue();
     ~CommandQueue();
-    
+
+    // Template helpers that wrap promise/future and call erased impl
+    template<typename Func>
+    auto enqueue_impl(
+        CommandLane lane,
+        Func&& task,
+        const EnqueueOptions& opts
+    ) -> std::future<typename std::invoke_result<Func>::type> {
+        using ReturnType = typename std::invoke_result<Func>::type;
+        auto promise_ptr = std::make_shared<std::promise<ReturnType>>();
+        auto future = promise_ptr->get_future();
+        auto wrapped = [task = std::forward<Func>(task), promise_ptr]() mutable {
+            try {
+                if constexpr (std::is_void_v<ReturnType>) {
+                    task();
+                    promise_ptr->set_value();
+                } else {
+                    promise_ptr->set_value(task());
+                }
+            } catch (...) {
+                promise_ptr->set_exception(std::current_exception());
+            }
+        };
+        enqueue_to_lane(lane, std::move(wrapped), opts);
+        return future;
+    }
+
+    template<typename Func>
+    auto enqueue_dynamic_impl(
+        const std::string& lane_name,
+        Func&& task,
+        const EnqueueOptions& opts
+    ) -> std::future<typename std::invoke_result<Func>::type> {
+        using ReturnType = typename std::invoke_result<Func>::type;
+        auto promise_ptr = std::make_shared<std::promise<ReturnType>>();
+        auto future = promise_ptr->get_future();
+        auto wrapped = [task = std::forward<Func>(task), promise_ptr]() mutable {
+            try {
+                if constexpr (std::is_void_v<ReturnType>) {
+                    task();
+                    promise_ptr->set_value();
+                } else {
+                    promise_ptr->set_value(task());
+                }
+            } catch (...) {
+                promise_ptr->set_exception(std::current_exception());
+            }
+        };
+        enqueue_to_dynamic_lane(lane_name, std::move(wrapped), opts);
+        return future;
+    }
+
+    // Non-template internal methods (defined in .cc)
+    void enqueue_to_lane(CommandLane lane, std::function<void()> task, const EnqueueOptions& opts);
+    void enqueue_to_dynamic_lane(const std::string& lane_name, std::function<void()> task, const EnqueueOptions& opts);
+
     class Impl;
     std::unique_ptr<Impl> impl_;
 };

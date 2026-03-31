@@ -94,14 +94,7 @@ public:
         }
     }
     
-    template<typename Func>
-    auto EnqueueInLane(
-        CommandLane lane, 
-        Func&& task, 
-        const EnqueueOptions& opts
-    ) -> std::future<typename std::invoke_result<Func>::type> {
-        using ReturnType = typename std::invoke_result<Func>::type;
-        
+    void EnqueueToLane(CommandLane lane, std::function<void()> task, const EnqueueOptions& opts) {
         // 检查排空状态
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -109,60 +102,33 @@ public:
                 throw GatewayDrainingError();
             }
         }
-        
-        // 创建packaged_task
-        auto promise_ptr = std::make_shared<std::promise<ReturnType>>();
-        auto future = promise_ptr->get_future();
-        
-        // 包装任务
-        auto wrapped_task = [task = std::forward<Func>(task), promise_ptr]() mutable {
-            try {
-                if constexpr (std::is_void_v<ReturnType>) {
-                    task();
-                    promise_ptr->set_value();
-                } else {
-                    promise_ptr->set_value(task());
-                }
-            } catch (...) {
-                promise_ptr->set_exception(std::current_exception());
-            }
-        };
-        
+
         // 入队
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            
+
             auto& state = lanes_[lane];
-            
+
             // 检查通道是否被清除
             if (state.cleared) {
                 throw CommandLaneClearedError(lane);
             }
-            
+
             TaskWrapper wrapper;
-            wrapper.task = std::move(wrapped_task);
+            wrapper.task = std::move(task);
             wrapper.label = opts.label;
             wrapper.urgent = opts.urgent;
             wrapper.enqueue_time_ms = GetCurrentTimeMs();
             wrapper.generation = state.generation;
-            
+
             state.queue.push(std::move(wrapper));
         }
-        
+
         cv_.notify_one();
-        return future;
     }
 
     // ── 动态字符串 Lane 入队（对齐 OpenClaw enqueueCommandInLane(lane: string, ...)）──
-    // session:xxx Lane 默认 maxConcurrent=1（串行），保证同一 session 请求串行执行
-    template<typename Func>
-    auto EnqueueInDynamicLane(
-        const std::string& lane_name,
-        Func&& task,
-        const EnqueueOptions& opts
-    ) -> std::future<typename std::invoke_result<Func>::type> {
-        using ReturnType = typename std::invoke_result<Func>::type;
-
+    void EnqueueToDynamicLane(const std::string& lane_name, std::function<void()> task, const EnqueueOptions& opts) {
         // 检查排空状态
         {
             std::lock_guard<std::mutex> lock(dynamic_mutex_);
@@ -170,29 +136,13 @@ public:
                 throw GatewayDrainingError();
             }
         }
-
-        auto promise_ptr = std::make_shared<std::promise<ReturnType>>();
-        auto future = promise_ptr->get_future();
-
-        auto wrapped_task = [task = std::forward<Func>(task), promise_ptr]() mutable {
-            try {
-                if constexpr (std::is_void_v<ReturnType>) {
-                    task();
-                    promise_ptr->set_value();
-                } else {
-                    promise_ptr->set_value(task());
-                }
-            } catch (...) {
-                promise_ptr->set_exception(std::current_exception());
-            }
-        };
 
         {
             std::lock_guard<std::mutex> lock(dynamic_mutex_);
             auto& state = GetOrCreateDynamicLane(lane_name);
 
             TaskWrapper wrapper;
-            wrapper.task = std::move(wrapped_task);
+            wrapper.task = std::move(task);
             wrapper.label = opts.label;
             wrapper.urgent = opts.urgent;
             wrapper.enqueue_time_ms = GetCurrentTimeMs();
@@ -202,7 +152,6 @@ public:
         }
 
         dynamic_cv_.notify_one();
-        return future;
     }
     
     void SetConcurrency(CommandLane lane, size_t max_concurrent) {
@@ -542,23 +491,18 @@ CommandQueue& CommandQueue::Instance() {
     return instance;
 }
 
-template<typename Func>
-auto CommandQueue::enqueue_command_in_lane(
-    CommandLane lane, 
-    Func&& task, 
-    const EnqueueOptions& opts
-) -> std::future<typename std::invoke_result<Func>::type> {
-    return impl_->EnqueueInLane(lane, std::forward<Func>(task), opts);
+void CommandQueue::enqueue_to_lane(
+    CommandLane lane,
+    std::function<void()> task,
+    const EnqueueOptions& opts) {
+    impl_->EnqueueToLane(lane, std::move(task), opts);
 }
 
-// 动态字符串 Lane 入队（对齐 OpenClaw enqueueCommandInLane(lane: string, ...)）
-template<typename Func>
-auto CommandQueue::enqueue_command_in_lane(
+void CommandQueue::enqueue_to_dynamic_lane(
     const std::string& lane_name,
-    Func&& task,
-    const EnqueueOptions& opts
-) -> std::future<typename std::invoke_result<Func>::type> {
-    return impl_->EnqueueInDynamicLane(lane_name, std::forward<Func>(task), opts);
+    std::function<void()> task,
+    const EnqueueOptions& opts) {
+    impl_->EnqueueToDynamicLane(lane_name, std::move(task), opts);
 }
 
 void CommandQueue::set_command_lane_concurrency(CommandLane lane, size_t max_concurrent) {
@@ -635,37 +579,6 @@ Result<void> CommandQueue::wait_for_lane_tasks(CommandLane lane, uint32_t timeou
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 }
-
-// 显式实例化常用模板（枚举 Lane）
-template auto CommandQueue::enqueue_command_in_lane<std::function<void()>>(
-    CommandLane, std::function<void()>&&, const EnqueueOptions&
-) -> std::future<void>;
-
-template auto CommandQueue::enqueue_command_in_lane<std::function<int()>>(
-    CommandLane, std::function<int()>&&, const EnqueueOptions&
-) -> std::future<int>;
-
-template auto CommandQueue::enqueue_command_in_lane<std::function<std::string()>>(
-    CommandLane, std::function<std::string()>&&, const EnqueueOptions&
-) -> std::future<std::string>;
-
-// 显式实例化常用模板（字符串 Lane）
-template auto CommandQueue::enqueue_command_in_lane<std::function<void()>>(
-    const std::string&, std::function<void()>&&, const EnqueueOptions&
-) -> std::future<void>;
-
-template auto CommandQueue::enqueue_command_in_lane<std::function<int()>>(
-    const std::string&, std::function<int()>&&, const EnqueueOptions&
-) -> std::future<int>;
-
-template auto CommandQueue::enqueue_command_in_lane<std::function<std::string()>>(
-    const std::string&, std::function<std::string()>&&, const EnqueueOptions&
-) -> std::future<std::string>;
-
-// DispatchResult 类型（用于 message_dispatcher.cc 中的 main lane 调度）
-template auto CommandQueue::enqueue_command_in_lane<std::function<auto_reply::MessageDispatcher::DispatchResult()>>(
-    const std::string&, std::function<auto_reply::MessageDispatcher::DispatchResult()>&&, const EnqueueOptions&
-) -> std::future<auto_reply::MessageDispatcher::DispatchResult>;
 
 }  // namespace queue
 }  // namespace hunterclaw

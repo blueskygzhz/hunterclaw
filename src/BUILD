@@ -39,9 +39,7 @@ cc_library(
 # ============================================================================
 cc_library(
     name = "hunterclaw_infra",
-    srcs = glob(["infra/*.cc"], exclude = [
-        "infra/exec_approvals.cc",  # TODO: 需要更新以匹配新的 API
-    ]),
+    srcs = glob(["infra/*.cc"]),
     deps = [
         "//:hunterclaw_headers",
         "@nlohmann_json//:json",
