@@ -1,6 +1,7 @@
 #include "hunterclaw/gateway/gateway.h"
 #include "hunterclaw/gateway/method_guard.h"
 #include "hunterclaw/cron/service.h"
+#include "hunterclaw/cron/gateway_integration.h"  // ✅ GatewayCronIntegration::job_to_json / json_to_job_create / json_to_job_patch
 #include "hunterclaw/core/utils.h"
 #include "hunterclaw/infra/heartbeat_runner.h"
 #include "hunterclaw/infra/heartbeat_wake.h"
@@ -474,11 +475,7 @@ core::Result<json> method_cron_list(
         auto jobs = cron_svc2->list_jobs(enabled_only);
         json jobs_arr = json::array();
         for (const auto& j : jobs) {
-            json jj;
-            jj["id"] = j.id;
-            jj["name"] = j.name;
-            jj["enabled"] = j.enabled;
-            jobs_arr.push_back(jj);
+            jobs_arr.push_back(hunterclaw::cron::GatewayCronIntegration::job_to_json(j));
         }
         result["jobs"] = jobs_arr;
         result["total"] = static_cast<int>(jobs.size());
@@ -620,14 +617,18 @@ core::Result<json> method_cron_add(
     // ✅ 对齐 OpenClaw: context.cron.add(jobCreate)
     auto cron_svc3 = server->cron_service();
     if (cron_svc3) {
-        // CronService::add_job 接受 CronJobCreate，这里我们跳过直接调用，
-        // 由下方手动构造逻辑处理（cron_service 为 stub 时）
-        (void)cron_svc3;
+        // 通过 GatewayCronIntegration 的 static 方法解析 JSON → CronJobCreate，再调用 CronService::add_job
+        try {
+            auto job_create = hunterclaw::cron::GatewayCronIntegration::json_to_job_create(normalized);
+            auto added_job = cron_svc3->add_job(job_create);
+            auto result_json = hunterclaw::cron::GatewayCronIntegration::job_to_json(added_job);
+            return core::Result<json>::Ok(result_json);
+        } catch (const std::exception& e) {
+            return core::Result<json>::Err(std::string("cron.add failed: ") + e.what());
+        }
     }
 
-    // 构造返回的 CronJob 对象 (对应 OpenClaw CronJobSchema)
-    std::string job_id = core::utils::generate_uuid();
-    int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+    // Fallback: stub path（CronService 未初始化时）    int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         core::utils::now().time_since_epoch()).count();
 
     json job;
@@ -658,11 +659,6 @@ core::Result<json> method_cron_add(
     if (normalized.contains("failureAlert")) {
         job["failureAlert"] = normalized["failureAlert"];
     }
-    // 🎯 OpenClaw 对齐: CronJobStateSchema
-    // 对应 OpenClaw CronJobStateSchema 字段 (全部 optional):
-    //   nextRunAtMs?, runningAtMs?, lastRunAtMs?, lastRunStatus?, lastStatus?,
-    //   lastError?, lastErrorReason?, lastDurationMs?, consecutiveErrors?,
-    //   lastDelivered?, lastDeliveryStatus?, lastDeliveryError?, lastFailureAlertAtMs?
     job["state"] = json::object();
 
     return core::Result<json>::Ok(job);
@@ -801,10 +797,20 @@ core::Result<json> method_cron_update(
     // ✅ 对齐 OpenClaw: context.cron.update(jobId, patch)
     auto cron_svc4 = server->cron_service();
     if (cron_svc4) {
-        // CronService::update_job 接受 CronJobPatch 结构体，这里跳过直接调用
-        (void)cron_svc4;
+        try {
+            auto job_patch = hunterclaw::cron::GatewayCronIntegration::json_to_job_patch(patch);
+            auto updated = cron_svc4->update_job(job_id, job_patch);
+            if (!updated.has_value()) {
+                return core::Result<json>::Err("cron job not found: " + job_id);
+            }
+            auto result_json = hunterclaw::cron::GatewayCronIntegration::job_to_json(*updated);
+            return core::Result<json>::Ok(result_json);
+        } catch (const std::exception& e) {
+            return core::Result<json>::Err(std::string("cron.update failed: ") + e.what());
+        }
     }
 
+    // Fallback: stub path（CronService 未初始化时）
     int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         core::utils::now().time_since_epoch()).count();
     json result;

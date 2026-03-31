@@ -117,6 +117,25 @@ public:
      * @return Agent 实例 (不存在返回 nullptr)
      */
     std::shared_ptr<AgentInstance> get_agent(const std::string& session_id);
+
+    /**
+     * 注册一个外部创建的 Agent 实例到 pool 中（临时注册）
+     *
+     * Aligned with openclaw: cron isolated agent runs create a fresh AgentInstance
+     * per invocation and must be reachable via agent_pool->get_agent(session_key)
+     * so that sub-agent announces (method_agent → agent_pool->get_agent) can find
+     * the parent agent while it is executing.
+     *
+     * Caller is responsible for calling remove_agent() after the run completes.
+     *
+     * @param session_key  Session key (e.g. "cron:job123")
+     * @param agent        Pre-created AgentInstance to register
+     * @return true if registered successfully, false if session_key already exists
+     */
+    bool register_agent(
+        const std::string& session_key,
+        std::shared_ptr<AgentInstance> agent
+    );
     
     /**
      * 移除 Agent 实例

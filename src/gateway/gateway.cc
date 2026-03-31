@@ -1899,6 +1899,11 @@ struct GatewayServer::Impl {
     // 对应 OpenClaw: createExecApprovalHandlers(manager, { forwarder })
     std::shared_ptr<ExecApprovalManager> exec_approval_manager;
     std::atomic<bool> running{false};
+    // Shared pointer to run_heartbeat_once lambda, patched after heartbeat_runner is built
+    std::shared_ptr<std::function<cron::HeartbeatRunResult(
+        const std::optional<std::string>&,
+        const std::optional<std::string>&,
+        const std::optional<std::string>&)>> run_heartbeat_once_fn_;
 };
 
 GatewayServer::GatewayServer(std::shared_ptr<core::Config> config)
@@ -2023,6 +2028,209 @@ core::Result<bool> GatewayServer::start() {
                 server_impl->broadcast(ef, /*drop_if_slow=*/true, nullptr);
             }
         );
+
+        // ✅ Aligned with openclaw: buildGatewayCronService({ cfg, deps, broadcast })
+        // Aligned with openclaw server.impl.ts:
+        //   let cronState = buildGatewayCronService({ cfg, deps, broadcast })
+        // Creates CronService with injected deps and starts the scheduler loop.
+        {
+            cron::CronServiceDeps cron_deps;
+
+            // now_ms: default (std::chrono::system_clock)
+
+            // cron_enabled: read from config
+            if (impl_->config) {
+                const auto& data = impl_->config->data;
+                if (data.contains("cron") && data["cron"].is_object()) {
+                    const auto& cron_cfg = data["cron"];
+                    if (cron_cfg.contains("enabled") && cron_cfg["enabled"].is_boolean()) {
+                        cron_deps.cron_enabled = cron_cfg["enabled"].get<bool>();
+                    }
+                    // CronConfig: maxConcurrentRuns
+                    cron::CronConfig cc;
+                    if (cron_cfg.contains("maxConcurrentRuns") && cron_cfg["maxConcurrentRuns"].is_number_integer()) {
+                        cc.max_concurrent_runs = cron_cfg["maxConcurrentRuns"].get<int>();
+                    }
+                    cron_deps.cron_config = cc;
+                }
+            }
+
+            // enqueue_system_event: inject system event into main session
+            // Aligned with openclaw: deps.enqueueSystemEvent(text, agentId, sessionKey, contextKey)
+            auto server_impl_weak2 = std::weak_ptr<GatewayServerImpl>(impl_->server_impl);
+            cron_deps.enqueue_system_event = [server_impl_weak2](
+                const std::string& text,
+                const std::optional<std::string>& agent_id,
+                const std::optional<std::string>& session_key,
+                const std::optional<std::string>& context_key
+            ) {
+                // Broadcast as "cron" system event so the agent's message loop picks it up
+                auto server_impl = server_impl_weak2.lock();
+                if (!server_impl) return;
+                json evt_payload;
+                evt_payload["text"] = text;
+                if (agent_id.has_value()) evt_payload["agentId"] = *agent_id;
+                if (session_key.has_value()) evt_payload["sessionKey"] = *session_key;
+                if (context_key.has_value()) evt_payload["contextKey"] = *context_key;
+                core::EventFrame ef;
+                ef.event = "cron";
+                ef.payload = evt_payload;
+                server_impl->broadcast(ef, /*drop_if_slow=*/false, nullptr);
+            };
+
+            // request_heartbeat_now: aligned with openclaw requestHeartbeatNow
+            cron_deps.request_heartbeat_now = [](
+                const std::optional<std::string>& reason,
+                const std::optional<std::string>& agent_id,
+                const std::optional<std::string>& session_key
+            ) {
+                hunterclaw::infra::request_heartbeat_now(reason, agent_id, session_key);
+            };
+
+            // run_heartbeat_once: will be injected after heartbeat_runner is built (below)
+            // Stored as shared_ptr<function> so we can patch it after construction
+            auto run_heartbeat_once_fn = std::make_shared<
+                std::function<cron::HeartbeatRunResult(
+                    const std::optional<std::string>&,
+                    const std::optional<std::string>&,
+                    const std::optional<std::string>&)>>();
+            cron_deps.run_heartbeat_once = [run_heartbeat_once_fn](
+                const std::optional<std::string>& reason,
+                const std::optional<std::string>& agent_id,
+                const std::optional<std::string>& session_key
+            ) -> cron::HeartbeatRunResult {
+                if (*run_heartbeat_once_fn) {
+                    return (*run_heartbeat_once_fn)(reason, agent_id, session_key);
+                }
+                return {cron::HeartbeatRunResult::Status::Skipped, "not-configured"};
+            };
+
+            // run_isolated_agent_job: aligned with openclaw runIsolatedAgentJob
+            // Aligned with openclaw server-cron.ts: runIsolatedAgentJob calls
+            // runCronIsolatedAgentTurn which creates a brand-new AgentInstance each
+            // time (never reuses an existing session from the pool).
+            // This avoids the "queued" false-positive: if we reused a pooled
+            // AgentInstance that is already processing, process_message() would
+            // return "queued" (is_ok()==true) and the cron scheduler would
+            // incorrectly record CronRunStatus::OK before the job actually ran.
+            // Fix: create a fresh, temporary AgentInstance per invocation, use it
+            // once, then discard it — exactly what openclaw's isolated runner does.
+            //
+            // Sub-agent visibility fix:
+            // openclaw's runEmbeddedPiAgent registers the agent run context via
+            // registerAgentRunContext(sessionId, { sessionKey }) so that sub-agent
+            // announces (callGateway("agent", { sessionKey })) can route back to the
+            // parent. In HunterClaw, method_agent looks up the parent via
+            // agent_pool->get_agent(session_key). Therefore the isolated agent must
+            // be temporarily registered in AgentPool for the duration of the run,
+            // then removed immediately after — so sub-agent announces can find it.
+            auto config_weak = std::weak_ptr<core::Config>(impl_->config);
+            auto skill_mgr_weak = std::weak_ptr<skills::SkillManager>(impl_->skill_mgr);
+            auto channel_mgr_weak = std::weak_ptr<channels::ChannelManager>(impl_->channel_mgr);
+            auto agent_pool_weak = std::weak_ptr<agents::AgentPool>(impl_->agent_pool);
+            cron_deps.run_isolated_agent_job = [config_weak, skill_mgr_weak, channel_mgr_weak,
+                                                agent_pool_weak](
+                const cron::CronJob& job,
+                const std::string& message,
+                const std::string& /*lane*/
+            ) -> cron::CronRunOutcome {
+                auto config = config_weak.lock();
+                auto skill_mgr = skill_mgr_weak.lock();
+                auto channel_mgr = channel_mgr_weak.lock();
+                auto agent_pool = agent_pool_weak.lock();
+                if (!config || !skill_mgr || !channel_mgr) {
+                    return {cron::CronRunStatus::ERROR, "gateway components unavailable"};
+                }
+
+                // Aligned with openclaw: sessionKey = `cron:${job.id}` (isolated, per-job)
+                // Each invocation gets a brand-new AgentInstance — never reused.
+                std::string session_key = "cron:" + job.id;
+                std::string agent_id = job.agent_id.value_or("");
+
+                // Create a fresh, temporary AgentInstance.
+                // Aligned with openclaw runCronIsolatedAgentTurn → runCliAgent/runEmbeddedPiAgent:
+                // each cron run starts from a clean slate with no shared mutable state.
+                std::shared_ptr<agents::AgentInstance> agent;
+                try {
+                    agent = std::make_shared<agents::AgentInstance>(
+                        session_key,
+                        agent_id,
+                        config,
+                        skill_mgr,
+                        channel_mgr
+                    );
+                } catch (const std::exception& e) {
+                    return {cron::CronRunStatus::ERROR,
+                            std::string("failed to create isolated agent: ") + e.what()};
+                }
+                if (!agent) {
+                    return {cron::CronRunStatus::ERROR, "failed to create isolated agent"};
+                }
+
+                // Temporarily register the isolated agent in AgentPool so that
+                // sub-agent announces (method_agent → agent_pool->get_agent(session_key))
+                // can find the parent agent while it is executing.
+                // Aligned with openclaw: registerAgentRunContext(sessionId, { sessionKey })
+                // which makes the parent reachable via the gateway's session routing.
+                bool registered_in_pool = false;
+                if (agent_pool) {
+                    registered_in_pool = agent_pool->register_agent(session_key, agent);
+                }
+
+                // Build options aligned with openclaw agentTurn payload fields
+                std::map<std::string, std::string> opts;
+                opts["is_cron"] = "true";
+                opts["session_key"] = session_key;
+                if (job.payload.model.has_value()) opts["model_override"] = *job.payload.model;
+                if (job.payload.light_context) opts["bootstrap_context_mode"] = "lightweight";
+                if (job.payload.timeout_seconds > 0) {
+                    opts["timeout_seconds"] = std::to_string(job.payload.timeout_seconds);
+                }
+                if (job.payload.allow_unsafe_external_content) {
+                    opts["allow_unsafe_external_content"] = "true";
+                }
+
+                // process_message is called directly; since this is a brand-new instance,
+                // is_processing_ is guaranteed false — no queuing can occur.
+                cron::CronRunOutcome outcome;
+                try {
+                    auto result = agent->process_message(message, opts);
+                    // A fresh instance can never return "queued" — is_processing_
+                    // starts as false, so compare_exchange always succeeds.
+                    if (result.is_ok()) {
+                        const std::string& output = result.get();
+                        outcome = {cron::CronRunStatus::OK, std::nullopt, output};
+                    } else {
+                        outcome = {cron::CronRunStatus::ERROR, result.error};
+                    }
+                } catch (const std::exception& e) {
+                    outcome = {cron::CronRunStatus::ERROR, std::string(e.what())};
+                }
+
+                // Unregister from AgentPool — the isolated agent's lifetime ends here.
+                // Any pending sub-agent announces that arrive after this point will
+                // fail to find the parent (same as openclaw: the cron runner has
+                // already returned and the session context is gone). This is
+                // acceptable because sub-agent announces are expected to complete
+                // before the parent's process_message returns.
+                if (registered_in_pool && agent_pool) {
+                    agent_pool->remove_agent(session_key);
+                }
+
+                return outcome;
+                // agent goes out of scope here and is destroyed — isolated, no leak.
+            };
+
+            // Create CronService with MemoryCronStore (in-memory, aligned with openclaw default)
+            // TODO: switch to file-backed store when store_path is configured
+            auto cron_store = cron::createMemoryCronStore();
+            impl_->cron_service = cron::createCronService(std::move(cron_store), std::move(cron_deps));
+            impl_->cron_service->start();
+
+            // Store run_heartbeat_once_fn pointer so we can patch it after heartbeat_runner is built
+            // (heartbeat_runner is built below, after this block)
+            impl_->run_heartbeat_once_fn_ = run_heartbeat_once_fn;
+        }
 
         // ✅ Aligned with openclaw: startHeartbeatRunner({ cfg: cfgAtStart })
         // Aligned with openclaw server.impl.ts:
@@ -2187,6 +2395,53 @@ core::Result<bool> GatewayServer::start() {
             impl_->heartbeat_runner = hunterclaw::infra::start_heartbeat_runner(
                 runner_cfg, run_once_fn);
 
+            // ✅ Patch run_heartbeat_once into CronService deps now that runner_cfg is ready
+            // Aligned with openclaw: cron wakeMode=now calls runHeartbeatOnce with full runner_cfg
+            if (impl_->run_heartbeat_once_fn_) {
+                auto run_once_fn_copy = run_once_fn;
+                auto runner_cfg_copy = runner_cfg;
+                auto heartbeat_reply_fn_copy = heartbeat_reply_fn;
+                *impl_->run_heartbeat_once_fn_ = [run_once_fn_copy, runner_cfg_copy, heartbeat_reply_fn_copy](
+                    const std::optional<std::string>& reason,
+                    const std::optional<std::string>& agent_id,
+                    const std::optional<std::string>& session_key
+                ) -> cron::HeartbeatRunResult {
+                    // Resolve agent_cfg from runner_cfg
+                    infra::HeartbeatAgentConfig agent_cfg;
+                    if (agent_id.has_value() && !agent_id->empty()) {
+                        for (const auto& a : runner_cfg_copy.agents) {
+                            if (a.agent_id == *agent_id) { agent_cfg = a; break; }
+                        }
+                        if (agent_cfg.agent_id.empty()) agent_cfg.agent_id = *agent_id;
+                    } else if (!runner_cfg_copy.agents.empty()) {
+                        agent_cfg = runner_cfg_copy.agents.front();
+                    }
+                    infra::HeartbeatRunOnceOptions opts;
+                    opts.reason = reason;
+                    opts.agent_id = agent_id;
+                    opts.session_key = session_key;
+                    opts.reply_fn = heartbeat_reply_fn_copy;
+                    opts.get_queue_size = [](const std::string& /*lane*/) -> int {
+                        return static_cast<int>(
+                            hunterclaw::queue::CommandQueue::Instance()
+                                .get_queue_size(hunterclaw::queue::CommandLane::Main)
+                        );
+                    };
+                    auto r = infra::run_heartbeat_once(runner_cfg_copy, agent_cfg, opts);
+                    cron::HeartbeatRunResult result;
+                    switch (r.status) {
+                        case infra::HeartbeatRunResult::Status::Ran:
+                            result.status = cron::HeartbeatRunResult::Status::Ran; break;
+                        case infra::HeartbeatRunResult::Status::Skipped:
+                            result.status = cron::HeartbeatRunResult::Status::Skipped; break;
+                        default:
+                            result.status = cron::HeartbeatRunResult::Status::Error; break;
+                    }
+                    result.reason = r.reason.value_or("");
+                    return result;
+                };
+            }
+
             // ✅ Aligned with openclaw: create GatewayCronIntegration (agent tool path)
             // Inject heartbeat_runner_cfg + get_queue_size_fn so CronTool's
             // handle_wake(mode=now) has the same lane guard as method_wake.
@@ -2214,6 +2469,10 @@ core::Result<bool> GatewayServer::start() {
 core::Result<bool> GatewayServer::stop() {
     if (!impl_->running.load()) {
         return core::Result<bool>::Err("Server not running");
+    }
+    // ✅ Aligned with openclaw: stop CronService before stopping server
+    if (impl_->cron_service) {
+        impl_->cron_service->stop();
     }
     // ✅ Aligned with openclaw: stop heartbeat runner before stopping server
     // Aligned with openclaw server-close.ts: heartbeatRunner.stop()

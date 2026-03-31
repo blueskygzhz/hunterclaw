@@ -131,6 +131,28 @@ std::shared_ptr<AgentInstance> AgentPool::get_agent(const std::string& session_i
     return nullptr;
 }
 
+bool AgentPool::register_agent(
+    const std::string& session_key,
+    std::shared_ptr<AgentInstance> agent
+) {
+    if (session_key.empty() || !agent) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    // Do not overwrite an existing entry — caller must remove first.
+    if (agents_.count(session_key)) {
+        spdlog::get("default")->warn(
+            "[AgentPool] register_agent: session_key already registered: {}", session_key);
+        return false;
+    }
+    agents_[session_key] = agent;
+    last_active_[session_key] = core::utils::now();
+    spdlog::get("default")->debug(
+        "[AgentPool] Registered isolated agent: session_key={}, agent_id={}",
+        session_key, agent->context().agent_id);
+    return true;
+}
+
 void AgentPool::remove_agent(const std::string& session_id) {
     std::lock_guard<std::mutex> lock(mutex_);
     
