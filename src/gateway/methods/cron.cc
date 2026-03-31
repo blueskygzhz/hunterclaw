@@ -882,18 +882,45 @@ core::Result<json> method_cron_run(
     std::string mode = params.value("mode", "force");
 
     // ✅ 对齐 OpenClaw: context.cron.enqueueRun(jobId, mode)
+    // OpenClaw 返回: { ok: true, enqueued: true, runId } 或 { ok: false, reason }
     auto cron_svc6 = server->cron_service();
     if (cron_svc6) {
-        cron_svc6->force_run(job_id);
+        bool force = (mode == "force");
+        bool enqueued = cron_svc6->enqueue_run(job_id, force);
+        if (!enqueued) {
+            // 对齐 OpenClaw: 返回 { ok: false, reason } 当 job 不存在/已在运行/未到期
+            auto job = cron_svc6->get_job(job_id);
+            if (!job.has_value()) {
+                return core::Result<json>::Err("cron job not found: " + job_id);
+            }
+            if (job->state.running_at_ms.has_value()) {
+                json result;
+                result["ok"] = false;
+                result["reason"] = "already-running";
+                return core::Result<json>::Ok(result);
+            }
+            if (!force && (!job->state.next_run_at_ms.has_value() || !job->enabled)) {
+                json result;
+                result["ok"] = false;
+                result["reason"] = "not-due";
+                return core::Result<json>::Ok(result);
+            }
+        }
+        // 对齐 OpenClaw: { ok: true, enqueued: true, runId: "manual:{id}:{ts}:..." }
         json result;
-        result["enqueued"] = true;
-        result["ran"] = (mode == "force");
+        result["ok"] = true;
+        result["enqueued"] = enqueued;
+        if (enqueued) {
+            result["runId"] = "manual:" + job_id + ":" +
+                              std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::system_clock::now().time_since_epoch()).count());
+        }
         return core::Result<json>::Ok(result);
     }
 
     json result;
-    result["enqueued"] = true;
-    result["ran"] = (mode == "force");
+    result["ok"] = false;
+    result["reason"] = "cron-service-unavailable";
     return core::Result<json>::Ok(result);
 }
 

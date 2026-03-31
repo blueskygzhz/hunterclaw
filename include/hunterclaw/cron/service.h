@@ -472,6 +472,10 @@ class CronService : public std::enable_shared_from_this<CronService> {
 
   // 下次唤醒时间 (ms)
   std::optional<int64_t> next_wake_at_ms_;
+
+  // 手动触发队列 (对齐 OpenClaw enqueueRun)
+  std::queue<std::pair<std::string, bool>> manual_run_queue_;
+  std::mutex manual_run_mutex_;
 };
 
 /**
