@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <ctime>
+#include <future>
 #include <iomanip>
 #include <mutex>
 #include <set>
@@ -673,19 +674,38 @@ bool CronService::enqueue_run(const std::string& job_id, bool force) {
   // 对齐 OpenClaw: void enqueueCommandInLane(CommandLane.Cron, async () => { run(state, id, mode) })
   // 通过 Cron lane 排队，保证手动触发与定时触发的并发控制一致
   // fire-and-forget: 不等待结果
+  //
+  // 对齐 OpenClaw run() = prepareManualRun（locked内）+ finishPreparedManualRun（locked外执行 + locked内apply）
+  // execute_job_core 必须在 lane 外执行，否则 Cron WorkerThread 被长时间占用，
+  // 导致 Phase 3 和下一次 tick 的 Phase 1 都被阻塞（调度器被手动触发"卡死"）。
   auto self = shared_from_this();
   auto& cq = hunterclaw::queue::CommandQueue::Instance();
-  // 包装为 std::function<void()>，匹配 command_queue.cc 中的显式实例化
-  std::function<void()> task = [self, job_id, force]() {
-      // 对齐 OpenClaw: run(state, id, mode) — 在 Cron lane 内串行执行
+
+  // 用 promise/future 在 Phase A（lane 内）和 Phase B（lane 外线程）之间同步
+  // 对齐 OpenClaw: prepareManualRun 返回 PreparedManualRun，finishPreparedManualRun 消费它
+  struct PreparedRun {
+    bool runnable = false;
+    CronJob execution_job;
+    int64_t started_at = 0;
+  };
+  auto promise_ptr = std::make_shared<std::promise<PreparedRun>>();
+  auto future_ptr = std::make_shared<std::future<PreparedRun>>(promise_ptr->get_future());
+
+  // Phase A（lane 内）: 对齐 OpenClaw prepareManualRun — 二次检查 + 标记 running（快速操作）
+  std::function<void()> phase_a = [self, job_id, promise_ptr]() {
+      PreparedRun result;
       // 再次检查是否仍可运行（可能在排队期间已被其他触发执行）
       auto stored = self->store_->get(job_id);
-      if (!stored.has_value()) return;
-      if (stored->state.running_at_ms.has_value()) {
-        // 对齐 OpenClaw: "cron: queued manual run skipped before execution"
+      if (!stored.has_value()) {
+        promise_ptr->set_value(result);  // runnable=false
         return;
       }
-      // 标记为 running
+      if (stored->state.running_at_ms.has_value()) {
+        // 对齐 OpenClaw: "cron: queued manual run skipped before execution"
+        promise_ptr->set_value(result);  // runnable=false
+        return;
+      }
+      // 标记为 running（对齐 OpenClaw prepareManualRun: job.state.runningAtMs = now; persist()）
       int64_t now = self->deps_.now_ms();
       stored->state.running_at_ms = now;
       stored->state.last_error = std::nullopt;
@@ -695,30 +715,62 @@ bool CronService::enqueue_run(const std::string& job_id, bool force) {
         p.state = stored->state;
         self->store_->update(job_id, p);
       }
-      // 执行
-      auto outcome = self->execute_job_core(*stored);
-      int64_t ended_at = self->deps_.now_ms();
-      {
-        std::lock_guard<std::mutex> lock(self->mutex_);
-        auto latest = self->store_->get(job_id);
-        if (!latest.has_value()) return;
-        bool should_delete = self->apply_job_result(
-            *latest, outcome.status, outcome.error, outcome.delivered,
-            now, ended_at, /*preserve_schedule=*/force);
-        hunterclaw::cron::CronJobPatch sp;
-        sp.state = latest->state;
-        sp.enabled = latest->enabled;
-        self->store_->update(job_id, sp);
-        if (should_delete) {
-          self->store_->remove(job_id);
-        }
-        self->rearm_timer();
-      }
+      result.runnable = true;
+      result.execution_job = *stored;
+      result.started_at = now;
+      promise_ptr->set_value(result);
   };
+
   cq.enqueue_command_in_lane(
     hunterclaw::queue::CommandLane::Cron,
-    std::move(task)
+    std::move(phase_a)
   );
+
+  // Phase B（lane 外）+ Phase C（lane 内）: 对齐 OpenClaw finishPreparedManualRun
+  // 在独立线程中等待 Phase A 结果，然后执行耗时的 execute_job_core，不占用 Cron lane，
+  // 保证 Phase 3 和下一次 tick 不被阻塞
+  std::thread([self, job_id, force, future_ptr]() {
+      // 等待 Phase A 完成（通过 future 精确同步，无竞态）
+      PreparedRun prepared;
+      try {
+        prepared = future_ptr->get();
+      } catch (...) {
+        return;  // Phase A 异常，跳过
+      }
+
+      if (!prepared.runnable) return;  // Phase A 判断不可运行，跳过
+
+      // Phase B（lane 外）: 执行 execute_job_core（耗时，不占 Cron lane）
+      // 对齐 OpenClaw finishPreparedManualRun: coreResult = await executeJobCoreWithTimeout(...)
+      auto outcome = self->execute_job_core(prepared.execution_job);
+      int64_t ended_at = self->deps_.now_ms();
+      int64_t started_at = prepared.started_at;
+
+      // Phase C（lane 内）: 对齐 OpenClaw finishPreparedManualRun 的第二个 locked 块
+      // apply result，保证与 tick Phase 3 串行化
+      auto& cq = hunterclaw::queue::CommandQueue::Instance();
+      std::function<void()> phase_c = [self, job_id, force, outcome, started_at, ended_at]() {
+          std::lock_guard<std::mutex> lock(self->mutex_);
+          auto latest = self->store_->get(job_id);
+          if (!latest.has_value()) return;
+          bool should_delete = self->apply_job_result(
+              *latest, outcome.status, outcome.error, outcome.delivered,
+              started_at, ended_at, /*preserve_schedule=*/force);
+          hunterclaw::cron::CronJobPatch sp;
+          sp.state = latest->state;
+          sp.enabled = latest->enabled;
+          self->store_->update(job_id, sp);
+          if (should_delete) {
+            self->store_->remove(job_id);
+          }
+          self->rearm_timer();
+      };
+      cq.enqueue_command_in_lane(
+        hunterclaw::queue::CommandLane::Cron,
+        std::move(phase_c)
+      );
+  }).detach();
+
   return true;
 }
 
@@ -1184,9 +1236,19 @@ void CronService::run_missed_jobs(const std::set<std::string>& skip_job_ids) {
 
 // ============================================================================
 // scheduler_loop (对齐 OpenClaw onTimer)
+//
+// 对齐要点：
+//   OpenClaw onTimer 通过 locked(state, async () => {...}) 将关键操作串行化到
+//   storePath 级别的 Promise chain mutex 上。
+//   HunterClaw 对应实现：将 tick 核心逻辑通过 CommandLane::Cron 入队，
+//   与 enqueue_run（手动触发）共享同一个串行 lane，防止并发竞争。
+//   任务执行本身（execute_job_core）在 lane 外并发执行，对齐 OpenClaw 的
+//   "locked 外 await Promise.all(workers)" 模式。
 // ============================================================================
 
 void CronService::scheduler_loop() {
+  auto& cq = queue::CommandQueue::Instance();
+
   while (running_) {
     // 等待到下次唤醒时间
     {
@@ -1196,7 +1258,8 @@ void CronService::scheduler_loop() {
       if (next_wake_at_ms_.has_value()) {
         int64_t d = *next_wake_at_ms_ - now;
         if (d <= 0) {
-          delay_ms = MIN_REFIRE_GAP_MS;  // 防热循环
+          // 对齐 OpenClaw armTimer: delay=0 时用 MIN_REFIRE_GAP_MS 防热循环
+          delay_ms = MIN_REFIRE_GAP_MS;
         } else {
           delay_ms = std::min(d, MAX_TIMER_DELAY_MS);
         }
@@ -1221,52 +1284,77 @@ void CronService::scheduler_loop() {
       rearm_timer();
     }
 
-    // 执行 tick
+    // ── Phase 1: locked — 收集到期任务并标记 running ──────────────────────────
+    // 对齐 OpenClaw: locked(state, async () => { collectRunnableJobs + mark running })
+    // 通过 CommandLane::Cron 入队，与 enqueue_run 共享同一串行 lane，防止并发竞争
+    struct TickResult {
+      std::string job_id;
+      CronRunStatus status;
+      std::optional<std::string> error;
+      std::optional<bool> delivered;
+      int64_t started_at;
+      int64_t ended_at;
+    };
+
+    // 使用 shared_ptr 在 lambda 和外部之间共享数据
+    auto due_jobs_ptr = std::make_shared<std::vector<CronJob>>();
+    auto tick_results_ptr = std::make_shared<std::vector<TickResult>>();
+    auto self = shared_from_this();
+
+    // Phase 1: 在 Cron lane 中收集到期任务（对齐 OpenClaw 第一个 locked 块）
+    auto phase1_future = cq.enqueue_command_in_lane(
+        queue::CommandLane::Cron,
+        [self, due_jobs_ptr]() -> bool {
+          std::lock_guard<std::mutex> lock(self->mutex_);
+          int64_t now = self->deps_.now_ms();
+          auto jobs = self->store_->list();
+          for (auto& job : jobs) {
+            if (!job.enabled) continue;
+            if (job.state.running_at_ms.has_value()) continue;
+            if (!job.state.next_run_at_ms.has_value()) continue;
+            if (now < *job.state.next_run_at_ms) continue;
+            due_jobs_ptr->push_back(job);
+          }
+
+          if (due_jobs_ptr->empty()) {
+            // 对齐 OpenClaw: 无到期任务时用 maintenance-only recompute (issue #13992)
+            self->recompute_next_runs_for_maintenance(now, /*recompute_expired=*/true);
+            self->rearm_timer();
+            return false;  // 无任务
+          }
+
+          // 标记为 running（持锁原子操作，对齐 OpenClaw locked 内 mark running）
+          for (auto& job : *due_jobs_ptr) {
+            job.state.running_at_ms = now;
+            job.state.last_error = std::nullopt;
+            CronJobPatch p;
+            p.state = job.state;
+            self->store_->update(job.id, p);
+          }
+          self->rearm_timer();
+          return true;  // 有任务
+        },
+        queue::EnqueueOptions{.label = "cron:tick:collect"});
+
+    bool has_due_jobs = false;
     try {
-      int64_t now = deps_.now_ms();
+      has_due_jobs = phase1_future.get();
+    } catch (const std::exception&) {
+      // lane 异常不应终止调度器
+    }
 
-      // 收集到期任务
-      std::vector<CronJob> due_jobs;
-      {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto jobs = store_->list();
-        for (auto& job : jobs) {
-          if (!job.enabled) continue;
-          if (job.state.running_at_ms.has_value()) continue;
-          if (!job.state.next_run_at_ms.has_value()) continue;
-          if (now < *job.state.next_run_at_ms) continue;
-          due_jobs.push_back(job);
-        }
+    if (!has_due_jobs) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      tick_running_ = false;
+      rearm_timer();
+      continue;
+    }
 
-        if (due_jobs.empty()) {
-          recompute_next_runs_for_maintenance(now, /*recompute_expired=*/true);
-          rearm_timer();
-          tick_running_ = false;
-          continue;
-        }
-
-        // 标记为 running
-        for (auto& job : due_jobs) {
-          job.state.running_at_ms = now;
-          job.state.last_error = std::nullopt;
-          CronJobPatch p;
-          p.state = job.state;
-          store_->update(job.id, p);
-        }
-        rearm_timer();
-      }
-
-      // 执行任务（在锁外执行，避免阻塞）
-      // 对齐 OpenClaw: 支持 maxConcurrentRuns 并发执行
-      struct TickResult {
-        std::string job_id;
-        CronRunStatus status;
-        std::optional<std::string> error;
-        std::optional<bool> delivered;
-        int64_t started_at;
-        int64_t ended_at;
-      };
-      std::vector<TickResult> tick_results(due_jobs.size());
+    // ── Phase 2: 执行任务（在 lane 外并发执行）────────────────────────────────
+    // 对齐 OpenClaw: "locked 外 await Promise.all(workers)"
+    // 任务执行本身不在 Cron lane 中，允许并发，不阻塞 lane 处理其他请求
+    try {
+      tick_results_ptr->resize(due_jobs_ptr->size());
 
       // 解析并发数 (对齐 OpenClaw resolveRunConcurrency)
       int concurrency = 1;
@@ -1274,17 +1362,17 @@ void CronService::scheduler_loop() {
         int raw = deps_.cron_config->max_concurrent_runs;
         if (raw > 1) concurrency = raw;
       }
-      concurrency = std::min(concurrency, static_cast<int>(due_jobs.size()));
+      concurrency = std::min(concurrency, static_cast<int>(due_jobs_ptr->size()));
 
       if (concurrency <= 1) {
         // 串行执行
-        for (size_t i = 0; i < due_jobs.size(); ++i) {
-          auto& job = due_jobs[i];
+        for (size_t i = 0; i < due_jobs_ptr->size(); ++i) {
+          auto& job = (*due_jobs_ptr)[i];
           int64_t started_at = deps_.now_ms();
           auto outcome = execute_job_core(job);
           int64_t ended_at = deps_.now_ms();
-          tick_results[i] = {job.id, outcome.status, outcome.error, outcome.delivered,
-                              started_at, ended_at};
+          (*tick_results_ptr)[i] = {job.id, outcome.status, outcome.error, outcome.delivered,
+                                     started_at, ended_at};
         }
       } else {
         // 并发执行 (对齐 OpenClaw worker pool)
@@ -1294,40 +1382,52 @@ void CronService::scheduler_loop() {
           workers.emplace_back([&]() {
             for (;;) {
               size_t idx = cursor.fetch_add(1);
-              if (idx >= due_jobs.size()) return;
-              auto& job = due_jobs[idx];
+              if (idx >= due_jobs_ptr->size()) return;
+              auto& job = (*due_jobs_ptr)[idx];
               int64_t started_at = deps_.now_ms();
               auto outcome = execute_job_core(job);
               int64_t ended_at = deps_.now_ms();
-              tick_results[idx] = {job.id, outcome.status, outcome.error, outcome.delivered,
-                                    started_at, ended_at};
+              (*tick_results_ptr)[idx] = {job.id, outcome.status, outcome.error, outcome.delivered,
+                                           started_at, ended_at};
             }
           });
         }
         for (auto& t : workers) t.join();
       }
+    } catch (const std::exception&) {
+      // 执行异常不应终止调度器
+    }
 
-      // 应用结果
-      {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (auto& r : tick_results) {
-          auto stored = store_->get(r.job_id);
-          if (!stored.has_value()) continue;
-          bool should_delete = apply_job_result(*stored, r.status, r.error, r.delivered,
-                                                r.started_at, r.ended_at);
-          CronJobPatch p;
-          p.state = stored->state;
-          p.enabled = stored->enabled;
-          store_->update(r.job_id, p);
-          if (should_delete) {
-            store_->remove(r.job_id);
+    // ── Phase 3: locked — 应用结果 ────────────────────────────────────────────
+    // 对齐 OpenClaw: 第二个 locked 块 applyOutcomeToStoredJob + recomputeNextRunsForMaintenance
+    // 通过 CommandLane::Cron 入队，与 enqueue_run 共享同一串行 lane
+    auto phase3_future = cq.enqueue_command_in_lane(
+        queue::CommandLane::Cron,
+        [self, tick_results_ptr]() {
+          std::lock_guard<std::mutex> lock(self->mutex_);
+          for (auto& r : *tick_results_ptr) {
+            auto stored = self->store_->get(r.job_id);
+            if (!stored.has_value()) continue;
+            bool should_delete = self->apply_job_result(
+                *stored, r.status, r.error, r.delivered, r.started_at, r.ended_at);
+            CronJobPatch p;
+            p.state = stored->state;
+            p.enabled = stored->enabled;
+            self->store_->update(r.job_id, p);
+            if (should_delete) {
+              self->store_->remove(r.job_id);
+            }
           }
-        }
-        recompute_next_runs_for_maintenance(deps_.now_ms());
-        rearm_timer();
-      }
-    } catch (const std::exception& e) {
-      // tick 异常不应终止调度器
+          // 对齐 OpenClaw: maintenance-only recompute，避免推进 past-due nextRunAtMs (issue #17852)
+          self->recompute_next_runs_for_maintenance(self->deps_.now_ms());
+          self->rearm_timer();
+        },
+        queue::EnqueueOptions{.label = "cron:tick:apply"});
+
+    try {
+      phase3_future.get();
+    } catch (const std::exception&) {
+      // lane 异常不应终止调度器
     }
 
     // 对齐 OpenClaw onTimer finally 块：tick 结束后重新 arm 定时器
