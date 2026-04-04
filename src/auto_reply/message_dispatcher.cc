@@ -574,6 +574,34 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
         gen_config.user_input      = captured_message.text;
         gen_config.session_key     = captured_message.session_key;
 
+        // ✅ 对齐 OpenClaw: setActiveEmbeddedRun(sessionId, queueHandle)
+        // 注册 engine 引用到 active_engines_，使 steer_embedded_session 能直接注入
+        // 同时消费 steer_queues_ 中残留的 fallback steer 消息
+        gen_config.on_engine_created = [this, captured_message](std::shared_ptr<react::ReactEngine> engine) {
+            std::vector<std::string> fallback_steers;
+            {
+                std::lock_guard<std::mutex> lock(session_state_mutex_);
+                active_engines_[captured_message.session_key] = engine;
+                streaming_sessions_.insert(captured_message.session_key);
+                // 消费残留 fallback steer 消息
+                auto it = steer_queues_.find(captured_message.session_key);
+                if (it != steer_queues_.end() && !it->second.empty()) {
+                    fallback_steers = std::move(it->second);
+                    steer_queues_.erase(it);
+                }
+            }
+            // 通过 engine->steer() 注入 fallback 消息
+            for (const auto& msg : fallback_steers) {
+                engine->steer(msg);
+            }
+            if (!fallback_steers.empty()) {
+                log()->info("dispatch_reply_from_config: injected {} fallback steer messages via engine session={}",
+                            fallback_steers.size(), captured_message.session_key);
+            }
+            log()->debug("dispatch_reply_from_config: registered active engine for session={}",
+                         captured_message.session_key);
+        };
+
         // ✅ 严格对齐 OpenClaw: onBlockReply callback
         // 参考: dispatch-from-config.ts:onBlockReply → dispatcher.sendBlockReply(ttsPayload)
         //
@@ -642,6 +670,14 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
         auto gen_result = ReplyGenerator::get_reply_from_config(
             gen_config, llm_client_, tool_manager_, session_manager_
         );
+
+        // ✅ 对齐 OpenClaw: clearActiveEmbeddedRun(sessionId, queueHandle)
+        // engine->run() 已完成，清除 active engine 引用
+        {
+            std::lock_guard<std::mutex> lock(session_state_mutex_);
+            active_engines_.erase(captured_message.session_key);
+            streaming_sessions_.erase(captured_message.session_key);
+        }
 
         if (!gen_result.success) {
             inner_result.success = false;
@@ -845,8 +881,24 @@ ActiveRunQueueAction MessageDispatcher::resolve_active_run_queue_action(
 // steer_embedded_session
 // Aligned with openclaw: queueEmbeddedPiMessage (pi-embedded-runner/runs.ts)
 //
-// Inject a steer message into a running session.
-// Returns true if the session is currently streaming (steer accepted).
+// OpenClaw 完整路径:
+//   queueEmbeddedPiMessage(sessionId, text)
+//     → handle = ACTIVE_EMBEDDED_RUNS.get(sessionId)   (全局 Map<sessionId, Handle>)
+//     → handle.queueMessage(text)                      (EmbeddedPiQueueHandle.queueMessage)
+//     → activeSession.steer(text)                      (attempt.ts:2231)
+//     → session.agent.steer(AgentMessage{role:user})   (pi-agent-core)
+//   语义: 向**正在 streaming 的 LLM session** 实时注入一条新 user turn
+//
+// 限制条件 (aligned with openclaw):
+//   - handle 不存在 → return false  (session 未激活)
+//   - !handle.isStreaming() → return false  (session 未 streaming)
+//   - handle.isCompacting() → return false  (正在 compaction)
+//
+// HunterClaw 实现 (✅ 已对齐 OpenClaw):
+//   active_engines_ ≈ ACTIVE_EMBEDDED_RUNS (session_key → ReactEngine)
+//   engine->steer(text) ≈ activeSession.steer(text)
+//   消息直接注入 ReactEngine 的 steer 队列，在 execute_loop 下一轮循环时消费
+//   作为新 user turn 追加到 messages 列表，LLM 在下次调用时看到
 // ============================================================================
 
 bool MessageDispatcher::steer_embedded_session(
@@ -856,10 +908,31 @@ bool MessageDispatcher::steer_embedded_session(
     std::lock_guard<std::mutex> lock(session_state_mutex_);
     // Aligned with openclaw: queueEmbeddedPiMessage returns false if no active streaming run
     if (streaming_sessions_.count(session_key) == 0) {
+        log()->debug("steer_embedded_session: session not streaming, steer rejected session={}",
+                     session_key);
         return false;
     }
+
+    // ✅ 对齐 OpenClaw: handle.queueMessage(text) → activeSession.steer(text)
+    // 直接调用 ReactEngine::steer()，消息立即注入 engine 的 steer 队列
+    auto it = active_engines_.find(session_key);
+    if (it != active_engines_.end() && it->second) {
+        bool ok = it->second->steer(message);
+        if (ok) {
+            log()->info("steer_embedded_session: injected steer message via ReactEngine session={}",
+                        session_key);
+            return true;
+        }
+        // Engine exists but steer() returned false (engine not running)
+        // Fall through to queue-based fallback
+        log()->warn("steer_embedded_session: engine->steer() returned false, fallback to queue session={}",
+                    session_key);
+    }
+
+    // Fallback: 当 active_engines_ 中没有 engine 时（不应发生），暂存到 steer_queues_
     steer_queues_[session_key].push_back(message);
-    log()->info("steer_embedded_session: steered message into session={}", session_key);
+    log()->info("steer_embedded_session: queued steer message (fallback) for session={} queueSize={}",
+                session_key, steer_queues_[session_key].size());
     return true;
 }
 
@@ -867,8 +940,25 @@ bool MessageDispatcher::steer_embedded_session(
 // abort_embedded_session
 // Aligned with openclaw: abortEmbeddedPiRun (pi-embedded-runner/runs.ts)
 //
-// Abort the currently running session (interrupt mode).
-// Returns true if a session was aborted.
+// OpenClaw 完整路径:
+//   abortEmbeddedPiRun(sessionId)
+//     → handle = ACTIVE_EMBEDDED_RUNS.get(sessionId)
+//     → handle.abort()                                   (runs.ts:74)
+//       → runAbortController.abort()                     (attempt.ts onAbort)
+//         → 中断正在执行的 LLM stream (pi-agent-core abort)
+//         → activeSession.abort()
+//     → return true
+//
+//   如果 handle 不存在 → return false (no active run)
+//
+// HunterClaw 对齐:
+//   active_engines_[session_key] ≈ ACTIVE_EMBEDDED_RUNS[sessionId]
+//   engine->cancel()             ≈ handle.abort() → runAbortController.abort()
+//   清除 active_engines_         ≈ clearActiveEmbeddedRun (在 run 完成后自动清除)
+//   清除 steer_queues_           ≈ 确保 abort 后不再注入 steer 消息
+//
+// 调用方 (interrupt mode) 还需要:
+//   clearCommandLane             → 清除 followup queue (在 run_reply_agent 中处理)
 // ============================================================================
 
 bool MessageDispatcher::abort_embedded_session(const std::string& session_key) {
@@ -876,15 +966,31 @@ bool MessageDispatcher::abort_embedded_session(const std::string& session_key) {
     if (active_sessions_.count(session_key) == 0) {
         return false;
     }
-    // Mark as aborted — the running thread will check this flag
-    // Aligned with openclaw: runAbortController.abort("sessions_yield")
-    // In HunterClaw, we signal abort via a dedicated set
-    // (actual abort mechanism depends on react_engine integration)
-    log()->info("abort_embedded_session: aborting session={}", session_key);
-    // Remove from active so drain can proceed after abort
-    // The actual LLM abort is handled by react_engine's abort signal
+
+    // ✅ 对齐 OpenClaw: handle.abort() → runAbortController.abort()
+    // 通过 ReactEngine::cancel() 中止正在执行的 LLM stream
+    auto eit = active_engines_.find(session_key);
+    if (eit != active_engines_.end() && eit->second) {
+        eit->second->cancel();
+        log()->info("abort_embedded_session: cancelled ReactEngine for session={}", session_key);
+    }
+
+    // ✅ 清除 active engine 引用
+    // engine->run() 返回后会在 on_engine_created 的 cleanup 中再次清除，
+    // 但这里提前清除可以防止 cancel 后仍有 steer 消息注入
+    active_engines_.erase(session_key);
+
+    // ✅ 清除 steer 队列 (abort 后不应再注入 steer 消息)
+    steer_queues_.erase(session_key);
+
+    // ✅ 对齐 OpenClaw: 标记 session 为非活跃
+    // cancel() 被调用后 execute_loop 会在下一次 cancelled_ 检查时退出，
+    // run() 返回后调用方 (run_reply_agent) 会执行 active_sessions_.erase
+    // 但 interrupt 路径需要立即标记为非活跃以允许新 run 立即启动
     active_sessions_.erase(session_key);
     streaming_sessions_.erase(session_key);
+
+    log()->info("abort_embedded_session: aborted session={}", session_key);
     return true;
 }
 
@@ -979,26 +1085,49 @@ MessageDispatcher::DispatchResult MessageDispatcher::run_reply_agent(
     }
 
     // ── interrupt mode: abort current run + clear lane, then run-now ─────────
-    // Aligned with openclaw: get-reply-run.ts
+    // Aligned with openclaw: get-reply-run.ts:448-452
     //   if (resolvedQueue.mode === "interrupt" && laneSize > 0) {
-    //     clearCommandLane(sessionLaneKey);
-    //     abortEmbeddedPiRun(sessionIdFinal);
+    //     clearCommandLane(sessionLaneKey);     ← 清除 session lane 中的 pending 命令
+    //     abortEmbeddedPiRun(sessionIdFinal);   ← 中止正在运行的 agent
     //   }
+    // + clearSessionQueues (cleanup.ts:12-31):
+    //   clearFollowupQueue(key)                 ← 清空 followup 队列
+    //   clearFollowupDrainCallback(key)         ← 停止 drain 回调
+    //   clearCommandLane(resolveEmbeddedSessionLane(key)) ← 清除 session lane
     if (qs.mode == QueueMode::Interrupt && is_active) {
-        // Clear followup queue (aligned with openclaw: clearCommandLane)
+        // ✅ 对齐 OpenClaw: clearSessionQueues — 清空所有 pending 工作
         {
             std::lock_guard<std::mutex> lock(session_state_mutex_);
             auto it = followup_queues_.find(session_key);
             if (it != followup_queues_.end()) {
+                const int cleared_items = static_cast<int>(it->second.items.size());
                 it->second.items.clear();
                 it->second.dropped_count = 0;
                 it->second.summary_lines.clear();
+                it->second.draining = false;  // ✅ 停止 drain (对齐 clearFollowupDrainCallback)
+                followup_queues_.erase(it);   // ✅ 完全移除 (对齐 OpenClaw: FOLLOWUP_QUEUES.delete)
+                if (cleared_items > 0) {
+                    log()->info("run_reply_agent: interrupt cleared {} followup items session={}",
+                                cleared_items, session_key);
+                }
             }
         }
-        // Abort current run (aligned with openclaw: abortEmbeddedPiRun)
+
+        // ✅ 对齐 OpenClaw: clearCommandLane(sessionLaneKey)
+        // 清除 CommandQueue 中该 session 的 pending 命令
+        {
+            auto& cmd_queue = queue::CommandQueue::Instance();
+            const std::string session_lane = "session:" + session_key;
+            cmd_queue.clear_command_lane(session_lane);
+            log()->debug("run_reply_agent: interrupt cleared command lane={} session={}",
+                        session_lane, session_key);
+        }
+
+        // ✅ 对齐 OpenClaw: abortEmbeddedPiRun(sessionIdFinal)
+        // 中止正在运行的 agent (调用 ReactEngine::cancel())
         const bool aborted = abort_embedded_session(session_key);
-        log()->info("run_reply_agent: interrupt mode session={} cleared={} aborted={}",
-                    session_key, true, aborted);
+        log()->info("run_reply_agent: interrupt mode session={} aborted={}", session_key, aborted);
+
         // After abort, is_active is now false → fall through to run-now
         is_active = false;
     }
@@ -1094,6 +1223,14 @@ MessageDispatcher::DispatchResult MessageDispatcher::run_reply_agent(
     // HunterClaw: run_fn 在 main lane 中执行，session lane 由调用方负责
     log()->debug("run_reply_agent: session={} is idle → run-now (main lane)", session_key);
 
+    // ── steer_queues_ fallback 说明 ──────────────────────────────────────────
+    // 正常路径: steer 消息通过 steer_embedded_session → engine->steer() 直接注入
+    // Fallback: 若 engine 不可用，消息暂存 steer_queues_，
+    //           由 on_engine_created 回调在 engine 创建时统一消费并注入
+    // 因此此处不再需要单独处理 steer_queues_
+
+    std::function<DispatchResult()> effective_run_fn = params.run_fn;
+
     // Mark session as active (aligned with openclaw: isEmbeddedPiRunActive → true)
     {
         std::lock_guard<std::mutex> lock(session_state_mutex_);
@@ -1109,10 +1246,9 @@ MessageDispatcher::DispatchResult MessageDispatcher::run_reply_agent(
         // 这与 OpenClaw 的 await 语义一致
         auto& cmd_queue = queue::CommandQueue::Instance();
         const std::string global_lane = queue::ResolveGlobalLane();  // "main"
-        std::function<DispatchResult()> run_fn_copy = params.run_fn;
         auto future = cmd_queue.enqueue_command_in_lane(
             global_lane,
-            std::move(run_fn_copy),
+            std::move(effective_run_fn),
             queue::EnqueueOptions{.label = params.label, .urgent = false}
         );
         run_result = future.get();
@@ -1987,6 +2123,12 @@ ReplyGenerator::GenerateResult ReplyGenerator::run_prepared_reply(
     react_config.block_reply.disable_streaming = false;
 
     auto engine = react::ReactEngine::create(tool_manager, llm_client, react_config);
+
+    // ✅ 对齐 OpenClaw: setActiveEmbeddedRun(sessionId, queueHandle)
+    // 通知调用方 engine 已创建，使其能获取 engine 引用用于 steer 注入
+    if (config.on_engine_created) {
+        config.on_engine_created(engine);
+    }
 
     // Aligned with openclaw: generateSecureUuid() in runEmbeddedPiAgent (pi-embedded-runner/run.ts)
     // runId is generated per-run and used to correlate events across the channel inbound path.

@@ -151,6 +151,13 @@ ReactResult ReactEngine::run(
     const StreamCallbacks& callbacks
 ) {
     cancelled_ = false;
+    running_ = true;  // ✅ Mark engine as running (enables steer)
+    // Clear any leftover steer messages from previous runs
+    {
+        std::lock_guard<std::mutex> lock(steer_mutex_);
+        std::queue<std::string> empty;
+        steer_queue_.swap(empty);
+    }
     start_time_ = std::chrono::steady_clock::now();
     
     // ✅ 可观测性: 开启 Span (对齐 OpenClaw)
@@ -191,6 +198,7 @@ ReactResult ReactEngine::run(
             callbacks.on_end();
         }
         
+        running_ = false;  // ✅ Mark engine as stopped (disables steer)
         return result;
     } catch (const std::exception& e) {
         // ✅ Span 失败标记
@@ -204,6 +212,7 @@ ReactResult ReactEngine::run(
             callbacks.on_error(e.what());
         }
         
+        running_ = false;  // ✅ Mark engine as stopped (disables steer)
         ReactResult result;
         result.success = false;
         result.error = e.what();
@@ -223,6 +232,32 @@ std::future<ReactResult> ReactEngine::run_async(
 
 void ReactEngine::cancel() {
     cancelled_ = true;
+}
+
+// ============================================================================
+// steer — 向正在运行的 execute_loop 实时注入 user message
+// 🎯 对齐 OpenClaw: activeSession.steer(text)  (attempt.ts:2231)
+//   → session.agent.steer(AgentMessage{role:"user", content:text})
+//
+// 线程安全: steer_mutex_ 保护 steer_queue_。
+// execute_loop 在每轮循环开始时消费 steer_queue_ 中的消息。
+//
+// 返回 true: 消息已入队（engine 正在运行 execute_loop）
+// 返回 false: engine 未运行，steer 被拒绝
+// ============================================================================
+bool ReactEngine::steer(const std::string& text) {
+    if (!running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    if (text.empty()) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(steer_mutex_);
+        steer_queue_.push(text);
+    }
+    log()->info("[ReactEngine] steer: queued user message ({} chars)", text.size());
+    return true;
 }
 
 ReactResult ReactEngine::execute_loop(
@@ -410,6 +445,29 @@ ReactResult ReactEngine::execute_loop(
             result.success = false;
             result.error = "ReAct loop timeout";
             break;
+        }
+        
+        // ✅ 新增: 消费 steer 队列 (对齐 OpenClaw: activeSession.steer → agent.steer)
+        // OpenClaw 语义: steer 消息作为新的 user turn 实时注入到正在运行的 LLM session
+        //   attempt.ts:2231: queueHandle.queueMessage → activeSession.steer(text)
+        //   pi-agent-core: session.agent.steer(AgentMessage{role:"user", content:text})
+        //
+        // HunterClaw 实现: 在每轮 ReAct 循环开始时，将 steer 队列中的消息
+        // 作为 user 消息追加到 messages 列表。这会在下一次 call_llm 时让 LLM 看到。
+        {
+            std::lock_guard<std::mutex> lock(steer_mutex_);
+            while (!steer_queue_.empty()) {
+                std::string steer_text = std::move(steer_queue_.front());
+                steer_queue_.pop();
+                
+                llm::LLMMessage steer_msg;
+                steer_msg.role = llm::LLMMessageRole::User;
+                steer_msg.content = std::move(steer_text);
+                messages.push_back(std::move(steer_msg));
+                
+                log()->info("[ReactEngine] steer consumed: injected user message into messages (total={})",
+                           messages.size());
+            }
         }
         
         // 🎯 对齐 OpenClaw: handleMessageStart — reset state at message boundary

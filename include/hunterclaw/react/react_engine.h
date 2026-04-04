@@ -13,6 +13,8 @@
 #include <chrono>
 #include <future>
 #include <optional>
+#include <mutex>
+#include <queue>
 
 namespace hunterclaw {
 namespace react {
@@ -223,6 +225,16 @@ public:
     // 取消执行
     void cancel();
     
+    // ✅ 新增: Steer — 向正在运行的 execute_loop 实时注入 user message
+    // 🎯 对齐 OpenClaw: activeSession.steer(text)  (attempt.ts:2231)
+    //   → session.agent.steer(AgentMessage{role:"user", content:text})
+    //   语义: 向正在 streaming 的 LLM session 注入一条新 user turn
+    //         注入的消息在下一轮 ReAct 循环开始时被消费，追加到 messages 列表
+    //
+    // 线程安全: 可从任意线程调用（通过 mutex 保护 steer 队列）
+    // 返回 true 表示消息已入队（engine 正在运行）
+    bool steer(const std::string& text);
+    
     // 获取配置
     const ReactConfig& config() const { return config_; }
     ReactConfig& mutable_config() { return config_; }
@@ -409,7 +421,13 @@ private:
     
     // 运行状态
     std::atomic<bool> cancelled_{false};
+    std::atomic<bool> running_{false};  // ✅ 新增: 标记 execute_loop 是否正在运行
     std::chrono::steady_clock::time_point start_time_;
+    
+    // ✅ 新增: Steer 队列 (对齐 OpenClaw: activeSession.steer → agent.steer)
+    // 线程安全: 由 steer_mutex_ 保护，steer() 写入，execute_loop 读取
+    mutable std::mutex steer_mutex_;
+    std::queue<std::string> steer_queue_;
     
     // ✅ 流式处理状态 (对齐 OpenClaw)
     StreamingState streaming_state_;

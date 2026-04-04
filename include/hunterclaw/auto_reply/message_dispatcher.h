@@ -261,7 +261,14 @@ private:
     // ✅ Steer queue (aligned with openclaw: queueEmbeddedPiMessage)
     // 向运行中的 session 注入消息（steer 模式）
     // Key: session_key → pending steer messages
+    // 注: 仅用于 fallback（engine 不可用时暂存）; 优先通过 active_engines_ 直接 steer
     std::unordered_map<std::string, std::vector<std::string>> steer_queues_;
+
+    // ✅ Active ReactEngine 引用 (对齐 OpenClaw: ACTIVE_EMBEDDED_RUNS Map)
+    // Key: session_key → 正在运行的 ReactEngine 实例
+    // steer_embedded_session 通过此 map 直接调用 engine->steer(text)
+    // 由 run_fn 中 on_engine_created 回调注册，run_fn 完成后清除
+    std::unordered_map<std::string, std::shared_ptr<react::ReactEngine>> active_engines_;
 
     // ✅ resolve_queue_settings (aligned with openclaw: resolveQueueSettings queue/settings.ts)
     // 从 session entry 和 config 解析 queue mode
@@ -355,6 +362,12 @@ public:
         // Aligned with openclaw: onToolResult callback
         // Called after each tool execution with the tool result payload.
         std::function<void(const std::string& tool_text)> on_tool_result;
+
+        // ✅ 对齐 OpenClaw: engine 生命周期回调
+        // run_prepared_reply 创建 ReactEngine 后调用此回调，
+        // 使调用方（MessageDispatcher）能获取 engine 引用用于 steer 注入。
+        // 对齐 OpenClaw: setActiveEmbeddedRun(sessionId, queueHandle)
+        std::function<void(std::shared_ptr<react::ReactEngine> engine)> on_engine_created;
     };
     
     // ✅ 生成结果

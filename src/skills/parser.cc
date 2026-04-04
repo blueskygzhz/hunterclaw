@@ -238,5 +238,123 @@ std::pair<std::string, std::string> SkillParser::split_frontmatter(const std::st
     return {"", content};
 }
 
+// ============================================================================
+// ✅ parse_raw_frontmatter (Aligned with OpenClaw parseFrontmatterBlock)
+// Returns raw key-value pairs from YAML frontmatter
+// ============================================================================
+
+ParsedSkillFrontmatter SkillParser::parse_raw_frontmatter(const std::string& content) {
+    ParsedSkillFrontmatter result;
+
+    auto [frontmatter_str, body] = split_frontmatter(content);
+    if (frontmatter_str.empty()) {
+        return result;
+    }
+
+    // Simple line-by-line YAML key: value parsing
+    std::istringstream stream(frontmatter_str);
+    std::string line;
+    while (std::getline(stream, line)) {
+        if (line.empty() || line[0] == '#') continue;
+
+        size_t colon = line.find(':');
+        if (colon == std::string::npos) continue;
+
+        std::string key = line.substr(0, colon);
+        std::string value = line.substr(colon + 1);
+
+        // Trim
+        auto trim = [](std::string& s) {
+            s.erase(0, s.find_first_not_of(" \t"));
+            s.erase(s.find_last_not_of(" \t") + 1);
+            // Remove surrounding quotes
+            if (s.size() >= 2 && ((s.front() == '"' && s.back() == '"') ||
+                                  (s.front() == '\'' && s.back() == '\''))) {
+                s = s.substr(1, s.size() - 2);
+            }
+        };
+        trim(key);
+        trim(value);
+
+        if (!key.empty()) {
+            result[key] = value;
+        }
+    }
+    return result;
+}
+
+// ============================================================================
+// ✅ resolve_openclaw_metadata (Aligned with OpenClaw resolveOpenClawMetadata)
+// ============================================================================
+
+std::optional<OpenClawSkillMetadata> SkillParser::resolve_openclaw_metadata(
+    const ParsedSkillFrontmatter& frontmatter
+) {
+    // Look for openclaw metadata keys in the raw frontmatter
+    // OpenClaw frontmatter stores them as nested YAML, but since we have a flat
+    // key-value map, we reconstruct from parsed structured fields
+    // Fall back to yaml-cpp-based parse_frontmatter for full nested YAML support
+    bool has_openclaw = false;
+    for (const auto& [key, val] : frontmatter) {
+        if (key.find("openclaw") != std::string::npos ||
+            key == "always" || key == "emoji" || key == "homepage") {
+            has_openclaw = true;
+            break;
+        }
+    }
+    if (!has_openclaw) {
+        return std::nullopt;
+    }
+
+    OpenClawSkillMetadata meta;
+    auto it = frontmatter.find("always");
+    if (it != frontmatter.end()) {
+        meta.always = (it->second == "true" || it->second == "1");
+    }
+    it = frontmatter.find("emoji");
+    if (it != frontmatter.end()) meta.emoji = it->second;
+    it = frontmatter.find("homepage");
+    if (it != frontmatter.end()) meta.homepage = it->second;
+    it = frontmatter.find("skill-key");
+    if (it == frontmatter.end()) it = frontmatter.find("skillKey");
+    if (it != frontmatter.end()) meta.skill_key = it->second;
+    it = frontmatter.find("primary-env");
+    if (it == frontmatter.end()) it = frontmatter.find("primaryEnv");
+    if (it != frontmatter.end()) meta.primary_env = it->second;
+
+    return meta;
+}
+
+// ============================================================================
+// ✅ resolve_invocation_policy (Aligned with OpenClaw resolveSkillInvocationPolicy)
+// Reads: user-invocable (default: true), disable-model-invocation (default: false)
+// ============================================================================
+
+SkillInvocationPolicy SkillParser::resolve_invocation_policy(
+    const ParsedSkillFrontmatter& frontmatter
+) {
+    SkillInvocationPolicy policy;
+
+    auto parse_bool = [](const std::string& val, bool default_val) -> bool {
+        if (val == "true" || val == "1" || val == "yes") return true;
+        if (val == "false" || val == "0" || val == "no") return false;
+        return default_val;
+    };
+
+    // user-invocable: default true
+    auto it = frontmatter.find("user-invocable");
+    if (it != frontmatter.end()) {
+        policy.user_invocable = parse_bool(it->second, true);
+    }
+
+    // disable-model-invocation: default false
+    it = frontmatter.find("disable-model-invocation");
+    if (it != frontmatter.end()) {
+        policy.disable_model_invocation = parse_bool(it->second, false);
+    }
+
+    return policy;
+}
+
 } // namespace skills
 } // namespace hunterclaw

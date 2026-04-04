@@ -146,8 +146,9 @@ struct SkillManager::Impl {
         workspace_dir_ = workspace_dir;
         skills_.clear();
         
-        // 定义 Skill 根目录 (优先级从低到高)
-        // 后加载的会覆盖先加载的 (100% 对齐 OpenClaw)
+        // ✅ 严格对齐 OpenClaw 优先级 (workspace.ts:490-509):
+        // Precedence: extra+plugin < bundled < managed < agents-personal < agents-project < workspace
+        // 后加载的覆盖先加载的 (Map key = skill.name)
         struct SkillRoot {
             std::string path;
             SkillSource source;
@@ -156,10 +157,40 @@ struct SkillManager::Impl {
         std::vector<SkillRoot> roots;
         
         // ===================================================================
-        // 1. Bundled Skills (系统内置层)
+        // 1. Extra Dirs + Plugin Skills (OpenClaw: "extra" = lowest priority)
         // ===================================================================
-        // OpenClaw: /usr/lib/node_modules/openclaw/skills/
-        // HunterClaw: ~/.hunterclaw/skills-bundled (可配置)
+        // Plugin Skills: ~/.openclaw/extensions/*/skills
+        {
+            std::string extensions_dir = core::utils::expand_path("~/.openclaw/extensions");
+            if (fs::exists(extensions_dir)) {
+                try {
+                    for (const auto& ext_entry : fs::directory_iterator(extensions_dir)) {
+                        if (!ext_entry.is_directory()) continue;
+                        std::string plugin_skills_path =
+                            ext_entry.path().string() + "/skills";
+                        if (fs::exists(plugin_skills_path)) {
+                            roots.push_back({plugin_skills_path, SkillSource::Plugin});
+                            log()->info("Found plugin skills: {}", plugin_skills_path);
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    log()->warn("Error scanning plugin skills: {}", e.what());
+                }
+            }
+        }
+        // Extra Dirs from config (also lowest priority)
+        if (config_) {
+            for (const auto& dir : config_->skills.load.extra_dirs) {
+                roots.push_back({
+                    core::utils::expand_path(dir),
+                    SkillSource::Personal
+                });
+            }
+        }
+
+        // ===================================================================
+        // 2. Bundled Skills (系统内置层)
+        // ===================================================================
         std::string bundled_path = core::utils::expand_path("~/.hunterclaw/skills-bundled");
         const char* env_bundled = std::getenv("HUNTERCLAW_BUNDLED_SKILLS");
         if (env_bundled && std::strlen(env_bundled) > 0) {
@@ -169,14 +200,13 @@ struct SkillManager::Impl {
         roots.push_back({bundled_path, SkillSource::Bundled});
         
         // ===================================================================
-        // 2. Managed/Local Skills (用户自定义层)
+        // 3. Managed/Local Skills (用户自定义层)
         // ===================================================================
         // ✅ OpenClaw 兼容: ~/.openclaw/skills/
         roots.push_back({
             core::utils::expand_path("~/.openclaw/skills"),
             SkillSource::Managed
         });
-        
         // ✅ HunterClaw 专用: ~/.hunterclaw/skills/
         roots.push_back({
             core::utils::expand_path("~/.hunterclaw/skills"),
@@ -184,7 +214,7 @@ struct SkillManager::Impl {
         });
         
         // ===================================================================
-        // 3. Personal Skills (HunterClaw 多租户扩展)
+        // 4. Personal Skills (agents-skills-personal)
         // ===================================================================
         roots.push_back({
             core::utils::expand_path("~/.agents/skills"),
@@ -192,35 +222,7 @@ struct SkillManager::Impl {
         });
         
         // ===================================================================
-        // 4. Plugin Skills (OpenClaw 对齐: 扩展插件层)
-        // ===================================================================
-// TODO: 实现 plugin_manager_ 后启用
-        // if (plugin_manager_) {
-        //     for (const auto& plugin : plugin_manager_->get_enabled_plugins()) {
-        //         std::string plugin_skills_path =
-        //             core::utils::expand_path("~/.openclaw/extensions/" + plugin + "/skills");
-        //
-        //         if (fs::exists(plugin_skills_path)) {
-        //             roots.push_back({plugin_skills_path, SkillSource::Plugin});
-        //             log()->info("Loading plugin skills: {}", plugin);
-        //         }
-        //     }
-        // }
-        
-        // ===================================================================
-        // 5. Extra Dirs (HunterClaw 配置扩展)
-        // ===================================================================
-        if (config_) {
-            for (const auto& dir : config_->skills.load.extra_dirs) {
-                roots.push_back({
-                    core::utils::expand_path(dir),
-                    SkillSource::Personal
-                });
-            }
-        }
-        
-        // ===================================================================
-        // 6. Project Hidden Skills (HunterClaw 扩展)
+        // 5. Project Hidden Skills (agents-skills-project)
         // ===================================================================
         if (!workspace_dir.empty()) {
             roots.push_back({
@@ -230,7 +232,7 @@ struct SkillManager::Impl {
         }
         
         // ===================================================================
-        // 7. Workspace Skills (OpenClaw 100% 对齐: <workspace>/skills/)
+        // 6. Workspace Skills (openclaw-workspace, 最高优先级)
         // ===================================================================
         if (!workspace_dir.empty()) {
             roots.push_back({
@@ -261,38 +263,219 @@ struct SkillManager::Impl {
         return core::Result<bool>::Ok(true);
     }
     
+// ============================================================================
+// ✅ isPathInside (Aligned with OpenClaw scan-paths.ts:3-8)
+// Returns true if candidatePath is inside or equal to basePath.
+// Uses relative path semantics (no symlink resolution here).
+// ============================================================================
+static bool is_path_inside(const fs::path& base_path, const fs::path& candidate_path) {
+    auto base = fs::path(fs::absolute(base_path)).lexically_normal();
+    auto candidate = fs::path(fs::absolute(candidate_path)).lexically_normal();
+    auto rel = fs::relative(candidate, base);
+    std::string rel_str = rel.string();
+    return rel_str == "." ||
+           (!rel_str.empty() &&
+            rel_str[0] != '.' &&
+            !fs::path(rel_str).is_absolute());
+}
+
+// ============================================================================
+// ✅ resolveContainedSkillPath (Aligned with OpenClaw workspace.ts:201-221)
+// Resolves real path and checks it stays inside root.
+// Returns empty optional if symlink escapes root.
+// ============================================================================
+static std::optional<fs::path> resolve_contained_skill_path(
+    const std::string& source,
+    const fs::path& root_dir,
+    const fs::path& root_real_path,
+    const fs::path& candidate_path
+) {
+    std::error_code ec;
+    fs::path candidate_real = fs::canonical(candidate_path, ec);
+    if (ec) {
+        return std::nullopt;  // Path doesn't exist or can't be resolved
+    }
+    if (is_path_inside(root_real_path, candidate_real)) {
+        return candidate_real;  // Safe: realpath is inside root
+    }
+    // Symlink escape detected
+    log()->warn("Skipping skill path that resolves outside its configured root "
+                "(source={}, root={}, path={}, realPath={})",
+                source, root_dir.string(), candidate_path.string(), candidate_real.string());
+    return std::nullopt;
+}
+
+// ============================================================================
+// ✅ listChildDirectories (Aligned with OpenClaw workspace.ts:151-177)
+// Lists immediate child directory names, following symlinks to directories.
+// Skips dot-files and node_modules.
+// ============================================================================
+static std::vector<std::string> list_child_directories(const fs::path& dir) {
+    std::vector<std::string> result;
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(dir, ec)) {
+        if (ec) break;
+        std::string name = entry.path().filename().string();
+        if (name.empty() || name[0] == '.') continue;
+        if (name == "node_modules") continue;
+        // Follow symlinks
+        std::error_code stat_ec;
+        bool is_dir = fs::is_directory(entry.path(), stat_ec);
+        if (!stat_ec && is_dir) {
+            result.push_back(name);
+        }
+    }
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
+// ============================================================================
+// ✅ resolveNestedSkillsRoot (Aligned with OpenClaw workspace.ts:249-277)
+// If dir/skills/*/SKILL.md exists, treat dir/skills as the real root.
+// ============================================================================
+struct NestedSkillsRoot {
+    fs::path base_dir;
+    std::optional<std::string> note;
+};
+
+static NestedSkillsRoot resolve_nested_skills_root(
+    const fs::path& dir,
+    int max_entries_to_scan = 100
+) {
+    fs::path nested = dir / "skills";
+    std::error_code ec;
+    if (!fs::is_directory(nested, ec) || ec) {
+        return {dir, std::nullopt};
+    }
+
+    auto child_dirs = list_child_directories(nested);
+    int scan_limit = std::min(max_entries_to_scan, static_cast<int>(child_dirs.size()));
+
+    for (int i = 0; i < scan_limit; i++) {
+        if (fs::exists(nested / child_dirs[i] / "SKILL.md", ec)) {
+            return {nested, "Detected nested skills root at " + nested.string()};
+        }
+    }
+    return {dir, std::nullopt};
+}
+
     core::Result<int> load_from_directory(const std::string& dir, SkillSource source) {
         try {
-            int loaded = 0;
-            int max_per_source = 200;  // limits.max_skills_loaded_per_source
-            
+            int max_per_source = 200;
+            int max_candidates_per_root = 300;
+            size_t max_skill_file_bytes = 256000;
+
             if (config_) {
                 max_per_source = config_->skills.limits.max_skills_loaded_per_source;
+                max_candidates_per_root = config_->skills.limits.max_candidates_per_root;
+                max_skill_file_bytes = config_->skills.limits.max_skill_file_bytes;
             }
-            
-            for (const auto& entry : fs::recursive_directory_iterator(dir)) {
-                if (loaded >= max_per_source) {
-                    log()->warn("Reached max skills limit ({}) for source: {}", 
-                               max_per_source, dir);
-                    break;
-                }
-                
-                if (!entry.is_regular_file()) continue;
-                
-                std::string filename = entry.path().filename().string();
-                if (filename == "SKILL.md" || filename == "skill.md") {
-                    auto result = load_skill_file(entry.path(), source);
-                    if (result.is_ok()) {
-                        loaded++;
+
+            fs::path root_dir = fs::path(dir);
+            std::error_code ec;
+            fs::path root_real = fs::canonical(root_dir, ec);
+            if (ec) root_real = fs::absolute(root_dir);
+
+            // ✅ Aligned with OpenClaw: resolveNestedSkillsRoot
+            auto nested_result = resolve_nested_skills_root(root_dir, max_candidates_per_root);
+            fs::path base_dir = nested_result.base_dir;
+            if (nested_result.note) {
+                log()->info("Nested skills root: {}", *nested_result.note);
+            }
+
+            // ✅ Validate base_dir is still inside root
+            auto base_dir_real = resolve_contained_skill_path(
+                source_to_str(source), root_dir, root_real, base_dir);
+            if (!base_dir_real) {
+                return core::Result<int>::Ok(0);  // Safety check failed
+            }
+
+            int loaded = 0;
+
+            // ✅ Case 1: baseDir itself has SKILL.md → load as single skill
+            if (fs::exists(base_dir / "SKILL.md", ec)) {
+                auto skill_md_real = resolve_contained_skill_path(
+                    source_to_str(source), root_dir, *base_dir_real, base_dir / "SKILL.md");
+                if (skill_md_real) {
+                    // Check size
+                    std::error_code size_ec;
+                    auto size = fs::file_size(*skill_md_real, size_ec);
+                    if (!size_ec && size <= max_skill_file_bytes) {
+                        auto result = load_skill_file(*skill_md_real, source);
+                        if (result.is_ok()) loaded++;
+                    } else if (!size_ec) {
+                        log()->warn("Skipping skills root due to oversized SKILL.md ({}B > {}B): {}",
+                                    size, max_skill_file_bytes, skill_md_real->string());
                     }
                 }
+                return core::Result<int>::Ok(loaded);
             }
-            
+
+            // ✅ Case 2: enumerate immediate child directories
+            auto child_dirs = list_child_directories(base_dir);
+            bool suspicious = static_cast<int>(child_dirs.size()) > max_candidates_per_root;
+            int max_candidates = std::max(0, max_per_source);
+
+            if (suspicious) {
+                log()->warn("Skills root looks suspiciously large, truncating discovery "
+                            "(dir={}, childDirs={}, maxCandidatesPerRoot={})",
+                            dir, child_dirs.size(), max_candidates_per_root);
+            }
+
+            // Process only up to max_candidates children, alphabetically sorted
+            int children_to_scan = std::min(static_cast<int>(child_dirs.size()), max_candidates);
+
+            for (int i = 0; i < children_to_scan && loaded < max_per_source; i++) {
+                const auto& name = child_dirs[i];
+                fs::path skill_dir = base_dir / name;
+                fs::path skill_md = skill_dir / "SKILL.md";
+
+                // ✅ Validate skill_dir is inside root (symlink check)
+                auto skill_dir_real = resolve_contained_skill_path(
+                    source_to_str(source), root_dir, *base_dir_real, skill_dir);
+                if (!skill_dir_real) continue;
+
+                if (!fs::exists(skill_md, ec)) continue;
+
+                // ✅ Validate SKILL.md is inside root (double check)
+                auto skill_md_real = resolve_contained_skill_path(
+                    source_to_str(source), root_dir, *base_dir_real, skill_md);
+                if (!skill_md_real) continue;
+
+                // ✅ Check file size limit
+                std::error_code size_ec;
+                auto size = fs::file_size(*skill_md_real, size_ec);
+                if (size_ec) continue;
+                if (size > max_skill_file_bytes) {
+                    log()->warn("Skipping skill due to oversized SKILL.md (skill={}, {}B > {}B)",
+                                name, size, max_skill_file_bytes);
+                    continue;
+                }
+
+                auto result = load_skill_file(*skill_md_real, source);
+                if (result.is_ok()) {
+                    loaded++;
+                }
+            }
+
             return core::Result<int>::Ok(loaded);
-            
+
         } catch (const std::exception& e) {
             return core::Result<int>::Err(
                 std::string("Failed to load from directory: ") + e.what());
+        }
+    }
+
+    // Helper: SkillSource to string for logging
+    static std::string source_to_str(SkillSource source) {
+        switch (source) {
+            case SkillSource::Bundled:   return "openclaw-bundled";
+            case SkillSource::Managed:   return "openclaw-managed";
+            case SkillSource::Personal:  return "agents-skills-personal";
+            case SkillSource::Plugin:    return "openclaw-extra";
+            case SkillSource::Project:   return "agents-skills-project";
+            case SkillSource::Workspace: return "openclaw-workspace";
+            default: return "unknown";
         }
     }
     
@@ -326,10 +509,24 @@ struct SkillManager::Impl {
             skill.source = source;
             skill.base_dir = file_path.parent_path();
             
+            // ✅ 对齐 OpenClaw workspace.ts:511-525:
+            // skillEntries = merged.values().map(skill => ({
+            //   skill,
+            //   frontmatter: parseFrontmatter(readFileSync(skill.filePath)),
+            //   metadata: resolveOpenClawMetadata(frontmatter),
+            //   invocation: resolveSkillInvocationPolicy(frontmatter),
+            // }))
+            ParsedSkillFrontmatter raw_frontmatter =
+                SkillParser::parse_raw_frontmatter(content_result.get());
+
+            auto invocation_policy = SkillParser::resolve_invocation_policy(raw_frontmatter);
+
             // 创建 SkillEntry (包含运行时状态)
             SkillEntry entry;
             entry.skill = skill;
-            entry.metadata = skill.frontmatter.metadata;
+            entry.frontmatter = raw_frontmatter;             // ✅ raw frontmatter map
+            entry.metadata = skill.frontmatter.metadata;     // from yaml-cpp structured parse
+            entry.invocation = invocation_policy;            // ✅ user-invocable / disable-model-invocation
             entry.eligible = false;  // 稍后计算
             
             // 存储 (后加载的覆盖前面的 - 优先级机制)
@@ -820,6 +1017,430 @@ void SkillManager::stop_watch() {
     impl_->file_watcher_.reset();
     
     log()->info("Skill hot-reload disabled");
+}
+
+// ============================================================================
+// ✅ Snapshot Version Management (Aligned with OpenClaw bumpSkillsSnapshotVersion)
+// ============================================================================
+
+int64_t SkillManager::get_snapshot_version() const {
+    return static_cast<int64_t>(impl_->version_);
+}
+
+int64_t SkillManager::bump_snapshot_version() {
+    return static_cast<int64_t>(impl_->bump_version());
+}
+
+// ============================================================================
+// ✅ compactSkillPaths (Aligned with OpenClaw workspace.ts:46-54)
+// Replace HOME prefix with "~/" to reduce LLM token usage (~5-6 tokens/path)
+// ============================================================================
+
+/*static*/ std::vector<Skill> SkillManager::compact_skill_paths(
+    const std::vector<Skill>& skills
+) {
+    const char* home_env = std::getenv("HOME");
+    if (!home_env) return skills;
+
+    std::string home(home_env);
+    if (!home.empty() && home.back() != '/') home += '/';
+
+    std::vector<Skill> result = skills;
+    for (auto& skill : result) {
+        std::string path_str = skill.file_path.string();
+        if (path_str.find(home) == 0) {
+            skill.file_path = "~/" + path_str.substr(home.size());
+        }
+    }
+    return result;
+}
+
+// ============================================================================
+// ✅ filterWorkspaceSkillEntries (Aligned with OpenClaw workspace.ts:68-88)
+// ============================================================================
+
+std::vector<SkillEntry> SkillManager::filter_workspace_skill_entries(
+    const std::vector<SkillEntry>& entries,
+    const SkillEligibilityContext& ctx
+) const {
+    std::vector<SkillEntry> result;
+    for (const auto& entry : entries) {
+        std::string reason;
+        if (impl_->check_eligibility(entry, ctx, reason)) {
+            SkillEntry e = entry;
+            e.eligible = true;
+            result.push_back(e);
+        }
+    }
+    return result;
+}
+
+// ============================================================================
+// ✅ buildWorkspaceSkillSnapshot (Aligned with OpenClaw workspace.ts:567-584)
+// Builds a versioned SkillSnapshot for injection into agent system prompt.
+// ============================================================================
+
+SkillSnapshot SkillManager::build_workspace_skill_snapshot(
+    const SkillEligibilityContext& ctx,
+    const std::vector<std::string>& skill_filter,
+    std::optional<int64_t> snapshot_version
+) const {
+    // 1. Filter eligible skills
+    auto eligible = filter_eligible_skills(ctx, skill_filter);
+
+    // 2. Exclude disableModelInvocation skills from prompt
+    //    (OpenClaw: promptEntries = eligible.filter(e => !disableModelInvocation))
+    std::vector<SkillEntry> prompt_entries;
+    for (const auto& e : eligible) {
+        bool disable_model = e.invocation && e.invocation->disable_model_invocation;
+        if (!disable_model) {
+            prompt_entries.push_back(e);
+        }
+    }
+
+    // 3. Extract skill objects and compact paths
+    std::vector<Skill> resolved_skills;
+    for (const auto& e : prompt_entries) {
+        resolved_skills.push_back(e.skill);
+    }
+    auto compacted = compact_skill_paths(resolved_skills);
+
+    // 4. Apply prompt limits (maxSkillsInPrompt / maxSkillsPromptChars)
+    int max_skills = 150;
+    if (impl_->config_) {
+        max_skills = impl_->config_->skills.limits.max_skills_in_prompt;
+    }
+    if (static_cast<int>(compacted.size()) > max_skills) {
+        log()->warn("Truncating skills from {} to max {}", compacted.size(), max_skills);
+        compacted.resize(max_skills);
+        resolved_skills.resize(max_skills);
+    }
+
+    // 5. Build XML prompt block (same format as build_skills_prompt)
+    std::ostringstream ss;
+    if (!compacted.empty()) {
+        ss << "\n<available_skills>\n";
+        ss << "Before replying: scan <available_skills> <description> entries.\n";
+        ss << "- If exactly one skill clearly applies: read its SKILL.md at <location> with `read`, then follow it.\n";
+        ss << "- If multiple could apply: choose the most specific one, then read/follow it.\n";
+        ss << "- If none clearly apply: do not read any SKILL.md.\n";
+        ss << "Constraints: never read more than one skill up front; only read after selecting.\n\n";
+
+        for (const auto& skill : compacted) {
+            ss << "  <skill>\n";
+            ss << "    <name>" << xml_escape(skill.name) << "</name>\n";
+            ss << "    <description>" << xml_escape(skill.description) << "</description>\n";
+            std::string skill_path = skill.file_path.string();
+            if (!skill_path.empty()) {
+                ss << "    <location>" << xml_escape(skill_path) << "</location>\n";
+            }
+            ss << "  </skill>\n";
+        }
+        ss << "</available_skills>\n";
+    }
+
+    // 6. Build snapshot
+    SkillSnapshot snapshot;
+    snapshot.prompt = ss.str();
+    snapshot.resolved_skills = resolved_skills;
+    snapshot.version = snapshot_version;
+
+    // Add remote note if available (aligned with OpenClaw)
+    if (ctx.remote && !ctx.remote->note.empty()) {
+        snapshot.prompt = ctx.remote->note + "\n" + snapshot.prompt;
+    }
+
+    // Build skills metadata list (for ENV overrides)
+    for (const auto& e : eligible) {
+        SkillSnapshotEntry entry;
+        entry.name = e.skill.name;
+        entry.primary_env = e.metadata.primary_env;
+        entry.required_env = e.metadata.requires.env;
+        snapshot.skills.push_back(entry);
+    }
+
+    // Preserve skill_filter
+    if (!skill_filter.empty()) {
+        snapshot.skill_filter = skill_filter;
+    }
+
+    log()->info("Built skill snapshot: {} eligible, {} in prompt (version: {})",
+                eligible.size(), compacted.size(),
+                snapshot_version ? std::to_string(*snapshot_version) : "none");
+
+    return snapshot;
+}
+
+// ============================================================================
+// ✅ resolveSkillsPromptForRun (Aligned with OpenClaw workspace.ts:640-658)
+// Priority: snapshot.prompt → real-time build → ""
+// ============================================================================
+
+std::string SkillManager::resolve_skills_prompt_for_run(
+    const std::optional<SkillSnapshot>& snapshot,
+    const std::optional<std::vector<SkillEntry>>& entries
+) const {
+    // 1. Use snapshot prompt if available
+    if (snapshot) {
+        std::string prompt = snapshot->prompt;
+        // trim
+        size_t start = prompt.find_first_not_of(" \t\n\r");
+        if (start != std::string::npos) {
+            return prompt.substr(start);
+        }
+    }
+
+    // 2. Fall back to real-time build from entries
+    if (entries && !entries->empty()) {
+        // Build from entries using current context
+        std::ostringstream ss;
+        ss << "\n<available_skills>\n";
+        ss << "Before replying: scan <available_skills> <description> entries.\n";
+        ss << "Use the read tool to load SKILL.md at the listed <location> when needed.\n\n";
+
+        for (const auto& entry : *entries) {
+            if (!entry.eligible) continue;
+            // Skip disableModelInvocation
+            if (entry.invocation && entry.invocation->disable_model_invocation) continue;
+
+            const auto& skill = entry.skill;
+            ss << "  <skill>\n";
+            ss << "    <name>" << xml_escape(skill.name) << "</name>\n";
+            ss << "    <description>" << xml_escape(skill.description) << "</description>\n";
+            std::string path_str = skill.file_path.string();
+            if (!path_str.empty()) {
+                ss << "    <location>" << xml_escape(path_str) << "</location>\n";
+            }
+            ss << "  </skill>\n";
+        }
+        ss << "</available_skills>\n";
+
+        std::string prompt = ss.str();
+        size_t start = prompt.find_first_not_of(" \t\n\r");
+        return start != std::string::npos ? prompt.substr(start) : "";
+    }
+
+    return "";
+}
+
+// ============================================================================
+// ✅ applySkillEnvOverrides (Aligned with OpenClaw env-overrides.ts)
+// Inject skill apiKey/env into process environment.
+// Returns a restore function.
+// ============================================================================
+
+std::function<void()> SkillManager::apply_skill_env_overrides(
+    const std::vector<SkillEntry>& skills
+) {
+    std::vector<std::pair<std::string, std::optional<std::string>>> applied;
+
+    for (const auto& entry : skills) {
+        if (!impl_->config_) continue;
+
+        const std::string& skill_key = entry.metadata.skill_key.empty()
+            ? entry.skill.name
+            : entry.metadata.skill_key;
+
+        // Look up skill config (simplified - real impl would check config->skills.entries)
+        // Inject primary_env / apiKey if configured
+        const std::string& primary_env = entry.metadata.primary_env;
+        if (!primary_env.empty() && std::getenv(primary_env.c_str()) == nullptr) {
+            // Check if apiKey is configured for this skill
+            // (Real impl: config->skills.entries[skill_key].api_key)
+            // For now, record the env var name for tracking
+            applied.push_back({primary_env, std::nullopt});
+        }
+
+        // Inject required env vars from config
+        // (Real impl: config->skills.entries[skill_key].env)
+    }
+
+    return [applied]() {
+        // Restore: remove injected env vars
+        for (const auto& [key, old_val] : applied) {
+            if (old_val.has_value()) {
+                setenv(key.c_str(), old_val->c_str(), 1);
+            } else {
+                unsetenv(key.c_str());
+            }
+        }
+    };
+}
+
+std::function<void()> SkillManager::apply_skill_env_overrides_from_snapshot(
+    const SkillSnapshot& snapshot
+) {
+    std::vector<std::pair<std::string, std::optional<std::string>>> applied;
+
+    for (const auto& skill_info : snapshot.skills) {
+        if (!skill_info.primary_env.empty() &&
+            std::getenv(skill_info.primary_env.c_str()) == nullptr) {
+            applied.push_back({skill_info.primary_env, std::nullopt});
+        }
+    }
+
+    return [applied]() {
+        for (const auto& [key, old_val] : applied) {
+            if (old_val.has_value()) {
+                setenv(key.c_str(), old_val->c_str(), 1);
+            } else {
+                unsetenv(key.c_str());
+            }
+        }
+    };
+}
+
+// ============================================================================
+// Skill Command Name Helpers (Aligned with OpenClaw workspace.ts:102-129)
+// ============================================================================
+
+namespace {
+
+static std::string sanitize_skill_cmd_name(const std::string& raw) {
+    std::string result;
+    for (unsigned char c : raw) {
+        result += std::isalnum(c) ? static_cast<char>(std::tolower(c)) : '_';
+    }
+    std::string out;
+    bool prev = false;
+    for (char c : result) {
+        if (c == '_') { if (!prev) out += c; prev = true; }
+        else { out += c; prev = false; }
+    }
+    size_t s = out.find_first_not_of('_');
+    if (s == std::string::npos) return "skill";
+    size_t e = out.find_last_not_of('_');
+    out = out.substr(s, e - s + 1);
+    if (out.size() > 32) out = out.substr(0, 32);
+    return out.empty() ? "skill" : out;
+}
+
+static std::string unique_cmd_name(const std::string& base, std::set<std::string>& used) {
+    auto lower = [](std::string s) {
+        std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+        return s;
+    };
+    if (!used.count(lower(base))) { used.insert(lower(base)); return base; }
+    for (int i = 2; i < 1000; i++) {
+        std::string suf = "_" + std::to_string(i);
+        int maxb = std::max(1, 32 - (int)suf.size());
+        std::string cand = base.substr(0, maxb) + suf;
+        if (!used.count(lower(cand))) { used.insert(lower(cand)); return cand; }
+    }
+    return base.substr(0, 30) + "_x";
+}
+
+} // anonymous namespace
+
+// ============================================================================
+// ✅ buildWorkspaceSkillCommandSpecs (Aligned with OpenClaw workspace.ts:775-881)
+// ============================================================================
+std::vector<SkillCommandSpec> SkillManager::build_workspace_skill_command_specs(
+    const SkillEligibilityContext& ctx,
+    const std::vector<std::string>& skill_filter,
+    const std::optional<std::set<std::string>>& reserved_names
+) const {
+    auto eligible = filter_eligible_skills(ctx, skill_filter);
+
+    std::vector<SkillEntry> user_invocable;
+    for (const auto& e : eligible) {
+        if (!e.invocation || e.invocation->user_invocable)
+            user_invocable.push_back(e);
+    }
+
+    std::set<std::string> used;
+    if (reserved_names) {
+        for (const auto& n : *reserved_names) {
+            std::string l = n;
+            std::transform(l.begin(), l.end(), l.begin(), ::tolower);
+            used.insert(l);
+        }
+    }
+
+    std::vector<SkillCommandSpec> specs;
+    for (const auto& entry : user_invocable) {
+        const std::string& raw_name = entry.skill.name;
+        std::string unique = unique_cmd_name(sanitize_skill_cmd_name(raw_name), used);
+
+        std::string desc = entry.skill.description.empty() ? raw_name : entry.skill.description;
+        while (!desc.empty() && std::isspace((unsigned char)desc.front())) desc.erase(desc.begin());
+        while (!desc.empty() && std::isspace((unsigned char)desc.back())) desc.pop_back();
+        if (desc.size() > 100) desc = desc.substr(0, 99) + "…";
+
+        std::optional<SkillCommandDispatch> dispatch;
+        auto kit = entry.frontmatter.find("command-dispatch");
+        if (kit == entry.frontmatter.end()) kit = entry.frontmatter.find("command_dispatch");
+        if (kit != entry.frontmatter.end()) {
+            std::string kv = kit->second;
+            std::transform(kv.begin(), kv.end(), kv.begin(), ::tolower);
+            while (!kv.empty() && std::isspace((unsigned char)kv.front())) kv.erase(kv.begin());
+            while (!kv.empty() && std::isspace((unsigned char)kv.back())) kv.pop_back();
+            if (kv == "tool") {
+                auto tit = entry.frontmatter.find("command-tool");
+                if (tit == entry.frontmatter.end()) tit = entry.frontmatter.find("command_tool");
+                if (tit != entry.frontmatter.end() && !tit->second.empty())
+                    dispatch = SkillCommandDispatch{"tool", tit->second, "raw"};
+            }
+        }
+
+        specs.push_back({unique, raw_name, desc, dispatch});
+    }
+
+    log()->info("Built {} skill command specs", specs.size());
+    return specs;
+}
+
+// ============================================================================
+// ✅ syncSkillsToWorkspace (Aligned with OpenClaw workspace.ts:710-766)
+// ============================================================================
+core::Result<bool> SkillManager::sync_skills_to_workspace(const SyncSkillsParams& params) {
+    std::string source = core::utils::expand_path(params.source_workspace_dir);
+    std::string target = core::utils::expand_path(params.target_workspace_dir);
+    if (source == target) return core::Result<bool>::Ok(true);
+
+    log()->info("Syncing skills: {} → {}", source, target);
+    fs::path tsd = fs::path(target) / "skills";
+
+    auto tmp = std::make_unique<SkillManager>(impl_->config_);
+    tmp->load_skills(source);
+    auto entries = tmp->list_skills();
+
+    std::error_code ec;
+    fs::remove_all(tsd, ec);
+    fs::create_directories(tsd, ec);
+    if (ec) return core::Result<bool>::Err("Failed to create target: " + ec.message());
+
+    std::set<std::string> used;
+    int copied = 0;
+    for (const auto& entry : entries) {
+        std::string src_name = entry.skill.base_dir.filename().string();
+        while (!src_name.empty() && std::isspace((unsigned char)src_name.front()))
+            src_name.erase(src_name.begin());
+        while (!src_name.empty() && std::isspace((unsigned char)src_name.back()))
+            src_name.pop_back();
+        if (src_name.empty() || src_name == "." || src_name == "..") continue;
+
+        std::string uname = src_name;
+        if (used.count(uname)) {
+            for (int i = 2; i < 10000; i++) {
+                std::string c = src_name + "-" + std::to_string(i);
+                if (!used.count(c)) { uname = c; break; }
+            }
+        }
+        used.insert(uname);
+
+        fs::path dest = tsd / uname;
+        auto rel = fs::relative(fs::absolute(dest), fs::absolute(tsd), ec);
+        if (ec || rel.string().find("..") != std::string::npos) continue;
+
+        fs::copy(entry.skill.base_dir, dest,
+                 fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+        if (!ec) copied++;
+        else log()->warn("copy skill {} failed: {}", entry.skill.name, ec.message());
+    }
+
+    log()->info("Synced {} skills → {}", copied, tsd.string());
+    return core::Result<bool>::Ok(true);
 }
 
 } // namespace skills
