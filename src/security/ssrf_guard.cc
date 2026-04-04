@@ -79,7 +79,7 @@ std::optional<std::string> SsrfGuard::resolve_hostname(const std::string& hostna
 
 bool SsrfGuard::is_private_or_special_ip(const std::string& ip) {
     // ✅ 对齐 OpenClaw: 使用 is_private_or_loopback_ip_address (来自 utils.cc)
-    return is_private_or_loopback_ip_address(ip);
+    return shared::is_private_or_loopback_ip_address(ip);
 }
 
 bool SsrfGuard::is_ipv6_private_range(const std::string& ip) {

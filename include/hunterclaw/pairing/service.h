@@ -134,6 +134,32 @@ class PairingStore {
 };
 
 // ============================================================================
+// Pairing Setup Types (对齐 OpenClaw pairing/setup-code.ts)
+// ============================================================================
+
+struct ResolvePairingSetupOptions {
+  std::optional<std::string> public_url;
+  bool prefer_remote_url = false;
+  bool force_secure = false;
+  std::optional<std::string> pairing_base_dir;
+};
+
+struct PairingSetupPayload {
+  std::string url;
+  std::optional<std::string> bootstrap_token;
+};
+
+struct PairingSetupResolution {
+  bool ok = false;
+  // ok=true fields
+  PairingSetupPayload payload;
+  std::string auth_label;  // "token" | "password"
+  std::string url_source;
+  // ok=false fields
+  std::string error;
+};
+
+// ============================================================================
 // Pairing Adapter Interface
 // ============================================================================
 

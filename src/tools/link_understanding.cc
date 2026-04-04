@@ -58,7 +58,7 @@ core::Result<LinkUnderstandingResult> LinkUnderstanding::extract_page_content(
     auto response = http_client->get(url, options);
     if (!response.is_ok()) {
         return core::Result<LinkUnderstandingResult>::Err(
-            "Failed to fetch URL: " + response.err()
+            "Failed to fetch URL: " + response.error
         );
     }
     
@@ -123,7 +123,7 @@ std::vector<LinkUnderstandingResult> LinkUnderstanding::extract_batch(
             results.push_back(result.get());
         } else {
             auto logger = core::get_logger("link_understanding");
-            logger->warn("Failed to extract URL {}: {}", url, result.error());
+            logger->warn("Failed to extract URL {}: {}", url, result.error);
         }
     }
     

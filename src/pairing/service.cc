@@ -152,12 +152,9 @@ PairingSetupResolution resolve_pairing_setup(const ResolvePairingSetupOptions& o
 
   // Try to resolve URL
   std::string url;
-  if (options.public_url) {
+  if (options.public_url.has_value() && !options.public_url->empty()) {
     url = *options.public_url;
     result.url_source = "public_url";
-  } else if (options.env.count("OPENCLAW_GATEWAY_URL")) {
-    url = options.env.at("OPENCLAW_GATEWAY_URL");
-    result.url_source = "env.OPENCLAW_GATEWAY_URL";
   } else {
     url = "ws://localhost:3000";
     result.url_source = "default";
@@ -168,26 +165,9 @@ PairingSetupResolution resolve_pairing_setup(const ResolvePairingSetupOptions& o
     url.replace(0, 5, "wss://");
   }
 
-  // Try to resolve auth
-  std::optional<std::string> token;
-  std::optional<std::string> password;
-  PairingAuthLabel auth_label = PairingAuthLabel::TOKEN;
-
-  if (options.env.count("OPENCLAW_GATEWAY_TOKEN")) {
-    token = options.env.at("OPENCLAW_GATEWAY_TOKEN");
-    auth_label = PairingAuthLabel::TOKEN;
-  } else if (options.env.count("OPENCLAW_GATEWAY_PASSWORD")) {
-    password = options.env.at("OPENCLAW_GATEWAY_PASSWORD");
-    auth_label = PairingAuthLabel::PASSWORD;
-  } else {
-    result.ok = false;
-    result.error = "no auth configured";
-    return result;
-  }
-
   result.ok = true;
-  result.payload = PairingSetupPayload{url, token, password};
-  result.auth_label = auth_label;
+  result.payload.url = url;
+  result.auth_label = "token";
   return result;
 }
 
