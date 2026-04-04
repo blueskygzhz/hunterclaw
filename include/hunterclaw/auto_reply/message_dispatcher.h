@@ -276,6 +276,13 @@ private:
     // 由 run_fn 中 on_engine_created 回调注册，run_fn 完成后清除
     std::unordered_map<std::string, std::shared_ptr<react::ReactEngine>> active_engines_;
 
+    // ✅ Abort 信号集 (对齐 OpenClaw: abortEmbeddedPiRun 时序保证)
+    // 当 abort_embedded_session 被调用但 active_engines_ 中没有 engine 时
+    // (engine 还在 main lane queue 中等待创建)，将 session_key 记录到此 set。
+    // on_engine_created 回调检查此 set，如果命中则立即调用 engine->cancel()，
+    // 确保 abort 信号不会因为 engine 尚未创建而丢失。
+    std::unordered_set<std::string> aborted_sessions_;
+
     // ✅ resolve_queue_settings (aligned with openclaw: resolveQueueSettings queue/settings.ts)
     // 从 session entry 和 config 解析 queue mode
     QueueSettings resolve_queue_settings(

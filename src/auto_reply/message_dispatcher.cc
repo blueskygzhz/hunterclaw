@@ -583,16 +583,33 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
         gen_config.on_engine_created = [this, captured_message, &my_engine](std::shared_ptr<react::ReactEngine> engine) {
             my_engine = engine;  // ✅ 记录 engine 引用，用于 cleanup handle 匹配
             std::vector<std::string> fallback_steers;
+            bool should_cancel = false;
             {
                 std::lock_guard<std::mutex> lock(session_state_mutex_);
                 active_engines_[captured_message.session_key] = engine;
                 streaming_sessions_.insert(captured_message.session_key);
+                // ✅ 检查 abort 信号：如果 abort_embedded_session 在 engine 创建前被调用，
+                // aborted_sessions_ 中会有此 session_key，此时需要立即 cancel
+                auto abort_it = aborted_sessions_.find(captured_message.session_key);
+                if (abort_it != aborted_sessions_.end()) {
+                    should_cancel = true;
+                    aborted_sessions_.erase(abort_it);
+                    log()->info("dispatch_reply_from_config: engine created but session was already aborted, "
+                                "cancelling immediately session={}",
+                                captured_message.session_key);
+                }
                 // 消费残留 fallback steer 消息
                 auto it = steer_queues_.find(captured_message.session_key);
                 if (it != steer_queues_.end() && !it->second.empty()) {
                     fallback_steers = std::move(it->second);
                     steer_queues_.erase(it);
                 }
+            }
+            // ✅ 如果 session 已被 abort，立即 cancel engine
+            // 对齐 OpenClaw: runAbortController.abort() 在 run 开始后生效
+            if (should_cancel) {
+                engine->cancel();
+                return;  // 不注入 steer 消息（session 已被中止）
             }
             // 通过 engine->steer() 注入 fallback 消息
             for (const auto& msg : fallback_steers) {
@@ -691,6 +708,10 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
                 log()->debug("dispatch_reply_from_config: skipped engine cleanup (handle mismatch) session={}",
                              captured_message.session_key);
             }
+            // 清理残留的 abort 信号（如果 abort 在 engine 创建后到达，
+            // abort_embedded_session 会直接 cancel engine，不会留在 aborted_sessions_ 中；
+            // 但防御性清理确保不会泄漏）
+            aborted_sessions_.erase(captured_message.session_key);
         }
 
         if (!gen_result.success) {
@@ -996,7 +1017,12 @@ bool MessageDispatcher::abort_embedded_session(const std::string& session_key) {
         eit->second->cancel();
         log()->info("abort_embedded_session: cancelled ReactEngine for session={}", session_key);
     } else {
-        log()->debug("abort_embedded_session: no active engine found for session={}", session_key);
+        // ✅ Engine 尚未创建 (run_fn 还在 main lane queue 中等待)
+        // 记录 abort 信号到 aborted_sessions_，on_engine_created 回调会检查
+        // 并在 engine 创建后立即 cancel()，确保 abort 不会丢失
+        aborted_sessions_.insert(session_key);
+        log()->info("abort_embedded_session: engine not yet created, "
+                    "recorded abort signal for session={}", session_key);
     }
 
     // ✅ 对齐 OpenClaw: abort 后**不移除** active_engines_ 中的 engine 引用
