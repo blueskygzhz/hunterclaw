@@ -1025,25 +1025,15 @@ bool MessageDispatcher::abort_embedded_session(const std::string& session_key) {
                     "recorded abort signal for session={}", session_key);
     }
 
-    // ✅ 对齐 OpenClaw: abort 后**不移除** active_engines_ 中的 engine 引用
-    // engine->run() 仍在另一个线程执行（cancel 是异步信号），
-    // engine 的 shared_ptr 需要保持有效直到 run() 返回。
-    // 清理由 run_fn 内部的 finally 路径完成:
-    //   get_reply_from_config 返回 → active_engines_.erase(key)
-    // 这与 OpenClaw 一致: clearActiveEmbeddedRun 在 attempt.ts 的 finally 中调用
+    // ✅ 严格对齐 OpenClaw: abort 后**不移除** active_engines_ 和 active_sessions_
+    // OpenClaw: abortEmbeddedPiRun 只调用 handle.abort()，不从 ACTIVE_EMBEDDED_RUNS 删除
+    // 清理统一由 run 的 finally block 完成:
+    //   attempt.ts finally → clearActiveEmbeddedRun(sessionId, queueHandle)
+    //   HunterClaw → run_reply_agent cleanup + dispatch_reply_from_config cleanup
+    // active_engines_ handle 指针匹配 ≈ OpenClaw ACTIVE_EMBEDDED_RUNS.get(id) === handle
 
     // ✅ 清除 steer 队列 (abort 后不应再有新 steer 消息注入到 engine)
     steer_queues_.erase(session_key);
-
-    // ✅ 标记 session 为非活跃 + 非 streaming
-    // 对齐 OpenClaw: interrupt 路径在 abort 后立即允许新 run 启动
-    // (OpenClaw 中 isActive 检查基于 ACTIVE_EMBEDDED_RUNS，abort 后 handle 仍在，
-    //  但 interrupt 路径在 abort 后直接 fall through 到 run-now，不再检查 isActive)
-    // HunterClaw: 从 active_sessions_ 移除以允许新 run 进入 run-now 路径
-    // 注: 被 cancel 的 engine->run() 返回后，run_reply_agent 的 finally 会再次 erase
-    //     (幂等操作，无副作用)
-    active_sessions_.erase(session_key);
-    streaming_sessions_.erase(session_key);
 
     log()->info("abort_embedded_session: aborted session={}", session_key);
     return true;
@@ -1180,11 +1170,16 @@ MessageDispatcher::DispatchResult MessageDispatcher::run_reply_agent(
 
         // ✅ 对齐 OpenClaw: abortEmbeddedPiRun(sessionIdFinal)
         // 中止正在运行的 agent (调用 ReactEngine::cancel())
+        // 严格对齐: abort 不从 active_sessions_ 移除 (OpenClaw: handle 仍在 ACTIVE_EMBEDDED_RUNS)
         const bool aborted = abort_embedded_session(session_key);
         log()->info("run_reply_agent: interrupt mode session={} aborted={}", session_key, aborted);
 
-        // After abort, is_active is now false → fall through to run-now
+        // ✅ 对齐 OpenClaw: interrupt 后无条件 fall through 到 run-now
+        // OpenClaw: get-reply-run.ts:448-452 abort 后不再检查 isActive，直接进入 enqueueSession
+        // 新 run 通过 setActiveEmbeddedRun 覆盖旧 handle (Map.set 语义)
+        // 旧 run finally 中 clearActiveEmbeddedRun 的 handle === 检查会 skip (handle_mismatch)
         is_active = false;
+        is_streaming = false;
     }
 
     // ── steer mode: inject into running session ───────────────────────────────
@@ -1295,7 +1290,10 @@ MessageDispatcher::DispatchResult MessageDispatcher::run_reply_agent(
 
     std::function<DispatchResult()> effective_run_fn = params.run_fn;
 
-    // Mark session as active (aligned with openclaw: isEmbeddedPiRunActive → true)
+    // Mark session as active (aligned with openclaw: setActiveEmbeddedRun)
+    // 对齐 OpenClaw: ACTIVE_EMBEDDED_RUNS.set(sessionId, handle)
+    // interrupt 后新 run 覆盖旧条目 (Map.set 语义)，旧 run finally 中的
+    // clearActiveEmbeddedRun 通过 handle === 检查 skip (handle_mismatch)
     {
         std::lock_guard<std::mutex> lock(session_state_mutex_);
         active_sessions_.insert(session_key);
@@ -1347,7 +1345,11 @@ MessageDispatcher::DispatchResult MessageDispatcher::run_reply_agent(
         run_result.error   = e.what();
     }
 
-    // Mark session as idle (aligned with openclaw: isEmbeddedPiRunActive → false)
+    // Mark session as idle (aligned with openclaw: clearActiveEmbeddedRun in finally)
+    // 对齐 OpenClaw: 无 generation counter，防误删由 active_engines_ handle 指针匹配保护
+    // OpenClaw: clearActiveEmbeddedRun(sessionId, handle) — if (map.get(id) === handle) delete
+    // HunterClaw: dispatch_reply_from_config 中 active_engines_[key] == my_engine 检查
+    // active_sessions_ 是简单 set，直接 erase (幂等)
     {
         std::lock_guard<std::mutex> lock(session_state_mutex_);
         active_sessions_.erase(session_key);

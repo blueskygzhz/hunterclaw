@@ -233,8 +233,10 @@ private:
     };
     std::vector<DedupRecord> dedup_cache_;
 
-    // ✅ Session active 状态跟踪 (aligned with openclaw: runReplyAgent isActive check)
+    // ✅ Session active 状态跟踪 (aligned with openclaw: ACTIVE_EMBEDDED_RUNS Map)
     // 记录哪些 session 当前正在运行 LLM 推理，用于 run-now vs enqueue-followup 决策
+    // 严格对齐 OpenClaw: abort 不从 map 中移除，cleanup 由 run 的 finally 完成
+    // 防误删保护由 active_engines_ 的 handle 指针匹配实现 (≈ OpenClaw handle === 检查)
     mutable std::mutex session_state_mutex_;
     std::unordered_set<std::string> active_sessions_;
     // 记录哪些 session 当前正在 streaming（对齐 openclaw: isEmbeddedPiRunStreaming）
