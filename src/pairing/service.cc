@@ -456,7 +456,12 @@ void DefaultPairingAdapter::remove_allowed(const std::string& sender_id) {
 
 PairingSetupResolution DefaultPairingAdapter::resolve_setup(
     const ResolvePairingSetupOptions& options) const {
-  return resolve_pairing_setup(options);
+  // NOTE: Use hunterclaw/pairing/setup_code.h for full functionality
+  // This is a minimal stub for backward compatibility
+  PairingSetupResolution result;
+  result.ok = false;
+  result.error = "DEPRECATED: Use setup_code.h instead";
+  return result;
 }
 
 // ============================================================================
@@ -468,9 +473,11 @@ std::string pairing_policy_to_string(PairingPolicy policy) {
     case PairingPolicy::OPEN:
       return "open";
     case PairingPolicy::CHALLENGE:
-      return "challenge";
+      return "pairing";  // ✅ Aligned with openclaw: "pairing" not "challenge"
+    case PairingPolicy::ALLOWLIST:
+      return "allowlist";  // ✅ NEW: openclaw dmPolicy=allowlist
     case PairingPolicy::CLOSED:
-      return "closed";
+      return "disabled";  // ✅ Aligned with openclaw: "disabled" not "closed"
     default:
       return "unknown";
   }
@@ -479,9 +486,10 @@ std::string pairing_policy_to_string(PairingPolicy policy) {
 PairingPolicy parse_pairing_policy(const std::string& str) {
   std::string lower = to_lower(str);
   if (lower == "open") return PairingPolicy::OPEN;
-  if (lower == "challenge") return PairingPolicy::CHALLENGE;
-  if (lower == "closed") return PairingPolicy::CLOSED;
-  return PairingPolicy::CHALLENGE;  // Default
+  if (lower == "pairing" || lower == "challenge") return PairingPolicy::CHALLENGE;
+  if (lower == "allowlist") return PairingPolicy::ALLOWLIST;  // ✅ NEW
+  if (lower == "disabled" || lower == "closed") return PairingPolicy::CLOSED;
+  return PairingPolicy::CHALLENGE;  // Default: pairing
 }
 
 }  // namespace pairing

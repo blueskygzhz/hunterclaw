@@ -118,10 +118,13 @@ static std::string resolve_send_policy(
     // Aligned with openclaw: normalizeSendPolicy(entry?.sendPolicy)
     // Check session entry override first
     if (entry.has_value()) {
-        const auto& chat_type_str = entry->chat_type.value_or("");
-        // If session has explicit sendPolicy stored in metadata, use it.
-        // (SessionEntry doesn't have sendPolicy field yet; use chat_type as proxy)
-        // TODO: add sendPolicy field to SessionEntry when needed
+        // ✅ Aligned with openclaw: SessionEntry.sendPolicy override
+        // SessionEntry now has send_policy field (session_manager.h:117)
+        if (entry->send_policy.has_value()) {
+            const auto& policy = *entry->send_policy;
+            if (policy == "deny") return SendPolicy::Deny;
+            if (policy == "allow") return SendPolicy::Allow;
+        }
     }
 
     // Aligned with openclaw: no config.session.sendPolicy rules → default "allow"
@@ -1823,16 +1826,47 @@ void MessageDispatcher::maybe_apply_tts_to_payload(
         if (payload.text.find("MEDIA:") != std::string::npos) continue;
         if (payload.text.size() < 10) continue;  // Too short for TTS
 
-        // Aligned with openclaw: parseTtsDirectives — check for [[tts]] tag
-        // For now, apply TTS to all text payloads when enabled.
-        // TODO: integrate actual TTS provider call (openai/elevenlabs/edge)
-        // The TTS call would:
-        //   1. Strip markdown from payload.text
-        //   2. Call textToSpeech({ text, provider, channel })
-        //   3. Set payload.media_url = result.audioPath
-        //   4. Set payload.audio_as_voice = VOICE_BUBBLE_CHANNELS.count(channel) > 0
-        log()->debug("maybe_apply_tts_to_payload: TTS enabled but provider '{}' not yet integrated",
-                     tts_provider);
+        // ✅ Aligned with openclaw: parseTtsDirectives — check for [[tts]] tag
+        // Aligned with openclaw: textToSpeech({ text, provider, channel })
+        
+        // Step 1: Get TTS provider instance
+        auto provider = tts::TtsProviderRegistry::instance().get_provider(tts_provider);
+        if (!provider) {
+            log()->warn("TTS provider '{}' not found, skipping TTS", tts_provider);
+            continue;
+        }
+        
+        // Step 2: Build TTS request
+        tts::TtsRequest tts_request;
+        tts_request.text = payload.text;
+        tts_request.provider = tts_provider;
+        tts_request.channel = channel;
+        // Optional: extract voice/model from config
+        // tts_request.voice = config.tts.voice;
+        // tts_request.model = config.tts.model;
+        
+        // Step 3: Call textToSpeech (markdown stripping happens inside provider)
+        auto tts_result = provider->text_to_speech(tts_request);
+        if (!tts_result.is_ok()) {
+            log()->error("TTS generation failed: {}", tts_result.err());
+            continue;
+        }
+        
+        const auto& tts_response = tts_result.get();
+        
+        // Step 4: Set audio URL/path in payload
+        // Aligned with openclaw: payload.mediaUrl = audioPath
+        payload.media_urls.push_back(tts_response.audio_path);
+        
+        // Step 5: Set audio_as_voice for voice-bubble channels
+        // Aligned with openclaw: VOICE_BUBBLE_CHANNELS = ["telegram", "feishu", "whatsapp"]
+        static const std::unordered_set<std::string> VOICE_BUBBLE_CHANNELS = {
+            "telegram", "feishu", "whatsapp"
+        };
+        payload.audio_as_voice = (VOICE_BUBBLE_CHANNELS.count(channel) > 0);
+        
+        log()->info("TTS generated: provider={}, audio_path={}, format={}, audio_as_voice={}",
+                    tts_provider, tts_response.audio_path, tts_response.format, payload.audio_as_voice);
     }
 }
 
@@ -2067,34 +2101,44 @@ void ReplyGenerator::apply_link_understanding(
     std::string& prompt,
     const channels::InboundMessage& message
 ) {
-    // Aligned with openclaw: applyLinkUnderstanding (link-understanding/apply.ts)
+    // ✅ Aligned with openclaw: applyLinkUnderstanding (link-understanding/apply.ts)
     //
     // Fetches and extracts content from URLs in the message:
     //   - Detects URLs in message text
     //   - Fetches page content (title, description, main text)
     //   - Appends extracted content to prompt as context
-    //
-    // Only applied when link understanding is enabled in config.
 
     if (message.text.empty()) return;
 
-    // Aligned with openclaw: URL detection regex
-    static const std::regex url_re(
-        R"(https?://[^\s<>"{}|\\^`\[\]]+)",
-        std::regex_constants::ECMAScript
-    );
-
-    auto begin = std::sregex_iterator(message.text.begin(), message.text.end(), url_re);
-    auto end = std::sregex_iterator();
-
-    for (auto it = begin; it != end; ++it) {
-        const std::string url = (*it)[0].str();
-        // Aligned with openclaw: link understanding fetches URL content
-        // For now, just note the URL in the prompt context.
-        // TODO: integrate HTTP client to fetch and extract page content.
-        log()->debug("apply_link_understanding: detected URL: {}", url);
-        // prompt += "\n[Link: " + url + "]";
+    // Step 1: Extract URLs from message text
+    auto link_tool = tools::LinkUnderstanding::create();
+    std::vector<std::string> urls = link_tool->extract_urls(message.text);
+    
+    if (urls.empty()) {
+        log()->debug("apply_link_understanding: no URLs detected");
+        return;
     }
+    
+    log()->info("apply_link_understanding: detected {} URL(s)", urls.size());
+    
+    // Step 2: Batch fetch and extract content (max 5 URLs to avoid timeout)
+    const size_t max_urls = std::min<size_t>(5, urls.size());
+    std::vector<std::string> limited_urls(urls.begin(), urls.begin() + max_urls);
+    
+    auto results = link_tool->extract_batch(limited_urls, 10000 /* 10s timeout */);
+    
+    if (results.empty()) {
+        log()->warn("apply_link_understanding: failed to extract any URL content");
+        return;
+    }
+    
+    // Step 3: Build link context and append to prompt
+    // Aligned with openclaw: buildLinkContext(results)
+    std::string link_context = link_tool->build_link_context(results);
+    prompt += link_context;
+    
+    log()->info("apply_link_understanding: added context from {} URL(s) ({} chars)",
+                results.size(), link_context.size());
 }
 
 } // namespace auto_reply

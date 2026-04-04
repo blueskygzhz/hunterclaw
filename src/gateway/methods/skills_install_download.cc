@@ -521,7 +521,7 @@ ExtractResult extract_archive(
     // 对齐 OpenClaw: extractArchiveSafe({ kind: "zip", stripComponents: strip })
     // 成功时返回 { stdout: "", stderr: "", code: 0 }
     if (archive_type == "zip") {
-        // 先解压到临时目录，再处理 strip_components
+        // ✅ 对齐 OpenClaw: 先解压到临时目录，再处理 stripComponents
         std::string staging_dir;
         std::string extract_target;
         if (strip_components > 0) {
@@ -550,30 +550,53 @@ ExtractResult extract_archive(
             return {false, exit_code, output, "unzip failed"};
         }
 
-        // 处理 strip_components: 将 staging 内容合并到 target_dir
+        // ✅ 对齐 OpenClaw: 处理 stripComponents (剥离指定层数的目录)
+        // 对应 OpenClaw: skills-install-extract.ts extractArchiveSafe
+        // 逻辑: 递归剥离 N 层目录,将最深层内容移动到目标目录
         if (strip_components > 0 && !staging_dir.empty()) {
             try {
-                // 找到解压后的顶层目录，跳过 strip_components 层
-                std::vector<fs::path> top_entries;
-                for (const auto& e : fs::directory_iterator(staging_dir)) top_entries.push_back(e.path());
-                // 对每个顶层条目，移动其内容到 target_dir
-                for (const auto& top : top_entries) {
-                    if (fs::is_directory(top)) {
-                        for (const auto& sub : fs::directory_iterator(top)) {
-                            fs::path dest = fs::path(target_dir) / sub.path().filename();
-                            if (fs::exists(dest)) fs::remove_all(dest);
-                            fs::rename(sub.path(), dest);
-                        }
+                fs::path source_path = fs::path(staging_dir);
+                
+                // 递归向下 strip_components 层
+                for (int i = 0; i < strip_components; ++i) {
+                    std::vector<fs::path> entries;
+                    for (const auto& e : fs::directory_iterator(source_path)) {
+                        entries.push_back(e.path());
+                    }
+                    
+                    // 如果只有一个目录,继续向下
+                    if (entries.size() == 1 && fs::is_directory(entries[0])) {
+                        source_path = entries[0];
+                    } else if (entries.size() > 1) {
+                        // 多个条目,这是最后一层,全部移动
+                        break;
                     } else {
-                        fs::path dest = fs::path(target_dir) / top.filename();
-                        if (fs::exists(dest)) fs::remove_all(dest);
-                        fs::rename(top, dest);
+                        // 空目录或文件,报错
+                        fs::remove_all(staging_dir);
+                        return {false, -1, "", "Invalid zip structure: cannot strip " +
+                               std::to_string(strip_components) + " components"};
                     }
                 }
+                
+                // 将 source_path 下的所有内容移动到 target_dir
+                for (const auto& entry : fs::directory_iterator(source_path)) {
+                    fs::path dest = fs::path(target_dir) / entry.path().filename();
+                    
+                    // 如果目标已存在,先删除
+                    if (fs::exists(dest)) {
+                        fs::remove_all(dest);
+                    }
+                    
+                    // 移动文件/目录
+                    fs::rename(entry.path(), dest);
+                }
+                
+                // 清理临时目录
                 fs::remove_all(staging_dir);
+                
             } catch (const std::exception& e) {
                 fs::remove_all(staging_dir);
-                return {false, -1, "", "Failed to merge zip tree: " + std::string(e.what())};
+                return {false, -1, "", "Failed to strip zip components: " + std::string(e.what())};
             }
         }
 

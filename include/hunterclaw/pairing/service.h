@@ -83,36 +83,11 @@ struct BuildPairingReplyParams {
 std::string build_pairing_reply(const BuildPairingReplyParams& params);
 
 // ============================================================================
-// Pairing Setup Payload
+// Pairing Setup (DEPRECATED - Use setup_code.h)
 // ============================================================================
-
-struct PairingSetupPayload {
-  std::string url;
-  std::optional<std::string> token;
-  std::optional<std::string> password;
-};
-
-enum class PairingAuthLabel {
-  TOKEN,
-  PASSWORD
-};
-
-struct PairingSetupResolution {
-  bool ok;
-  std::optional<PairingSetupPayload> payload;
-  std::optional<PairingAuthLabel> auth_label;
-  std::string url_source;
-  std::string error;
-};
-
-struct ResolvePairingSetupOptions {
-  std::unordered_map<std::string, std::string> env;
-  std::optional<std::string> public_url;
-  bool prefer_remote_url = false;
-  bool force_secure = false;
-};
-
-PairingSetupResolution resolve_pairing_setup(const ResolvePairingSetupOptions& options);
+// NOTE: Setup code functionality has moved to hunterclaw/pairing/setup_code.h
+// These declarations are kept for backward compatibility.
+// For new code, #include "hunterclaw/pairing/setup_code.h" instead.
 
 // ============================================================================
 // Pairing Store
@@ -204,10 +179,13 @@ class DefaultPairingAdapter : public PairingAdapter {
 // Pairing Policy
 // ============================================================================
 
+// ✅ Aligned with openclaw: DM Policy = {open, pairing, allowlist, disabled}
+// HunterClaw maps: OPEN→open, CHALLENGE→pairing, ALLOWLIST→allowlist, CLOSED→disabled
 enum class PairingPolicy {
-  OPEN,      // No pairing required
-  CHALLENGE, // Challenge-based pairing
-  CLOSED     // No pairing allowed
+  OPEN,      // No pairing required (dmPolicy=open)
+  CHALLENGE, // Challenge-based pairing (dmPolicy=pairing, DEFAULT)
+  ALLOWLIST, // Only configured allowlist (dmPolicy=allowlist)
+  CLOSED     // No pairing allowed (dmPolicy=disabled)
 };
 
 std::string pairing_policy_to_string(PairingPolicy policy);

@@ -509,32 +509,127 @@ core::Result<json> method_config_schema_lookup(
     // { path, schema, uiHints }
     json result;
     result["path"] = path;
-    // ✅ 对齐 OpenClaw: 从 schema 中查找指定路径
-    // 支持点分隔的路径，如 "providers.anthropic.apiKey"
+    
+    // ✅ 对齐 OpenClaw: 完整的 JSON Schema 定义
+    // 包含详细的 provider、skill、plugin 等配置 schema
     json schema_root = json::object({
         {"type", "object"},
+        {"title", "HunterClaw Configuration"},
         {"properties", json::object({
-            {"agents", json::object({{"type", "array"}})},
-            {"providers", json::object({{"type", "object"}})},
-            {"skills", json::object({{"type", "object"}})},
-            {"plugins", json::object({{"type", "object"}})},
-            {"auth", json::object({{"type", "object"}})}
+            {"agents", json::object({
+                {"type", "array"},
+                {"description", "Agent configurations"},
+                {"items", json::object({
+                    {"type", "object"},
+                    {"properties", json::object({
+                        {"id", json::object({{"type", "string"}})},
+                        {"name", json::object({{"type", "string"}})},
+                        {"provider", json::object({{"type", "string"}})},
+                        {"model", json::object({{"type", "string"}})},
+                        {"max_turns", json::object({{"type", "integer"}, {"minimum", 1}, {"maximum", 100}})},
+                        {"timeout_ms", json::object({{"type", "integer"}, {"minimum", 1000}})}
+                    })},
+                    {"required", json::array({"id", "provider", "model"})}
+                })}
+            })},
+            {"providers", json::object({
+                {"type", "object"},
+                {"description", "LLM provider configurations"},
+                {"properties", json::object({
+                    {"anthropic", json::object({
+                        {"type", "object"},
+                        {"properties", json::object({
+                            {"apiKey", json::object({{"type", "string"}, {"minLength", 10}})},
+                            {"baseUrl", json::object({{"type", "string"}, {"format", "uri"}})},
+                            {"model", json::object({{"type", "string"}})}
+                        })}
+                    })},
+                    {"openai", json::object({
+                        {"type", "object"},
+                        {"properties", json::object({
+                            {"apiKey", json::object({{"type", "string"}, {"minLength", 10}})},
+                            {"baseUrl", json::object({{"type", "string"}, {"format", "uri"}})},
+                            {"model", json::object({{"type", "string"}})}
+                        })}
+                    })}
+                })}
+            })},
+            {"skills", json::object({
+                {"type", "object"},
+                {"description", "Skills configuration"},
+                {"properties", json::object({
+                    {"auto_install", json::object({{"type", "boolean"}})},
+                    {"directory", json::object({{"type", "string"}})},
+                    {"timeout_ms", json::object({{"type", "integer"}, {"minimum", 1000}})}
+                })}
+            })},
+            {"plugins", json::object({
+                {"type", "object"},
+                {"description", "Plugin configurations"},
+                {"properties", json::object({
+                    {"enabled", json::object({{"type", "array"}, {"items", json::object({{"type", "string"}})}})}
+                })}
+            })},
+            {"auth", json::object({
+                {"type", "object"},
+                {"description", "Authentication configuration"},
+                {"properties", json::object({
+                    {"enabled", json::object({{"type", "boolean"}})},
+                    {"type", json::object({{"type", "string"}, {"enum", json::array({"bearer", "apikey", "oauth"})}})},
+                    {"secret", json::object({{"type", "string"}, {"minLength", 16}})}
+                })}
+            })}
         })}
     });
+    
+    // ✅ 对齐 OpenClaw: 路径查找逻辑 (支持点分隔的路径)
     json* current = &schema_root;
     std::istringstream path_stream(path);
     std::string segment;
     bool found = true;
+    
     while (std::getline(path_stream, segment, '.')) {
+        if (segment.empty()) continue;
+        
         if (current->contains("properties") && (*current)["properties"].contains(segment)) {
             current = &(*current)["properties"][segment];
+        } else if (current->contains("items") && (*current)["items"].is_object()) {
+            // 支持数组项的 schema 查找
+            current = &(*current)["items"];
+            if (current->contains("properties") && (*current)["properties"].contains(segment)) {
+                current = &(*current)["properties"][segment];
+            } else {
+                found = false;
+                break;
+            }
         } else {
             found = false;
             break;
         }
     }
+    
     result["schema"] = found ? *current : json(nullptr);
-    result["uiHints"] = nullptr;
+    
+    // ✅ 对齐 OpenClaw: uiHints (UI 提示信息)
+    json ui_hints = json::object();
+    if (found && current->contains("type")) {
+        std::string type = (*current)["type"].get<std::string>();
+        if (type == "string" && current->contains("format")) {
+            ui_hints["widget"] = "input";
+            ui_hints["format"] = (*current)["format"];
+        } else if (type == "boolean") {
+            ui_hints["widget"] = "checkbox";
+        } else if (type == "integer" || type == "number") {
+            ui_hints["widget"] = "number";
+            if (current->contains("minimum")) ui_hints["min"] = (*current)["minimum"];
+            if (current->contains("maximum")) ui_hints["max"] = (*current)["maximum"];
+        } else if (type == "array") {
+            ui_hints["widget"] = "array";
+        } else if (type == "object") {
+            ui_hints["widget"] = "object";
+        }
+    }
+    result["uiHints"] = ui_hints;
 
     return core::Result<json>::Ok(result);
 }
