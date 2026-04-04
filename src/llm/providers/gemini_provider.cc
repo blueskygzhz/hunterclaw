@@ -1,7 +1,7 @@
 #include "hunterclaw/llm/provider.h"
+#include "hunterclaw/infra/http_client.h"
 #include "hunterclaw/core/logger.h"
 #include "hunterclaw/core/result.h"
-#include <curl/curl.h>
 #include <json/json.h>
 #include <nlohmann/json.hpp>
 #include <sstream>
@@ -13,22 +13,8 @@
 namespace hunterclaw {
 namespace llm {
 
-// HTTP 响应结构体
-struct HttpResponse {
-    std::string body;
-    long status_code = 0;
-    std::map<std::string, std::string> headers;
-};
-
-// 前向声明
-core::Result<HttpResponse> http_post(
-    const std::string& url,
-    const std::string& json_body,
-    const std::map<std::string, std::string>& headers
-);
-
 // UUID 生成函数
-std::string generate_uuid() {
+static std::string generate_uuid() {
     static std::random_device rd;
     static std::mt19937 gen(rd());
     static std::uniform_int_distribution<> dis(0, 15);
@@ -48,39 +34,30 @@ std::string generate_uuid() {
     return uuid;
 }
 
-// 流式 HTTP POST (简化版，暂时返回错误)
-core::Result<HttpResponse> http_post_stream(
-    const std::string& url,
-    const std::string& json_body,
-    const std::map<std::string, std::string>& headers,
-    std::function<void(const std::string&)> callback
-) {
-    // TODO: 实现真实的 SSE 流式处理
-    return core::Result<HttpResponse>::Err("Stream not yet implemented");
-}
-
 // ============================================================================
-// Gemini Provider 实现
+// Gemini Provider 实现 (使用 infra::HttpClient，无 curl 依赖)
 // ============================================================================
 
 class GeminiProvider : public Provider {
 public:
-    GeminiProvider(const ProviderConfig& config) : config_(config) {
-        // Logger initialized
-        (void)config;
+    GeminiProvider(const ProviderConfig& config)
+        : config_(config), http_client_(infra::HttpClient::create()) {
     }
     
     core::Result<GenerateResponse> generate(const GenerateOptions& options) override {
         auto request_json = build_request_json(options);
         
-        // Gemini uses API key in URL
-        std::string url = config_.base_url + "/v1beta/models/" + config_.model + ":generateContent?key=" + config_.api_key;
+        std::string url = config_.base_url + "/v1beta/models/" + config_.model +
+                         ":generateContent?key=" + config_.api_key;
         
-        std::map<std::string, std::string> headers = {
+        infra::HttpRequestOptions http_opts;
+        http_opts.body = request_json;
+        http_opts.timeout_ms = 60000;
+        http_opts.headers = {
             {"Content-Type", "application/json"}
         };
         
-        auto http_result = http_post(url, request_json, headers);
+        auto http_result = http_client_->post(url, http_opts);
         if (!http_result.is_ok()) {
             return core::Result<GenerateResponse>::Err(http_result.error);
         }
@@ -92,112 +69,97 @@ public:
         const GenerateOptions& options,
         StreamCallback callback
     ) override {
-        // ✅ Gemini 流式支持 (SSE)
-        // 参考: https://ai.google.dev/api/generate-content#text-gen-text-only-stream
-        
         auto request_json = build_request_json(options);
         
-        // Gemini streaming endpoint
-        std::string url = config_.base_url + "/v1beta/models/" + config_.model + 
-                         ":streamGenerateContent?key=" + config_.api_key + 
+        std::string url = config_.base_url + "/v1beta/models/" + config_.model +
+                         ":streamGenerateContent?key=" + config_.api_key +
                          "&alt=sse";
         
-        std::map<std::string, std::string> headers = {
+        infra::HttpRequestOptions http_opts;
+        http_opts.body = request_json;
+        http_opts.timeout_ms = 120000;
+        http_opts.headers = {
             {"Content-Type", "application/json"}
         };
         
-        // ═══════════════════════════════════════════════════════
-        // SSE 流式解析 (对齐 OpenClaw)
-        // ═══════════════════════════════════════════════════════
         GenerateResponse final_response;
         std::string accumulated_text;
-        std::map<std::string, ToolCall> partial_tool_calls;
         
-        auto http_result = http_post_stream(url, request_json, headers,
-            [&](const std::string& sse_line) {
-                // Gemini SSE format: "data: {...JSON...}"
-                if (sse_line.compare(0, 6, "data: ") != 0) {
-                    return;
-                }
+        // SSE 行回调
+        auto line_callback = [&](const std::string& line) {
+            std::string trimmed = line;
+            while (!trimmed.empty() && (trimmed.back() == '\n' || trimmed.back() == '\r')) {
+                trimmed.pop_back();
+            }
+            
+            if (trimmed.compare(0, 6, "data: ") != 0) return;
+            
+            std::string data = trimmed.substr(6);
+            if (data.empty() || data == "[DONE]") return;
+            
+            Json::CharReaderBuilder reader;
+            Json::Value chunk_json;
+            std::istringstream data_stream(data);
+            std::string parse_errs;
+            if (!Json::parseFromStream(reader, data_stream, &chunk_json, &parse_errs)) {
+                return;
+            }
+            
+            const auto& candidates = chunk_json["candidates"];
+            if (candidates.isArray() && !candidates.empty()) {
+                const auto& first_candidate = candidates[0];
+                const auto& content = first_candidate["content"];
+                const auto& parts = content["parts"];
                 
-                std::string data = sse_line.substr(6);
-                if (data.empty() || data == "[DONE]") return;
-                
-                // 解析 JSON
-                Json::CharReaderBuilder reader;
-                Json::Value chunk_json;
-                std::istringstream data_stream(data);
-                std::string parse_errs;
-                if (!Json::parseFromStream(reader, data_stream, &chunk_json, &parse_errs)) {
-                    // Warn:("Failed to parse Gemini SSE JSON: {}", parse_errs);
-                    return;
-                }
-                
-                // ───────────────────────────────────────────────────
-                // Gemini 流式响应处理 (对齐 API 规范)
-                // ───────────────────────────────────────────────────
-                
-                const auto& candidates = chunk_json["candidates"];
-                if (candidates.isArray() && !candidates.empty()) {
-                    const auto& first_candidate = candidates[0];
-                    const auto& content = first_candidate["content"];
-                    const auto& parts = content["parts"];
-                    
-                    if (parts.isArray()) {
-                        for (const auto& part : parts) {
-                            if (part.isMember("text")) {
-                                // 文本增量
-                                std::string text = part["text"].asString();
-                                accumulated_text += text;
-                                
-                                // 流式回调
-                                StreamChunk chunk;
-                                chunk.delta = text;
-                                chunk.is_final = false;
-                                callback(chunk);
-                                
-                            } else if (part.isMember("functionCall")) {
-                                // 工具调用
-                                const auto& func_call = part["functionCall"];
-                                ToolCall tool_call;
-                                tool_call.id = generate_uuid();  // Gemini不提供ID
-                                tool_call.name = func_call["name"].asString();
-                                
-                                // Convert Json::Value to JsonValue
-                                std::string args_str = Json::writeString(Json::StreamWriterBuilder(), func_call["args"]);
-                                nlohmann::json args_nlohmann = nlohmann::json::parse(args_str);
-                                tool_call.input = core::JsonValue(args_nlohmann);
-                                
-                                final_response.tool_calls.push_back(tool_call);
-                                
-                                // 发送工具调用通知
-                                StreamChunk chunk;
-                                chunk.is_tool_call = true;
-                                chunk.tool_call = tool_call;
-                                callback(chunk);
-                            }
+                if (parts.isArray()) {
+                    for (const auto& part : parts) {
+                        if (part.isMember("text")) {
+                            std::string text = part["text"].asString();
+                            accumulated_text += text;
+                            
+                            StreamChunk chunk;
+                            chunk.delta = text;
+                            chunk.is_final = false;
+                            if (callback) callback(chunk);
+                            
+                        } else if (part.isMember("functionCall")) {
+                            const auto& func_call = part["functionCall"];
+                            ToolCall tool_call;
+                            tool_call.id = generate_uuid();
+                            tool_call.name = func_call["name"].asString();
+                            
+                            std::string args_str = Json::writeString(Json::StreamWriterBuilder(), func_call["args"]);
+                            nlohmann::json args_nlohmann = nlohmann::json::parse(args_str);
+                            tool_call.input = core::JsonValue(args_nlohmann);
+                            
+                            final_response.tool_calls.push_back(tool_call);
+                            
+                            StreamChunk chunk;
+                            chunk.is_tool_call = true;
+                            chunk.tool_call = tool_call;
+                            if (callback) callback(chunk);
                         }
                     }
-                    
-                    // 检查是否完成
-                    if (first_candidate.isMember("finishReason")) {
-                        StreamChunk chunk;
-                        chunk.is_final = true;
-                        callback(chunk);
-                    }
                 }
                 
-                // Token 使用统计
-                const auto& usage = chunk_json["usageMetadata"];
-                if (!usage.isNull()) {
-                    final_response.input_tokens = usage["promptTokenCount"].asInt();
-                    final_response.output_tokens = usage["candidatesTokenCount"].asInt();
+                if (first_candidate.isMember("finishReason")) {
+                    StreamChunk chunk;
+                    chunk.is_final = true;
+                    if (callback) callback(chunk);
                 }
             }
-        );
+            
+            const auto& usage = chunk_json["usageMetadata"];
+            if (!usage.isNull()) {
+                final_response.input_tokens = usage["promptTokenCount"].asInt();
+                final_response.output_tokens = usage["candidatesTokenCount"].asInt();
+            }
+        };
         
-        if (!http_result.is_ok()) {
-            return core::Result<GenerateResponse>::Err(http_result.error);
+        auto result = http_client_->post_stream(url, http_opts, line_callback);
+        if (!result.is_ok()) {
+            return core::Result<GenerateResponse>::Err(
+                std::string("Gemini stream error: ") + result.error);
         }
         
         final_response.content = accumulated_text;
@@ -218,55 +180,32 @@ private:
     std::string build_request_json(const GenerateOptions& options) {
         Json::Value root;
         
-        // Contents (Gemini format)
         Json::Value contents(Json::arrayValue);
-        
         for (const auto& msg : options.messages) {
             Json::Value content;
-            
-            // Role mapping
             switch (msg.role) {
-                case MessageRole::User:
-                    content["role"] = "user";
-                    break;
-                case MessageRole::Assistant:
-                    content["role"] = "model";
-                    break;
-                case MessageRole::System:
-                    // Gemini doesn't have system role, prepend to first user message
-                    continue;
-                default:
-                    continue;
+                case MessageRole::User:      content["role"] = "user"; break;
+                case MessageRole::Assistant: content["role"] = "model"; break;
+                case MessageRole::System:    continue;
+                default:                     continue;
             }
             
             Json::Value parts(Json::arrayValue);
             Json::Value text_part;
             text_part["text"] = msg.content;
             parts.append(text_part);
-            
             content["parts"] = parts;
             contents.append(content);
         }
-        
         root["contents"] = contents;
         
-        // Generation config
         Json::Value gen_config;
         gen_config["maxOutputTokens"] = options.max_tokens.value_or(config_.max_tokens);
-        
-        if (options.temperature.has_value()) {
-            gen_config["temperature"] = options.temperature.value();
-        }
-        if (options.top_p.has_value()) {
-            gen_config["topP"] = options.top_p.value();
-        }
-        if (options.top_k.has_value()) {
-            gen_config["topK"] = options.top_k.value();
-        }
-        
+        if (options.temperature.has_value()) gen_config["temperature"] = options.temperature.value();
+        if (options.top_p.has_value()) gen_config["topP"] = options.top_p.value();
+        if (options.top_k.has_value()) gen_config["topK"] = options.top_k.value();
         root["generationConfig"] = gen_config;
         
-        // Tools (Gemini function calling format)
         if (!options.tools.empty()) {
             Json::Value tools_json(Json::arrayValue);
             Json::Value tool_wrapper;
@@ -277,7 +216,6 @@ private:
                 func_decl["name"] = tool.name;
                 func_decl["description"] = tool.description;
                 
-                // Convert nlohmann::json to Json::Value
                 nlohmann::json schema_nlohmann = tool.input_schema.to_json();
                 std::string schema_str = schema_nlohmann.dump();
                 Json::CharReaderBuilder reader;
@@ -299,7 +237,12 @@ private:
         return Json::writeString(builder, root);
     }
     
-    core::Result<GenerateResponse> parse_response(const HttpResponse& http_resp) {
+    core::Result<GenerateResponse> parse_response(const infra::HttpResponse& http_resp) {
+        if (!http_resp.ok) {
+            return core::Result<GenerateResponse>::Err(
+                "HTTP error " + std::to_string(http_resp.status_code) + ": " + http_resp.body);
+        }
+        
         Json::CharReaderBuilder reader_builder;
         Json::Value root;
         std::string errs;
@@ -311,7 +254,6 @@ private:
         
         GenerateResponse response;
         
-        // Extract candidates
         const auto& candidates = root["candidates"];
         if (candidates.isArray() && !candidates.empty()) {
             const auto& first_candidate = candidates[0];
@@ -323,12 +265,10 @@ private:
                     if (part.isMember("text")) {
                         response.content += part["text"].asString();
                     } else if (part.isMember("functionCall")) {
-                        // Function call
                         const auto& func_call = part["functionCall"];
                         ToolCall tool_call;
                         tool_call.name = func_call["name"].asString();
                         
-                        // 将 Json::Value 转换为 JsonValue
                         nlohmann::json args_nlohmann;
                         std::string args_str = Json::writeString(Json::StreamWriterBuilder(), func_call["args"]);
                         args_nlohmann = nlohmann::json::parse(args_str);
@@ -340,7 +280,6 @@ private:
             }
         }
         
-        // Token usage
         const auto& usage = root["usageMetadata"];
         if (!usage.isNull()) {
             response.input_tokens = usage["promptTokenCount"].asInt();
@@ -351,6 +290,7 @@ private:
     }
     
     ProviderConfig config_;
+    infra::HttpClient::Ptr http_client_;
 };
 
 core::Result<Provider::Ptr> create_gemini_provider(const ProviderConfig& config) {

@@ -584,6 +584,199 @@ core::Result<HttpResponse> HttpClient::recv_response(
 }
 
 // ----------------------------------------------------------------------------
+// SSE Streaming POST
+// ----------------------------------------------------------------------------
+
+core::Result<HttpResponse> HttpClient::post_stream(
+    const std::string& url,
+    const HttpRequestOptions& options,
+    std::function<void(const std::string& line)> line_callback
+) {
+    // 1. Parse URL
+    auto parsed = parse_url(url);
+    if (parsed.is_err()) {
+        return core::Result<HttpResponse>::Err(parsed.error);
+    }
+    auto& u = parsed.get();
+    
+    int socket_fd = -1;
+    void* ssl_ctx = nullptr;
+    void* ssl = nullptr;
+    
+    // 2. Create connection
+    if (u.use_ssl) {
+#ifdef HUNTERCLAW_ENABLE_SSL
+        auto ssl_result = connect_ssl(u.host, u.port, options.timeout_ms);
+        if (ssl_result.is_err()) {
+            return core::Result<HttpResponse>::Err(ssl_result.error);
+        }
+        socket_fd = ssl_result.get().socket_fd;
+        ssl_ctx = ssl_result.get().ssl_ctx;
+        ssl = ssl_result.get().ssl;
+#else
+        return core::Result<HttpResponse>::Err("HTTPS not supported (compile with HUNTERCLAW_ENABLE_SSL)");
+#endif
+    } else {
+        auto socket_result = connect_socket(u.host, u.port, options.timeout_ms);
+        if (socket_result.is_err()) {
+            return core::Result<HttpResponse>::Err(socket_result.error);
+        }
+        socket_fd = socket_result.get();
+    }
+    
+    // 3. Send request
+    auto send_result = send_request(socket_fd, ssl, "POST", u.path, u.host, u.port, options);
+    if (send_result.is_err()) {
+        close_connection(socket_fd, ssl_ctx, ssl);
+        return core::Result<HttpResponse>::Err(send_result.error);
+    }
+    
+    // 4. Receive streaming response — read line-by-line, invoke callback per line
+    HttpResponse response;
+    response.status_code = 0;
+    response.ok = false;
+    
+    std::string recv_buffer;
+    char buf[4096];
+    bool headers_done = false;
+    std::string accumulated_body;
+    
+    // Use a longer timeout for streaming (default 120s)
+    int stream_timeout_ms = std::max(options.timeout_ms, 120000);
+    
+    while (true) {
+        // Poll for data (timeout per chunk, not total)
+        if (!ssl) {
+            struct pollfd pfd;
+            pfd.fd = socket_fd;
+            pfd.events = POLLIN;
+            
+            int ret = poll(&pfd, 1, stream_timeout_ms);
+            if (ret == 0) {
+                // Timeout — treat as end of stream
+                break;
+            } else if (ret < 0) {
+                close_connection(socket_fd, ssl_ctx, ssl);
+                return core::Result<HttpResponse>::Err("Poll error during streaming");
+            }
+        }
+        
+        // Read data
+        ssize_t received;
+        if (ssl) {
+#ifdef HUNTERCLAW_ENABLE_SSL
+            SSL* ssl_ptr = static_cast<SSL*>(ssl);
+            received = SSL_read(ssl_ptr, buf, sizeof(buf) - 1);
+            if (received <= 0) {
+                break;  // Connection closed or error
+            }
+#else
+            break;
+#endif
+        } else {
+            received = recv(socket_fd, buf, sizeof(buf) - 1, 0);
+            if (received <= 0) {
+                break;  // Connection closed or error
+            }
+        }
+        
+        buf[received] = '\0';
+        recv_buffer.append(buf, received);
+        
+        // Parse headers first
+        if (!headers_done) {
+            size_t header_end = recv_buffer.find("\r\n\r\n");
+            if (header_end != std::string::npos) {
+                headers_done = true;
+                std::string header_str = recv_buffer.substr(0, header_end);
+                std::string remaining = recv_buffer.substr(header_end + 4);
+                recv_buffer = remaining;
+                
+                // Parse status line
+                std::istringstream header_stream(header_str);
+                std::string status_line;
+                std::getline(header_stream, status_line);
+                
+                std::istringstream status_stream(status_line);
+                std::string http_version;
+                status_stream >> http_version >> response.status_code;
+                response.ok = (response.status_code >= 200 && response.status_code < 300);
+                
+                // Parse headers
+                std::string header_line;
+                while (std::getline(header_stream, header_line) && !header_line.empty()) {
+                    if (header_line.back() == '\r') header_line.pop_back();
+                    size_t colon = header_line.find(':');
+                    if (colon != std::string::npos) {
+                        std::string key = header_line.substr(0, colon);
+                        std::string value = header_line.substr(colon + 1);
+                        value.erase(0, value.find_first_not_of(" \t"));
+                        value.erase(value.find_last_not_of(" \t\r\n") + 1);
+                        response.headers[key] = value;
+                    }
+                }
+                
+                // If HTTP error, collect body and return error
+                if (!response.ok) {
+                    // Read remaining body
+                    accumulated_body = recv_buffer;
+                    // Try to read more
+                    while (true) {
+                        if (!ssl) {
+                            struct pollfd pfd2;
+                            pfd2.fd = socket_fd;
+                            pfd2.events = POLLIN;
+                            if (poll(&pfd2, 1, 1000) <= 0) break;
+                        }
+                        ssize_t r;
+                        if (ssl) {
+#ifdef HUNTERCLAW_ENABLE_SSL
+                            r = SSL_read(static_cast<SSL*>(ssl), buf, sizeof(buf) - 1);
+#else
+                            r = -1;
+#endif
+                        } else {
+                            r = recv(socket_fd, buf, sizeof(buf) - 1, 0);
+                        }
+                        if (r <= 0) break;
+                        buf[r] = '\0';
+                        accumulated_body.append(buf, r);
+                    }
+                    close_connection(socket_fd, ssl_ctx, ssl);
+                    response.body = accumulated_body;
+                    return core::Result<HttpResponse>::Err(
+                        "HTTP error " + std::to_string(response.status_code) + ": " + accumulated_body);
+                }
+            } else {
+                continue;  // Headers not complete yet
+            }
+        }
+        
+        // Process body lines — invoke callback per complete line
+        accumulated_body += recv_buffer;
+        size_t pos;
+        while ((pos = recv_buffer.find('\n')) != std::string::npos) {
+            std::string line = recv_buffer.substr(0, pos + 1);
+            recv_buffer.erase(0, pos + 1);
+            if (line_callback) {
+                line_callback(line);
+            }
+        }
+    }
+    
+    // Process any remaining data in buffer
+    if (!recv_buffer.empty() && line_callback) {
+        line_callback(recv_buffer);
+        accumulated_body += recv_buffer;
+    }
+    
+    close_connection(socket_fd, ssl_ctx, ssl);
+    
+    response.body = accumulated_body;
+    return core::Result<HttpResponse>::Ok(response);
+}
+
+// ----------------------------------------------------------------------------
 // Connection Cleanup
 // ----------------------------------------------------------------------------
 

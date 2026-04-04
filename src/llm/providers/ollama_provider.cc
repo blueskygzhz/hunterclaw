@@ -1,7 +1,7 @@
 #include "hunterclaw/llm/provider.h"
+#include "hunterclaw/infra/http_client.h"
 #include "hunterclaw/core/logger.h"
 #include "hunterclaw/core/result.h"
-#include <curl/curl.h>
 #include <json/json.h>
 #include <nlohmann/json.hpp>
 #include <sstream>
@@ -9,40 +9,29 @@
 namespace hunterclaw {
 namespace llm {
 
-// HTTP 响应结构体
-struct HttpResponse {
-    std::string body;
-    long status_code = 0;
-    std::map<std::string, std::string> headers;
-};
-
-extern core::Result<HttpResponse> http_post(
-    const std::string& url,
-    const std::string& json_body,
-    const std::map<std::string, std::string>& headers
-);
-
 // ============================================================================
-// Ollama Provider 实现
+// Ollama Provider 实现 (使用 infra::HttpClient，无 curl 依赖)
 // ============================================================================
 
 class OllamaProvider : public Provider {
 public:
-    OllamaProvider(const ProviderConfig& config) : config_(config) {
-        // Logger initialized
-        (void)config;
+    OllamaProvider(const ProviderConfig& config)
+        : config_(config), http_client_(infra::HttpClient::create()) {
     }
 
     core::Result<GenerateResponse> generate(const GenerateOptions& options) override {
         auto request_json = build_request_json(options);
 
-        std::map<std::string, std::string> headers = {
+        infra::HttpRequestOptions http_opts;
+        http_opts.body = request_json;
+        http_opts.timeout_ms = 60000;
+        http_opts.headers = {
             {"Content-Type", "application/json"}
         };
 
         std::string url = config_.base_url + "/api/chat";
 
-        auto http_result = http_post(url, request_json, headers);
+        auto http_result = http_client_->post(url, http_opts);
         if (!http_result.is_ok()) {
             return core::Result<GenerateResponse>::Err(http_result.error);
         }
@@ -71,29 +60,22 @@ public:
     core::Result<std::vector<std::string>> list_models() {
         std::string url = config_.base_url + "/api/tags";
 
-        CURL* curl = curl_easy_init();
-        if (!curl) {
-            return core::Result<std::vector<std::string>>::Err("Failed to initialize CURL");
+        auto http_result = http_client_->get(url, 5000);
+        if (!http_result.is_ok()) {
+            return core::Result<std::vector<std::string>>::Err(http_result.error);
         }
 
-        std::string response_body;
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_body);
-
-        CURLcode res = curl_easy_perform(curl);
-        curl_easy_cleanup(curl);
-
-        if (res != CURLE_OK) {
-            return core::Result<std::vector<std::string>>::Err(std::string("CURL error: ") + curl_easy_strerror(res));
+        const auto& resp = http_result.get();
+        if (!resp.ok) {
+            return core::Result<std::vector<std::string>>::Err(
+                "HTTP error " + std::to_string(resp.status_code) + ": " + resp.body);
         }
 
-        // Parse response
         Json::CharReaderBuilder reader_builder;
         Json::Value root;
         std::string errs;
 
-        std::istringstream stream(response_body);
+        std::istringstream stream(resp.body);
         if (!Json::parseFromStream(reader_builder, stream, &root, &errs)) {
             return core::Result<std::vector<std::string>>::Err("Failed to parse JSON: " + errs);
         }
@@ -115,48 +97,26 @@ private:
         root["model"] = config_.model;
         root["stream"] = false;
         
-        // Messages
         Json::Value messages_json(Json::arrayValue);
         for (const auto& msg : options.messages) {
             Json::Value msg_json;
-            
             switch (msg.role) {
-                case MessageRole::System:
-                    msg_json["role"] = "system";
-                    break;
-                case MessageRole::User:
-                    msg_json["role"] = "user";
-                    break;
-                case MessageRole::Assistant:
-                    msg_json["role"] = "assistant";
-                    break;
-                case MessageRole::Tool:
-                    msg_json["role"] = "tool";
-                    break;
+                case MessageRole::System:    msg_json["role"] = "system"; break;
+                case MessageRole::User:      msg_json["role"] = "user"; break;
+                case MessageRole::Assistant: msg_json["role"] = "assistant"; break;
+                case MessageRole::Tool:      msg_json["role"] = "tool"; break;
             }
-            
             msg_json["content"] = msg.content;
             messages_json.append(msg_json);
         }
         root["messages"] = messages_json;
         
-        // Options
         Json::Value opts;
-        if (options.temperature.has_value()) {
-            opts["temperature"] = options.temperature.value();
-        }
-        if (options.top_p.has_value()) {
-            opts["top_p"] = options.top_p.value();
-        }
-        if (options.top_k.has_value()) {
-            opts["top_k"] = options.top_k.value();
-        }
+        if (options.temperature.has_value()) opts["temperature"] = options.temperature.value();
+        if (options.top_p.has_value()) opts["top_p"] = options.top_p.value();
+        if (options.top_k.has_value()) opts["top_k"] = options.top_k.value();
+        if (!opts.empty()) root["options"] = opts;
         
-        if (!opts.empty()) {
-            root["options"] = opts;
-        }
-        
-        // Tools (Ollama native format)
         if (!options.tools.empty()) {
             Json::Value tools_json(Json::arrayValue);
             for (const auto& tool : options.tools) {
@@ -165,7 +125,6 @@ private:
                 tool_json["function"]["name"] = tool.name;
                 tool_json["function"]["description"] = tool.description;
                 
-                // Convert nlohmann::json to Json::Value
                 nlohmann::json schema_nlohmann = tool.input_schema.to_json();
                 std::string schema_str = schema_nlohmann.dump();
                 Json::CharReaderBuilder reader;
@@ -184,7 +143,12 @@ private:
         return Json::writeString(builder, root);
     }
     
-    core::Result<GenerateResponse> parse_response(const HttpResponse& http_resp) {
+    core::Result<GenerateResponse> parse_response(const infra::HttpResponse& http_resp) {
+        if (!http_resp.ok) {
+            return core::Result<GenerateResponse>::Err(
+                "HTTP error " + std::to_string(http_resp.status_code) + ": " + http_resp.body);
+        }
+        
         Json::CharReaderBuilder reader_builder;
         Json::Value root;
         std::string errs;
@@ -196,12 +160,10 @@ private:
         
         GenerateResponse response;
         
-        // Extract message
         const auto& message = root["message"];
         if (!message.isNull()) {
             response.content = message["content"].asString();
             
-            // Tool calls
             const auto& tool_calls = message["tool_calls"];
             if (tool_calls.isArray()) {
                 for (const auto& call : tool_calls) {
@@ -220,13 +182,8 @@ private:
         return core::Result<GenerateResponse>::Ok(response);
     }
     
-    static size_t write_callback(char* ptr, size_t size, size_t nmemb, void* userdata) {
-        auto* str = static_cast<std::string*>(userdata);
-        str->append(ptr, size * nmemb);
-        return size * nmemb;
-    }
-    
     ProviderConfig config_;
+    infra::HttpClient::Ptr http_client_;
 };
 
 core::Result<Provider::Ptr> create_ollama_provider(const ProviderConfig& config) {

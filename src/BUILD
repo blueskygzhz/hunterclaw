@@ -186,6 +186,7 @@ cc_library(
     srcs = glob(["llm/*.cc", "llm/providers/*.cc"]),
     deps = [
         "//:hunterclaw_headers",
+        ":hunterclaw_infra",     # ✅ HttpClient (替代 curl)
         "@nlohmann_json//:json",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -198,7 +199,6 @@ cc_library(
     ],
     linkopts = [
         "-lpthread",
-        "-lcurl",
         "-ljsoncpp",
     ],
     linkstatic = False,

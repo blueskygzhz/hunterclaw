@@ -6,6 +6,7 @@
 #include <map>
 #include <optional>
 #include <memory>
+#include <functional>
 
 namespace hunterclaw {
 namespace infra {
@@ -159,6 +160,23 @@ public:
         const std::string& method,
         const std::string& url,
         const HttpRequestOptions& options
+    );
+    
+    /**
+     * @brief SSE 流式 POST 请求
+     * 
+     * 用于 LLM Provider 的 Server-Sent Events 流式调用。
+     * 每收到一行数据就调用 line_callback。
+     * 
+     * @param url 完整 URL
+     * @param options 请求选项 (body 必须设置)
+     * @param line_callback 每收到一行 SSE 数据时的回调 (含换行符)
+     * @return HttpResponse (body 为完整累积响应) 或错误
+     */
+    core::Result<HttpResponse> post_stream(
+        const std::string& url,
+        const HttpRequestOptions& options,
+        std::function<void(const std::string& line)> line_callback
     );
     
 private:
