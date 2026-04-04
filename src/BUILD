@@ -470,7 +470,7 @@ cc_library(
 # ============================================================================
 cc_library(
     name = "hunterclaw_react",
-    srcs = glob(["react/*.cc"]),  # ✅ 不再排除 message_processor.cc - 所有依赖已实现
+    srcs = glob(["react/*.cc"]),
     deps = [
         "//:hunterclaw_headers",
         ":hunterclaw_core_base",     # ✅ 添加 core_base 依赖 (ThreadPool)
@@ -479,8 +479,6 @@ cc_library(
         ":hunterclaw_memory",
         ":hunterclaw_sessions",
         ":hunterclaw_observability",  # ✅ 添加 observability 依赖 (Tracer, Span, DiagnosticEventBus)
-        # ✅ 移除 hunterclaw_agents 依赖，打破循环依赖
-        # message_processor 只需要 AgentConfig 类型，该类型定义在头文件中
         "@nlohmann_json//:json",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -495,7 +493,7 @@ cc_library(
     linkopts = [
         "-lpthread",
         "-ljsoncpp",
-        "-lssl",       # ✅ message_processor 需要 OpenSSL (SHA256 用于 echo 检测)
+        "-lssl",       # loop_detection 需要 OpenSSL (SHA256)
         "-lcrypto",
     ],
     linkstatic = False,
