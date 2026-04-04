@@ -2132,7 +2132,7 @@ core::Result<bool> GatewayServer::start() {
                                                 agent_pool_weak](
                 const cron::CronJob& job,
                 const std::string& message,
-                const std::string& /*lane*/
+                const std::string& lane
             ) -> cron::CronRunOutcome {
                 auto config = config_weak.lock();
                 auto skill_mgr = skill_mgr_weak.lock();
@@ -2190,19 +2190,50 @@ core::Result<bool> GatewayServer::start() {
                     opts["allow_unsafe_external_content"] = "true";
                 }
 
-                // process_message is called directly; since this is a brand-new instance,
-                // is_processing_ is guaranteed false — no queuing can occur.
+                // ✅ 严格对齐 OpenClaw 双层 lane 并发控制:
+                //   runCronIsolatedAgentTurn 传入 lane: resolveNestedAgentLane("cron") → "nested"
+                //   runEmbeddedPiAgent({ lane: "nested" }):
+                //     resolveGlobalLane("nested") → "nested" (不变)
+                //     enqueueSession(() => enqueueGlobal(async () => { ... }))
+                //
+                // HunterClaw 对齐:
+                //   lane 参数 = "cron" → ResolveGlobalLane("cron") → "nested"
+                //   session lane "session:cron:<jobId>" → nested lane "nested"
+                //
+                // 这保证了:
+                //   1. 同一 cron session 不会并行运行（session lane 串行）
+                //   2. 全局 cron agent 运行受 nested lane 并发度限制
+                //   3. 不占用 cron lane 的唯一槽位（防止死锁）
                 cron::CronRunOutcome outcome;
                 try {
-                    auto result = agent->process_message(message, opts);
-                    // A fresh instance can never return "queued" — is_processing_
-                    // starts as false, so compare_exchange always succeeds.
-                    if (result.is_ok()) {
-                        const std::string& output = result.get();
-                        outcome = {cron::CronRunStatus::OK, std::nullopt, output};
-                    } else {
-                        outcome = {cron::CronRunStatus::ERROR, result.error};
-                    }
+                    auto& cmd_queue = queue::CommandQueue::Instance();
+                    const std::string session_lane = queue::ResolveSessionLane(session_key);
+                    const std::string global_lane = queue::ResolveGlobalLane(lane);  // "cron" → "nested"
+
+                    // 外层: session lane (保证同一 cron session 串行)
+                    auto session_future = cmd_queue.enqueue_command_in_lane(
+                        session_lane,
+                        std::function<cron::CronRunOutcome()>(
+                            [&cmd_queue, global_lane, agent, message, opts, session_key]() -> cron::CronRunOutcome {
+                            // 内层: nested lane (全局并发控制)
+                            auto inner_future = cmd_queue.enqueue_command_in_lane(
+                                global_lane,
+                                std::function<cron::CronRunOutcome()>(
+                                    [agent, message, opts]() -> cron::CronRunOutcome {
+                                    auto result = agent->process_message(message, opts);
+                                    if (result.is_ok()) {
+                                        return {cron::CronRunStatus::OK, std::nullopt, result.get()};
+                                    } else {
+                                        return {cron::CronRunStatus::ERROR, result.error};
+                                    }
+                                }),
+                                queue::EnqueueOptions{.label = "cron:agent:" + session_key, .urgent = false}
+                            );
+                            return inner_future.get();
+                        }),
+                        queue::EnqueueOptions{.label = "session:cron:" + session_key, .urgent = false}
+                    );
+                    outcome = session_future.get();
                 } catch (const std::exception& e) {
                     outcome = {cron::CronRunStatus::ERROR, std::string(e.what())};
                 }

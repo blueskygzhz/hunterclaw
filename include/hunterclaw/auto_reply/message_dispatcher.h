@@ -155,6 +155,12 @@ public:
         QueueSettings queue_settings;
         bool is_heartbeat = false;
         bool is_streaming = false;   // aligned with openclaw: isEmbeddedPiRunStreaming
+        // ✅ 对齐 OpenClaw 双层 lane 机制:
+        // OpenClaw runEmbeddedPiAgent 内部自己做 session lane → main lane 嵌套
+        // HunterClaw: 部分调用方 (chat.cc/agent.cc) 已在外部包了 session lane，
+        //             此时 run_reply_agent 不再重复进 session lane (避免死锁)
+        //             auto_reply 路径未包 session lane，run_reply_agent 需自行包装
+        bool in_session_lane = false;  // true = 调用方已在 session lane 中
     };
     DispatchResult run_reply_agent(const RunReplyAgentParams& params);
 

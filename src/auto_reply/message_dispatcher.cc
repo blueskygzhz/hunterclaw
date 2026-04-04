@@ -574,10 +574,14 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
         gen_config.user_input      = captured_message.text;
         gen_config.session_key     = captured_message.session_key;
 
+        // ✅ 对齐 OpenClaw: clearActiveEmbeddedRun 的 handle 匹配
+        // on_engine_created 设置此变量，cleanup 时用于比较 active_engines_[key]
+        // 防止 interrupt 后新 run 注册的 engine 被旧 run 的 cleanup 误删
+        std::shared_ptr<react::ReactEngine> my_engine;
+
         // ✅ 对齐 OpenClaw: setActiveEmbeddedRun(sessionId, queueHandle)
-        // 注册 engine 引用到 active_engines_，使 steer_embedded_session 能直接注入
-        // 同时消费 steer_queues_ 中残留的 fallback steer 消息
-        gen_config.on_engine_created = [this, captured_message](std::shared_ptr<react::ReactEngine> engine) {
+        gen_config.on_engine_created = [this, captured_message, &my_engine](std::shared_ptr<react::ReactEngine> engine) {
+            my_engine = engine;  // ✅ 记录 engine 引用，用于 cleanup handle 匹配
             std::vector<std::string> fallback_steers;
             {
                 std::lock_guard<std::mutex> lock(session_state_mutex_);
@@ -672,11 +676,21 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
         );
 
         // ✅ 对齐 OpenClaw: clearActiveEmbeddedRun(sessionId, queueHandle)
-        // engine->run() 已完成，清除 active engine 引用
+        // runs.ts:238: if (ACTIVE_EMBEDDED_RUNS.get(sessionId) === handle) { delete }
+        // 只有当 active_engines_ 中的 engine 与当前 run 的 engine 是同一个时才 erase
+        // 防止 interrupt 后新 run 注册的 engine 被旧 run 的 cleanup 误删
         {
             std::lock_guard<std::mutex> lock(session_state_mutex_);
-            active_engines_.erase(captured_message.session_key);
-            streaming_sessions_.erase(captured_message.session_key);
+            auto eit = active_engines_.find(captured_message.session_key);
+            if (eit != active_engines_.end() && eit->second == my_engine) {
+                active_engines_.erase(eit);
+                streaming_sessions_.erase(captured_message.session_key);
+                log()->debug("dispatch_reply_from_config: cleared active engine for session={}",
+                             captured_message.session_key);
+            } else {
+                log()->debug("dispatch_reply_from_config: skipped engine cleanup (handle mismatch) session={}",
+                             captured_message.session_key);
+            }
         }
 
         if (!gen_result.success) {
@@ -938,27 +952,34 @@ bool MessageDispatcher::steer_embedded_session(
 
 // ============================================================================
 // abort_embedded_session
-// Aligned with openclaw: abortEmbeddedPiRun (pi-embedded-runner/runs.ts)
+// Aligned with openclaw: abortEmbeddedPiRun (pi-embedded-runner/runs.ts:63-81)
 //
 // OpenClaw 完整路径:
 //   abortEmbeddedPiRun(sessionId)
 //     → handle = ACTIVE_EMBEDDED_RUNS.get(sessionId)
-//     → handle.abort()                                   (runs.ts:74)
-//       → runAbortController.abort()                     (attempt.ts onAbort)
+//     → if (!handle) return false                         (runs.ts:69-71)
+//     → handle.abort()                                    (runs.ts:74)
+//       → runAbortController.abort()                      (attempt.ts onAbort)
 //         → 中断正在执行的 LLM stream (pi-agent-core abort)
-//         → activeSession.abort()
 //     → return true
 //
-//   如果 handle 不存在 → return false (no active run)
+// 关键时序 (strictly aligned with openclaw):
+//   1. abort() 只发送取消信号，**不等待** run 完成
+//   2. abort() **不从 ACTIVE_EMBEDDED_RUNS 中移除 handle**
+//   3. handle 的清理由 run 的 finally block 完成:
+//      clearActiveEmbeddedRun(sessionId, queueHandle)     (attempt.ts finally)
 //
 // HunterClaw 对齐:
-//   active_engines_[session_key] ≈ ACTIVE_EMBEDDED_RUNS[sessionId]
-//   engine->cancel()             ≈ handle.abort() → runAbortController.abort()
-//   清除 active_engines_         ≈ clearActiveEmbeddedRun (在 run 完成后自动清除)
-//   清除 steer_queues_           ≈ 确保 abort 后不再注入 steer 消息
+//   active_engines_[key] ≈ ACTIVE_EMBEDDED_RUNS[sessionId]
+//   engine->cancel()     ≈ handle.abort() → runAbortController.abort()
 //
-// 调用方 (interrupt mode) 还需要:
-//   clearCommandLane             → 清除 followup queue (在 run_reply_agent 中处理)
+//   engine 引用的清理由 run_fn 内部完成 (dispatch_reply_from_config lambda):
+//     get_reply_from_config 返回后 → active_engines_.erase(key)
+//   **此处不 erase active_engines_**，避免 engine 被提前析构
+//
+// 调用方 (interrupt mode in run_reply_agent) 还需要:
+//   clearFollowupQueue   → 清除 followup 队列
+//   clearCommandLane     → 清除 CommandQueue session lane
 // ============================================================================
 
 bool MessageDispatcher::abort_embedded_session(const std::string& session_key) {
@@ -968,25 +989,33 @@ bool MessageDispatcher::abort_embedded_session(const std::string& session_key) {
     }
 
     // ✅ 对齐 OpenClaw: handle.abort() → runAbortController.abort()
-    // 通过 ReactEngine::cancel() 中止正在执行的 LLM stream
+    // 通过 ReactEngine::cancel() 发送取消信号，中止正在执行的 LLM stream
+    // cancel() 设置 cancelled_ = true (atomic)，execute_loop 在下一次循环检查时退出
     auto eit = active_engines_.find(session_key);
     if (eit != active_engines_.end() && eit->second) {
         eit->second->cancel();
         log()->info("abort_embedded_session: cancelled ReactEngine for session={}", session_key);
+    } else {
+        log()->debug("abort_embedded_session: no active engine found for session={}", session_key);
     }
 
-    // ✅ 清除 active engine 引用
-    // engine->run() 返回后会在 on_engine_created 的 cleanup 中再次清除，
-    // 但这里提前清除可以防止 cancel 后仍有 steer 消息注入
-    active_engines_.erase(session_key);
+    // ✅ 对齐 OpenClaw: abort 后**不移除** active_engines_ 中的 engine 引用
+    // engine->run() 仍在另一个线程执行（cancel 是异步信号），
+    // engine 的 shared_ptr 需要保持有效直到 run() 返回。
+    // 清理由 run_fn 内部的 finally 路径完成:
+    //   get_reply_from_config 返回 → active_engines_.erase(key)
+    // 这与 OpenClaw 一致: clearActiveEmbeddedRun 在 attempt.ts 的 finally 中调用
 
-    // ✅ 清除 steer 队列 (abort 后不应再注入 steer 消息)
+    // ✅ 清除 steer 队列 (abort 后不应再有新 steer 消息注入到 engine)
     steer_queues_.erase(session_key);
 
-    // ✅ 对齐 OpenClaw: 标记 session 为非活跃
-    // cancel() 被调用后 execute_loop 会在下一次 cancelled_ 检查时退出，
-    // run() 返回后调用方 (run_reply_agent) 会执行 active_sessions_.erase
-    // 但 interrupt 路径需要立即标记为非活跃以允许新 run 立即启动
+    // ✅ 标记 session 为非活跃 + 非 streaming
+    // 对齐 OpenClaw: interrupt 路径在 abort 后立即允许新 run 启动
+    // (OpenClaw 中 isActive 检查基于 ACTIVE_EMBEDDED_RUNS，abort 后 handle 仍在，
+    //  但 interrupt 路径在 abort 后直接 fall through 到 run-now，不再检查 isActive)
+    // HunterClaw: 从 active_sessions_ 移除以允许新 run 进入 run-now 路径
+    // 注: 被 cancel 的 engine->run() 返回后，run_reply_agent 的 finally 会再次 erase
+    //     (幂等操作，无副作用)
     active_sessions_.erase(session_key);
     streaming_sessions_.erase(session_key);
 
@@ -1216,12 +1245,21 @@ MessageDispatcher::DispatchResult MessageDispatcher::run_reply_agent(
     }
 
     // ── "run-now" path ───────────────────────────────────────────────────────
-    // Aligned with openclaw: directly await runAgentTurnWithFallback(...)
-    // OpenClaw: session lane → main lane (双层 lane 机制)
-    //   resolveEmbeddedSessionLane(sessionKey) → session:<key> lane (串行)
-    //   resolveGlobalLane() → "main" lane (全局并发控制)
-    // HunterClaw: run_fn 在 main lane 中执行，session lane 由调用方负责
-    log()->debug("run_reply_agent: session={} is idle → run-now (main lane)", session_key);
+    // ✅ 严格对齐 OpenClaw: runEmbeddedPiAgent (pi-embedded-runner/run.ts:276-277)
+    //   return enqueueSession(() =>       // session lane: 保证同 session 串行
+    //       enqueueGlobal(async () => {   // global/main lane: 控制全局并发
+    //           ... agent run ...
+    //       })
+    //   );
+    //
+    // 双层 lane 机制:
+    //   session lane "session:<key>" → maxConcurrent=1 (同一 session 串行)
+    //   global lane  "main"         → maxConcurrent=N (全局并发控制)
+    //
+    // in_session_lane 标志:
+    //   true  → 调用方 (chat.cc/agent.cc) 已在 session lane 中，只进 main lane
+    //   false → auto_reply 路径，需自行包 session lane + main lane
+    log()->debug("run_reply_agent: session={} is idle → run-now (dual lane)", session_key);
 
     // ── steer_queues_ fallback 说明 ──────────────────────────────────────────
     // 正常路径: steer 消息通过 steer_embedded_session → engine->steer() 直接注入
@@ -1239,19 +1277,44 @@ MessageDispatcher::DispatchResult MessageDispatcher::run_reply_agent(
 
     DispatchResult run_result;
     try {
-        // ✅ 对齐 OpenClaw: 通过 main lane 执行 run_fn
-        // OpenClaw: enqueueCommandInLane(resolveGlobalLane(lane), async () => { ... })
-        // HunterClaw: CommandQueue::Instance().enqueue_command_in_lane(CommandLane::Main, run_fn)
-        // 注意: 这里同步等待 main lane 完成（session lane 线程阻塞等待 main lane）
-        // 这与 OpenClaw 的 await 语义一致
         auto& cmd_queue = queue::CommandQueue::Instance();
         const std::string global_lane = queue::ResolveGlobalLane();  // "main"
-        auto future = cmd_queue.enqueue_command_in_lane(
-            global_lane,
-            std::move(effective_run_fn),
-            queue::EnqueueOptions{.label = params.label, .urgent = false}
-        );
-        run_result = future.get();
+
+        if (params.in_session_lane) {
+            // ✅ 调用方已在 session lane 中 (chat.cc / agent.cc)
+            // 只进 main lane，避免 session lane 死锁
+            // 对齐 OpenClaw: enqueueGlobal(async () => { ... })
+            auto future = cmd_queue.enqueue_command_in_lane(
+                global_lane,
+                std::move(effective_run_fn),
+                queue::EnqueueOptions{.label = params.label, .urgent = false}
+            );
+            run_result = future.get();
+        } else {
+            // ✅ 严格对齐 OpenClaw 双层 lane:
+            //   enqueueSession(() => enqueueGlobal(async () => { ... }))
+            // auto_reply 路径未包 session lane，此处自行包装
+            const std::string session_lane = queue::ResolveSessionLane(session_key);
+            auto captured_run_fn = std::move(effective_run_fn);
+            auto captured_label = params.label;
+
+            // 外层: session lane (保证同一 session 串行)
+            auto session_future = cmd_queue.enqueue_command_in_lane(
+                session_lane,
+                std::function<DispatchResult()>([&cmd_queue, global_lane,
+                                                  captured_run_fn, captured_label]() -> DispatchResult {
+                    // 内层: main lane (控制全局并发)
+                    auto inner_future = cmd_queue.enqueue_command_in_lane(
+                        global_lane,
+                        captured_run_fn,
+                        queue::EnqueueOptions{.label = captured_label, .urgent = false}
+                    );
+                    return inner_future.get();
+                }),
+                queue::EnqueueOptions{.label = "session:" + params.label, .urgent = false}
+            );
+            run_result = session_future.get();
+        }
     } catch (const std::exception& e) {
         log()->error("run_reply_agent: run_fn failed session={}: {}", session_key, e.what());
         run_result.success = false;
@@ -1404,19 +1467,30 @@ void MessageDispatcher::drain_followup_queue(const std::string& session_key) {
 
                 // Run the merged prompt using the last item's run_fn
                 // (aligned with openclaw: await runFollowup({ prompt, run: last.run, ... }))
-                // ✅ 对齐 OpenClaw: 通过 main lane 执行 (双层 lane 机制)
-                // OpenClaw: enqueueCommandInLane(resolveGlobalLane(), async () => runFollowup(...))
+                // ✅ 对齐 OpenClaw 双层 lane: session lane → main lane
+                // OpenClaw: runFollowup → runEmbeddedPiAgent → enqueueSession(() => enqueueGlobal(...))
                 try {
                     if (last_run_fn) {
                         auto& cmd_queue = queue::CommandQueue::Instance();
+                        const std::string session_lane = queue::ResolveSessionLane(session_key);
                         const std::string global_lane = queue::ResolveGlobalLane();  // "main"
                         std::function<DispatchResult()> fn_copy = last_run_fn;
-                        auto future = cmd_queue.enqueue_command_in_lane(
-                            global_lane,
-                            std::move(fn_copy),
-                            queue::EnqueueOptions{.label = "drain:collect:" + session_key, .urgent = false}
+                        // 外层: session lane
+                        auto session_future = cmd_queue.enqueue_command_in_lane(
+                            session_lane,
+                            std::function<DispatchResult()>([&cmd_queue, global_lane,
+                                                              fn_copy, session_key]() -> DispatchResult {
+                                // 内层: main lane
+                                auto inner_future = cmd_queue.enqueue_command_in_lane(
+                                    global_lane,
+                                    fn_copy,
+                                    queue::EnqueueOptions{.label = "drain:collect:" + session_key, .urgent = false}
+                                );
+                                return inner_future.get();
+                            }),
+                            queue::EnqueueOptions{.label = "session:drain:collect:" + session_key, .urgent = false}
                         );
-                        future.get();  // wait for main lane to complete
+                        session_future.get();
                     }
                 } catch (const std::exception& e) {
                     log()->error("drain_followup_queue: collect run failed session={}: {}",
@@ -1476,17 +1550,29 @@ void MessageDispatcher::drain_followup_queue(const std::string& session_key) {
                              session_key, next_task.label);
 
                 try {
-                    // ✅ 对齐 OpenClaw: 通过 main lane 执行 (双层 lane 机制)
-                    // OpenClaw: enqueueCommandInLane(resolveGlobalLane(), async () => runFollowup(...))
+                    // ✅ 对齐 OpenClaw 双层 lane: session lane → main lane
+                    // OpenClaw: runFollowup → runEmbeddedPiAgent → enqueueSession(() => enqueueGlobal(...))
                     auto& cmd_queue = queue::CommandQueue::Instance();
+                    const std::string session_lane = queue::ResolveSessionLane(session_key);
                     const std::string global_lane = queue::ResolveGlobalLane();  // "main"
                     std::function<DispatchResult()> fn_copy = next_task.run_fn;
-                    auto future = cmd_queue.enqueue_command_in_lane(
-                        global_lane,
-                        std::move(fn_copy),
-                        queue::EnqueueOptions{.label = "drain:followup:" + next_task.label, .urgent = false}
+                    std::string task_label = next_task.label;
+                    // 外层: session lane
+                    auto session_future = cmd_queue.enqueue_command_in_lane(
+                        session_lane,
+                        std::function<DispatchResult()>([&cmd_queue, global_lane,
+                                                          fn_copy, task_label]() -> DispatchResult {
+                            // 内层: main lane
+                            auto inner_future = cmd_queue.enqueue_command_in_lane(
+                                global_lane,
+                                fn_copy,
+                                queue::EnqueueOptions{.label = "drain:followup:" + task_label, .urgent = false}
+                            );
+                            return inner_future.get();
+                        }),
+                        queue::EnqueueOptions{.label = "session:drain:followup:" + task_label, .urgent = false}
                     );
-                    future.get();  // wait for main lane to complete
+                    session_future.get();
                 } catch (const std::exception& e) {
                     log()->error("drain_followup_queue: followup failed session={}: {}",
                                  session_key, e.what());

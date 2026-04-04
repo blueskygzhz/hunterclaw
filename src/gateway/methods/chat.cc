@@ -501,6 +501,7 @@ core::Result<json> method_chat_send(
                                         : message;
         agent_params.queue_settings = queue_settings;
         agent_params.is_heartbeat   = false;
+        agent_params.in_session_lane = true;  // ✅ 调用方已在 session lane 中
 
         // ✅ 对齐 OpenClaw: 通过 session lane 入队 (双层 lane 机制)
         // OpenClaw: enqueueCommandInLane(resolveEmbeddedSessionLane(sessionKey), async () => {

@@ -343,6 +343,7 @@ core::Result<json> method_agent(
         agent_params.label        = "agent:" + session_key + ":" + run_id;
         agent_params.prompt       = message;
         agent_params.is_heartbeat = false;
+        agent_params.in_session_lane = true;  // ✅ 调用方已在 session lane 中
 
         auto& cmd_queue = queue::CommandQueue::Instance();
         const std::string session_lane = queue::ResolveSessionLane(session_key);
