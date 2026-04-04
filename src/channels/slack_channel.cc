@@ -363,6 +363,7 @@ ChannelPlugin make_slack_plugin() {
     p.meta.docs_label     = "slack";
     p.meta.blurb          = "supported (Socket Mode).";
     p.meta.system_image   = "number";
+    p.meta.prefer_session_lookup_for_announce_target = true;  // Aligned with openclaw
 
     // ── capabilities (对齐 OpenClaw dock.ts DOCKS["slack"]) ──────────────────
     p.capabilities.chat_types      = {"direct", "channel", "thread"};
@@ -1063,6 +1064,35 @@ ChannelPlugin make_slack_plugin() {
     commands.skip_when_config_empty = true;
     p.commands = commands;
 
+    // ── pairing (对齐 OpenClaw: ChannelPairingAdapter) ──────────────────────
+    // Aligned with openclaw: pairing.idLabel = "slackUserId"
+    // pairing.normalizeAllowEntry → strip "slack:/user:" prefix
+    // pairing.notifyApproval → send approval message via Slack
+    ChannelPairingAdapter pairing;
+    pairing.id_label = "Slack user id";
+    pairing.normalize_allow_entry = [](const std::string& entry) -> std::string {
+        std::string s = entry;
+        std::string s_lower = s;
+        std::transform(s_lower.begin(), s_lower.end(), s_lower.begin(), ::tolower);
+        for (const auto& prefix : std::vector<std::string>{"slack:", "user:"}) {
+            if (s_lower.rfind(prefix, 0) == 0) {
+                s = s.substr(prefix.size());
+                break;
+            }
+        }
+        while (!s.empty() && std::isspace((unsigned char)s.front())) s.erase(s.begin());
+        while (!s.empty() && std::isspace((unsigned char)s.back()))  s.pop_back();
+        return s;
+    };
+    pairing.notify_approval = [](const core::Config& cfg, const std::string& id) -> void {
+        auto account = resolve_slack_account(cfg, "default");
+        const std::string bot_token = resolve_slack_bot_token(account, cfg, "default");
+        if (bot_token.empty()) return;
+        send_slack_message(bot_token, "user:" + id, "Pairing approved! You can now send messages.",
+                           std::nullopt, std::nullopt, std::nullopt);
+    };
+    p.pairing = pairing;
+
     // ── setup (对齐 OpenClaw: ChannelSetupAdapter) ────────────────────────────
     // Aligned with openclaw: setup.applyAccountConfig → patchScopedAccountConfig
     // setup.resolveAccountId → normalizeAccountId(input.name ?? accountId)
@@ -1114,6 +1144,74 @@ ChannelPlugin make_slack_plugin() {
     };
 
     p.setup = setup;
+
+    // ── messaging (对齐 OpenClaw: ChannelMessagingAdapter) ──────────────────
+    // Aligned with openclaw: messaging.normalizeTarget = normalizeSlackMessagingTarget
+    // messaging.targetResolver.looksLikeId = looksLikeSlackTargetId
+    // messaging.targetResolver.hint = "<channelId|user:ID|channel:ID>"
+    ChannelMessagingAdapter messaging;
+    messaging.normalize_target = [](const std::string& raw) -> std::optional<std::string> {
+        // Aligned with openclaw: normalizeSlackMessagingTarget → parseSlackTarget(raw, { defaultKind: "channel" })
+        std::string s = raw;
+        while (!s.empty() && std::isspace((unsigned char)s.front())) s.erase(s.begin());
+        while (!s.empty() && std::isspace((unsigned char)s.back()))  s.pop_back();
+        if (s.empty()) return std::nullopt;
+        // Strip slack: prefix
+        std::string s_lower = s;
+        std::transform(s_lower.begin(), s_lower.end(), s_lower.begin(), ::tolower);
+        if (s_lower.rfind("slack:", 0) == 0) {
+            s = s.substr(6);
+        }
+        while (!s.empty() && std::isspace((unsigned char)s.front())) s.erase(s.begin());
+        while (!s.empty() && std::isspace((unsigned char)s.back()))  s.pop_back();
+        if (s.empty()) return std::nullopt;
+        // Detect kind: user: / channel: / <@...> / #... / bare ID
+        if (s.rfind("user:", 0) == 0 || s.rfind("channel:", 0) == 0) {
+            return s;
+        }
+        // <@U...> → user:U...
+        if (s.size() > 3 && s.front() == '<' && s[1] == '@') {
+            auto end = s.find('>');
+            if (end != std::string::npos) {
+                return "user:" + s.substr(2, end - 2);
+            }
+        }
+        // #channel → channel:channel
+        if (s.front() == '#') {
+            return "channel:" + s.substr(1);
+        }
+        // Bare Slack ID (C/U/W/G/D prefix)
+        if (!s.empty() && (s[0] == 'C' || s[0] == 'U' || s[0] == 'W' || s[0] == 'G' || s[0] == 'D')) {
+            return "channel:" + s;
+        }
+        return s;
+    };
+    p.messaging = messaging;
+
+    // ── agentPrompt (对齐 OpenClaw: ChannelAgentPromptAdapter) ──────────────
+    // Aligned with openclaw: agentPrompt.messageToolHints → interactive replies hints
+    ChannelAgentPromptAdapter agent_prompt;
+    agent_prompt.message_tool_hints = [](const core::Config& cfg, const std::string& /*account_id*/) -> std::vector<std::string> {
+        // Aligned with openclaw: isSlackInteractiveRepliesEnabled check
+        bool interactive_enabled = false;
+        const auto& j = cfg.data;
+        if (j.contains("channels") && j["channels"].contains("slack")) {
+            const auto& sl = j["channels"]["slack"];
+            if (sl.contains("capabilities") && sl["capabilities"].is_object()) {
+                interactive_enabled = sl["capabilities"].value("interactiveReplies", false);
+            }
+        }
+        if (interactive_enabled) {
+            return {
+                "Slack interactive replies: use `[[slack_buttons: Label:value, Other:other]]` to add action buttons.",
+                "Slack selects: use `[[slack_select: Placeholder | Label:value, Other:other]]` to add a static select menu."
+            };
+        }
+        return {
+            "Slack interactive replies are disabled. Set channels.slack.capabilities.interactiveReplies=true to enable."
+        };
+    };
+    p.agent_prompt = agent_prompt;
 
     // ── status (对齐 OpenClaw: ChannelStatusAdapter) ──────────────────────────
     // Aligned with openclaw: status.collectStatusIssues

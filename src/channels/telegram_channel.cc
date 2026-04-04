@@ -381,8 +381,12 @@ ChannelPlugin make_telegram_plugin() {
     p.meta.system_image   = "paperplane";
     p.meta.selection_docs_omit_label = true;
 
-    // ── capabilities (对齐 OpenClaw dock.ts DOCKS["telegram"]) ──────────────
+    // ── capabilities (对齐 OpenClaw extensions/telegram/src/channel.ts) ─────
     p.capabilities.chat_types      = {"direct", "group", "channel", "thread"};
+    p.capabilities.reactions       = true;   // Aligned with openclaw: reactions: true
+    p.capabilities.threads         = true;   // Aligned with openclaw: threads: true
+    p.capabilities.media           = true;   // Aligned with openclaw: media: true
+    p.capabilities.polls           = true;   // Aligned with openclaw: polls: true
     p.capabilities.native_commands = true;
     p.capabilities.block_streaming = true;
 
@@ -398,6 +402,7 @@ ChannelPlugin make_telegram_plugin() {
     outbound.chunker          = markdown_to_telegram_html_chunks;
     outbound.chunker_mode     = "markdown";
     outbound.text_chunk_limit = 4000;
+    outbound.poll_max_options = 10;  // Aligned with openclaw: pollMaxOptions: 10
 
     // Aligned with openclaw: telegramOutbound.sendText
     outbound.send_text = [](const ChannelOutboundContext& ctx) -> core::Result<OutboundDeliveryResult> {
@@ -1119,6 +1124,14 @@ ChannelPlugin make_telegram_plugin() {
         while (!s.empty() && std::isspace((unsigned char)s.back()))  s.pop_back();
         return s;
     };
+    // Aligned with openclaw: notifyApproval → send PAIRING_APPROVED_MESSAGE via bot
+    pairing.notify_approval = [](const core::Config& cfg, const std::string& id) -> void {
+        const std::string token = resolve_telegram_token(
+            resolve_telegram_account(cfg, "default"), cfg, "default"
+        );
+        if (token.empty()) return;
+        send_telegram_message(token, id, "Pairing approved! You can now send messages.", std::nullopt, std::nullopt, std::nullopt);
+    };
     p.pairing = pairing;
 
     // ── setup (对齐 OpenClaw: ChannelSetupAdapter) ────────────────────────────
@@ -1177,6 +1190,36 @@ ChannelPlugin make_telegram_plugin() {
     };
 
     p.setup = setup;
+
+    // ── messaging (对齐 OpenClaw: ChannelMessagingAdapter) ──────────────────
+    // Aligned with openclaw: messaging.normalizeTarget = normalizeTelegramMessagingTarget
+    // messaging.targetResolver.looksLikeId = looksLikeTelegramTargetId
+    // messaging.targetResolver.hint = "<chatId>"
+    ChannelMessagingAdapter messaging;
+    messaging.normalize_target = [](const std::string& raw) -> std::optional<std::string> {
+        // Aligned with openclaw: normalizeTelegramMessagingTarget
+        // Strip telegram:/tg: prefix, trim, lowercase
+        std::string s = raw;
+        while (!s.empty() && std::isspace((unsigned char)s.front())) s.erase(s.begin());
+        while (!s.empty() && std::isspace((unsigned char)s.back()))  s.pop_back();
+        if (s.empty()) return std::nullopt;
+        // Strip prefix
+        std::string s_lower = s;
+        std::transform(s_lower.begin(), s_lower.end(), s_lower.begin(), ::tolower);
+        for (const auto& prefix : std::vector<std::string>{"telegram:", "tg:"}) {
+            if (s_lower.rfind(prefix, 0) == 0) {
+                s = s.substr(prefix.size());
+                s_lower = s_lower.substr(prefix.size());
+                break;
+            }
+        }
+        while (!s.empty() && std::isspace((unsigned char)s.front())) s.erase(s.begin());
+        while (!s.empty() && std::isspace((unsigned char)s.back()))  s.pop_back();
+        if (s.empty()) return std::nullopt;
+        std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+        return "telegram:" + s;
+    };
+    p.messaging = messaging;
 
     // ── status (对齐 OpenClaw: ChannelStatusAdapter + collectTelegramStatusIssues) ──
     // Aligned with openclaw: status.collectStatusIssues → collectTelegramStatusIssues

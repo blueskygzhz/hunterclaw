@@ -720,7 +720,7 @@ cc_binary(
 # ============================================================================
 # Channel Plugins
 # ============================================================================
-# All channel plugins (discord, telegram, slack, feishu, google_chat) are
+# All channel plugins (discord, telegram, slack) are
 # compiled as part of hunterclaw_core via glob(["channels/*.cc"]).
 #
 # Each src/channels/xxx_channel.cc contains:
