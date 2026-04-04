@@ -1,4 +1,5 @@
 #include "hunterclaw/channels/plugin.h"
+#include "hunterclaw/plugins/plugin_system.h"   // PluginDefinition for channel-as-plugin registration
 #include "hunterclaw/channels/discord_listener.h"
 #include "hunterclaw/channels/discord_message_handler.h"
 #include "hunterclaw/channels/discord_monitor.h"
@@ -1506,17 +1507,27 @@ ChannelPlugin make_discord_plugin() {
     return p;
 }
 
-// Static registration
+// Static registration — no longer uses C++ static initializer.
 static const ChannelPlugin DISCORD_PLUGIN = make_discord_plugin();
 
 } // namespace
 
-// Register on library load
-static struct DiscordPluginRegistrar {
-    DiscordPluginRegistrar() {
+// ============================================================================
+// Discord PluginDefinition (对齐 OpenClaw extensions/discord/index.ts)
+// ============================================================================
+
+plugins::PluginDefinition make_discord_plugin_definition() {
+    plugins::PluginDefinition def;
+    def.id = "discord";
+    def.name = "Discord";
+    def.description = "Discord channel plugin";
+    def.register_func = [](plugins::PluginApi& api) {
+        // 对齐 OpenClaw: api.registerChannel({ plugin: discordPlugin })
         ChannelPluginRegistry::instance().register_plugin(DISCORD_PLUGIN, 0);
-    }
-} _discord_registrar;
+        api.register_channel("discord");
+    };
+    return def;
+}
 
 } // namespace channels
 } // namespace hunterclaw

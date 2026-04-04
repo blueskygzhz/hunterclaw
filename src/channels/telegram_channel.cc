@@ -1,4 +1,5 @@
 #include "hunterclaw/channels/plugin.h"
+#include "hunterclaw/plugins/plugin_system.h"   // PluginDefinition for channel-as-plugin registration
 #include "hunterclaw/security/timing_safe.h"   // constant-time compare for webhook secret
 #include <httplib.h>                            // dedicated HTTP server for webhook listener
 #include <nlohmann/json.hpp>
@@ -1676,17 +1677,34 @@ ChannelPlugin make_telegram_plugin() {
     return p;
 }
 
-// Static registration
+// Static registration — no longer uses C++ static initializer.
+// Instead, make_telegram_plugin() is called from PluginDefinition.register_func.
+// (对齐 OpenClaw: extensions/telegram/index.ts → api.registerChannel({ plugin: telegramPlugin }))
 static const ChannelPlugin TELEGRAM_PLUGIN = make_telegram_plugin();
 
 } // namespace
 
-// Register on library load
-static struct TelegramPluginRegistrar {
-    TelegramPluginRegistrar() {
+// ============================================================================
+// Telegram PluginDefinition (对齐 OpenClaw extensions/telegram/index.ts)
+// ============================================================================
+// OpenClaw pattern:
+//   export default { id: "telegram", register(api) { api.registerChannel({ plugin }) } }
+//
+// HunterClaw C++ equivalent:
+//   make_telegram_plugin_definition() → PluginDefinition with register_func
+
+plugins::PluginDefinition make_telegram_plugin_definition() {
+    plugins::PluginDefinition def;
+    def.id = "telegram";
+    def.name = "Telegram";
+    def.description = "Telegram channel plugin";
+    def.register_func = [](plugins::PluginApi& api) {
+        // 对齐 OpenClaw: api.registerChannel({ plugin: telegramPlugin })
         ChannelPluginRegistry::instance().register_plugin(TELEGRAM_PLUGIN, 0);
-    }
-} _telegram_registrar;
+        api.register_channel("telegram");
+    };
+    return def;
+}
 
 } // namespace channels
 } // namespace hunterclaw

@@ -718,14 +718,25 @@ cc_binary(
 )
 
 # ============================================================================
-# Channel Plugins
+# Channel Plugins (对齐 OpenClaw extensions/*/index.ts)
 # ============================================================================
-# All channel plugins (discord, telegram, slack) are
-# compiled as part of hunterclaw_core via glob(["channels/*.cc"]).
+# All channel plugins (discord, telegram, slack) are compiled as part of
+# hunterclaw_core via glob(["channels/*.cc"]).
 #
-# Each src/channels/xxx_channel.cc contains:
-#   1. make_xxx_plugin() — ChannelPlugin descriptor implementation
-#   2. Static registrar  — registers into ChannelPluginRegistry at startup
+# Architecture (对齐 OpenClaw):
+#   Each channel is a bundled plugin that provides a PluginDefinition.
+#   During startup, register_bundled_channel_plugins() loads each channel via
+#   PluginLoader::load_plugin_definition(), which calls register_func(api).
+#   The register_func calls api.register_channel(channel_id) — pushing into
+#   PluginRegistry.channels (bookkeeping) and ChannelPluginRegistry (runtime).
 #
-# No separate plugin registration files needed (plugins/channels/ removed).
-# This aligns with OpenClaw: src/channels/plugins/ is the canonical location.
+# OpenClaw equivalent:
+#   extensions/telegram/index.ts → { register(api) { api.registerChannel({ plugin }) } }
+#   extensions/slack/index.ts    → { register(api) { api.registerChannel({ plugin }) } }
+#   extensions/discord/index.ts  → { register(api) { api.registerChannel({ plugin }) } }
+#
+# Files:
+#   src/channels/bundled_channel_plugins.cc — entry point for loading all bundled channels
+#   src/channels/telegram_channel.cc — make_telegram_plugin_definition()
+#   src/channels/slack_channel.cc    — make_slack_plugin_definition()
+#   src/channels/discord_channel.cc  — make_discord_plugin_definition()

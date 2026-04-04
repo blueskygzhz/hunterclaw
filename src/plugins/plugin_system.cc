@@ -41,6 +41,7 @@ struct PluginRegistry::Impl {
   std::vector<PluginHttpRouteRegistration> http_routes;
   std::vector<PluginServiceRegistration> services;
   std::vector<PluginCommandRegistration> commands;
+  std::vector<PluginChannelRegistration> channels;  // 对齐 OpenClaw: registry.channels
   std::vector<PluginDiagnostic> diagnostics;
   mutable std::mutex mutex;
 };
@@ -93,6 +94,24 @@ void PluginRegistry::register_service(const PluginServiceRegistration& reg) {
 void PluginRegistry::register_command(const PluginCommandRegistration& reg) {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   impl_->commands.push_back(reg);
+}
+
+// 对齐 OpenClaw: registerChannel — 记录 channel 注册到 registry.channels
+void PluginRegistry::register_channel(const PluginChannelRegistration& reg) {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  // 检查重复注册 (对齐 OpenClaw: reject duplicate channel ids)
+  auto it = std::find_if(impl_->channels.begin(), impl_->channels.end(),
+                         [&](const PluginChannelRegistration& c) { return c.channel_id == reg.channel_id; });
+  if (it != impl_->channels.end()) {
+    PluginDiagnostic diag;
+    diag.level = PluginDiagnostic::Level::ERROR;
+    diag.plugin_id = reg.plugin_id;
+    diag.source = reg.source;
+    diag.message = "channel already registered: " + reg.channel_id + " (" + it->plugin_id + ")";
+    impl_->diagnostics.push_back(diag);
+    return;
+  }
+  impl_->channels.push_back(reg);
 }
 
 void PluginRegistry::add_diagnostic(const PluginDiagnostic& diag) {
@@ -154,6 +173,11 @@ std::vector<PluginCommandRegistration> PluginRegistry::list_commands() const {
   return impl_->commands;
 }
 
+std::vector<PluginChannelRegistration> PluginRegistry::list_channels() const {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  return impl_->channels;
+}
+
 std::vector<PluginDiagnostic> PluginRegistry::get_diagnostics() const {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   return impl_->diagnostics;
@@ -167,6 +191,7 @@ void PluginRegistry::clear() {
   impl_->http_routes.clear();
   impl_->services.clear();
   impl_->commands.clear();
+  impl_->channels.clear();
   impl_->diagnostics.clear();
 }
 
@@ -367,7 +392,7 @@ bool PluginLoader::load_plugin_definition(const PluginDefinition& def, PluginReg
   record.description = def.description;
   record.kind = def.kind;
   record.source = source;
-  record.origin = PluginOrigin::CONFIG;
+  record.origin = PluginOrigin::BUNDLED;
   record.enabled = true;
   record.status = PluginStatus::LOADED;
   
@@ -379,7 +404,77 @@ bool PluginLoader::load_plugin_definition(const PluginDefinition& def, PluginReg
   
   registry.register_plugin(record);
   
-  // \u2705 \u5bf9\u9f50 OpenClaw: \u8c03\u7528 register_func \u548c activate_func\n  // OpenClaw: plugin.register(context) \u7136\u540e plugin.activate(context)\n  if (def.register_func) {\n    try {\n      def.register_func(registry);\n    } catch (const std::exception& e) {\n      // register \u5931\u8d25\u4e0d\u963b\u6b62\u52a0\u8f7d\uff0c\u4f46\u8bb0\u5f55\u9519\u8bef\n      // \u5bf9\u9f50 OpenClaw: \u5982\u679c register \u629b\u51fa\u5f02\u5e38\uff0c\u8bb0\u5f55\u9519\u8bef\u4f46\u7ee7\u7eed\n    }\n  }\n  if (def.activate_func) {\n    try {\n      def.activate_func(registry);\n    } catch (const std::exception& e) {\n      // activate \u5931\u8d25\u4e0d\u963b\u6b62\u52a0\u8f7d\n    }\n  }
+  // ✅ 对齐 OpenClaw: 调用 register_func 和 activate_func
+  // OpenClaw: plugin.register(api) — api 提供 registerChannel/registerTool 等方法
+  // HunterClaw: create a lightweight PluginApi that delegates to registry
+  if (def.register_func || def.activate_func) {
+    // Create a simple PluginApi implementation that delegates to the registry
+    class BundledPluginApi : public PluginApi {
+    public:
+      PluginRegistry& registry_;
+      std::string plugin_id_;
+      std::string source_;
+      
+      BundledPluginApi(PluginRegistry& reg, const std::string& id, const std::string& src)
+          : registry_(reg), plugin_id_(id), source_(src) {
+        this->id = id;
+        this->name = id;
+        this->source = src;
+      }
+      
+      void register_tool(PluginToolFactory, const PluginToolOptions&) override {}
+      void register_hook(const std::vector<PluginHookName>&, PluginHookHandler, const PluginHookOptions&) override {}
+      void register_http_route(const PluginHttpRouteParams&) override {}
+      void register_gateway_method(const std::string&, std::function<void()>) override {}
+      void register_service(std::shared_ptr<PluginService>) override {}
+      void register_command(const PluginCommandDefinition&) override {}
+      void register_context_engine(const std::string&, std::function<void()>) override {}
+      std::string resolve_path(const std::string& input) const override { return input; }
+      void on(PluginHookName, PluginHookHandler, int) override {}
+      
+      // 对齐 OpenClaw: api.registerChannel({ plugin }) → registry.channels.push(...)
+      void register_channel(const std::string& channel_id) override {
+        PluginChannelRegistration reg;
+        reg.plugin_id = plugin_id_;
+        reg.channel_id = channel_id;
+        reg.source = source_;
+        registry_.register_channel(reg);
+        
+        // Also update the PluginRecord.channel_ids for bookkeeping
+        auto plugin_opt = registry_.get_plugin(plugin_id_);
+        if (plugin_opt.has_value()) {
+          auto updated = *plugin_opt;
+          updated.channel_ids.push_back(channel_id);
+          registry_.register_plugin(updated);  // re-register with updated channel_ids
+        }
+      }
+    };
+    
+    BundledPluginApi api(registry, record.id, source);
+    
+    if (def.register_func) {
+      try {
+        (*def.register_func)(api);
+      } catch (const std::exception& e) {
+        PluginDiagnostic diag;
+        diag.level = PluginDiagnostic::Level::ERROR;
+        diag.plugin_id = record.id;
+        diag.message = std::string("register_func failed: ") + e.what();
+        registry.add_diagnostic(diag);
+      }
+    }
+    if (def.activate_func) {
+      try {
+        (*def.activate_func)(api);
+      } catch (const std::exception& e) {
+        PluginDiagnostic diag;
+        diag.level = PluginDiagnostic::Level::ERROR;
+        diag.plugin_id = record.id;
+        diag.message = std::string("activate_func failed: ") + e.what();
+        registry.add_diagnostic(diag);
+      }
+    }
+  }
   
   return true;
 }

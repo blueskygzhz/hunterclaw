@@ -686,6 +686,7 @@ class PluginApi {
   virtual void register_service(std::shared_ptr<PluginService> service) = 0;
   virtual void register_command(const PluginCommandDefinition& command) = 0;
   virtual void register_context_engine(const std::string& id, std::function<void()> factory) = 0;
+  virtual void register_channel(const std::string& channel_id) = 0;  // 对齐 OpenClaw: api.registerChannel
   virtual std::string resolve_path(const std::string& input) const = 0;
 
   /** Register a lifecycle hook handler (typed, mirrors OpenClaw api.on()) */
@@ -752,6 +753,21 @@ struct PluginCommandRegistration {
 };
 
 // ============================================================================
+// Plugin Channel Registration (对齐 OpenClaw PluginChannelRegistration)
+// ============================================================================
+
+// Forward declaration — full ChannelPlugin type defined in channels/plugin.h
+// We store an opaque JSON descriptor here to avoid circular dependency.
+// The actual ChannelPlugin is registered via ChannelPluginRegistry at load time.
+struct PluginChannelRegistration {
+  std::string plugin_id;
+  std::string channel_id;
+  std::string source;
+  // Note: The actual ChannelPlugin descriptor is stored in ChannelPluginRegistry.
+  // This record tracks which plugin registered which channel for bookkeeping.
+};
+
+// ============================================================================
 // Plugin Record
 // ============================================================================
 
@@ -801,6 +817,7 @@ class PluginRegistry {
   void register_http_route(const PluginHttpRouteRegistration& reg);
   void register_service(const PluginServiceRegistration& reg);
   void register_command(const PluginCommandRegistration& reg);
+  void register_channel(const PluginChannelRegistration& reg);  // 对齐 OpenClaw: registry.channels
   void add_diagnostic(const PluginDiagnostic& diag);
 
   // Query methods
@@ -812,6 +829,7 @@ class PluginRegistry {
   std::vector<PluginHttpRouteRegistration> list_http_routes() const;
   std::vector<PluginServiceRegistration> list_services() const;
   std::vector<PluginCommandRegistration> list_commands() const;
+  std::vector<PluginChannelRegistration> list_channels() const;  // 对齐 OpenClaw
   std::vector<PluginDiagnostic> get_diagnostics() const;
 
   // Clear

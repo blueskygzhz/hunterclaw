@@ -1,4 +1,5 @@
 #include "hunterclaw/channels/plugin.h"
+#include "hunterclaw/plugins/plugin_system.h"   // PluginDefinition for channel-as-plugin registration
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -1228,17 +1229,27 @@ ChannelPlugin make_slack_plugin() {
     return p;
 }
 
-// Static registration
+// Static registration — no longer uses C++ static initializer.
 static const ChannelPlugin SLACK_PLUGIN = make_slack_plugin();
 
 } // namespace
 
-// Register on library load
-static struct SlackPluginRegistrar {
-    SlackPluginRegistrar() {
+// ============================================================================
+// Slack PluginDefinition (对齐 OpenClaw extensions/slack/index.ts)
+// ============================================================================
+
+plugins::PluginDefinition make_slack_plugin_definition() {
+    plugins::PluginDefinition def;
+    def.id = "slack";
+    def.name = "Slack";
+    def.description = "Slack channel plugin";
+    def.register_func = [](plugins::PluginApi& api) {
+        // 对齐 OpenClaw: api.registerChannel({ plugin: slackPlugin })
         ChannelPluginRegistry::instance().register_plugin(SLACK_PLUGIN, 0);
-    }
-} _slack_registrar;
+        api.register_channel("slack");
+    };
+    return def;
+}
 
 } // namespace channels
 } // namespace hunterclaw
