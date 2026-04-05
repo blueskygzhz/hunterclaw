@@ -5,7 +5,8 @@
 #include "hunterclaw/tools/tool_manager.h"  // Full definition of ToolManager
 #include "hunterclaw/llm/llm_client.h"
 #include "hunterclaw/llm/provider.h"  // For Response, ToolCall, Usage
-#include "hunterclaw/memory/compaction_manager.h"  // ✅ 新增: Compaction 支持
+#include "hunterclaw/memory/compaction_manager.h"  // ✅ Compaction 支持
+#include "hunterclaw/context/context_engine.h"    // ✅ Context Engine 支持
 #include <string>
 #include <vector>
 #include <memory>
@@ -442,6 +443,9 @@ private:
     // ✅ 新增: CompactionManager 集成 (对齐 OpenClaw)
     std::shared_ptr<memory::CompactionManager> compaction_mgr_;
     
+    // ✅ 新增: ContextEngine 集成 (对齐 OpenClaw run.ts:contextEngine)
+    std::shared_ptr<context::ContextEngine> context_engine_;
+    
     // ✅ 新增: Context Window 配置 (对齐 OpenClaw)
     struct ContextWindowConfig {
         int context_window_tokens = 200000;
@@ -454,6 +458,17 @@ public:
     // ✅ 新增: 设置 CompactionManager (从 AgentInstance 调用)
     void set_compaction_manager(std::shared_ptr<memory::CompactionManager> mgr) {
         compaction_mgr_ = mgr;
+    }
+    
+    // ✅ 新增: 设置 ContextEngine (对齐 OpenClaw run.ts:contextEngine)
+    // 在 run 开始前设置，由 message_dispatcher 或 agent instance 注入
+    void set_context_engine(std::shared_ptr<context::ContextEngine> engine) {
+        context_engine_ = std::move(engine);
+    }
+    
+    // 获取 ContextEngine (用于外部访问)
+    std::shared_ptr<context::ContextEngine> get_context_engine() const {
+        return context_engine_;
     }
     
     // ✅ 新增: 配置 Context Window (对齐 OpenClaw)

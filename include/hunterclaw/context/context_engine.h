@@ -6,6 +6,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <nlohmann/json.hpp>
 
 namespace hunterclaw {
 namespace context {
@@ -97,8 +98,9 @@ enum class SubagentEndReason {
 /**
  * Runtime context for context engine operations.
  * Opaque key-value map for engine-specific state.
+ * Aligned with OpenClaw: ContextEngineRuntimeContext = Record<string, unknown>
  */
-using ContextEngineRuntimeContext = std::unordered_map<std::string, std::string>;
+using ContextEngineRuntimeContext = nlohmann::json;
 
 // ============================================================================
 // ContextEngine Interface

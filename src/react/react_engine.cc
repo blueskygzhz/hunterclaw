@@ -181,8 +181,50 @@ ReactResult ReactEngine::run(
         callbacks.on_start();
     }
     
+    // ✅ ContextEngine: bootstrap (对齐 OpenClaw attempt.ts:1737-1745)
+    // 在 session 文件存在时初始化引擎状态
+    if (context_engine_) {
+        try {
+            if (!callbacks.transcript_path.empty()) {
+                auto bootstrap_result = context_engine_->bootstrap(
+                    callbacks.session_id, callbacks.transcript_path);
+                if (bootstrap_result.bootstrapped) {
+                    log()->info("[ContextEngine] bootstrap completed: imported {} messages",
+                        bootstrap_result.imported_messages.value_or(0));
+                }
+            }
+        } catch (const std::exception& e) {
+            log()->warn("[ContextEngine] bootstrap failed: {}", e.what());
+        }
+    }
+    
     try {
         auto result = execute_loop(user_input, history, callbacks);
+        
+        // ✅ ContextEngine: afterTurn (对齐 OpenClaw attempt.ts:2608-2660)
+        if (context_engine_) {
+            try {
+                // 构建消息 JSON 列表
+                std::vector<std::string> messages_json;
+                // afterTurn 需要的 pre_prompt_message_count
+                int pre_prompt_count = static_cast<int>(history.size());
+                
+                context_engine_->after_turn(
+                    callbacks.session_id,
+                    callbacks.transcript_path,
+                    messages_json,
+                    pre_prompt_count,
+                    std::nullopt,  // auto_compaction_summary
+                    false,         // is_heartbeat
+                    context_window_config_.context_window_tokens,  // token_budget
+                    nlohmann::json::object()  // runtime_context
+                );
+            } catch (const std::exception& e) {
+                log()->warn("[ContextEngine] afterTurn failed: {}", e.what());
+                // 对齐 OpenClaw: afterTurn 失败时降级到 ingestBatch/ingest
+                // (simplified — 完整实现需要逐条 ingest 新消息)
+            }
+        }
         
         // ✅ Span 成功标记
         if (span) {
@@ -198,6 +240,11 @@ ReactResult ReactEngine::run(
             callbacks.on_end();
         }
         
+        // ✅ ContextEngine: dispose (对齐 OpenClaw run.ts:1601)
+        if (context_engine_) {
+            try { context_engine_->dispose(); } catch (...) {}
+        }
+        
         running_ = false;  // ✅ Mark engine as stopped (disables steer)
         return result;
     } catch (const std::exception& e) {
@@ -210,6 +257,11 @@ ReactResult ReactEngine::run(
         // 生命周期: error
         if (callbacks.on_error) {
             callbacks.on_error(e.what());
+        }
+        
+        // ✅ ContextEngine: dispose on error path
+        if (context_engine_) {
+            try { context_engine_->dispose(); } catch (...) {}
         }
         
         running_ = false;  // ✅ Mark engine as stopped (disables steer)
@@ -378,6 +430,46 @@ ReactResult ReactEngine::execute_loop(
     user_msg.role = llm::LLMMessageRole::User;
     user_msg.content = user_input;
     messages.push_back(user_msg);
+
+    // ✅ ContextEngine: assemble (对齐 OpenClaw attempt.ts:2094-2102)
+    // 让 context engine 在 token 预算内组装上下文
+    if (context_engine_) {
+        try {
+            // 将 LLMMessage 序列化为 JSON 字符串列表
+            std::vector<std::string> messages_json;
+            for (const auto& msg : messages) {
+                nlohmann::json j;
+                j["role"] = [&]() {
+                    switch (msg.role) {
+                        case llm::LLMMessageRole::User: return "user";
+                        case llm::LLMMessageRole::Assistant: return "assistant";
+                        case llm::LLMMessageRole::System: return "system";
+                        case llm::LLMMessageRole::Tool: return "toolResult";
+                        default: return "unknown";
+                    }
+                }();
+                j["content"] = msg.content;
+                messages_json.push_back(j.dump());
+            }
+            
+            auto assembled = context_engine_->assemble(
+                callbacks.session_id,
+                messages_json,
+                context_window_config_.context_window_tokens
+            );
+            
+            // 如果 assemble 返回了 system_prompt_addition，注入到 hook 结果
+            if (assembled.system_prompt_addition) {
+                if (!hook_prepend_system_context) {
+                    hook_prepend_system_context = *assembled.system_prompt_addition;
+                } else {
+                    hook_prepend_system_context = *hook_prepend_system_context + "\n" + *assembled.system_prompt_addition;
+                }
+            }
+        } catch (const std::exception& e) {
+            log()->warn("[ContextEngine] assemble failed: {}", e.what());
+        }
+    }
 
     // 🎯 对齐 OpenClaw: handleAgentStart — emit lifecycle start event
     if (callbacks.on_start) {

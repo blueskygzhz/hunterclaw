@@ -1232,33 +1232,55 @@ MessageDispatcher::DispatchResult MessageDispatcher::run_reply_agent(
         log()->debug("run_reply_agent: session={} is active → enqueue-followup mode={}",
                      session_key, (int)qs.mode);
 
-        std::lock_guard<std::mutex> lock(session_state_mutex_);
-        auto& queue = followup_queues_[session_key];
+        bool need_drain = false;
+        {
+            std::lock_guard<std::mutex> lock(session_state_mutex_);
+            auto& queue = followup_queues_[session_key];
 
-        // Apply runtime settings (aligned with openclaw: applyQueueRuntimeSettings)
-        queue.mode        = qs.mode;
-        queue.debounce_ms = qs.debounce_ms;
-        queue.cap         = qs.cap;
-        queue.drop_policy = qs.drop_policy;
+            // Apply runtime settings (aligned with openclaw: applyQueueRuntimeSettings)
+            queue.mode        = qs.mode;
+            queue.debounce_ms = qs.debounce_ms;
+            queue.cap         = qs.cap;
+            queue.drop_policy = qs.drop_policy;
 
-        // Apply drop policy (aligned with openclaw: applyQueueDropPolicy)
-        const bool should_enqueue = apply_queue_drop_policy(queue, params.summary_line);
-        if (!should_enqueue) {
-            log()->debug("run_reply_agent: session={} item dropped by policy=new", session_key);
-            DispatchResult drop_result;
-            drop_result.success = true;
-            return drop_result;
+            // Apply drop policy (aligned with openclaw: applyQueueDropPolicy)
+            const bool should_enqueue = apply_queue_drop_policy(queue, params.summary_line);
+            if (!should_enqueue) {
+                log()->debug("run_reply_agent: session={} item dropped by policy=new", session_key);
+                DispatchResult drop_result;
+                drop_result.success = true;
+                return drop_result;
+            }
+
+            FollowupTask task;
+            task.run_fn       = params.run_fn;
+            task.label        = params.label;
+            task.prompt       = params.prompt;
+            task.summary_line = params.summary_line;
+            task.enqueued_at_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            queue.items.push_back(std::move(task));
+            queue.last_enqueued_at_ms = task.enqueued_at_ms;
+
+            // ── Race condition fix ───────────────────────────────────────
+            // Between our is_active check (line ~1128) and this push, the
+            // running thread may have already completed and called
+            // drain_followup_queue() which found the queue empty and returned.
+            // If the session is no longer active AND drain is not running,
+            // we must trigger drain ourselves.
+            //
+            // OpenClaw (single-threaded JS) doesn't have this race because
+            // the is_active check → enqueue → scheduleFollowupDrain sequence
+            // is non-preemptable within a single microtask.
+            if (active_sessions_.count(session_key) == 0 && !queue.draining) {
+                need_drain = true;
+            }
         }
 
-        FollowupTask task;
-        task.run_fn       = params.run_fn;
-        task.label        = params.label;
-        task.prompt       = params.prompt;
-        task.summary_line = params.summary_line;
-        task.enqueued_at_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        queue.items.push_back(std::move(task));
-        queue.last_enqueued_at_ms = task.enqueued_at_ms;
+        if (need_drain) {
+            log()->debug("run_reply_agent: session={} enqueued but session already idle → triggering drain", session_key);
+            drain_followup_queue(session_key);
+        }
 
         DispatchResult queued_result;
         queued_result.success = true;
