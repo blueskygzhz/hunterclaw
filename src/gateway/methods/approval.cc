@@ -610,11 +610,21 @@ core::Result<json> method_exec_approval_resolve(
         );
     }
 
-    // 对齐 OpenClaw: allow-always → 添加到白名单
+    // 对齐 OpenClaw: allow-always → 使用 resolveAllowAlwaysPatterns 添加到白名单
+    // OpenClaw bash-tools.exec-host-gateway.ts:226-239
+    // 当 shell wrapper 时，持久化内层可执行文件路径而非 shell 二进制本身
     if (decision == "allow-always" && snapshot.has_value()) {
         const auto& req = snapshot.value().request;
         std::string agent_id = req.agent_id.value_or("main");
-        std::string pattern = req.command;  // 使用 command 作为 pattern
+        
+        // 对齐 OpenClaw resolveAllowAlwaysPatterns()
+        // 提取白名单 pattern：优先使用 resolvedPath（精确路径），否则使用 command
+        std::vector<std::string> patterns;
+        if (req.resolved_path.has_value() && !req.resolved_path.value().empty()) {
+            patterns.push_back(req.resolved_path.value());
+        } else {
+            patterns.push_back(req.command);
+        }
 
         // 读取当前 approvals 文件
         auto snap = read_exec_approvals_snapshot();
@@ -634,26 +644,35 @@ core::Result<json> method_exec_approval_resolve(
         }
         auto& allowlist = agent["allowlist"];
 
-        // 检查是否已存在
-        bool already_exists = false;
-        for (const auto& entry : allowlist) {
-            if (entry.is_object() && entry.contains("pattern") &&
-                entry["pattern"].is_string() &&
-                entry["pattern"].get<std::string>() == pattern) {
-                already_exists = true;
-                break;
+        bool changed = false;
+        for (const auto& pattern : patterns) {
+            if (pattern.empty()) continue;
+            
+            // 对齐 OpenClaw addAllowlistEntry(): 检查 pattern 重复
+            bool already_exists = false;
+            for (const auto& entry : allowlist) {
+                if (entry.is_object() && entry.contains("pattern") &&
+                    entry["pattern"].is_string() &&
+                    entry["pattern"].get<std::string>() == pattern) {
+                    already_exists = true;
+                    break;
+                }
+            }
+
+            if (!already_exists) {
+                json new_entry;
+                new_entry["pattern"] = pattern;
+                new_entry["lastUsedAt"] = now_ms();
+                new_entry["lastUsedCommand"] = req.command;
+                if (req.resolved_path.has_value()) {
+                    new_entry["lastResolvedPath"] = req.resolved_path.value();
+                }
+                allowlist.push_back(new_entry);
+                changed = true;
             }
         }
-
-        if (!already_exists && !pattern.empty()) {
-            json new_entry;
-            new_entry["pattern"] = pattern;
-            new_entry["lastUsedAt"] = now_ms();
-            new_entry["lastUsedCommand"] = req.command;
-            if (req.resolved_path.has_value()) {
-                new_entry["lastResolvedPath"] = req.resolved_path.value();
-            }
-            allowlist.push_back(new_entry);
+        
+        if (changed) {
             save_exec_approvals(file);
         }
     }

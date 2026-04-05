@@ -60,7 +60,7 @@ struct AllowlistEntry {
 struct AgentApprovalConfig {
     ExecSecurity security = ExecSecurity::ALLOWLIST;
     ExecAsk ask = ExecAsk::ON_MISS;
-    ExecAsk ask_fallback = ExecAsk::OFF;    // UI 不可用时降级策略
+    ExecSecurity ask_fallback = ExecSecurity::DENY;  // 对齐 OpenClaw: askFallback 类型为 ExecSecurity, 默认 "deny"
     bool auto_allow_skills = false;          // 自动允许技能 CLI
     std::vector<AllowlistEntry> allowlist;
 };
@@ -193,11 +193,21 @@ public:
     // ===== 策略评估 =====
     
     /// 评估是否需要审批
+    /// 对齐 OpenClaw requiresExecApproval({ ask, security, analysisOk, allowlistSatisfied })
     bool requires_approval(
         const std::string& agent_id,
         const std::string& command,
         const AgentApprovalConfig& config
     ) const;
+    
+    /// 严格对齐 OpenClaw requiresExecApproval() 的静态版本
+    /// 用于 gateway/exec 工具层直接调用
+    static bool requires_exec_approval(
+        ExecAsk ask,
+        ExecSecurity security,
+        bool analysis_ok,
+        bool allowlist_satisfied
+    );
     
     /// 自动决策（根据配置和白名单）
     core::Result<ApprovalDecision> auto_decide(
@@ -258,6 +268,36 @@ bool is_sensitive_command(const std::string& command);
 
 /// 检查是否为 shell 包装器
 bool is_shell_wrapper(const std::vector<std::string>& argv);
+
+// ============================================================================
+// Policy Merge Functions (对齐 OpenClaw exec-approvals.ts)
+// ============================================================================
+
+/// 取更严格的安全策略 (deny < allowlist < full)
+/// 对齐 OpenClaw: minSecurity(a, b)
+ExecSecurity min_security(ExecSecurity a, ExecSecurity b);
+
+/// 取更严格的询问策略 (off < on-miss < always)
+/// 对齐 OpenClaw: maxAsk(a, b)
+ExecAsk max_ask(ExecAsk a, ExecAsk b);
+
+// ============================================================================
+// Approval Decision Resolution (对齐 OpenClaw bash-tools.exec-host-shared.ts)
+// ============================================================================
+
+/// 解析基础审批决策结果
+/// 对齐 OpenClaw: resolveBaseExecApprovalDecision()
+struct BaseApprovalDecisionResult {
+    bool approved_by_ask = false;
+    std::string denied_reason;     // 空字符串 = 未拒绝
+    bool timed_out = false;
+};
+
+BaseApprovalDecisionResult resolve_base_exec_approval_decision(
+    const std::string& decision,          // "allow-once" / "allow-always" / "deny" / ""(null)
+    ExecSecurity ask_fallback,
+    bool obfuscation_detected
+);
 
 }  // namespace tools
 }  // namespace hunterclaw

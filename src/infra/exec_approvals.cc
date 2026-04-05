@@ -362,4 +362,32 @@ std::string ExecHostToString(ExecHost host) {
   return "gateway";
 }
 
+// ============================================================================
+// Policy Merge Functions (对齐 OpenClaw exec-approvals.ts:547-554)
+// ============================================================================
+
+ExecSecurity MinSecurity(ExecSecurity a, ExecSecurity b) {
+  // order: deny=0, allowlist=1, full=2
+  static constexpr int order[] = {0, 1, 2};
+  return order[static_cast<int>(a)] <= order[static_cast<int>(b)] ? a : b;
+}
+
+ExecAsk MaxAsk(ExecAsk a, ExecAsk b) {
+  // order: off=0, on-miss=1, always=2
+  static constexpr int order[] = {0, 1, 2};
+  return order[static_cast<int>(a)] >= order[static_cast<int>(b)] ? a : b;
+}
+
+// 对齐 OpenClaw: requiresExecApproval({ ask, security, analysisOk, allowlistSatisfied })
+// exec-approvals.ts:484-496
+bool RequiresExecApproval(ExecAsk ask, ExecSecurity security,
+                          bool analysis_ok, bool allowlist_satisfied) {
+  return (
+    ask == ExecAsk::kAlways ||
+    (ask == ExecAsk::kOnMiss &&
+     security == ExecSecurity::kAllowlist &&
+     (!analysis_ok || !allowlist_satisfied))
+  );
+}
+
 }  // namespace hunterclaw::infra

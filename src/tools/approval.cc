@@ -52,7 +52,7 @@ core::Result<void> ApprovalManager::load_config() {
         config_.version = 1;
         config_.defaults.security = ExecSecurity::ALLOWLIST;
         config_.defaults.ask = ExecAsk::ON_MISS;
-        config_.defaults.ask_fallback = ExecAsk::OFF;
+        config_.defaults.ask_fallback = ExecSecurity::DENY;  // 对齐 OpenClaw DEFAULT_ASK_FALLBACK = "deny"
         config_.defaults.auto_allow_skills = false;
         
         save_config();
@@ -85,6 +85,14 @@ core::Result<void> ApprovalManager::load_config() {
             if (ask_str == "off") config_.defaults.ask = ExecAsk::OFF;
             else if (ask_str == "on-miss") config_.defaults.ask = ExecAsk::ON_MISS;
             else if (ask_str == "always") config_.defaults.ask = ExecAsk::ALWAYS;
+            
+            // 对齐 OpenClaw: askFallback (ExecSecurity 类型)
+            if (defaults.contains("askFallback") && defaults["askFallback"].is_string()) {
+                auto fallback_str = defaults["askFallback"].get<std::string>();
+                if (fallback_str == "deny") config_.defaults.ask_fallback = ExecSecurity::DENY;
+                else if (fallback_str == "allowlist") config_.defaults.ask_fallback = ExecSecurity::ALLOWLIST;
+                else if (fallback_str == "full") config_.defaults.ask_fallback = ExecSecurity::FULL;
+            }
             
             if (defaults.contains("autoAllowSkills")) {
                 config_.defaults.auto_allow_skills = defaults["autoAllowSkills"].get<bool>();
@@ -148,6 +156,9 @@ core::Result<void> ApprovalManager::save_config() {
                             config_.defaults.security == ExecSecurity::ALLOWLIST ? "allowlist" : "full");
     defaults["ask"] = (config_.defaults.ask == ExecAsk::OFF ? "off" :
                        config_.defaults.ask == ExecAsk::ON_MISS ? "on-miss" : "always");
+    // 对齐 OpenClaw: askFallback (ExecSecurity 类型)
+    defaults["askFallback"] = (config_.defaults.ask_fallback == ExecSecurity::DENY ? "deny" :
+                                config_.defaults.ask_fallback == ExecSecurity::ALLOWLIST ? "allowlist" : "full");
     defaults["autoAllowSkills"] = config_.defaults.auto_allow_skills;
     json["defaults"] = defaults;
     
@@ -364,16 +375,57 @@ core::Result<void> ApprovalManager::resolve_approval(
     response.resolved_at_ms = core::utils::current_timestamp_ms();
     
     // 如果是 ALLOW_ALWAYS，添加到白名单
+    // 对齐 OpenClaw: resolveAllowAlwaysPatterns() — 提取内层可执行文件路径
     if (decision == ApprovalDecision::ALLOW_ALWAYS) {
         const auto& request = req_it->second;
-        AllowlistEntry entry;
-        entry.id = core::utils::generate_uuid();
-        entry.pattern = request.command;  // 简单使用完整命令作为模式
-        entry.created_at_ms = core::utils::current_timestamp_ms();
-        entry.created_by = resolved_by;
+        
+        // 生成白名单模式 (对齐 OpenClaw: 当 shell wrapper 时持久化内层命令)
+        std::vector<std::string> patterns;
+        if (is_shell_wrapper(request.command_argv) && request.command_argv.size() >= 3) {
+            // Shell wrapper (e.g., "zsh -lc cmd"): 提取内层命令的可执行文件
+            // 对齐 OpenClaw resolveAllowAlwaysPatterns(): persist inner executable
+            for (size_t i = 0; i < request.command_argv.size(); ++i) {
+                if (request.command_argv[i] == "-c" && i + 1 < request.command_argv.size()) {
+                    // 使用 -c 后面的命令作为 pattern 来源
+                    // 简化版：取内层命令的第一个 token
+                    const std::string& inner = request.command_argv[i + 1];
+                    auto space_pos = inner.find(' ');
+                    if (space_pos != std::string::npos) {
+                        patterns.push_back(inner.substr(0, space_pos));
+                    } else {
+                        patterns.push_back(inner);
+                    }
+                    break;
+                }
+            }
+        }
+        
+        // 如果未提取到内层命令，使用 argv[0] 或完整命令
+        if (patterns.empty()) {
+            if (!request.command_argv.empty()) {
+                patterns.push_back(request.command_argv[0]);
+            } else {
+                patterns.push_back(request.command);
+            }
+        }
         
         auto& agent_cfg = config_.agents[request.agent_id];
-        agent_cfg.allowlist.push_back(entry);
+        for (const auto& pattern : patterns) {
+            if (pattern.empty()) continue;
+            // 检查是否已存在相同 pattern
+            bool exists = false;
+            for (const auto& e : agent_cfg.allowlist) {
+                if (e.pattern == pattern) { exists = true; break; }
+            }
+            if (!exists) {
+                AllowlistEntry entry;
+                entry.id = core::utils::generate_uuid();
+                entry.pattern = pattern;
+                entry.created_at_ms = core::utils::current_timestamp_ms();
+                entry.created_by = resolved_by;
+                agent_cfg.allowlist.push_back(entry);
+            }
+        }
         save_config();
     }
     
@@ -466,6 +518,22 @@ bool ApprovalManager::requires_approval(
     }
     
     return false;
+}
+
+// 严格对齐 OpenClaw requiresExecApproval({ ask, security, analysisOk, allowlistSatisfied })
+// exec-approvals.ts:484-496
+bool ApprovalManager::requires_exec_approval(
+    ExecAsk ask,
+    ExecSecurity security,
+    bool analysis_ok,
+    bool allowlist_satisfied) {
+    
+    return (
+        ask == ExecAsk::ALWAYS ||
+        (ask == ExecAsk::ON_MISS &&
+         security == ExecSecurity::ALLOWLIST &&
+         (!analysis_ok || !allowlist_satisfied))
+    );
 }
 
 core::Result<ApprovalDecision> ApprovalManager::auto_decide(
@@ -642,6 +710,69 @@ bool is_shell_wrapper(const std::vector<std::string>& argv) {
     }
     
     return false;
+}
+
+// ============================================================================
+// Policy Merge Functions (对齐 OpenClaw exec-approvals.ts:547-554)
+// ============================================================================
+
+ExecSecurity min_security(ExecSecurity a, ExecSecurity b) {
+    // 对齐 OpenClaw: const order: Record<ExecSecurity, number> = { deny: 0, allowlist: 1, full: 2 };
+    // return order[a] <= order[b] ? a : b;
+    static constexpr int order[] = { 0, 1, 2 };  // DENY=0, ALLOWLIST=1, FULL=2
+    return order[static_cast<int>(a)] <= order[static_cast<int>(b)] ? a : b;
+}
+
+ExecAsk max_ask(ExecAsk a, ExecAsk b) {
+    // 对齐 OpenClaw: const order: Record<ExecAsk, number> = { off: 0, "on-miss": 1, always: 2 };
+    // return order[a] >= order[b] ? a : b;
+    static constexpr int order[] = { 0, 1, 2 };  // OFF=0, ON_MISS=1, ALWAYS=2
+    return order[static_cast<int>(a)] >= order[static_cast<int>(b)] ? a : b;
+}
+
+// ============================================================================
+// Approval Decision Resolution
+// 对齐 OpenClaw bash-tools.exec-host-shared.ts:141-170
+// ============================================================================
+
+BaseApprovalDecisionResult resolve_base_exec_approval_decision(
+    const std::string& decision,
+    ExecSecurity ask_fallback,
+    bool obfuscation_detected) {
+    
+    BaseApprovalDecisionResult result;
+    
+    if (decision == "deny") {
+        result.denied_reason = "user-denied";
+        return result;
+    }
+    
+    if (decision.empty()) {
+        // No decision (null/timeout)
+        result.timed_out = true;
+        
+        if (obfuscation_detected) {
+            result.denied_reason = "approval-timeout (obfuscation-detected)";
+            return result;
+        }
+        
+        if (ask_fallback == ExecSecurity::FULL) {
+            result.approved_by_ask = true;
+            return result;
+        }
+        
+        if (ask_fallback == ExecSecurity::DENY) {
+            result.denied_reason = "approval-timeout";
+            return result;
+        }
+        
+        // ask_fallback == ALLOWLIST → timedOut=true, deniedReason="" (caller handles)
+        return result;
+    }
+    
+    // decision is present but not "deny" and not empty
+    // (could be "allow-once" or "allow-always" — handled by caller)
+    return result;
 }
 
 }  // namespace tools

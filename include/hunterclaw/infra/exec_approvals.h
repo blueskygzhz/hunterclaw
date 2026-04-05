@@ -166,6 +166,22 @@ std::string ExecSecurityToString(ExecSecurity security);
 std::string ExecAskToString(ExecAsk ask);
 std::string ExecHostToString(ExecHost host);
 
+// ============================================================================
+// Policy Merge Functions (对齐 OpenClaw exec-approvals.ts:547-554)
+// ============================================================================
+
+// 取更严格的安全策略 (deny < allowlist < full)
+// 对齐 OpenClaw: minSecurity(a, b)
+ExecSecurity MinSecurity(ExecSecurity a, ExecSecurity b);
+
+// 取更严格的询问策略 (off < on-miss < always)
+// 对齐 OpenClaw: maxAsk(a, b)
+ExecAsk MaxAsk(ExecAsk a, ExecAsk b);
+
+// 对齐 OpenClaw: requiresExecApproval({ ask, security, analysisOk, allowlistSatisfied })
+bool RequiresExecApproval(ExecAsk ask, ExecSecurity security,
+                          bool analysis_ok, bool allowlist_satisfied);
+
 }  // namespace hunterclaw::infra
 
 #endif  // HUNTERCLAW_INFRA_EXEC_APPROVALS_H_
