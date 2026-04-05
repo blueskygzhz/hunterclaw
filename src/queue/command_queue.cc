@@ -104,15 +104,12 @@ public:
         }
 
         // 入队
+        // ✅ 对齐 OpenClaw: enqueueCommandInLane 只检查 gatewayDraining，
+        // 不检查 lane 级别的 cleared 标志。clear 后仍可正常 enqueue。
         {
             std::lock_guard<std::mutex> lock(mutex_);
 
             auto& state = lanes_[lane];
-
-            // 检查通道是否被清除
-            if (state.cleared) {
-                throw CommandLaneClearedError(lane);
-            }
 
             TaskWrapper wrapper;
             wrapper.task = std::move(task);
@@ -167,27 +164,49 @@ public:
         dynamic_cv_.notify_all();
     }
     
-    void ClearLane(CommandLane lane) {
+    // ✅ 严格对齐 OpenClaw: clearCommandLane (command-queue.ts:223-235)
+    // OpenClaw 实现:
+    //   const pending = state.queue.splice(0);
+    //   for (const entry of pending) { entry.reject(new CommandLaneClearedError(cleaned)); }
+    //   return removed;
+    //
+    // 关键: clearCommandLane **不设置任何标志**，不阻止后续 enqueue。
+    // 它只是清空队列中等待执行的任务。interrupt 模式依赖此行为:
+    //   1. clearCommandLane(sessionLane)  ← 清空 pending
+    //   2. abortEmbeddedPiRun(sessionId)  ← 取消 active
+    //   3. enqueueCommandInLane(sessionLane, newTask)  ← 新任务入队（必须成功！）
+    //
+    // 如果 clear 设置 cleared=true，步骤 3 会 throw CommandLaneClearedError，
+    // 导致 interrupt 后新 run 无法入队，这是错误行为。
+    int ClearLane(CommandLane lane) {
         std::lock_guard<std::mutex> lock(mutex_);
         auto& state = lanes_[lane];
         
-        // 清空队列
+        int removed = 0;
         while (!state.queue.empty()) {
             state.queue.pop();
+            removed++;
         }
         
-        state.cleared = true;
+        // ✅ 对齐 OpenClaw: 不设置 cleared 标志，不阻止后续 enqueue
+        // state.cleared = true;  ← 删除！OpenClaw 没有此行为
+        return removed;
     }
 
-    void ClearDynamicLane(const std::string& lane_name) {
+    int ClearDynamicLane(const std::string& lane_name) {
         std::lock_guard<std::mutex> lock(dynamic_mutex_);
         auto it = dynamic_lanes_.find(lane_name);
-        if (it != dynamic_lanes_.end()) {
-            while (!it->second.queue.empty()) {
-                it->second.queue.pop();
-            }
-            it->second.cleared = true;
+        if (it == dynamic_lanes_.end()) {
+            return 0;
         }
+        int removed = 0;
+        while (!it->second.queue.empty()) {
+            it->second.queue.pop();
+            removed++;
+        }
+        // ✅ 对齐 OpenClaw: 不设置 cleared 标志
+        // it->second.cleared = true;  ← 删除！
+        return removed;
     }
     
     void ResetAllLanes() {
