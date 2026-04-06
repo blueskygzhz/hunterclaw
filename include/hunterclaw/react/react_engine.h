@@ -133,6 +133,14 @@ struct StreamCallbacks {
     // 🎯 OpenClaw 对齐: transcript 路径 (用于 tool_result_persist hook)
     // 如果非空，工具结果将通过 append_tool_result_to_transcript 写入
     std::string transcript_path;
+
+    // 🎯 OpenClaw 对齐: abortSignal (chat.send 传入的 per-run abort 信号)
+    // OpenClaw: dispatchInboundMessage({ replyOptions: { abortSignal: abortController.signal } })
+    // 当 chat.abort 被调用时，abort_signal->load() 变为 true。
+    // execute_loop 在每步循环开始时检查此信号（除了 ReactEngine::cancelled_ 以外），
+    // 使得 per-run-id 的精确 abort 能直接中断该 run 的执行，
+    // 而不需要通过 session-level 的 abort_embedded_session。
+    std::shared_ptr<std::atomic<bool>> abort_signal;
 };
 
 // ReAct 配置

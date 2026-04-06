@@ -491,6 +491,13 @@ ReactResult ReactEngine::execute_loop(
     std::vector<std::string> assistant_texts;
     
     while (step_count < config_.max_steps && !cancelled_) {
+        // ✅ 对齐 OpenClaw: 检查 per-run abort signal (abortController.signal.aborted)
+        // cancelled_ 是 session 级别的 abort (来自 abort_embedded_session → engine->cancel())
+        // abort_signal 是 run 级别的 abort (来自 chat.abort({runId}) → abort_flag->store(true))
+        if (callbacks.abort_signal && callbacks.abort_signal->load()) {
+            cancelled_ = true;
+            break;
+        }
         // ✅ 新增: Token Overflow 检查 (对齐 OpenClaw)
         if (compaction_mgr_) {
             int current_tokens = estimate_conversation_tokens(messages);

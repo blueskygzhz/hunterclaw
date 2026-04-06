@@ -340,6 +340,9 @@ core::Result<json> method_chat_send(
     react::StreamCallbacks callbacks;
     callbacks.session_id = session_id;
     callbacks.transcript_path = transcript_path;  // 用于 tool_result_persist hook
+    // ✅ 对齐 OpenClaw: replyOptions.abortSignal = abortController.signal
+    // 将 per-run abort flag 传入 ReactEngine，使 execute_loop 能检查 per-run abort
+    callbacks.abort_signal = abort_flag;
     
     // 助手输出流 (chat.delta)
     callbacks.on_assistant_delta = [server, session_id, run_id](const std::string& delta) {
@@ -565,12 +568,13 @@ core::Result<json> method_chat_send(
     };
 
     // ✅ 解析 queue settings (对齐 OpenClaw: resolveQueueSettings)
-    // 从 session entry 读取 queue_mode/debounce_ms/cap/drop
-    // 默认 mode = collect (对齐 OpenClaw: defaultQueueModeForChannel → "collect")
+    // chat.send 路径通过 msg_dispatcher->resolve_queue_settings() 获取完整 5 层优先级
+    // session entry 可选——未加载时走 byChannel > global config > default 三层
+    // chat.send 的 channel 是 "webchat" (对齐 OpenClaw: webchat 路径)
     auto_reply::QueueSettings queue_settings;
-    // TODO: load session entry and pass to resolve_queue_settings
-    // For now, use defaults (collect mode, debounce=1000ms, cap=20)
-    // Aligned with openclaw: resolveQueueSettings defaults
+    if (msg_dispatcher) {
+        queue_settings = msg_dispatcher->resolve_queue_settings(std::nullopt, "webchat");
+    }
 
     // ✅ 通过 run_reply_agent 调度 (对齐 OpenClaw: runReplyAgent)
     // 决策: run-now (session 空闲) 或 enqueue-followup (session 忙碌)

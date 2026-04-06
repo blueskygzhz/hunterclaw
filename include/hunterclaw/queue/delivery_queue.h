@@ -12,6 +12,9 @@
 namespace hunterclaw {
 namespace queue {
 
+// ⚠️ LEGACY: 以下 queue::QueueMode / queue::QueueSettings 仅供 DeliveryQueue/FollowupQueue 使用
+// 实际 queue mode 调度逻辑使用 auto_reply::QueueMode / auto_reply::QueueSettings (message_dispatcher.h)
+// auto_reply 版本包含完整的 5 层优先级解析链和严格的 OpenClaw 对齐
 // 队列模式 (对齐 OpenClaw QueueMode)
 enum class QueueMode {
     Steer,         // 立即注入当前运行
@@ -33,7 +36,7 @@ struct QueueSettings {
     QueueMode mode = QueueMode::Collect;
     int debounce_ms = 1000;    // 防抖延迟 (默认1s)
     int cap = 20;              // 队列容量 (默认20)
-    DropPolicy drop_policy = DropPolicy::Old;
+    DropPolicy drop_policy = DropPolicy::Old;  // NOTE: auto_reply 版本默认 Summarize
 };
 
 // 消息Payload (对齐 OpenClaw ReplyPayload)

@@ -32,6 +32,7 @@
 #include "hunterclaw/acp/acp_reply_projector.h"  // ✅ 对齐 OpenClaw: ACP 流式投影器
 #include <sstream>
 #include <iomanip>
+#include <set>
 #include <algorithm>
 #include <chrono>
 #include <spdlog/spdlog.h>
@@ -492,18 +493,218 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
     log()->debug("dispatch_reply_from_config: suppress_typing={} session={}",
                  suppress_typing, session_key);
 
-    // ── Step 10: Resolve queue settings ─────────────────────────────────────
-    // Aligned with openclaw: resolveQueueSettings (auto-reply/reply/queue/settings.ts)
+    // ── Step 10: extractQueueDirective + resolveQueueSettings ────────────────
+    // 对齐 OpenClaw: directive-handling.parse.ts → extractQueueDirective
+    //               directive-handling.persist.ts → persist queue overrides
+    //               get-reply-run.ts → resolveQueueSettings({ inlineMode, inlineOptions })
     //
-    // Queue mode controls how concurrent messages are handled:
-    //   collect   (default) → merge all queued into one prompt
-    //   followup  (serial)  → run one-by-one after current run
-    //   steer               → inject into running session
-    //   interrupt           → abort current run, then run-now
-    //   steer-backlog       → steer first, fallback to followup
+    // /queue 指令格式 (对齐 OpenClaw directive.ts):
+    //   /queue <mode>                        → 切换 queue mode 并持久化
+    //   /queue <mode> debounce:2s cap:5 drop:summarize → 完整配置
+    //   /queue reset                         → 重置所有 queue 覆盖
+    // ========================================================================
+    
+    std::optional<QueueMode> per_message_queue_mode;
+    std::optional<InlineQueueOptions> per_message_queue_options;
+    bool queue_directive_only = false;  // true = /queue 是唯一内容，不需要执行 agent
+    
+    if (command_authorized) {
+        // ✅ 对齐 OpenClaw: extractQueueDirective (queue/directive.ts)
+        const std::string& text = message.text;
+        // 正则匹配 /queue（对齐 OpenClaw: /(?:^|\s)\/queue(?=$|\s|:)/i）
+        std::string lower_text = text;
+        std::transform(lower_text.begin(), lower_text.end(), lower_text.begin(), ::tolower);
+        size_t queue_pos = std::string::npos;
+        // 简化匹配：查找 "/queue" 并验证边界
+        for (size_t p = lower_text.find("/queue"); p != std::string::npos; p = lower_text.find("/queue", p + 1)) {
+            // 检查前面是空白或行首
+            if (p > 0 && lower_text[p - 1] != ' ' && lower_text[p - 1] != '\t' && lower_text[p - 1] != '\n') continue;
+            // 检查后面是空白、冒号、或末尾
+            size_t end = p + 6;
+            if (end < lower_text.size() && lower_text[end] != ' ' && lower_text[end] != '\t' && lower_text[end] != ':' && lower_text[end] != '\n') continue;
+            queue_pos = p;
+            break;
+        }
+        
+        if (queue_pos != std::string::npos) {
+            // 解析 /queue 后的参数 (对齐 OpenClaw: parseQueueDirectiveArgs)
+            std::string args_str;
+            size_t args_start = queue_pos + 6;
+            if (args_start < text.size()) {
+                args_str = text.substr(args_start);
+                // trim leading whitespace/colon
+                size_t start = args_str.find_first_not_of(" \t:");
+                if (start != std::string::npos) args_str = args_str.substr(start);
+                else args_str.clear();
+            }
+            
+            bool queue_reset = false;
+            std::optional<QueueMode> parsed_mode;
+            std::optional<int> parsed_debounce;
+            std::optional<int> parsed_cap;
+            std::optional<QueueDropPolicy> parsed_drop;
+            
+            // 逐 token 解析 (对齐 OpenClaw: parseQueueDirectiveArgs)
+            std::istringstream iss(args_str);
+            std::string token;
+            while (iss >> token) {
+                std::string lowered = token;
+                std::transform(lowered.begin(), lowered.end(), lowered.begin(), ::tolower);
+                
+                if (lowered == "default" || lowered == "reset" || lowered == "clear") {
+                    queue_reset = true;
+                    break;
+                }
+                // debounce:2s / debounce=2000
+                if (lowered.substr(0, 9) == "debounce:" || lowered.substr(0, 9) == "debounce=") {
+                    std::string val = token.substr(9);
+                    // 简化 duration 解析：支持 ms/s/m 后缀
+                    int ms = 0;
+                    if (!val.empty()) {
+                        if (val.back() == 's') { ms = std::stoi(val.substr(0, val.size()-1)) * 1000; }
+                        else if (val.back() == 'm') { ms = std::stoi(val.substr(0, val.size()-1)) * 60000; }
+                        else if (val.size() > 2 && val.substr(val.size()-2) == "ms") { ms = std::stoi(val.substr(0, val.size()-2)); }
+                        else { try { ms = std::stoi(val); } catch (...) {} }
+                    }
+                    if (ms > 0) parsed_debounce = ms;
+                    continue;
+                }
+                // cap:5 / cap=5
+                if (lowered.substr(0, 4) == "cap:" || lowered.substr(0, 4) == "cap=") {
+                    std::string val = token.substr(4);
+                    try { int c = std::stoi(val); if (c >= 1) parsed_cap = c; } catch (...) {}
+                    continue;
+                }
+                // drop:summarize / drop=old
+                if (lowered.substr(0, 5) == "drop:" || lowered.substr(0, 5) == "drop=") {
+                    std::string val = token.substr(5);
+                    auto d = normalize_queue_drop_policy(val);
+                    if (d.has_value()) parsed_drop = d;
+                    continue;
+                }
+                // mode token
+                auto m = normalize_queue_mode(token);
+                if (m.has_value()) {
+                    parsed_mode = m;
+                    continue;
+                }
+                break;  // 对齐 OpenClaw: 遇到不可识别 token 时停止解析
+            }
+            
+            // ✅ 对齐 OpenClaw: persistInlineDirectives (directive-handling.persist.ts L187-193)
+            // 将 /queue 设置持久化到 session entry
+            if (session_manager_ && !session_key.empty() && session_entry_for_dispatch.has_value()) {
+                auto entry = *session_entry_for_dispatch;
+                bool updated = false;
+                
+                if (queue_reset) {
+                    // 对齐 OpenClaw: delete sessionEntry.queueMode/debounceMs/cap/drop
+                    entry.queue_mode = std::nullopt;
+                    entry.queue_debounce_ms = std::nullopt;
+                    entry.queue_cap = std::nullopt;
+                    entry.queue_drop = std::nullopt;
+                    updated = true;
+                } else {
+                    if (parsed_mode.has_value()) {
+                        // 将 QueueMode enum 转为字符串存储
+                        std::string mode_str;
+                        switch (*parsed_mode) {
+                            case QueueMode::Steer:       mode_str = "steer"; break;
+                            case QueueMode::Followup:    mode_str = "followup"; break;
+                            case QueueMode::Collect:     mode_str = "collect"; break;
+                            case QueueMode::SteerBacklog: mode_str = "steer-backlog"; break;
+                            case QueueMode::Interrupt:   mode_str = "interrupt"; break;
+                            default:                     mode_str = "collect"; break;
+                        }
+                        entry.queue_mode = mode_str;
+                        updated = true;
+                    }
+                    if (parsed_debounce.has_value()) { entry.queue_debounce_ms = *parsed_debounce; updated = true; }
+                    if (parsed_cap.has_value()) { entry.queue_cap = *parsed_cap; updated = true; }
+                    if (parsed_drop.has_value()) {
+                        std::string drop_str;
+                        switch (*parsed_drop) {
+                            case QueueDropPolicy::Old:       drop_str = "old"; break;
+                            case QueueDropPolicy::New:       drop_str = "new"; break;
+                            case QueueDropPolicy::Summarize: drop_str = "summarize"; break;
+                        }
+                        entry.queue_drop = drop_str;
+                        updated = true;
+                    }
+                }
+                
+                if (updated) {
+                    session_manager_->update_session(session_key, entry);
+                    session_entry_for_dispatch = entry;
+                    log()->info("dispatch_reply_from_config: /queue persisted session={} reset={} mode={}",
+                                session_key, queue_reset, entry.queue_mode.value_or("(default)"));
+                }
+            }
+            
+            // 设置 per-message 覆盖 (对齐 OpenClaw: get-reply-directives-apply.ts L275-294)
+            if (!queue_reset && parsed_mode.has_value()) {
+                per_message_queue_mode = parsed_mode;
+            }
+            if (!queue_reset && (parsed_debounce.has_value() || parsed_cap.has_value() || parsed_drop.has_value())) {
+                InlineQueueOptions opts;
+                opts.debounce_ms = parsed_debounce;
+                opts.cap = parsed_cap;
+                opts.drop_policy = parsed_drop;
+                per_message_queue_options = opts;
+            }
+            
+            // 检查是否是 directive-only (对齐 OpenClaw: isDirectiveOnly)
+            // 移除 /queue 及参数后，如果剩余文本为空，则不执行 agent
+            std::string cleaned = text.substr(0, queue_pos);
+            // 简化 cleaned 判断
+            cleaned.erase(0, cleaned.find_first_not_of(" \t\n"));
+            if (!cleaned.empty()) cleaned.erase(cleaned.find_last_not_of(" \t\n") + 1);
+            if (cleaned.empty()) {
+                queue_directive_only = true;
+            }
+        }
+    }
+    
+    // ✅ 对齐 OpenClaw: directive-only /queue → 返回确认文本，不执行 agent
+    // (对齐 OpenClaw: directive-handling.impl.ts L492-505)
+    if (queue_directive_only) {
+        // 构建 ACK 文本
+        std::string ack_parts;
+        if (per_message_queue_mode.has_value()) {
+            std::string mode_str;
+            switch (*per_message_queue_mode) {
+                case QueueMode::Steer:       mode_str = "steer"; break;
+                case QueueMode::Followup:    mode_str = "followup"; break;
+                case QueueMode::Collect:     mode_str = "collect"; break;
+                case QueueMode::SteerBacklog: mode_str = "steer-backlog"; break;
+                case QueueMode::Interrupt:   mode_str = "interrupt"; break;
+                default:                     mode_str = "collect"; break;
+            }
+            ack_parts += "⚙️ Queue mode set to " + mode_str + ".";
+        } else if (session_entry_for_dispatch.has_value() && !session_entry_for_dispatch->queue_mode.has_value()) {
+            // reset case
+            ack_parts += "⚙️ Queue mode reset to default.";
+        }
+        if (per_message_queue_options.has_value()) {
+            if (per_message_queue_options->debounce_ms.has_value())
+                ack_parts += " ⚙️ Queue debounce set to " + std::to_string(*per_message_queue_options->debounce_ms) + "ms.";
+            if (per_message_queue_options->cap.has_value())
+                ack_parts += " ⚙️ Queue cap set to " + std::to_string(*per_message_queue_options->cap) + ".";
+        }
+        if (ack_parts.empty()) ack_parts = "⚙️ Queue mode reset to default.";
+        
+        result.success = true;
+        result.react_result.output = ack_parts;
+        // TODO: 通过 delivery 路径投递 ack 文本（当前直接返回）
+        return result;
+    }
+    
+    // ── Resolve queue settings (with inlineMode if present) ─────────────────
     const QueueSettings resolved_queue = resolve_queue_settings(
         session_entry_for_dispatch,
-        message.channel
+        message.channel,
+        per_message_queue_mode,
+        per_message_queue_options
     );
 
     // ── interrupt mode: clear lane + abort before run ────────────────────────
@@ -541,6 +742,11 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
                                     : message.text;
     agent_params.queue_settings = resolved_queue;
     agent_params.is_heartbeat   = false;
+    // ✅ 对齐 OpenClaw FollowupRun: originating routing metadata
+    agent_params.originating_channel    = message.originating_channel;
+    agent_params.originating_to         = message.originating_to;
+    agent_params.originating_account_id = message.account_id.value_or("");
+    agent_params.originating_thread_id  = "";
     agent_params.run_fn = [this,
                            captured_message,
                            captured_config,
@@ -836,55 +1042,155 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
 // resolve_queue_settings
 // Aligned with openclaw: resolveQueueSettings (auto-reply/reply/queue/settings.ts)
 //
-// Priority: inlineMode > sessionEntry.queueMode > config.messages.queue.mode > default("collect")
+// 严格对齐 OpenClaw 5 层优先级链:
+//   mode:     inlineMode > sessionEntry.queueMode > byChannel[channel] > config.queue.mode > default("collect")
+//   debounce: inlineOptions > sessionEntry > debounceMsByChannel > config.queue.debounceMs > DEFAULT(1000)
+//   cap:      inlineOptions > sessionEntry > config.queue.cap > DEFAULT(20)
+//   drop:     inlineOptions > sessionEntry > config.queue.drop > DEFAULT("summarize")
 // ============================================================================
+
+// ✅ 对齐 OpenClaw: normalizeQueueMode (queue/normalize.ts)
+// 独立 static 函数，供 resolve_queue_settings 和 /queue 命令处理使用
+static std::optional<QueueMode> normalize_queue_mode(const std::string& raw) {
+    if (raw.empty()) return std::nullopt;
+    std::string s = raw;
+    std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+    // trim
+    s.erase(0, s.find_first_not_of(" \t"));
+    s.erase(s.find_last_not_of(" \t") + 1);
+
+    if (s == "queue" || s == "queued")                              return QueueMode::Steer;
+    if (s == "interrupt" || s == "interrupts" || s == "abort")      return QueueMode::Interrupt;
+    if (s == "steer" || s == "steering")                            return QueueMode::Steer;
+    if (s == "followup" || s == "follow-ups" || s == "followups")   return QueueMode::Followup;
+    if (s == "collect" || s == "coalesce")                          return QueueMode::Collect;
+    if (s == "steer+backlog" || s == "steer-backlog" || s == "steer_backlog") return QueueMode::SteerBacklog;
+    return std::nullopt;
+}
+
+// ✅ 对齐 OpenClaw: normalizeQueueDropPolicy (queue/normalize.ts)
+static std::optional<QueueDropPolicy> normalize_queue_drop_policy(const std::string& raw) {
+    if (raw.empty()) return std::nullopt;
+    std::string s = raw;
+    std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+    s.erase(0, s.find_first_not_of(" \t"));
+    s.erase(s.find_last_not_of(" \t") + 1);
+
+    if (s == "old" || s == "oldest")       return QueueDropPolicy::Old;
+    if (s == "new" || s == "newest")       return QueueDropPolicy::New;
+    if (s == "summarize" || s == "summary") return QueueDropPolicy::Summarize;
+    return std::nullopt;
+}
 
 QueueSettings MessageDispatcher::resolve_queue_settings(
     const std::optional<sessions::SessionEntry>& session_entry,
-    const std::string& channel
+    const std::string& channel,
+    std::optional<QueueMode> inline_mode,
+    std::optional<InlineQueueOptions> inline_options
 ) const {
     QueueSettings settings;
+    const auto& queue_cfg = config_.queue;
+    
+    // Normalize channel key (对齐 OpenClaw: channelKey = params.channel?.trim().toLowerCase())
+    std::string channel_key = channel;
+    std::transform(channel_key.begin(), channel_key.end(), channel_key.begin(), ::tolower);
 
-    // Aligned with openclaw: normalizeQueueMode
-    auto normalize_mode = [](const std::string& raw) -> std::optional<QueueMode> {
-        if (raw.empty()) return std::nullopt;
-        std::string s = raw;
-        std::transform(s.begin(), s.end(), s.begin(), ::tolower);
-        // trim
-        s.erase(0, s.find_first_not_of(" \t"));
-        s.erase(s.find_last_not_of(" \t") + 1);
-
-        if (s == "queue" || s == "queued")                              return QueueMode::Steer;
-        if (s == "interrupt" || s == "interrupts" || s == "abort")      return QueueMode::Interrupt;
-        if (s == "steer" || s == "steering")                            return QueueMode::Steer;
-        if (s == "followup" || s == "follow-ups" || s == "followups")   return QueueMode::Followup;
-        if (s == "collect" || s == "coalesce")                          return QueueMode::Collect;
-        if (s == "steer+backlog" || s == "steer-backlog" || s == "steer_backlog") return QueueMode::SteerBacklog;
-        return std::nullopt;
-    };
-
-    // 1. session entry override
-    if (session_entry.has_value() && session_entry->queue_mode.has_value()) {
-        auto m = normalize_mode(*session_entry->queue_mode);
-        if (m.has_value()) settings.mode = *m;
+    // ── Mode: 5 层优先级链 ──────────────────────────────────────────────────
+    // 对齐 OpenClaw settings.ts L39-44:
+    //   params.inlineMode ??
+    //   normalizeQueueMode(sessionEntry?.queueMode) ??
+    //   normalizeQueueMode(providerModeRaw) ??
+    //   normalizeQueueMode(queueCfg?.mode) ??
+    //   defaultQueueModeForChannel(channelKey)
+    
+    // 1. inlineMode (最高优先级 — 来自 /queue 内联指令)
+    std::optional<QueueMode> resolved_mode;
+    if (inline_mode.has_value()) {
+        resolved_mode = inline_mode;
     }
-
-    // 2. session entry debounce/cap/drop overrides
-    if (session_entry.has_value()) {
-        if (session_entry->queue_debounce_ms.has_value())
-            settings.debounce_ms = *session_entry->queue_debounce_ms;
-        if (session_entry->queue_cap.has_value())
-            settings.cap = std::max(1, static_cast<int>(*session_entry->queue_cap));
-        if (session_entry->queue_drop.has_value()) {
-            const std::string& drop = *session_entry->queue_drop;
-            if (drop == "old" || drop == "oldest")       settings.drop_policy = QueueDropPolicy::Old;
-            else if (drop == "new" || drop == "newest")  settings.drop_policy = QueueDropPolicy::New;
-            else if (drop == "summarize" || drop == "summary") settings.drop_policy = QueueDropPolicy::Summarize;
+    // 2. sessionEntry.queueMode
+    if (!resolved_mode.has_value() && session_entry.has_value() && session_entry->queue_mode.has_value()) {
+        resolved_mode = normalize_queue_mode(*session_entry->queue_mode);
+    }
+    // 3. byChannel[channelKey] (对齐 OpenClaw: providerModeRaw = queueCfg?.byChannel?.[channelKey])
+    if (!resolved_mode.has_value() && !channel_key.empty()) {
+        auto it = queue_cfg.by_channel.find(channel_key);
+        if (it != queue_cfg.by_channel.end()) {
+            resolved_mode = normalize_queue_mode(it->second);
         }
     }
+    // 4. config.messages.queue.mode (全局配置)
+    if (!resolved_mode.has_value() && queue_cfg.mode.has_value()) {
+        resolved_mode = normalize_queue_mode(*queue_cfg.mode);
+    }
+    // 5. default: collect (对齐 OpenClaw: defaultQueueModeForChannel → "collect")
+    settings.mode = resolved_mode.value_or(QueueMode::Collect);
 
-    // 3. default: collect (aligned with openclaw: defaultQueueModeForChannel → "collect")
-    // (already set as default in QueueSettings constructor)
+    // ── Debounce: 6 层优先级链 ──────────────────────────────────────────────
+    // 对齐 OpenClaw settings.ts L45-51:
+    //   inlineOptions?.debounceMs ?? sessionEntry?.queueDebounceMs ??
+    //   resolveChannelDebounce(byChannel, channelKey) ??
+    //   resolvePluginDebounce(channelKey) ??   ← HunterClaw 无 plugin 层，跳过
+    //   queueCfg?.debounceMs ?? DEFAULT(1000)
+    bool debounce_resolved = false;
+    // 1. inlineOptions
+    if (!debounce_resolved && inline_options.has_value() && inline_options->debounce_ms.has_value()) {
+        settings.debounce_ms = std::max(0, *inline_options->debounce_ms);
+        debounce_resolved = true;
+    }
+    // 2. sessionEntry
+    if (!debounce_resolved && session_entry.has_value() && session_entry->queue_debounce_ms.has_value()) {
+        settings.debounce_ms = std::max(0, *session_entry->queue_debounce_ms);
+        debounce_resolved = true;
+    }
+    // 3. debounceMsByChannel (对齐 OpenClaw: resolveChannelDebounce)
+    if (!debounce_resolved && !channel_key.empty()) {
+        auto it = queue_cfg.debounce_ms_by_channel.find(channel_key);
+        if (it != queue_cfg.debounce_ms_by_channel.end()) {
+            settings.debounce_ms = std::max(0, it->second);
+            debounce_resolved = true;
+        }
+    }
+    // 4. config.messages.queue.debounceMs
+    if (!debounce_resolved && queue_cfg.debounce_ms.has_value()) {
+        settings.debounce_ms = std::max(0, *queue_cfg.debounce_ms);
+        debounce_resolved = true;
+    }
+    // 5. default: 1000ms (already set in QueueSettings constructor)
+
+    // ── Cap: 4 层优先级链 ───────────────────────────────────────────────────
+    // 对齐 OpenClaw settings.ts L52-56:
+    //   inlineOptions?.cap ?? sessionEntry?.queueCap ?? queueCfg?.cap ?? DEFAULT(20)
+    bool cap_resolved = false;
+    if (!cap_resolved && inline_options.has_value() && inline_options->cap.has_value()) {
+        settings.cap = std::max(1, *inline_options->cap);
+        cap_resolved = true;
+    }
+    if (!cap_resolved && session_entry.has_value() && session_entry->queue_cap.has_value()) {
+        settings.cap = std::max(1, static_cast<int>(*session_entry->queue_cap));
+        cap_resolved = true;
+    }
+    if (!cap_resolved && queue_cfg.cap.has_value()) {
+        settings.cap = std::max(1, *queue_cfg.cap);
+        cap_resolved = true;
+    }
+
+    // ── Drop: 4 层优先级链 ──────────────────────────────────────────────────
+    // 对齐 OpenClaw settings.ts L57-61:
+    //   inlineOptions?.dropPolicy ?? sessionEntry?.queueDrop ?? queueCfg?.drop ?? DEFAULT("summarize")
+    bool drop_resolved = false;
+    if (!drop_resolved && inline_options.has_value() && inline_options->drop_policy.has_value()) {
+        settings.drop_policy = *inline_options->drop_policy;
+        drop_resolved = true;
+    }
+    if (!drop_resolved && session_entry.has_value() && session_entry->queue_drop.has_value()) {
+        auto d = normalize_queue_drop_policy(*session_entry->queue_drop);
+        if (d.has_value()) { settings.drop_policy = *d; drop_resolved = true; }
+    }
+    if (!drop_resolved && queue_cfg.drop.has_value()) {
+        auto d = normalize_queue_drop_policy(*queue_cfg.drop);
+        if (d.has_value()) { settings.drop_policy = *d; drop_resolved = true; }
+    }
 
     return settings;
 }
@@ -1259,6 +1565,11 @@ MessageDispatcher::DispatchResult MessageDispatcher::run_reply_agent(
             task.label        = params.label;
             task.prompt       = params.prompt;
             task.summary_line = params.summary_line;
+            // ✅ 对齐 OpenClaw FollowupRun: originating routing metadata
+            task.originating_channel    = params.originating_channel;
+            task.originating_to         = params.originating_to;
+            task.originating_account_id = params.originating_account_id;
+            task.originating_thread_id  = params.originating_thread_id;
             task.enqueued_at_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
             queue.items.push_back(std::move(task));
@@ -1419,6 +1730,9 @@ void MessageDispatcher::drain_followup_queue(const std::string& session_key) {
     // Launch async drain in detached thread
     // Aligned with openclaw: void (async () => {...})()
     std::thread([this, session_key]() {
+        // ✅ 对齐 OpenClaw: collectState = { forceIndividualCollect: false }
+        // 一旦检测到跨频道，在同一 drain 内永不再合并
+        bool force_individual_collect = false;
         while (true) {
             // ── waitForQueueDebounce ──────────────────────────────────────
             // Aligned with openclaw: waitForQueueDebounce(queue)
@@ -1463,15 +1777,17 @@ void MessageDispatcher::drain_followup_queue(const std::string& session_key) {
 
             if (mode == QueueMode::Collect) {
                 // ── collect mode: merge all items into one prompt ─────────
-                // Aligned with openclaw: drain.ts collect branch
-                //   const items = queue.items.slice();
-                //   const prompt = buildCollectPrompt({...});
-                //   await runFollowup({ prompt, run, ... });
-                //   queue.items.splice(0, items.length);
+                // ✅ 严格对齐 OpenClaw drain.ts collect branch:
+                //   1. hasCrossChannelItems(queue.items, resolveCrossChannelKey)
+                //   2. drainCollectQueueStep({ collectState, isCrossChannel, items, run })
+                //      → isCrossChannel → forceIndividualCollect = true → 逐条处理
+                //      → 同频道 → "skipped" → 合并为 buildCollectPrompt
+                //   3. forceIndividualCollect 一旦为 true 永不重置（同一 drain 内）
 
                 std::vector<FollowupTask> items_to_run;
                 std::string summary_prompt;
                 std::function<DispatchResult()> last_run_fn;
+                bool is_cross_channel = false;
 
                 {
                     std::lock_guard<std::mutex> lock(session_state_mutex_);
@@ -1480,6 +1796,40 @@ void MessageDispatcher::drain_followup_queue(const std::string& session_key) {
                     auto& queue = it->second;
 
                     if (queue.items.empty() && queue.dropped_count == 0) break;
+
+                    // ✅ 对齐 OpenClaw: hasCrossChannelItems(queue.items, resolveCrossChannelKey)
+                    // 检查 items 是否来自不同频道，如果是则逐条处理
+                    {
+                        std::set<std::string> channel_keys;
+                        bool has_unkeyed = false;
+                        for (const auto& item : queue.items) {
+                            const auto& ch = item.originating_channel;
+                            const auto& to = item.originating_to;
+                            const auto& acct = item.originating_account_id;
+                            const auto& tid = item.originating_thread_id;
+                            
+                            if (ch.empty() && to.empty() && acct.empty() && tid.empty()) {
+                                has_unkeyed = true;
+                                continue;
+                            }
+                            // 对齐 OpenClaw: isRoutableChannel — 排除 webchat/internal
+                            if (ch == "web" || ch == "webchat" || ch == "internal" || to.empty()) {
+                                is_cross_channel = true;
+                                break;
+                            }
+                            std::string key = ch + "|" + to + "|" + acct + "|" + tid;
+                            channel_keys.insert(key);
+                        }
+                        if (!is_cross_channel) {
+                            if (channel_keys.size() > 1) is_cross_channel = true;
+                            else if (has_unkeyed && !channel_keys.empty()) is_cross_channel = true;
+                        }
+                    }
+                    
+                    // 对齐 OpenClaw: forceIndividualCollect 持久状态
+                    if (is_cross_channel || force_individual_collect) {
+                        force_individual_collect = true;
+                    }
 
                     // Build summary prompt for dropped items
                     if (queue.drop_policy == QueueDropPolicy::Summarize && queue.dropped_count > 0) {
@@ -1510,8 +1860,48 @@ void MessageDispatcher::drain_followup_queue(const std::string& session_key) {
                     break;
                 }
 
-                // Build merged collect prompt
-                // Aligned with openclaw: buildCollectPrompt
+                // ✅ 对齐 OpenClaw: drainCollectQueueStep
+                // force_individual_collect → 逐条处理（不合并），保留 per-message 路由
+                if (force_individual_collect && !items_to_run.empty()) {
+                    log()->info("drain_followup_queue: session={} cross-channel collect → individual mode ({} items)",
+                                session_key, items_to_run.size());
+                    // 逐条执行 (对齐 OpenClaw: drainCollectItemIfNeeded → drainNextQueueItem)
+                    for (auto& item : items_to_run) {
+                        try {
+                            if (item.run_fn) {
+                                auto& cmd_queue = queue::CommandQueue::Instance();
+                                const std::string session_lane = queue::ResolveSessionLane(session_key);
+                                const std::string global_lane = queue::ResolveGlobalLane();
+                                std::function<DispatchResult()> fn_copy = item.run_fn;
+                                std::string item_label = item.label;
+                                auto session_future = cmd_queue.enqueue_command_in_lane(
+                                    session_lane,
+                                    std::function<DispatchResult()>([&cmd_queue, global_lane,
+                                                                      fn_copy, item_label]() -> DispatchResult {
+                                        auto inner_future = cmd_queue.enqueue_command_in_lane(
+                                            global_lane, fn_copy,
+                                            queue::EnqueueOptions{.label = "drain:collect:individual:" + item_label, .urgent = false}
+                                        );
+                                        return inner_future.get();
+                                    }),
+                                    queue::EnqueueOptions{.label = "session:drain:collect:individual:" + item_label, .urgent = false}
+                                );
+                                session_future.get();
+                            }
+                        } catch (const std::exception& e) {
+                            log()->error("drain_followup_queue: individual collect failed session={}: {}",
+                                         session_key, e.what());
+                        }
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(session_state_mutex_);
+                        active_sessions_.erase(session_key);
+                        streaming_sessions_.erase(session_key);
+                    }
+                    continue;
+                }
+
+                // 同频道: 正常合并 (对齐 OpenClaw: buildCollectPrompt)
                 const std::string merged_prompt = build_collect_prompt(items_to_run, summary_prompt);
 
                 log()->info("drain_followup_queue: session={} collect mode merging {} items",

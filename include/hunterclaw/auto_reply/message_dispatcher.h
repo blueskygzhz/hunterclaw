@@ -155,13 +155,31 @@ public:
         QueueSettings queue_settings;
         bool is_heartbeat = false;
         bool is_streaming = false;   // aligned with openclaw: isEmbeddedPiRunStreaming
+        // ✅ 对齐 OpenClaw FollowupRun: originating routing metadata
+        // 用于 collect 模式下的跨频道检测 (hasCrossChannelItems)
+        std::string originating_channel;
+        std::string originating_to;
+        std::string originating_account_id;
+        std::string originating_thread_id;
         // ✅ 对齐 OpenClaw 双层 lane 机制:
-        // OpenClaw runEmbeddedPiAgent 内部自己做 session lane → main lane 嵌套
-        // HunterClaw: 部分调用方 (chat.cc/agent.cc) 已在外部包了 session lane，
-        //             此时 run_reply_agent 不再重复进 session lane (避免死锁)
-        //             auto_reply 路径未包 session lane，run_reply_agent 需自行包装
         bool in_session_lane = false;  // true = 调用方已在 session lane 中
     };
+    // ✅ resolve_queue_settings (aligned with openclaw: resolveQueueSettings queue/settings.ts)
+    // PUBLIC: 供 chat.send 路径调用
+    // 从 session entry、config、inlineMode 解析 queue mode
+    // 优先级: inlineMode > sessionEntry > byChannel > global config > default("collect")
+    struct InlineQueueOptions {
+        std::optional<int> debounce_ms;
+        std::optional<int> cap;
+        std::optional<QueueDropPolicy> drop_policy;
+    };
+    QueueSettings resolve_queue_settings(
+        const std::optional<sessions::SessionEntry>& session_entry,
+        const std::string& channel,
+        std::optional<QueueMode> inline_mode = std::nullopt,
+        std::optional<InlineQueueOptions> inline_options = std::nullopt
+    ) const;
+
     DispatchResult run_reply_agent(const RunReplyAgentParams& params);
 
 private:
@@ -256,6 +274,12 @@ private:
         std::string prompt;          // for collect mode merging
         std::string summary_line;    // for drop policy summarize
         int64_t enqueued_at_ms = 0;
+        // ✅ 对齐 OpenClaw FollowupRun: originating routing metadata
+        // collect 模式中用于跨频道检测 (hasCrossChannelItems)
+        std::string originating_channel;
+        std::string originating_to;
+        std::string originating_account_id;
+        std::string originating_thread_id;
     };
     struct FollowupQueueState {
         std::vector<FollowupTask> items;
@@ -289,13 +313,6 @@ private:
     // on_engine_created 回调检查此 set，如果命中则立即调用 engine->cancel()，
     // 确保 abort 信号不会因为 engine 尚未创建而丢失。
     std::unordered_set<std::string> aborted_sessions_;
-
-    // ✅ resolve_queue_settings (aligned with openclaw: resolveQueueSettings queue/settings.ts)
-    // 从 session entry 和 config 解析 queue mode
-    QueueSettings resolve_queue_settings(
-        const std::optional<sessions::SessionEntry>& session_entry,
-        const std::string& channel
-    ) const;
 
     // ✅ resolve_active_run_queue_action (aligned with openclaw: resolveActiveRunQueueAction queue-policy.ts)
     // 决定 run-now / enqueue-followup / drop
