@@ -190,9 +190,16 @@ struct ChatRunEntry {
     std::string client_run_id;
 };
 
+// Aligned with OpenClaw: ChatAbortControllerEntry (chat-abort.ts L3-11)
+// Key in chat_abort_controllers map = clientRunId (idempotencyKey)
 struct ChatAbortControllerEntry {
-    std::shared_ptr<std::atomic<bool>> aborted;
-    int64_t created_at;
+    std::shared_ptr<std::atomic<bool>> aborted;    // abort signal (≈ AbortController)
+    std::string session_id;                         // session store ID
+    std::string session_key;                        // raw session key from chat.send
+    int64_t started_at_ms = 0;                      // run start time
+    int64_t expires_at_ms = 0;                      // timeout expiry (for maintenance cleanup)
+    std::optional<std::string> owner_conn_id;       // WebSocket connId of originator
+    std::optional<std::string> owner_device_id;     // device ID of originator
 };
 
 // Chat run registry (对齐 OpenClaw createChatRunState)
