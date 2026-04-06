@@ -1903,7 +1903,8 @@ struct GatewayServer::Impl {
     std::shared_ptr<std::function<cron::HeartbeatRunResult(
         const std::optional<std::string>&,
         const std::optional<std::string>&,
-        const std::optional<std::string>&)>> run_heartbeat_once_fn_;
+        const std::optional<std::string>&,
+        const std::optional<cron::CronServiceDeps::HeartbeatOverride>&)>> run_heartbeat_once_fn_;
 };
 
 GatewayServer::GatewayServer(std::shared_ptr<core::Config> config)

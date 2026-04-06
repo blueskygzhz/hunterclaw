@@ -323,6 +323,7 @@ private:
         QueueMode queue_mode
     ) const;
 
+public:
     // ✅ steer_embedded_session (aligned with openclaw: queueEmbeddedPiMessage)
     // 向运行中的 session 注入 steer 消息
     bool steer_embedded_session(const std::string& session_key, const std::string& message);
@@ -331,7 +332,7 @@ private:
     // 中止运行中的 session（interrupt 模式）
     bool abort_embedded_session(const std::string& session_key);
 
-public:
+private:
     // 按 mode 消费 followup 队列：followup=逐条串行，collect=批量合并
     void drain_followup_queue(const std::string& session_key);
 
