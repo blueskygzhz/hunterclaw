@@ -2067,10 +2067,22 @@ core::Result<bool> GatewayServer::start() {
                 // Broadcast as "cron" system event so the agent's message loop picks it up
                 auto server_impl = server_impl_weak2.lock();
                 if (!server_impl) return;
+
+                // Aligned with OpenClaw: resolveCronSessionKey — normalize session key
+                // to agent-scoped format "agent:<agentId>:<rest>" if not already prefixed.
+                std::optional<std::string> resolved_key = session_key;
+                if (session_key.has_value() && !session_key->empty() &&
+                    agent_id.has_value() && !agent_id->empty()) {
+                    const std::string& sk = *session_key;
+                    if (sk.rfind("agent:", 0) != 0) {
+                        resolved_key = "agent:" + *agent_id + ":" + sk;
+                    }
+                }
+
                 json evt_payload;
                 evt_payload["text"] = text;
                 if (agent_id.has_value()) evt_payload["agentId"] = *agent_id;
-                if (session_key.has_value()) evt_payload["sessionKey"] = *session_key;
+                if (resolved_key.has_value()) evt_payload["sessionKey"] = *resolved_key;
                 if (context_key.has_value()) evt_payload["contextKey"] = *context_key;
                 core::EventFrame ef;
                 ef.event = "cron";
@@ -2084,7 +2096,16 @@ core::Result<bool> GatewayServer::start() {
                 const std::optional<std::string>& agent_id,
                 const std::optional<std::string>& session_key
             ) {
-                hunterclaw::infra::request_heartbeat_now(reason, agent_id, session_key);
+                // Aligned with OpenClaw: resolveCronWakeTarget — normalize session key
+                std::optional<std::string> resolved_key = session_key;
+                if (session_key.has_value() && !session_key->empty() &&
+                    agent_id.has_value() && !agent_id->empty()) {
+                    const std::string& sk = *session_key;
+                    if (sk.rfind("agent:", 0) != 0) {
+                        resolved_key = "agent:" + *agent_id + ":" + sk;
+                    }
+                }
+                hunterclaw::infra::request_heartbeat_now(reason, agent_id, resolved_key);
             };
 
             // run_heartbeat_once: will be injected after heartbeat_runner is built (below)
@@ -2093,14 +2114,16 @@ core::Result<bool> GatewayServer::start() {
                 std::function<cron::HeartbeatRunResult(
                     const std::optional<std::string>&,
                     const std::optional<std::string>&,
-                    const std::optional<std::string>&)>>();
+                    const std::optional<std::string>&,
+                    const std::optional<cron::CronServiceDeps::HeartbeatOverride>&)>>();
             cron_deps.run_heartbeat_once = [run_heartbeat_once_fn](
                 const std::optional<std::string>& reason,
                 const std::optional<std::string>& agent_id,
-                const std::optional<std::string>& session_key
+                const std::optional<std::string>& session_key,
+                const std::optional<cron::CronServiceDeps::HeartbeatOverride>& heartbeat
             ) -> cron::HeartbeatRunResult {
                 if (*run_heartbeat_once_fn) {
-                    return (*run_heartbeat_once_fn)(reason, agent_id, session_key);
+                    return (*run_heartbeat_once_fn)(reason, agent_id, session_key, heartbeat);
                 }
                 return {cron::HeartbeatRunResult::Status::Skipped, "not-configured"};
             };
@@ -2124,6 +2147,11 @@ core::Result<bool> GatewayServer::start() {
             // agent_pool->get_agent(session_key). Therefore the isolated agent must
             // be temporarily registered in AgentPool for the duration of the run,
             // then removed immediately after — so sub-agent announces can find it.
+            // NOTE: OpenClaw's resolveCronAgent calls loadConfig() on every execution
+            // to pick up hot-reloaded config. HunterClaw uses config_weak.lock() which
+            // returns the current shared_ptr — equivalent if config is replaced atomically.
+            // For full hot-reload parity, implement config watcher → stop cron → rebuild
+            // CronService with new config (aligned with server-reload-handlers.ts restartCron).
             auto config_weak = std::weak_ptr<core::Config>(impl_->config);
             auto skill_mgr_weak = std::weak_ptr<skills::SkillManager>(impl_->skill_mgr);
             auto channel_mgr_weak = std::weak_ptr<channels::ChannelManager>(impl_->channel_mgr);
@@ -2250,6 +2278,67 @@ core::Result<bool> GatewayServer::start() {
 
                 return outcome;
                 // agent goes out of scope here and is destroyed — isolated, no leak.
+            };
+
+            // ✅ Aligned with openclaw: sendCronFailureAlert (server-cron.ts L298-356)
+            // Supports announce mode (via enqueue_system_event fallback) and webhook mode (TODO).
+            cron_deps.send_cron_failure_alert = [server_impl_weak2](
+                const cron::CronJob& job,
+                const std::string& text,
+                const std::string& channel,
+                const std::optional<std::string>& to,
+                const std::optional<std::string>& mode,
+                const std::optional<std::string>& account_id
+            ) {
+                // Webhook mode: TODO — requires fetchWithSsrfGuard equivalent
+                if (mode.has_value() && *mode == "webhook" && to.has_value()) {
+                    // TODO: POST to webhook URL with SSRF guard
+                    return;
+                }
+                // Announce mode: broadcast as system event (aligned with OpenClaw fallback)
+                auto server_impl = server_impl_weak2.lock();
+                if (!server_impl) return;
+                json payload;
+                payload["text"] = text;
+                if (job.agent_id.has_value()) payload["agentId"] = *job.agent_id;
+                payload["contextKey"] = "cron:" + job.id + ":failure-alert";
+                core::EventFrame ef;
+                ef.event = "cron";
+                ef.payload = payload;
+                server_impl->broadcast(ef, /*drop_if_slow=*/false, nullptr);
+            };
+
+            // ✅ Aligned with openclaw: onEvent callback — broadcast SSE + run log
+            // OpenClaw server-cron.ts L358-501: params.broadcast("cron", evt, { dropIfSlow: true })
+            // + appendCronRunLog on "finished" events.
+            auto server_impl_weak3 = std::weak_ptr<GatewayServerImpl>(impl_->server_impl);
+            cron_deps.on_event = [server_impl_weak3](const cron::CronServiceDeps::CronEvent& evt) {
+                // 1. Broadcast to WebSocket clients (aligned with openclaw)
+                auto server_impl = server_impl_weak3.lock();
+                if (server_impl) {
+                    json payload;
+                    payload["jobId"] = evt.job_id;
+                    payload["action"] = evt.action;
+                    if (evt.run_at_ms.has_value()) payload["runAtMs"] = *evt.run_at_ms;
+                    if (evt.duration_ms.has_value()) payload["durationMs"] = *evt.duration_ms;
+                    if (evt.next_run_at_ms.has_value()) payload["nextRunAtMs"] = *evt.next_run_at_ms;
+                    if (evt.status.has_value()) payload["status"] = cron::cron_run_status_to_string(*evt.status);
+                    if (evt.error.has_value()) payload["error"] = *evt.error;
+                    if (evt.summary.has_value()) payload["summary"] = *evt.summary;
+                    if (evt.delivered.has_value()) payload["delivered"] = *evt.delivered;
+                    if (evt.delivery_status.has_value()) payload["deliveryStatus"] = *evt.delivery_status;
+                    if (evt.delivery_error.has_value()) payload["deliveryError"] = *evt.delivery_error;
+                    if (evt.session_id.has_value()) payload["sessionId"] = *evt.session_id;
+                    if (evt.session_key.has_value()) payload["sessionKey"] = *evt.session_key;
+                    if (evt.model.has_value()) payload["model"] = *evt.model;
+                    if (evt.provider.has_value()) payload["provider"] = *evt.provider;
+                    core::EventFrame ef;
+                    ef.event = "cron";
+                    ef.payload = payload;
+                    server_impl->broadcast(ef, /*drop_if_slow=*/true, nullptr);
+                }
+                // 2. TODO: appendCronRunLog for "finished" events (requires file-backed store)
+                // 3. TODO: webhook POST for "finished" events with delivery.mode=webhook
             };
 
             // Create CronService with MemoryCronStore (in-memory, aligned with openclaw default)
@@ -2435,7 +2524,8 @@ core::Result<bool> GatewayServer::start() {
                 *impl_->run_heartbeat_once_fn_ = [run_once_fn_copy, runner_cfg_copy, heartbeat_reply_fn_copy](
                     const std::optional<std::string>& reason,
                     const std::optional<std::string>& agent_id,
-                    const std::optional<std::string>& session_key
+                    const std::optional<std::string>& session_key,
+                    const std::optional<cron::CronServiceDeps::HeartbeatOverride>& heartbeat
                 ) -> cron::HeartbeatRunResult {
                     // Resolve agent_cfg from runner_cfg
                     infra::HeartbeatAgentConfig agent_cfg;
@@ -2446,6 +2536,11 @@ core::Result<bool> GatewayServer::start() {
                         if (agent_cfg.agent_id.empty()) agent_cfg.agent_id = *agent_id;
                     } else if (!runner_cfg_copy.agents.empty()) {
                         agent_cfg = runner_cfg_copy.agents.front();
+                    }
+                    // Aligned with OpenClaw #28508: apply heartbeat override (target:"last")
+                    // so cron-triggered heartbeats deliver to the last active channel.
+                    if (heartbeat.has_value() && heartbeat->target.has_value()) {
+                        agent_cfg.target = heartbeat->target;
                     }
                     infra::HeartbeatRunOnceOptions opts;
                     opts.reason = reason;

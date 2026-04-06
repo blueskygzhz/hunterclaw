@@ -322,6 +322,12 @@ CronJob CronService::add_job(const CronJobCreate& create) {
     store_->update(job.id, patch);
   }
   rearm_timer();
+  // Aligned with OpenClaw: emit(state, { jobId, action: "added", nextRunAtMs })
+  CronServiceDeps::CronEvent evt;
+  evt.job_id = job.id;
+  evt.action = "added";
+  evt.next_run_at_ms = job.state.next_run_at_ms;
+  emit(evt);
   return job;
 }
 
@@ -345,6 +351,12 @@ std::optional<CronJob> CronService::update_job(const std::string& job_id,
       store_->update(job_id, state_patch);
     }
     rearm_timer();
+    // Aligned with OpenClaw: emit(state, { jobId, action: "updated", nextRunAtMs })
+    CronServiceDeps::CronEvent evt;
+    evt.job_id = job_id;
+    evt.action = "updated";
+    evt.next_run_at_ms = result->state.next_run_at_ms;
+    emit(evt);
   }
   return result;
 }
@@ -354,6 +366,11 @@ bool CronService::delete_job(const std::string& job_id) {
   bool removed = store_->remove(job_id);
   if (removed) {
     rearm_timer();
+    // Aligned with OpenClaw: emit(state, { jobId, action: "removed" })
+    CronServiceDeps::CronEvent evt;
+    evt.job_id = job_id;
+    evt.action = "removed";
+    emit(evt);
   }
   return removed;
 }
@@ -381,7 +398,7 @@ void CronService::force_run(const std::string& job_id) {
   patch.state = job->state;
   store_->update(job_id, patch);
 
-  auto outcome = execute_job_core(*job);
+  auto outcome = execute_job_core_with_timeout(*job);
   int64_t end = deps_.now_ms();
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -742,7 +759,7 @@ bool CronService::enqueue_run(const std::string& job_id, bool force) {
 
       // Phase B（lane 外）: 执行 execute_job_core（耗时，不占 Cron lane）
       // 对齐 OpenClaw finishPreparedManualRun: coreResult = await executeJobCoreWithTimeout(...)
-      auto outcome = self->execute_job_core(prepared.execution_job);
+      auto outcome = self->execute_job_core_with_timeout(prepared.execution_job);
       int64_t ended_at = self->deps_.now_ms();
       int64_t started_at = prepared.started_at;
 
@@ -821,7 +838,13 @@ CronRunOutcome CronService::execute_job_core(const CronJob& job) {
       int64_t wait_started_at = deps_.now_ms();
 
       for (;;) {
-        auto hb_result = deps_.run_heartbeat_once(reason, job.agent_id, job.session_key);
+        // Aligned with OpenClaw: cron-triggered heartbeats pass { target: "last" }
+      // so the heartbeat delivers to the last active channel. Without this,
+      // heartbeat target defaults to "none" (since e2362d35) and cron main-session
+      // responses are silently swallowed. See: openclaw#28508
+      CronServiceDeps::HeartbeatOverride hb_override;
+      hb_override.target = "last";
+      auto hb_result = deps_.run_heartbeat_once(reason, job.agent_id, job.session_key, hb_override);
 
         // 非 "requests-in-flight" 的 skipped 状态：退出循环
         if (hb_result.status != HeartbeatRunResult::Status::Skipped ||
@@ -878,6 +901,39 @@ CronRunOutcome CronService::execute_job_core(const CronJob& job) {
   }
 
   return {CronRunStatus::SKIPPED, "no executor configured"};
+}
+
+// ============================================================================
+// execute_job_core_with_timeout (对齐 OpenClaw executeJobCoreWithTimeout)
+// Uses resolveCronJobTimeoutMs: agentTurn → 60min, others → 10min, explicit → payload.timeoutSeconds
+// ============================================================================
+
+CronRunOutcome CronService::execute_job_core_with_timeout(const CronJob& job) {
+  // Resolve timeout (aligned with OpenClaw timeout-policy.ts)
+  int64_t timeout_ms;
+  if (job.payload.kind == CronPayload::Kind::AGENT_TURN && job.payload.timeout_seconds > 0) {
+    timeout_ms = static_cast<int64_t>(job.payload.timeout_seconds) * 1000;
+    if (timeout_ms <= 0) {
+      // timeout_seconds <= 0 means no timeout
+      return execute_job_core(job);
+    }
+  } else if (job.payload.kind == CronPayload::Kind::AGENT_TURN) {
+    timeout_ms = 60 * 60'000;  // AGENT_TURN_SAFETY_TIMEOUT_MS
+  } else {
+    timeout_ms = 10 * 60'000;  // DEFAULT_JOB_TIMEOUT_MS
+  }
+
+  // Run execute_job_core in a separate thread with timeout
+  auto future = std::async(std::launch::async, [this, &job]() {
+    return execute_job_core(job);
+  });
+
+  auto status = future.wait_for(std::chrono::milliseconds(timeout_ms));
+  if (status == std::future_status::ready) {
+    return future.get();
+  }
+  // Timeout: aligned with OpenClaw timeoutErrorMessage()
+  return {CronRunStatus::ERROR, "cron: job execution timed out"};
 }
 
 // ============================================================================
@@ -1097,6 +1153,19 @@ void CronService::update_job_state(const std::string& job_id, const CronJobState
 }
 
 // ============================================================================
+// emit (对齐 OpenClaw timer.ts emit())
+// ============================================================================
+
+void CronService::emit(const CronServiceDeps::CronEvent& evt) {
+  if (!deps_.on_event) return;
+  try {
+    deps_.on_event(evt);
+  } catch (...) {
+    // Aligned with OpenClaw: ignore listener errors
+  }
+}
+
+// ============================================================================
 // run_missed_jobs (对齐 OpenClaw runMissedJobs)
 // ============================================================================
 
@@ -1194,7 +1263,7 @@ void CronService::run_missed_jobs(const std::set<std::string>& skip_job_ids) {
   std::vector<RunResult> results;
   for (auto& job : immediate) {
     int64_t started_at = deps_.now_ms();
-    auto outcome = execute_job_core(job);
+    auto outcome = execute_job_core_with_timeout(job);
     int64_t ended_at = deps_.now_ms();
     results.push_back({job.id, outcome.status, outcome.error, outcome.delivered,
                        started_at, ended_at});
@@ -1369,7 +1438,9 @@ void CronService::scheduler_loop() {
         for (size_t i = 0; i < due_jobs_ptr->size(); ++i) {
           auto& job = (*due_jobs_ptr)[i];
           int64_t started_at = deps_.now_ms();
-          auto outcome = execute_job_core(job);
+          // Aligned with OpenClaw: emit(state, { jobId, action: "started", runAtMs })
+          { CronServiceDeps::CronEvent sevt; sevt.job_id = job.id; sevt.action = "started"; sevt.run_at_ms = started_at; emit(sevt); }
+          auto outcome = execute_job_core_with_timeout(job);
           int64_t ended_at = deps_.now_ms();
           (*tick_results_ptr)[i] = {job.id, outcome.status, outcome.error, outcome.delivered,
                                      started_at, ended_at};
@@ -1379,14 +1450,15 @@ void CronService::scheduler_loop() {
         std::atomic<size_t> cursor{0};
         std::vector<std::thread> workers;
         for (int w = 0; w < concurrency; ++w) {
-          workers.emplace_back([&]() {
+          workers.emplace_back([this, &cursor, due_jobs_ptr, tick_results_ptr]() {
             for (;;) {
               size_t idx = cursor.fetch_add(1);
               if (idx >= due_jobs_ptr->size()) return;
               auto& job = (*due_jobs_ptr)[idx];
-              int64_t started_at = deps_.now_ms();
-              auto outcome = execute_job_core(job);
-              int64_t ended_at = deps_.now_ms();
+              int64_t started_at = this->deps_.now_ms();
+              { CronServiceDeps::CronEvent sevt; sevt.job_id = job.id; sevt.action = "started"; sevt.run_at_ms = started_at; this->emit(sevt); }
+              auto outcome = this->execute_job_core_with_timeout(job);
+              int64_t ended_at = this->deps_.now_ms();
               (*tick_results_ptr)[idx] = {job.id, outcome.status, outcome.error, outcome.delivered,
                                            started_at, ended_at};
             }
@@ -1414,8 +1486,29 @@ void CronService::scheduler_loop() {
             p.state = stored->state;
             p.enabled = stored->enabled;
             self->store_->update(r.job_id, p);
+
+            // Aligned with OpenClaw: emitJobFinished(state, job, result, runAtMs)
+            {
+              CronServiceDeps::CronEvent fevt;
+              fevt.job_id = r.job_id;
+              fevt.action = "finished";
+              fevt.status = r.status;
+              fevt.error = r.error;
+              fevt.delivered = r.delivered;
+              fevt.delivery_status = stored->state.last_delivery_status;
+              fevt.delivery_error = stored->state.last_delivery_error;
+              fevt.run_at_ms = r.started_at;
+              fevt.duration_ms = stored->state.last_duration_ms;
+              fevt.next_run_at_ms = stored->state.next_run_at_ms;
+              self->emit(fevt);
+            }
+
             if (should_delete) {
               self->store_->remove(r.job_id);
+              CronServiceDeps::CronEvent revt;
+              revt.job_id = r.job_id;
+              revt.action = "removed";
+              self->emit(revt);
             }
           }
           // 对齐 OpenClaw: maintenance-only recompute，避免推进 past-due nextRunAtMs (issue #17852)

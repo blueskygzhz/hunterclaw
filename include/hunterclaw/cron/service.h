@@ -359,12 +359,21 @@ struct CronServiceDeps {
                      const std::optional<std::string>& agent_id,
                      const std::optional<std::string>& session_key)> request_heartbeat_now;
 
+  // Heartbeat config override for cron-triggered heartbeats.
+  // Aligned with OpenClaw: opts.heartbeat = { target: "last" } (#28508)
+  struct HeartbeatOverride {
+    std::optional<std::string> target;  // e.g. "last"
+  };
+
   // 同步执行一次 heartbeat 并等待结果 (wakeMode=now 路径)
   // 对齐 OpenClaw runHeartbeatOnce
+  // heartbeat override: cron passes { target: "last" } so heartbeat delivers to
+  // the last active channel instead of "none" (default since e2362d35). (#28508)
   std::function<HeartbeatRunResult(
       const std::optional<std::string>& reason,
       const std::optional<std::string>& agent_id,
-      const std::optional<std::string>& session_key)> run_heartbeat_once;
+      const std::optional<std::string>& session_key,
+      const std::optional<HeartbeatOverride>& heartbeat)> run_heartbeat_once;
 
   // 执行 isolated agent job
   // 对齐 OpenClaw server-cron.ts: runIsolatedAgentJob({ job, message, abortSignal })
@@ -381,10 +390,27 @@ struct CronServiceDeps {
                      const std::optional<std::string>& mode,
                      const std::optional<std::string>& account_id)> send_cron_failure_alert;
 
-  // 事件回调
-  std::function<void(const std::string& job_id,
-                     const std::string& action,
-                     const std::optional<int64_t>& next_run_at_ms)> on_event;
+  // 事件回调 — aligned with OpenClaw CronEvent (service/state.ts)
+  // Emitted on job lifecycle events: added, updated, removed, started, finished.
+  struct CronEvent {
+    std::string job_id;
+    std::string action;  // "added" | "updated" | "removed" | "started" | "finished"
+    std::optional<int64_t> run_at_ms;
+    std::optional<int64_t> duration_ms;
+    std::optional<int64_t> next_run_at_ms;
+    std::optional<CronRunStatus> status;
+    std::optional<std::string> error;
+    std::optional<std::string> summary;
+    std::optional<bool> delivered;
+    std::optional<std::string> delivery_status;
+    std::optional<std::string> delivery_error;
+    std::optional<std::string> session_id;
+    std::optional<std::string> session_key;
+    // CronRunTelemetry
+    std::optional<std::string> model;
+    std::optional<std::string> provider;
+  };
+  std::function<void(const CronEvent& evt)> on_event;
 };
 
 /**
@@ -420,6 +446,10 @@ class CronService : public std::enable_shared_from_this<CronService> {
   
   // 执行单个任务核心逻辑 (对齐 OpenClaw executeJobCore)
   CronRunOutcome execute_job_core(const CronJob& job);
+
+  // 带超时的执行 (对齐 OpenClaw executeJobCoreWithTimeout)
+  // Uses resolveCronJobTimeoutMs to determine the timeout.
+  CronRunOutcome execute_job_core_with_timeout(const CronJob& job);
   
   // 应用执行结果，更新状态，返回是否应删除任务 (对齐 OpenClaw applyJobResult)
   bool apply_job_result(
@@ -457,6 +487,9 @@ class CronService : public std::enable_shared_from_this<CronService> {
   
   // 发送失败告警
   void emit_failure_alert(const CronJob& job, const std::string& error, int consecutive_errors);
+
+  // Emit CronEvent to on_event callback (aligned with OpenClaw emit())
+  void emit(const CronServiceDeps::CronEvent& evt);
   
   // 更新 job 状态到 store
   void update_job_state(const std::string& job_id, const CronJobState& state);

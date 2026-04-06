@@ -531,8 +531,13 @@ core::Result<json> method_chat_send(
             }
         }).detach();
     } else {
-        // Fallback: 直接在后台线程执行（MessageDispatcher 未初始化时）
-        std::thread([run_fn]() { run_fn(); }).detach();
+        // Aligned with openclaw: chat.send REQUIRES MessageDispatcher.
+        // OpenClaw has no fallback — dispatchInboundMessage is the only path.
+        // If MessageDispatcher is not initialized, it's a startup bug, not a
+        // recoverable situation. Running without dispatcher bypasses session lane,
+        // queue mode, active_sessions_ tracking, and abort support.
+        return core::Result<json>::Err(
+            "MessageDispatcher not initialized — chat.send requires dispatcher");
     }
     
     // ========================================================================
@@ -551,7 +556,21 @@ core::Result<json> method_chat_send(
 }
 
 // ============================================================================
-// 14. chat.abort - Abort active chat run (对齐 OpenClaw)
+// 14. chat.abort - Abort active chat run (对齐 OpenClaw chat.abort)
+//
+// OpenClaw chat.abort 实现核心：
+//   params: { sessionKey: string, runId?: string }
+//   - 无 runId → session 级别: 遍历 chatAbortControllers 中所有 sessionKey 匹配
+//     的 active run，逐个 abortChatRunById，返回 { ok, aborted, runIds[] }
+//   - 有 runId → run 级别: 精确查找 chatAbortControllers.get(runId)，验证
+//     active.sessionKey === rawSessionKey，验证权限，然后 abortChatRunById
+//
+// HunterClaw 当前限制:
+//   - 没有 per-run AbortController Map（chatAbortControllers），因此 run_id
+//     级别的精确 abort 退化为 session 级别。
+//   - 没有权限模型（owner connId/deviceId）。
+//   - 没有 chatRunBuffers（部分文本持久化）。
+//   以上功能需要在 chat.send 中注册 AbortController 后才能完整对齐。
 // ============================================================================
 
 core::Result<json> method_chat_abort(
@@ -561,20 +580,36 @@ core::Result<json> method_chat_abort(
     const json& params
 ) {
     // ========================================================================
-    // Step 1: 参数验证
+    // Step 1: 参数验证 (对齐 OpenClaw: ChatAbortParamsSchema)
+    // params: { sessionKey: NonEmptyString, runId?: NonEmptyString }
     // ========================================================================
     
-    if (!params.contains("session_id")) {
-        return core::Result<json>::Err("Missing required parameter: session_id");
+    if (!params.contains("sessionKey") && !params.contains("session_id")) {
+        return core::Result<json>::Err("invalid chat.abort params: sessionKey is required");
     }
     
-    std::string session_id = params["session_id"];
-    std::string run_id = params.value("run_id", "");
+    // Accept both "sessionKey" (OpenClaw) and "session_id" (legacy HunterClaw) for back-compat
+    const std::string session_key = params.contains("sessionKey")
+        ? params["sessionKey"].get<std::string>()
+        : params["session_id"].get<std::string>();
     
-    get_logger()->info("[chat.abort] session={}, run_id={}", session_id, run_id.empty() ? "<all>" : run_id);
+    if (session_key.empty()) {
+        return core::Result<json>::Err("invalid chat.abort params: sessionKey must be non-empty");
+    }
+    
+    // Accept both "runId" (OpenClaw) and "run_id" (legacy)
+    std::string run_id;
+    if (params.contains("runId") && params["runId"].is_string()) {
+        run_id = params["runId"].get<std::string>();
+    } else if (params.contains("run_id") && params["run_id"].is_string()) {
+        run_id = params["run_id"].get<std::string>();
+    }
+    
+    get_logger()->info("[chat.abort] sessionKey={}, runId={}", session_key,
+        run_id.empty() ? "<session-level>" : run_id);
     
     // ========================================================================
-    // Step 2: 获取 Agent
+    // Step 2: 获取 Agent (通过 sessionKey 查找)
     // ========================================================================
     
     auto agent_pool = server->agent_pool();
@@ -582,9 +617,9 @@ core::Result<json> method_chat_abort(
         return core::Result<json>::Err("AgentPool not initialized");
     }
     
-    auto agent = agent_pool->get_agent(session_id);
+    auto agent = agent_pool->get_agent(session_key);
     if (!agent) {
-        // 没有活跃 Agent，返回成功
+        // Aligned with OpenClaw: run not found → { ok: true, aborted: false, runIds: [] }
         json result;
         result["ok"] = true;
         result["aborted"] = false;
@@ -593,7 +628,16 @@ core::Result<json> method_chat_abort(
     }
     
     // ========================================================================
-    // Step 3: 中止执行 (ReAct Engine)
+    // Step 3: 中止执行
+    //
+    // OpenClaw 模型:
+    //   - 无 runId → abortChatRunsForSessionKeyWithPartials: 遍历所有匹配
+    //     sessionKey 的 active run，逐个 abort
+    //   - 有 runId → abortChatRunById: 精确查找 + sessionKey 匹配验证
+    //
+    // HunterClaw 当前实现:
+    //   ReactEngine::cancel() 中止当前 session 的所有活跃执行。
+    //   TODO: 引入 per-run AbortController 注册表后，可实现 run_id 精确 abort。
     // ========================================================================
     
     auto react_engine = agent->react_engine();
@@ -605,35 +649,53 @@ core::Result<json> method_chat_abort(
         return core::Result<json>::Ok(result);
     }
     
-    // 如果指定了 run_id，中止特定运行
-    // 如果没有指定，中止所有运行
-    bool aborted = false;
-    std::vector<std::string> aborted_runs;
-    
-    // ✅ 对齐 OpenClaw: abort_chat_run
-    // ReactEngine::cancel() 中止当前正在执行的 run
-    // OpenClaw 通过 AbortController 实现 run_id 级别的中止
-    // HunterClaw: cancel() 中止当前 session 的所有活跃 run（session 级别）
+    // Abort all active runs for this session.
+    // Aligned with OpenClaw: active.controller.abort() + cleanup state
     react_engine->cancel();
-    aborted = true;
-
-    if (run_id.empty()) {
-        aborted_runs.push_back("all");
-    } else {
-        aborted_runs.push_back(run_id);
-    }
     
-    get_logger()->info("[chat.abort] Result: session={}, aborted={}, count={}",
-        session_id, aborted, aborted_runs.size());
+    // Build response (aligned with OpenClaw response format)
+    std::vector<std::string> aborted_run_ids;
+    if (!run_id.empty()) {
+        // run-level abort: report the specific run_id
+        // TODO: validate that run_id actually belongs to this session_key
+        // (requires chatAbortControllers registry from chat.send)
+        aborted_run_ids.push_back(run_id);
+    }
+    // If no run_id specified, we aborted all runs but OpenClaw returns the
+    // actual runIds from chatAbortControllers. Without that registry, we
+    // cannot enumerate them, so return empty array (aborted=true signals success).
+    
+    bool aborted = true;
     
     // ========================================================================
-    // Step 4: 返回结果 (对齐 OpenClaw)
+    // Step 4: Broadcast "aborted" event (对齐 OpenClaw broadcastChatAborted)
+    // ========================================================================
+    
+    if (server->impl()) {
+        json abort_payload;
+        abort_payload["sessionKey"] = session_key;
+        abort_payload["state"] = "aborted";
+        abort_payload["stopReason"] = "rpc";
+        if (!run_id.empty()) {
+            abort_payload["runId"] = run_id;
+        }
+        core::EventFrame ef;
+        ef.event = "chat";
+        ef.payload = abort_payload;
+        server->broadcast(ef);
+    }
+    
+    get_logger()->info("[chat.abort] Result: sessionKey={}, aborted={}, runIds={}",
+        session_key, aborted, aborted_run_ids.size());
+    
+    // ========================================================================
+    // Step 5: 返回结果 (对齐 OpenClaw: { ok, aborted, runIds })
     // ========================================================================
     
     json result;
     result["ok"] = true;
     result["aborted"] = aborted;
-    result["runIds"] = aborted_runs;
+    result["runIds"] = aborted_run_ids;
     
     return core::Result<json>::Ok(result);
 }
