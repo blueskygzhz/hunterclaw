@@ -1,293 +1,222 @@
-#ifndef HUNTERCLAW_ROUTING_SESSION_KEY_H
-#define HUNTERCLAW_ROUTING_SESSION_KEY_H
+#pragma once
+// Aligned with openclaw: src/routing/session-key.ts (254 lines) + account-id.ts (71 lines)
+// Session key normalization, agent ID, account ID, session key construction
 
 #include <string>
 #include <optional>
-#include <vector>
-#include <map>
-#include <algorithm>
 #include <regex>
-#include "hunterclaw/sessions/session_key_utils.h"
-#include "hunterclaw/routing/router.h"
+#include <unordered_map>
+#include <mutex>
 
 namespace hunterclaw {
 namespace routing {
 
-// Session key shape classification (aligned with OpenClaw: SessionKeyShape)
-enum class SessionKeyShape {
-    Missing,          // "missing"
-    Agent,            // "agent"
-    LegacyOrAlias,    // "legacy_or_alias"
-    MalformedAgent    // "malformed_agent"
+// ============================================================================
+// Constants (对齐 session-key.ts) - use sk_ prefix to avoid conflicts
+// ============================================================================
+inline constexpr const char* SK_DEFAULT_AGENT_ID = "main";
+inline constexpr const char* SK_DEFAULT_MAIN_KEY = "main";
+inline constexpr const char* SK_DEFAULT_ACCOUNT_ID = "default";
+
+// ============================================================================
+// SessionKeyShape (对齐 session-key.ts)
+// ============================================================================
+enum class SessionKeyShape { Missing, Agent, LegacyOrAlias, MalformedAgent };
+
+// ============================================================================
+// ParsedAgentSessionKey (对齐 session-key-utils.ts)
+// ============================================================================
+struct ParsedAgentSessionKey {
+    std::string agent_id;
+    std::string rest;
 };
 
-// Default constants (aligned with OpenClaw)
-inline const std::string DEFAULT_AGENT_ID = "main";
-inline const std::string DEFAULT_MAIN_KEY_STR = "main";
+// Aligned with openclaw: parseAgentSessionKey
+inline std::optional<ParsedAgentSessionKey> parse_agent_session_key(const std::string& key) {
+    if (key.empty()) return std::nullopt;
+    // Pattern: agent:{agentId}:{rest}
+    if (key.size() < 7 || key.substr(0, 6) != "agent:") return std::nullopt;
+    auto second_colon = key.find(':', 6);
+    if (second_colon == std::string::npos) return std::nullopt;
+    return ParsedAgentSessionKey{key.substr(6, second_colon - 6), key.substr(second_colon + 1)};
+}
 
-/**
- * Normalize a main key value.
- * Aligned with OpenClaw: normalizeMainKey()
- */
+// ============================================================================
+// Agent ID normalization (对齐 session-key.ts:89-116)
+// ============================================================================
+inline std::string normalize_agent_id(const std::string& value) {
+    std::string trimmed = value;
+    auto s = trimmed.find_first_not_of(" \t\n\r");
+    auto e = trimmed.find_last_not_of(" \t\n\r");
+    if (s == std::string::npos) return SK_DEFAULT_AGENT_ID;
+    trimmed = trimmed.substr(s, e - s + 1);
+    if (trimmed.empty()) return SK_DEFAULT_AGENT_ID;
+    // Check valid ID
+    static const std::regex valid_re("^[a-z0-9][a-z0-9_-]{0,63}$", std::regex::icase);
+    if (std::regex_match(trimmed, valid_re)) {
+        std::string lower = trimmed;
+        for (auto& c : lower) c = std::tolower(c);
+        return lower;
+    }
+    // Best-effort fallback
+    std::string result;
+    for (auto& c : trimmed) result += std::tolower(c);
+    static const std::regex invalid_re("[^a-z0-9_-]+");
+    result = std::regex_replace(result, invalid_re, "-");
+    // Strip leading/trailing dashes
+    while (!result.empty() && result.front() == '-') result.erase(0, 1);
+    while (!result.empty() && result.back() == '-') result.pop_back();
+    if (result.size() > 64) result = result.substr(0, 64);
+    return result.empty() ? SK_DEFAULT_AGENT_ID : result;
+}
+
+inline bool is_valid_agent_id(const std::string& value) {
+    std::string trimmed = value;
+    auto s = trimmed.find_first_not_of(" \t");
+    if (s == std::string::npos) return false;
+    auto e = trimmed.find_last_not_of(" \t");
+    trimmed = trimmed.substr(s, e - s + 1);
+    if (trimmed.empty()) return false;
+    static const std::regex valid_re("^[a-z0-9][a-z0-9_-]{0,63}$", std::regex::icase);
+    return std::regex_match(trimmed, valid_re);
+}
+
+inline std::string sanitize_agent_id(const std::string& value) {
+    return normalize_agent_id(value);
+}
+
+// ============================================================================
+// Account ID normalization (对齐 account-id.ts)
+// ============================================================================
+inline std::string normalize_account_id(const std::string& value) {
+    std::string trimmed = value;
+    auto s = trimmed.find_first_not_of(" \t\n\r");
+    auto e = trimmed.find_last_not_of(" \t\n\r");
+    if (s == std::string::npos) return SK_DEFAULT_ACCOUNT_ID;
+    trimmed = trimmed.substr(s, e - s + 1);
+    if (trimmed.empty()) return SK_DEFAULT_ACCOUNT_ID;
+    // Prototype pollution check
+    if (trimmed == "__proto__" || trimmed == "constructor" || trimmed == "prototype") {
+        return SK_DEFAULT_ACCOUNT_ID;
+    }
+    static const std::regex valid_re("^[a-z0-9][a-z0-9_-]{0,63}$", std::regex::icase);
+    if (std::regex_match(trimmed, valid_re)) {
+        std::string lower = trimmed;
+        for (auto& c : lower) c = std::tolower(c);
+        return lower;
+    }
+    std::string result;
+    for (auto& c : trimmed) result += std::tolower(c);
+    static const std::regex invalid_re("[^a-z0-9_-]+");
+    result = std::regex_replace(result, invalid_re, "-");
+    while (!result.empty() && result.front() == '-') result.erase(0, 1);
+    while (!result.empty() && result.back() == '-') result.pop_back();
+    if (result.size() > 64) result = result.substr(0, 64);
+    return result.empty() ? SK_DEFAULT_ACCOUNT_ID : result;
+}
+
+inline std::optional<std::string> normalize_optional_account_id(const std::string& value) {
+    std::string trimmed = value;
+    auto s = trimmed.find_first_not_of(" \t\n\r");
+    if (s == std::string::npos) return std::nullopt;
+    auto e = trimmed.find_last_not_of(" \t\n\r");
+    trimmed = trimmed.substr(s, e - s + 1);
+    if (trimmed.empty()) return std::nullopt;
+    auto result = normalize_account_id(trimmed);
+    return result == SK_DEFAULT_ACCOUNT_ID ? std::nullopt : std::optional<std::string>(result);
+}
+
+// ============================================================================
+// Main Key normalization (对齐 session-key.ts:40-43)
+// ============================================================================
 inline std::string normalize_main_key(const std::string& value) {
     std::string trimmed = value;
-    size_t s = trimmed.find_first_not_of(" \t\r\n");
-    if (s == std::string::npos) return DEFAULT_MAIN_KEY_STR;
-    size_t e = trimmed.find_last_not_of(" \t\r\n");
+    auto s = trimmed.find_first_not_of(" \t\n\r");
+    if (s == std::string::npos) return SK_DEFAULT_MAIN_KEY;
+    auto e = trimmed.find_last_not_of(" \t\n\r");
     trimmed = trimmed.substr(s, e - s + 1);
-    if (trimmed.empty()) return DEFAULT_MAIN_KEY_STR;
-    std::transform(trimmed.begin(), trimmed.end(), trimmed.begin(), ::tolower);
+    if (trimmed.empty()) return SK_DEFAULT_MAIN_KEY;
+    for (auto& c : trimmed) c = std::tolower(c);
     return trimmed;
 }
 
-/**
- * Normalize an agent ID.
- * Aligned with OpenClaw: normalizeAgentId()
- */
-inline std::string normalize_agent_id(const std::string& value) {
-    std::string trimmed = value;
-    size_t s = trimmed.find_first_not_of(" \t\r\n");
-    if (s == std::string::npos) return DEFAULT_AGENT_ID;
-    size_t e = trimmed.find_last_not_of(" \t\r\n");
-    trimmed = trimmed.substr(s, e - s + 1);
-    if (trimmed.empty()) return DEFAULT_AGENT_ID;
-
-    static const std::regex valid_id_re{"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$"};
-    if (std::regex_match(trimmed, valid_id_re)) {
-        std::transform(trimmed.begin(), trimmed.end(), trimmed.begin(), ::tolower);
-        return trimmed;
-    }
-
-    // Best-effort fallback: collapse invalid characters to "-"
-    std::string lower = trimmed;
-    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-    std::string result;
-    for (char c : lower) {
-        if (std::isalnum(c) || c == '_' || c == '-') result += c;
-        else result += '-';
-    }
-    // Remove leading/trailing dashes
-    size_t rs = result.find_first_not_of('-');
-    if (rs == std::string::npos) return DEFAULT_AGENT_ID;
-    size_t re = result.find_last_not_of('-');
-    result = result.substr(rs, re - rs + 1);
-    if (result.size() > 64) result = result.substr(0, 64);
-    return result.empty() ? DEFAULT_AGENT_ID : result;
-}
-
-/**
- * Check if an agent ID is valid.
- * Aligned with OpenClaw: isValidAgentId()
- */
-inline bool is_valid_agent_id(const std::string& value) {
-    std::string trimmed = value;
-    size_t s = trimmed.find_first_not_of(" \t\r\n");
-    if (s == std::string::npos) return false;
-    size_t e = trimmed.find_last_not_of(" \t\r\n");
-    trimmed = trimmed.substr(s, e - s + 1);
-    if (trimmed.empty()) return false;
-    static const std::regex valid_id_re{"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$"};
-    return std::regex_match(trimmed, valid_id_re);
-}
-
-/**
- * Convert a store session key to a request session key (strip agent prefix).
- * Aligned with OpenClaw: toAgentRequestSessionKey()
- */
-inline std::optional<std::string> to_agent_request_session_key(const std::string& store_key) {
-    std::string raw = store_key;
-    size_t s = raw.find_first_not_of(" \t\r\n");
-    if (s == std::string::npos) return std::nullopt;
-    size_t e = raw.find_last_not_of(" \t\r\n");
-    raw = raw.substr(s, e - s + 1);
-    if (raw.empty()) return std::nullopt;
-
-    auto parsed = sessions::parse_agent_session_key(raw);
-    if (parsed) return parsed->rest;
-    return raw;
-}
-
-/**
- * Convert a request session key to a store session key (add agent prefix).
- * Aligned with OpenClaw: toAgentStoreSessionKey()
- */
-inline std::string to_agent_store_session_key(
-    const std::string& agent_id,
-    const std::string& request_key,
-    const std::string& main_key = ""
-) {
-    std::string raw = request_key;
-    size_t s = raw.find_first_not_of(" \t\r\n");
-    if (s == std::string::npos) raw = "";
-    else {
-        size_t e = raw.find_last_not_of(" \t\r\n");
-        raw = raw.substr(s, e - s + 1);
-    }
-
-    if (raw.empty() || raw == DEFAULT_MAIN_KEY_STR) {
-        std::string mk = main_key.empty() ? DEFAULT_MAIN_KEY_STR : normalize_main_key(main_key);
-        return "agent:" + normalize_agent_id(agent_id) + ":" + mk;
-    }
-
-    auto parsed = sessions::parse_agent_session_key(raw);
-    if (parsed) {
-        return "agent:" + parsed->agent_id + ":" + parsed->rest;
-    }
-
-    std::string lower = raw;
-    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-    if (lower.substr(0, 6) == "agent:") return lower;
-
-    return "agent:" + normalize_agent_id(agent_id) + ":" + lower;
-}
-
-/**
- * Resolve agent ID from session key.
- * Aligned with OpenClaw: resolveAgentIdFromSessionKey()
- */
-inline std::string resolve_agent_id_from_session_key(const std::string& session_key) {
-    auto parsed = sessions::parse_agent_session_key(session_key);
-    return normalize_agent_id(parsed ? parsed->agent_id : DEFAULT_AGENT_ID);
-}
-
-/**
- * Classify the shape of a session key.
- * Aligned with OpenClaw: classifySessionKeyShape()
- */
+// ============================================================================
+// Session Key Classification (对齐 session-key.ts:78-87)
+// ============================================================================
 inline SessionKeyShape classify_session_key_shape(const std::string& session_key) {
     std::string raw = session_key;
-    size_t s = raw.find_first_not_of(" \t\r\n");
+    auto s = raw.find_first_not_of(" \t\n\r");
     if (s == std::string::npos) return SessionKeyShape::Missing;
-    size_t e = raw.find_last_not_of(" \t\r\n");
+    auto e = raw.find_last_not_of(" \t\n\r");
     raw = raw.substr(s, e - s + 1);
     if (raw.empty()) return SessionKeyShape::Missing;
-
-    if (sessions::parse_agent_session_key(raw)) return SessionKeyShape::Agent;
-
+    if (parse_agent_session_key(raw)) return SessionKeyShape::Agent;
     std::string lower = raw;
-    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    for (auto& c : lower) c = std::tolower(c);
     return lower.substr(0, 6) == "agent:" ? SessionKeyShape::MalformedAgent : SessionKeyShape::LegacyOrAlias;
 }
 
-/**
- * Build the main session key for an agent.
- * Aligned with OpenClaw: buildAgentMainSessionKey()
- */
-inline std::string build_agent_main_session_key(
-    const std::string& agent_id,
-    const std::string& main_key = ""
-) {
-    return "agent:" + normalize_agent_id(agent_id) + ":" +
-           (main_key.empty() ? DEFAULT_MAIN_KEY_STR : normalize_main_key(main_key));
+// ============================================================================
+// Session Key Builders (对齐 session-key.ts:118-174)
+// ============================================================================
+inline std::string build_agent_main_session_key(const std::string& agent_id,
+                                                  const std::string& main_key = "") {
+    return "agent:" + normalize_agent_id(agent_id) + ":" + normalize_main_key(main_key);
 }
 
-/**
- * Build a peer session key for an agent.
- * Aligned with OpenClaw: buildAgentPeerSessionKey()
- */
-inline std::string build_agent_peer_session_key(
-    const std::string& agent_id,
-    const std::string& channel,
-    const std::string& account_id,
-    const std::string& peer_kind,  // "direct", "group", "channel"
-    const std::string& peer_id,
-    DmScope dm_scope = DmScope::Main,
-    const std::string& main_key = ""
-) {
-    std::string normalized_agent = normalize_agent_id(agent_id);
-
-    if (peer_kind == "direct") {
-        std::string pid = peer_id;
-        std::transform(pid.begin(), pid.end(), pid.begin(), ::tolower);
-
-        if (dm_scope == DmScope::PerAccountChannelPeer && !pid.empty()) {
-            std::string ch = channel;
-            std::transform(ch.begin(), ch.end(), ch.begin(), ::tolower);
-            if (ch.empty()) ch = "unknown";
-            std::string aid = account_id.empty() ? DEFAULT_ACCOUNT_ID : account_id;
-            return "agent:" + normalized_agent + ":" + ch + ":" + aid + ":direct:" + pid;
-        }
-        if (dm_scope == DmScope::PerChannelPeer && !pid.empty()) {
-            std::string ch = channel;
-            std::transform(ch.begin(), ch.end(), ch.begin(), ::tolower);
-            if (ch.empty()) ch = "unknown";
-            return "agent:" + normalized_agent + ":" + ch + ":direct:" + pid;
-        }
-        if (dm_scope == DmScope::PerPeer && !pid.empty()) {
-            return "agent:" + normalized_agent + ":direct:" + pid;
-        }
-        return build_agent_main_session_key(agent_id, main_key);
-    }
-
-    std::string ch = channel;
-    std::transform(ch.begin(), ch.end(), ch.begin(), ::tolower);
-    if (ch.empty()) ch = "unknown";
-    std::string pid = peer_id.empty() ? "unknown" : peer_id;
-    std::transform(pid.begin(), pid.end(), pid.begin(), ::tolower);
-
-    return "agent:" + normalized_agent + ":" + ch + ":" + peer_kind + ":" + pid;
+inline std::string resolve_agent_id_from_session_key(const std::string& session_key) {
+    auto parsed = parse_agent_session_key(session_key);
+    return normalize_agent_id(parsed ? parsed->agent_id : SK_DEFAULT_AGENT_ID);
 }
 
-/**
- * Resolve thread session keys.
- * Aligned with OpenClaw: resolveThreadSessionKeys()
- */
-struct ThreadSessionKeys {
-    std::string session_key;
-    std::optional<std::string> parent_session_key;
-};
-
-inline ThreadSessionKeys resolve_thread_session_keys(
-    const std::string& base_session_key,
-    const std::string& thread_id = "",
-    const std::string& parent_session_key = "",
-    bool use_suffix = true
-) {
-    std::string tid = thread_id;
-    size_t s = tid.find_first_not_of(" \t\r\n");
-    if (s == std::string::npos) tid = "";
-    else {
-        size_t e = tid.find_last_not_of(" \t\r\n");
-        tid = tid.substr(s, e - s + 1);
-    }
-
-    if (tid.empty()) {
-        return {base_session_key, std::nullopt};
-    }
-
-    std::string normalized_tid = tid;
-    std::transform(normalized_tid.begin(), normalized_tid.end(), normalized_tid.begin(), ::tolower);
-
-    std::string session_key = use_suffix
-        ? base_session_key + ":thread:" + normalized_tid
-        : base_session_key;
-
-    std::optional<std::string> parent;
-    if (!parent_session_key.empty()) parent = parent_session_key;
-
-    return {session_key, parent};
+inline std::optional<std::string> to_agent_request_session_key(const std::string& store_key) {
+    std::string raw = store_key;
+    auto s = raw.find_first_not_of(" \t\n\r");
+    if (s == std::string::npos) return std::nullopt;
+    auto e = raw.find_last_not_of(" \t\n\r");
+    raw = raw.substr(s, e - s + 1);
+    if (raw.empty()) return std::nullopt;
+    auto parsed = parse_agent_session_key(raw);
+    return parsed ? std::optional<std::string>(parsed->rest) : std::optional<std::string>(raw);
 }
 
-/**
- * Build a group history key.
- * Aligned with OpenClaw: buildGroupHistoryKey()
- */
-inline std::string build_group_history_key(
-    const std::string& channel,
-    const std::string& account_id,
-    const std::string& peer_kind,  // "group" | "channel"
-    const std::string& peer_id
+// Aligned with openclaw: isAcpSessionKey / isCronSessionKey / isSubagentSessionKey
+// NOTE: prefixed with sk_ to avoid conflict with session_key_utils.h equivalents
+inline bool sk_is_acp_session_key(const std::string& key) {
+    auto parsed = parse_agent_session_key(key);
+    return parsed && parsed->rest.find("acp:") == 0;
+}
+
+inline bool sk_is_cron_session_key(const std::string& key) {
+    auto parsed = parse_agent_session_key(key);
+    return parsed && parsed->rest.find("cron:") == 0;
+}
+
+inline bool sk_is_subagent_session_key(const std::string& key) {
+    auto parsed = parse_agent_session_key(key);
+    return parsed && parsed->rest.find("sub:") == 0;
+}
+
+// ============================================================================
+// Account Lookup (对齐 account-lookup.ts)
+// ============================================================================
+template<typename T>
+inline std::optional<T> resolve_account_entry(
+    const std::unordered_map<std::string, T>& accounts,
+    const std::string& account_id
 ) {
-    std::string ch = channel;
-    std::transform(ch.begin(), ch.end(), ch.begin(), ::tolower);
-    if (ch.empty()) ch = "unknown";
-    std::string aid = account_id.empty() ? DEFAULT_ACCOUNT_ID : account_id;
-    std::string pid = peer_id.empty() ? "unknown" : peer_id;
-    std::transform(pid.begin(), pid.end(), pid.begin(), ::tolower);
-    return ch + ":" + aid + ":" + peer_kind + ":" + pid;
+    if (accounts.empty()) return std::nullopt;
+    auto it = accounts.find(account_id);
+    if (it != accounts.end()) return it->second;
+    std::string lower = account_id;
+    for (auto& c : lower) c = std::tolower(c);
+    for (const auto& [key, val] : accounts) {
+        std::string key_lower = key;
+        for (auto& c : key_lower) c = std::tolower(c);
+        if (key_lower == lower) return val;
+    }
+    return std::nullopt;
 }
 
 } // namespace routing
 } // namespace hunterclaw
-
-#endif // HUNTERCLAW_ROUTING_SESSION_KEY_H

@@ -123,6 +123,31 @@ cc_library(
 )
 
 # ============================================================================
+# Media Library - Media Store, Parse, MIME, Path Policy (对齐 OpenClaw media/)
+# ============================================================================
+cc_library(
+    name = "hunterclaw_media",
+    srcs = glob(["media/*.cc"]),
+    deps = [
+        "//:hunterclaw_headers",
+        "@nlohmann_json//:json",
+    ],
+    copts = [
+        "-std=c++17",
+        "-Wall",
+        "-Wextra",
+        "-I/usr/include/spdlog",
+    ],
+    linkopts = [
+        "-lpthread",
+        "-luuid",
+        "-lstdc++fs",
+    ],
+    linkstatic = False,
+    visibility = ["//visibility:public"],
+)
+
+# ============================================================================
 # Memory Library - 严格对齐 OpenClaw Memory 实现
 # ============================================================================
 # ============================================================================
