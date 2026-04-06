@@ -331,7 +331,7 @@ private:
     // 中止运行中的 session（interrupt 模式）
     bool abort_embedded_session(const std::string& session_key);
 
-private:
+public:
     // 按 mode 消费 followup 队列：followup=逐条串行，collect=批量合并
     void drain_followup_queue(const std::string& session_key);
 

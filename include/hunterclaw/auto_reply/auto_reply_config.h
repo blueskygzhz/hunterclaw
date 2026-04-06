@@ -93,6 +93,22 @@ struct ChannelConfig {
 };
 
 // ═══════════════════════════════════════════════════════════════
+// ✅ 对齐 OpenClaw: config.messages.queue (types.messages.ts)
+// 全局 queue 配置，优先级低于 session entry 但高于 default
+// ═══════════════════════════════════════════════════════════════
+
+struct QueueConfig {
+    std::optional<std::string> mode;                  // global default mode
+    std::optional<int> debounce_ms;                   // global default debounce
+    std::optional<int> cap;                           // global default cap
+    std::optional<std::string> drop;                  // global default drop policy
+    // ✅ 对齐 OpenClaw: byChannel — per-channel queue mode overrides
+    std::map<std::string, std::string> by_channel;
+    // ✅ 对齐 OpenClaw: debounceMsByChannel — per-channel debounce overrides
+    std::map<std::string, int> debounce_ms_by_channel;
+};
+
+// ═══════════════════════════════════════════════════════════════
 // ✅ 严格对齐 OpenClaw: src/auto-reply/types.ts
 // 消息分发配置 (Dispatch Config)
 // ═══════════════════════════════════════════════════════════════
@@ -127,6 +143,10 @@ struct DispatchConfig {
         double backoff_multiplier = 2.0;
     };
     RetryPolicy retry_policy;
+    
+    // ✅ 对齐 OpenClaw: config.messages.queue
+    // 全局 queue 配置（优先级: inlineMode > sessionEntry > byChannel > global > default）
+    QueueConfig queue;
 };
 
 // ═══════════════════════════════════════════════════════════════

@@ -6,6 +6,7 @@
 #include "hunterclaw/infra/heartbeat_wake.h"
 #include <mutex>
 #include <atomic>
+#include <thread>
 
 namespace hunterclaw {
 namespace infra {
@@ -62,15 +63,28 @@ std::function<void()> set_heartbeat_wake_handler(HeartbeatWakeHandler handler) {
 }
 
 // ── request_heartbeat_now ────────────────────────────────────────────────────
-// Aligned with openclaw: requestHeartbeatNow
+// ✅ 严格对齐 OpenClaw: requestHeartbeatNow (heartbeat-wake.ts)
 //
-// export function requestHeartbeatNow(opts?) {
-//   queuePendingWakeReason({ reason: opts?.reason, ... });
-//   schedule(opts?.coalesceMs ?? DEFAULT_COALESCE_MS, "normal");
-// }
+// OpenClaw 实现:
+//   export function requestHeartbeatNow(opts?) {
+//     queuePendingWakeReason({ reason: opts?.reason, ... });
+//     schedule(opts?.coalesceMs ?? DEFAULT_COALESCE_MS, "normal");
+//   }
+//   function schedule(ms, priority) {
+//     if (pendingTimer) return;                // coalesce: 已有 timer 就跳过
+//     pendingTimer = setTimeout(() => {
+//       handler(drainPendingReasons());        // 异步执行
+//     }, ms);
+//   }
 //
-// HunterClaw: simplified synchronous dispatch (no coalesce timer needed
-// since C++ heartbeat runner uses its own thread-based scheduling).
+// 关键行为: requestHeartbeatNow 是异步的 (setTimeout)
+//   调用方立即返回，handler 在 event loop 的下一个 tick 执行
+//   这对 cron wakeMode=next-heartbeat 路径至关重要:
+//     cron 线程不应该被 LLM 调用阻塞 (对齐 OpenClaw: cron 立即返回 OK)
+//
+// HunterClaw 对齐:
+//   使用 detached thread 模拟 setTimeout 的异步语义
+//   handler 在独立线程中执行，调用方立即返回
 
 void request_heartbeat_now(
     const std::optional<std::string>& reason,
@@ -83,15 +97,21 @@ void request_heartbeat_now(
         handler_copy = g_handler;
     }
     if (!handler_copy) return;
+
+    // ✅ 对齐 OpenClaw: 异步执行 handler (模拟 setTimeout)
+    // 参数按值捕获，确保 detached thread 的生命周期安全
     HeartbeatWakeParams params;
     params.reason = reason;
     params.agent_id = agent_id;
     params.session_key = session_key;
-    try {
-        handler_copy(params);
-    } catch (...) {
-        // Aligned with openclaw: errors are logged by the runner, not here
-    }
+
+    std::thread([handler_copy, params]() {
+        try {
+            handler_copy(params);
+        } catch (...) {
+            // Aligned with openclaw: errors are logged by the runner, not here
+        }
+    }).detach();
 }
 
 } // namespace infra

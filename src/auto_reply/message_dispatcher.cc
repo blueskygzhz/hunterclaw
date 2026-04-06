@@ -40,6 +40,11 @@
 namespace hunterclaw {
 namespace auto_reply {
 
+// ✅ 前向声明: 供 /queue 指令解析 (dispatch_reply_from_config) 使用
+// 实现在 resolve_queue_settings 前面 (L1054, L1072)
+static std::optional<QueueMode> normalize_queue_mode(const std::string& raw);
+static std::optional<QueueDropPolicy> normalize_queue_drop_policy(const std::string& raw);
+
 namespace {
 
 auto log() {
@@ -634,7 +639,7 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
                 }
                 
                 if (updated) {
-                    session_manager_->update_session(session_key, entry);
+                    session_manager_->update_session(entry);
                     session_entry_for_dispatch = entry;
                     log()->info("dispatch_reply_from_config: /queue persisted session={} reset={} mode={}",
                                 session_key, queue_reset, entry.queue_mode.value_or("(default)"));
@@ -694,7 +699,7 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
         if (ack_parts.empty()) ack_parts = "⚙️ Queue mode reset to default.";
         
         result.success = true;
-        result.react_result.output = ack_parts;
+        result.react_result.final_response = ack_parts;
         // TODO: 通过 delivery 路径投递 ack 文本（当前直接返回）
         return result;
     }

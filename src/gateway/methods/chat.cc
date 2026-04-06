@@ -718,7 +718,7 @@ static bool abort_chat_run_by_id(
     state->remove_chat_run(run_id, run_id, session_key);
     
     // 8. 广播 aborted 事件 (对齐 OpenClaw: broadcastChatAborted)
-    if (server->impl()) {
+    {
         json abort_payload;
         abort_payload["runId"] = run_id;
         abort_payload["sessionKey"] = session_key;
