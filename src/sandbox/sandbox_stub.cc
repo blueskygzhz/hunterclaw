@@ -1,3 +1,7 @@
+// Aligned with openclaw: src/agents/sandbox/manage.ts
+// SandboxManager: now fully connected to DockerSandbox implementation.
+// Previously a stub returning "not implemented"; now delegates to docker_sandbox.cc.
+
 #include "hunterclaw/sandbox/sandbox.h"
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_sinks.h>
@@ -6,7 +10,6 @@ namespace hunterclaw::sandbox {
 
 namespace {
 
-// 获取 Sandbox logger
 auto get_logger() {
     static auto logger = []() {
         auto log = spdlog::get("sandbox");
@@ -26,27 +29,57 @@ SandboxManager::SandboxManager() {
 }
 
 SandboxManager::~SandboxManager() {
+    // Cleanup all sandboxes on destruction
+    for (auto& [id, sandbox] : sandboxes_) {
+        try {
+            sandbox->cleanup();
+        } catch (...) {}
+    }
+    sandboxes_.clear();
     get_logger()->info("SandboxManager destroyed");
 }
 
-std::shared_ptr<Sandbox> SandboxManager::get_sandbox_instance(const std::string&) const {
-    get_logger()->warn("SandboxManager::get_sandbox_instance not implemented");
+// Aligned with openclaw: manage.ts — get sandbox instance by ID
+std::shared_ptr<Sandbox> SandboxManager::get_sandbox_instance(const std::string& sandbox_id) const {
+    auto it = sandboxes_.find(sandbox_id);
+    if (it != sandboxes_.end()) {
+        return it->second;
+    }
+    get_logger()->debug("SandboxManager::get_sandbox_instance: not found id={}", sandbox_id);
     return nullptr;
 }
 
-SandboxInfo SandboxManager::get_sandbox(const std::string&) const {
-    get_logger()->warn("SandboxManager::get_sandbox not implemented");
-    return SandboxInfo{};
+// Aligned with openclaw: manage.ts — get sandbox info by ID
+SandboxInfo SandboxManager::get_sandbox(const std::string& sandbox_id) const {
+    auto it = sandboxes_.find(sandbox_id);
+    if (it == sandboxes_.end()) {
+        get_logger()->debug("SandboxManager::get_sandbox: not found id={}", sandbox_id);
+        return SandboxInfo{};
+    }
+    SandboxInfo info;
+    info.id = sandbox_id;
+    info.status = it->second->get_status();
+    return info;
 }
 
-bool SandboxManager::pause_sandbox(const std::string&) {
-    get_logger()->warn("SandboxManager::pause_sandbox not implemented");
-    return false;
+// Aligned with openclaw: docker pause container
+bool SandboxManager::pause_sandbox(const std::string& sandbox_id) {
+    auto it = sandboxes_.find(sandbox_id);
+    if (it == sandboxes_.end()) {
+        get_logger()->warn("SandboxManager::pause_sandbox: not found id={}", sandbox_id);
+        return false;
+    }
+    return it->second->pause();
 }
 
-bool SandboxManager::resume_sandbox(const std::string&) {
-    get_logger()->warn("SandboxManager::resume_sandbox not implemented");
-    return false;
+// Aligned with openclaw: docker unpause container
+bool SandboxManager::resume_sandbox(const std::string& sandbox_id) {
+    auto it = sandboxes_.find(sandbox_id);
+    if (it == sandboxes_.end()) {
+        get_logger()->warn("SandboxManager::resume_sandbox: not found id={}", sandbox_id);
+        return false;
+    }
+    return it->second->resume();
 }
 
 } // namespace hunterclaw::sandbox

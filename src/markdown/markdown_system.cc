@@ -473,14 +473,84 @@ RenderStyleMap WhatsAppStyle::get_style_markers() {
     };
 }
 
-std::string WhatsAppFormatter::markdown_to_whatsapp(const std::string& markdown) {
-    MarkdownParser parser;
-    auto ir = parser.parse(markdown);
-    
-    RenderOptions options;
-    options.style_markers = WhatsAppStyle::get_style_markers();
-    
-    return MarkdownRenderer::render_with_markers(ir, options);
+// Aligned with openclaw: markdown/whatsapp.ts markdownToWhatsApp (lines 38-77)
+// Order of operations:
+//   1. Protect fenced code blocks (```...```) — already WhatsApp-compatible
+//   2. Protect inline code (`...`) — leave as-is
+//   3. Convert **bold** → *bold* and __bold__ → *bold*
+//   4. Convert ~~strike~~ → ~strike~
+//   5. Restore protected spans
+std::string WhatsAppFormatter::markdown_to_whatsapp(const std::string& text) {
+    if (text.empty()) return text;
+
+    // 1. Protect fenced code blocks
+    static const std::string FENCE_PLACEHOLDER = "\x00FENCE";
+    static const std::string CODE_PLACEHOLDER = "\x00CODE";
+
+    std::vector<std::string> fences;
+    std::string result = text;
+
+    // Extract fenced code blocks
+    std::regex fence_re("```[\\s\\S]*?```");
+    {
+        std::string tmp;
+        std::sregex_iterator it(result.begin(), result.end(), fence_re);
+        std::sregex_iterator end;
+        size_t last_pos = 0;
+        for (; it != end; ++it) {
+            tmp += result.substr(last_pos, it->position() - last_pos);
+            fences.push_back(it->str());
+            tmp += FENCE_PLACEHOLDER + std::to_string(fences.size() - 1);
+            last_pos = it->position() + it->length();
+        }
+        tmp += result.substr(last_pos);
+        result = tmp;
+    }
+
+    // 2. Protect inline code
+    std::vector<std::string> inline_codes;
+    {
+        std::regex code_re("`[^`\\n]+`");
+        std::string tmp;
+        std::sregex_iterator it(result.begin(), result.end(), code_re);
+        std::sregex_iterator end;
+        size_t last_pos = 0;
+        for (; it != end; ++it) {
+            tmp += result.substr(last_pos, it->position() - last_pos);
+            inline_codes.push_back(it->str());
+            tmp += CODE_PLACEHOLDER + std::to_string(inline_codes.size() - 1);
+            last_pos = it->position() + it->length();
+        }
+        tmp += result.substr(last_pos);
+        result = tmp;
+    }
+
+    // 3. Convert **bold** → *bold* and __bold__ → *bold*
+    result = std::regex_replace(result, std::regex("\\*\\*(.+?)\\*\\*"), "*$1*");
+    result = std::regex_replace(result, std::regex("__(.+?)__"), "*$1*");
+
+    // 4. Convert ~~strikethrough~~ → ~strikethrough~
+    result = std::regex_replace(result, std::regex("~~(.+?)~~"), "~$1~");
+
+    // 5. Restore inline code
+    for (size_t i = 0; i < inline_codes.size(); ++i) {
+        std::string placeholder = CODE_PLACEHOLDER + std::to_string(i);
+        auto pos = result.find(placeholder);
+        if (pos != std::string::npos) {
+            result.replace(pos, placeholder.size(), inline_codes[i]);
+        }
+    }
+
+    // 6. Restore fenced code blocks
+    for (size_t i = 0; i < fences.size(); ++i) {
+        std::string placeholder = FENCE_PLACEHOLDER + std::to_string(i);
+        auto pos = result.find(placeholder);
+        if (pos != std::string::npos) {
+            result.replace(pos, placeholder.size(), fences[i]);
+        }
+    }
+
+    return result;
 }
 
 std::string WhatsAppFormatter::whatsapp_to_markdown(const std::string& whatsapp_text) {
