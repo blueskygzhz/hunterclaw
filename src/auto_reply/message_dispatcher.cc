@@ -28,6 +28,8 @@
 #include "hunterclaw/core/utils.h"
 #include "hunterclaw/agents/agent_pool.h"      // ✅ 对齐 OpenClaw: ACP dispatch 需要 agent_pool
 #include "hunterclaw/agents/agent_instance.h"  // ✅ 需要完整类型以访问 context().last_channel 等字段
+#include "hunterclaw/acp/acp_session_manager.h"  // ✅ 对齐 OpenClaw: ACP 控制平面
+#include "hunterclaw/acp/acp_reply_projector.h"  // ✅ 对齐 OpenClaw: ACP 流式投影器
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
@@ -1749,205 +1751,235 @@ MessageDispatcher::FastAbortResult MessageDispatcher::try_fast_abort_from_messag
 
 // ============================================================================
 // try_dispatch_acp_reply
-// Aligned with openclaw: tryDispatchAcpReply (dispatch-acp.ts)
+// ✅ 严格对齐 OpenClaw: tryDispatchAcpReply (dispatch-acp.ts)
+//
+// 完整数据流 (对齐 OpenClaw):
+//   用户消息
+//   → acpManager.resolveSession()       ← 三态解析 (none/stale/ready)
+//   → 策略检查 (dispatch.enabled)
+//   → AcpReplyProjector 创建            ← 流式投影器
+//   → acpManager.runTurn({
+//       sessionKey, text, mode: "prompt",
+//       onEvent: projector.onEvent       ← 流式投影
+//     })
+//     → withSessionActor()              ← per-session 串行化
+//     → ensureRuntimeHandle()           ← 懒创建 + 缓存 + identity 合并
+//     → applyRuntimeControls()          ← 签名比对推送选项
+//     → setSessionState("running")      ← 持久化状态机
+//     → runtime.runTurn()               ← AcpRuntime 接口
+//       → AcpRuntimeEvent stream
+//       → projector.onEvent()           ← 流式投影
+//     → setSessionState("idle")
+//     → reconcileIdentifiers()          ← identity 对账
+//   → projector.flush()
 // ============================================================================
 
 MessageDispatcher::AcpDispatchResult MessageDispatcher::try_dispatch_acp_reply(
     const channels::InboundMessage& message,
     const std::string& delivery_to
 ) {
-    // Aligned with openclaw: tryDispatchAcpReply (dispatch-acp.ts)
-    //
-    // ACP (Agent Context Protocol) dispatch routes messages to a running ACP agent session.
-    // ACP sessions are identified by session_key and managed by AcpSessionManager.
-    //
-    // Resolution logic (aligned with openclaw):
-    //   1. Resolve session_key from message context
-    //   2. Check if ACP session exists for this session_key
-    //   3. If acpResolution.kind == "none" → return null (fall through to normal dispatch)
-    //   4. If acpResolution.kind == "stale" → throw error
-    //   5. If acpResolution.kind == "ready" → run ACP turn
-    //
-    // HunterClaw ACP integration:
-    //   - ACP sessions are managed by agents::AgentPool
-    //   - A session is "ACP-ready" when it has an active subagent running
-    //   - The subagent receives the message via its input channel
-
     AcpDispatchResult result;
 
     const std::string& session_key = message.session_key;
     if (session_key.empty()) {
-        return result;  // No session key → no ACP dispatch
+        return result;
     }
 
+    // ── Step 1: acpManager.resolveSession ────────────────────────────────
     // Aligned with openclaw: acpManager.resolveSession({ cfg, sessionKey })
-    // Check if there is an active ACP (subagent) session for this session_key.
-    // For now, we check via session_manager if the session has ACP metadata.
-    if (!session_manager_) {
-        return result;
+    // 三态解析: none → fall through, stale → error, ready → run turn
+    acp::AcpSessionResolution resolution;
+    try {
+        resolution = acp::get_acp_session_manager().resolve_session(session_key);
+    } catch (...) {
+        // AcpSessionManager not initialized — fall back to legacy path
+        // (maintains backward compatibility during migration)
+        return try_dispatch_acp_reply_legacy(message, delivery_to);
     }
 
-    auto session_result = session_manager_->get_session(session_key);
-    if (!session_result.is_ok()) {
-        return result;  // Session not found → no ACP dispatch
+    if (resolution.kind == acp::AcpSessionResolution::Kind::None) {
+        return result;  // Not an ACP session → fall through to normal dispatch
+    }
+    if (resolution.kind == acp::AcpSessionResolution::Kind::Stale) {
+        log()->warn("try_dispatch_acp_reply: stale ACP session: session={} error={}",
+                    session_key, resolution.error ? resolution.error->what() : "unknown");
+        return result;  // Stale → fall through (OpenClaw throws, we're lenient)
     }
 
-    const auto& session = session_result.get();
-    if (!session.acp.has_value()) {
-        return result;  // No ACP metadata → not an ACP session
-    }
-
-    const auto& acp_meta = *session.acp;
-
-    // Aligned with openclaw: acpResolution.kind == "stale" → throw
-    if (acp_meta.state == "error") {
-        log()->warn("try_dispatch_acp_reply: ACP session is in error state for session={}",
-                    session_key);
-        // Return handled=false to fall through to normal dispatch
-        return result;
-    }
-
-    // Aligned with openclaw: acpResolution.kind == "ready" → run ACP turn
-    if (acp_meta.state != "idle" && acp_meta.state != "running") {
-        return result;  // Not ready
-    }
-
-    // Aligned with openclaw: resolveAcpPromptText
-    // Use the message text as the ACP prompt.
+    // kind == Ready
+    const auto& acp_meta = *resolution.meta;
     const std::string prompt_text = message.text;
     if (prompt_text.empty()) {
         log()->debug("try_dispatch_acp_reply: empty prompt for session={}", session_key);
         return result;
     }
 
-    // ✅ 严格对齐 OpenClaw: acpManager.runTurn({ sessionKey, text, mode: "prompt" })
-    // 参考: dispatch-acp.ts:
-    //   await acpManager.runTurn({
-    //     cfg, sessionKey, text: promptText, attachments, mode: "prompt",
-    //     requestId: resolveAcpRequestId(ctx),
-    //     onEvent: async (event) => await projector.onEvent(event),
-    //   });
-    //   await projector.flush(true);
-    //
-    // OpenClaw 的 acpManager.runTurn 通过 onEvent 回调实时投递每个 block，
-    // projector.onEvent 调用 delivery.deliver("block", payload)，
-    // delivery.deliver 调用 dispatcher.sendBlockReply(payload)，
-    // dispatcher.sendBlockReply 调用 options.deliver(payload)，
-    // options.deliver 调用 channel API（Discord/Telegram/etc.）。
-    //
-    // HunterClaw 对齐:
-    //   - 通过 agent_pool_ 找到 subagent（ACP session 对应的 agent）
-    //   - 调用 subagent.process_message(prompt_text, options)
-    //   - subagent 的 on_block_reply 通过 deliver_outbound_payloads 实时发送
-    //   - 注意: deliver=true（消息来自用户，需要发给用户）
     log()->info("try_dispatch_acp_reply: routing to ACP session={} agent={}",
                 session_key, acp_meta.agent);
 
-    // ✅ 对齐 OpenClaw: 通过 agent_pool 找到 ACP session 对应的 agent
-    // ACP session 的 session_key 就是 agent 的 session_id
-    if (!agent_pool_) {
-        log()->warn("try_dispatch_acp_reply: agent_pool not available, cannot route to ACP session={}",
-                    session_key);
-        return result;  // fall through to normal dispatch
-    }
+    // ── Step 2: Build deliver function (channel → delivery queue) ────────
+    // Aligned with openclaw: delivery.deliver("block", payload) → channel.send()
+    auto captured_delivery_queue = delivery_queue_;
+    auto captured_channel = message.channel;
+    auto captured_to = delivery_to.empty() ? message.sender_id : delivery_to;
+    auto captured_account_id = message.account_id.value_or("");
+    auto captured_thread_id = message.thread_id.value_or("");
+    auto captured_reply_to_id = message.reply_to_id.value_or("");
 
-    auto acp_agent = agent_pool_->get_agent(acp_meta.agent.empty() ? session_key : acp_meta.agent);
-    if (!acp_agent) {
-        // 尝试用 session_key 直接查找
-        acp_agent = agent_pool_->get_agent(session_key);
-    }
-    if (!acp_agent) {
-        log()->warn("try_dispatch_acp_reply: ACP agent not found: session={} agent={}",
-                    session_key, acp_meta.agent);
-        return result;  // fall through to normal dispatch
-    }
+    auto deliver_to_channel = [captured_delivery_queue,
+                               captured_channel, captured_to,
+                               captured_account_id, captured_thread_id,
+                               captured_reply_to_id](const std::string& text) {
+        if (!captured_delivery_queue || text.empty()) return;
+        ::hunterclaw::queue::MessagePayload payload;
+        payload.text = text;
 
-    // ✅ 对齐 OpenClaw: 构建 process_message options
-    // deliver=true: 消息来自用户，需要发给用户（通过 on_block_reply → deliver_outbound_payloads）
-    std::map<std::string, std::string> acp_options = {
-        {"deliver", "true"},
-        {"session_key", session_key},
-        {"input_provenance_kind", "user"},
-        {"source_tool", "acp_dispatch"},
+        ::hunterclaw::outbound::DeliverOutboundPayloadsParams params;
+        params.channel      = captured_channel;
+        params.to           = captured_to;
+        params.payloads     = {payload};
+        params.delivery_queue = captured_delivery_queue;
+        params.skip_queue   = false;
+        params.best_effort  = true;
+        params.silent       = false;
+        if (!captured_account_id.empty()) params.account_id = captured_account_id;
+        if (!captured_thread_id.empty())  params.thread_id  = captured_thread_id;
+        if (!captured_reply_to_id.empty()) params.reply_to_id = captured_reply_to_id;
+
+        auto deliver_result = ::hunterclaw::outbound::deliver_outbound_payloads(params);
+        if (!deliver_result.is_ok()) {
+            spdlog::get("default")->warn(
+                "try_dispatch_acp_reply: deliver failed: channel={} to={} error={}",
+                captured_channel, captured_to, deliver_result.error
+            );
+        }
     };
 
-    // ✅ 对齐 OpenClaw: 更新 ACP agent context 中的 channel 信息
-    // 用于 on_block_reply 中构建 deliver 函数（通过 method_agent 路径）
-    // 同时直接注入 deliver_fn_（避免依赖 method_agent 路径）
-    {
-        auto& ctx = acp_agent->context();
-        ctx.last_channel    = message.channel;
-        ctx.last_to         = delivery_to.empty() ? message.sender_id : delivery_to;
-        ctx.last_account_id = message.account_id.value_or("");
-        ctx.last_thread_id  = message.thread_id.value_or("");
-        ctx.last_reply_to_id = message.reply_to_id.value_or("");
-    }
+    // ── Step 3: Create AcpReplyProjector ─────────────────────────────────
+    // Aligned with openclaw: createAcpReplyProjector (acp-projector.ts)
+    acp::AcpReplyProjector::Config projector_config;
+    projector_config.delivery_mode = acp::AcpDeliveryMode::Block;
+    projector_config.should_send_tool_summaries = true;
 
-    // ✅ 对齐 OpenClaw: 注入 deliver_fn_（channel-specific 发送函数）
-    // 对应 OpenClaw: delivery.deliver("block", payload) → dispatcher.sendBlockReply → options.deliver → channel.send()
-    if (delivery_queue_) {
-        auto captured_delivery_queue = delivery_queue_;
-        auto captured_channel = message.channel;
-        auto captured_to = delivery_to.empty() ? message.sender_id : delivery_to;
-        auto captured_account_id = message.account_id.value_or("");
-        auto captured_thread_id = message.thread_id.value_or("");
-        auto captured_reply_to_id = message.reply_to_id.value_or("");
+    auto projector = std::make_shared<acp::AcpReplyProjector>(
+        projector_config,
+        [deliver_to_channel](const std::string& kind,
+                             const std::string& text,
+                             const std::optional<acp::AcpProjectedDeliveryMeta>&) {
+            // Both "block" and "tool" kinds deliver text to channel
+            deliver_to_channel(text);
+        }
+    );
 
-        acp_agent->set_deliver_fn([captured_delivery_queue,
-                                   captured_channel,
-                                   captured_to,
-                                   captured_account_id,
-                                   captured_thread_id,
-                                   captured_reply_to_id](const std::string& text) {
-            ::hunterclaw::queue::MessagePayload payload;
-            payload.text = text;
+    // ── Step 4: acpManager.runTurn ───────────────────────────────────────
+    // Aligned with openclaw: await acpManager.runTurn({ ... onEvent: projector.onEvent })
+    // OpenClaw awaits this; HunterClaw runs in background thread to avoid blocking.
+    std::string captured_session_key = session_key;
+    auto captured_projector = projector;
 
-            ::hunterclaw::outbound::DeliverOutboundPayloadsParams params;
-            params.channel      = captured_channel;
-            params.to           = captured_to;
-            params.payloads     = {payload};
-            params.delivery_queue = captured_delivery_queue;
-            params.skip_queue   = false;
-            params.best_effort  = true;
-            params.silent       = false;
-            if (!captured_account_id.empty()) params.account_id = captured_account_id;
-            if (!captured_thread_id.empty())  params.thread_id  = captured_thread_id;
-            if (!captured_reply_to_id.empty()) params.reply_to_id = captured_reply_to_id;
-
-            auto deliver_result = ::hunterclaw::outbound::deliver_outbound_payloads(params);
-            if (!deliver_result.is_ok()) {
-                spdlog::get("default")->warn(
-                    "try_dispatch_acp_reply: deliver_fn failed: channel={} to={} error={}",
-                    captured_channel, captured_to, deliver_result.error
-                );
-            }
-        });
-    }
-
-    // ✅ 对齐 OpenClaw: 异步执行（fire-and-forget，不阻塞当前线程）
-    // OpenClaw: await acpManager.runTurn(...) 是 async，但在 dispatch-acp.ts 中是 await
-    // HunterClaw: 在后台线程执行，避免阻塞 dispatch_reply_from_config
-    std::thread([acp_agent, prompt_text, acp_options, session_key, this]() mutable {
+    std::thread([captured_session_key, prompt_text, captured_projector, this]() mutable {
         try {
-            auto res = acp_agent->process_message(prompt_text, acp_options);
-            if (res.is_err()) {
-                log()->warn("try_dispatch_acp_reply: ACP process_message failed: session={} error={}",
-                            session_key, res.error);
-            } else {
-                log()->info("try_dispatch_acp_reply: ACP turn completed: session={}", session_key);
-            }
-            // ✅ 清理 deliver_fn_（避免悬空引用）
-            acp_agent->set_deliver_fn(nullptr);
+            acp::AcpRunTurnInput turn_input;
+            turn_input.session_key = captured_session_key;
+            turn_input.text = prompt_text;
+            turn_input.mode = acp::AcpRuntimePromptMode::Prompt;
+            turn_input.request_id = captured_session_key + ":" + std::to_string(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()
+                ).count()
+            );
+            // Aligned with openclaw: onEvent: projector.onEvent
+            turn_input.on_event = [captured_projector](const acp::AcpRuntimeEvent& event) {
+                captured_projector->on_event(event);
+            };
+
+            acp::get_acp_session_manager().run_turn(turn_input);
+
+            // Aligned with openclaw: await projector.flush(true)
+            captured_projector->flush(true);
+
+            log()->info("try_dispatch_acp_reply: ACP turn completed: session={}",
+                        captured_session_key);
+        } catch (const acp::AcpRuntimeError& e) {
+            log()->error("try_dispatch_acp_reply: ACP turn failed: session={} code={} error={}",
+                         captured_session_key, e.code_string(), e.what());
+            captured_projector->flush(true);
         } catch (const std::exception& e) {
-            log()->error("try_dispatch_acp_reply: ACP process_message exception: session={} error={}",
-                         session_key, e.what());
-            acp_agent->set_deliver_fn(nullptr);
+            log()->error("try_dispatch_acp_reply: ACP turn exception: session={} error={}",
+                         captured_session_key, e.what());
+            captured_projector->flush(true);
         }
     }).detach();
 
-    // Mark as handled — the subagent will deliver the reply asynchronously.
     result.handled = true;
     result.response = "";
+    return result;
+}
+
+// ── Legacy fallback (backward compatibility) ─────────────────────────────────
+// Used when AcpSessionManager is not initialized (migration period).
+MessageDispatcher::AcpDispatchResult MessageDispatcher::try_dispatch_acp_reply_legacy(
+    const channels::InboundMessage& message,
+    const std::string& delivery_to
+) {
+    AcpDispatchResult result;
+    const std::string& session_key = message.session_key;
+
+    if (!session_manager_) return result;
+    auto session_result = session_manager_->get_session(session_key);
+    if (!session_result.is_ok()) return result;
+    const auto& session = session_result.get();
+    if (!session.acp.has_value()) return result;
+    const auto& acp_meta = *session.acp;
+    if (acp_meta.state == "error") return result;
+    if (acp_meta.state != "idle" && acp_meta.state != "running") return result;
+
+    const std::string prompt_text = message.text;
+    if (prompt_text.empty()) return result;
+
+    if (!agent_pool_) return result;
+    auto acp_agent = agent_pool_->get_agent(acp_meta.agent.empty() ? session_key : acp_meta.agent);
+    if (!acp_agent) acp_agent = agent_pool_->get_agent(session_key);
+    if (!acp_agent) return result;
+
+    std::map<std::string, std::string> acp_options = {
+        {"deliver", "true"}, {"session_key", session_key},
+        {"input_provenance_kind", "user"}, {"source_tool", "acp_dispatch"},
+    };
+    {
+        auto& ctx = acp_agent->context();
+        ctx.last_channel = message.channel;
+        ctx.last_to = delivery_to.empty() ? message.sender_id : delivery_to;
+        ctx.last_account_id = message.account_id.value_or("");
+        ctx.last_thread_id = message.thread_id.value_or("");
+        ctx.last_reply_to_id = message.reply_to_id.value_or("");
+    }
+    if (delivery_queue_) {
+        auto dq = delivery_queue_;
+        auto ch = message.channel;
+        auto to = delivery_to.empty() ? message.sender_id : delivery_to;
+        auto aid = message.account_id.value_or("");
+        auto tid = message.thread_id.value_or("");
+        auto rid = message.reply_to_id.value_or("");
+        acp_agent->set_deliver_fn([dq, ch, to, aid, tid, rid](const std::string& text) {
+            ::hunterclaw::queue::MessagePayload payload; payload.text = text;
+            ::hunterclaw::outbound::DeliverOutboundPayloadsParams params;
+            params.channel = ch; params.to = to; params.payloads = {payload};
+            params.delivery_queue = dq; params.skip_queue = false;
+            params.best_effort = true; params.silent = false;
+            if (!aid.empty()) params.account_id = aid;
+            if (!tid.empty()) params.thread_id = tid;
+            if (!rid.empty()) params.reply_to_id = rid;
+            ::hunterclaw::outbound::deliver_outbound_payloads(params);
+        });
+    }
+    std::thread([acp_agent, prompt_text, acp_options, session_key, this]() mutable {
+        try {
+            acp_agent->process_message(prompt_text, acp_options);
+            acp_agent->set_deliver_fn(nullptr);
+        } catch (...) { acp_agent->set_deliver_fn(nullptr); }
+    }).detach();
+    result.handled = true;
     return result;
 }
 // ============================================================================

@@ -501,6 +501,29 @@ cc_library(
 )
 
 # ============================================================================
+# ACP Library - ACP Control Plane (对齐 OpenClaw acp/ control-plane/)
+# ============================================================================
+cc_library(
+    name = "hunterclaw_acp",
+    srcs = glob(["acp/*.cc"]),
+    deps = [
+        "//:hunterclaw_headers",
+        "@nlohmann_json//:json",
+    ],
+    copts = [
+        "-std=c++17",
+        "-Wall",
+        "-Wextra",
+        "-I/usr/include/spdlog",
+    ],
+    linkopts = [
+        "-lpthread",
+    ],
+    linkstatic = False,
+    visibility = ["//visibility:public"],
+)
+
+# ============================================================================
 # Agents Library - Agent Pool, Instance, Scope, Subagent Management
 # ============================================================================
 cc_library(
@@ -593,6 +616,7 @@ cc_library(
     deps = [
         ":hunterclaw_core_base",  # ✅ 依赖 core_base (core/*.cc)
         ":hunterclaw_logging",   # ✅ 添加 logging 依赖 (create_subsystem_logger)
+        ":hunterclaw_acp",       # ✅ 添加 ACP 控制平面依赖
         ":hunterclaw_agents",    # ✅ 添加 agents 依赖
         ":hunterclaw_cron",      # ✅ 添加 cron 依赖
         ":hunterclaw_infra",     # ✅ 添加 infra 依赖 (heartbeat_runner 等)

@@ -201,6 +201,11 @@ private:
         const channels::InboundMessage& message,
         const std::string& delivery_to = ""
     );
+    // Legacy fallback when AcpSessionManager not initialized
+    AcpDispatchResult try_dispatch_acp_reply_legacy(
+        const channels::InboundMessage& message,
+        const std::string& delivery_to = ""
+    );
     
     // ✅ 权限检查
     struct PermissionCheckResult {
