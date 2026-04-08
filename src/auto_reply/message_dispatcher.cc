@@ -26,6 +26,7 @@
 #include "hunterclaw/tools/tool_manager.h"
 #include "hunterclaw/llm/llm_client.h"
 #include "hunterclaw/core/utils.h"
+#include "hunterclaw/tools/tool_hooks.h"    // 🎯 message_received hook
 #include "hunterclaw/agents/agent_pool.h"      // ✅ 对齐 OpenClaw: ACP dispatch 需要 agent_pool
 #include "hunterclaw/agents/agent_instance.h"  // ✅ 需要完整类型以访问 context().last_channel 等字段
 #include "hunterclaw/acp/acp_session_manager.h"  // ✅ 对齐 OpenClaw: ACP 控制平面
@@ -362,14 +363,31 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
     (void)session_tts_auto;
 
     // ── Plugin hook: message_received ────────────────────────────────────────
-    // Aligned with openclaw: hookRunner.runMessageReceived + triggerInternalHook("message","received")
+    // 🎯 对齐 OpenClaw: dispatch-from-config.ts L188-195
+    //   hookRunner.runMessageReceived(toPluginMessageReceivedEvent(hookContext), toPluginMessageContext(hookContext))
     // Fire-and-forget: do not block dispatch on hook failure.
-    // HunterClaw: hook system is a future integration point.
-    // When hook_runner is available, call:
-    //   hook_runner->run_message_received(message);
-    //   trigger_internal_hook("message", "received", session_key, ...);
-    // For now, log the intent.
-    log()->debug("dispatch_reply_from_config: [hook] message_received session={}", session_key);
+    {
+        auto* hook_mgr = tools::get_global_hook_manager();
+        if (hook_mgr && hook_mgr->has_hooks(plugins::PluginHookName::MESSAGE_RECEIVED)) {
+            plugins::PluginHookMessageReceivedEvent mr_event;
+            mr_event.from    = message.sender_id;
+            mr_event.content = message.text;
+            mr_event.timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                message.timestamp.time_since_epoch()).count();
+
+            plugins::PluginHookMessageContext mr_ctx;
+            mr_ctx.channel_id      = message.channel;
+            mr_ctx.account_id      = message.account_id;
+            mr_ctx.conversation_id = message.chat_id.empty()
+                ? std::make_optional(message.sender_id)
+                : std::make_optional(message.chat_id);
+            try {
+                hook_mgr->run_message_received(mr_event, mr_ctx);
+            } catch (const std::exception& e) {
+                log()->warn("dispatch_reply_from_config: message_received hook failed: {}", e.what());
+            }
+        }
+    }
 
     // ── Step 2: shouldRouteToOriginating ────────────────────────────────────
     // Aligned with openclaw: check if originating channel differs from current surface.

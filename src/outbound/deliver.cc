@@ -19,6 +19,7 @@
 
 #include "hunterclaw/outbound/deliver.h"
 #include "hunterclaw/channels/plugin.h"
+#include "hunterclaw/tools/tool_hooks.h"    // 🎯 message_sending / message_sent hooks
 #include "hunterclaw/observability/diagnostic_events.h"
 #include <spdlog/spdlog.h>
 #include <algorithm>
@@ -401,6 +402,28 @@ core::Result<std::vector<OutboundDeliveryResult>> deliver_outbound_payloads_core
     std::vector<OutboundDeliveryResult> results;
 
     // 4. Per-payload send loop (aligned with openclaw: for (const payload of normalizedPayloads))
+    // 🎯 对齐 OpenClaw: deliver.ts L358-376 — emitMessageSent hook
+    auto emit_message_sent_hook = [&](const std::string& msg_text, bool success,
+                                       const std::string& msg_id, const std::string& error_str) {
+        auto* hook_mgr = tools::get_global_hook_manager();
+        if (hook_mgr && hook_mgr->has_hooks(plugins::PluginHookName::MESSAGE_SENT)) {
+            plugins::PluginHookMessageSentEvent mst_event;
+            mst_event.to      = to;
+            mst_event.content = msg_text;
+            mst_event.success = success;
+            if (!error_str.empty()) mst_event.error = error_str;
+
+            plugins::PluginHookMessageContext mst_ctx;
+            mst_ctx.channel_id      = channel_id;
+            mst_ctx.account_id      = params.account_id;
+            mst_ctx.conversation_id = to.empty()
+                ? std::nullopt : std::make_optional(to);
+            try {
+                hook_mgr->run_message_sent(mst_event, mst_ctx);
+            } catch (...) {}  // fire-and-forget
+        }
+    };
+
     for (const auto& payload : normalized_payloads) {
         NormalizedOutboundPayload payload_summary = build_payload_summary(payload);
 
@@ -408,18 +431,37 @@ core::Result<std::vector<OutboundDeliveryResult>> deliver_outbound_payloads_core
             // throwIfAborted (aligned with openclaw)
             throw_if_aborted(params.abort_signal);
 
-            // ── message_sending hook (aligned with openclaw: applyMessageSendingHook) ──────────
-            // Aligned with openclaw: hookRunner.runMessageSending(...):
-            //   - May cancel the payload (hookResult.cancel === true)
-            //   - May modify the content (hookResult.content != null)
-            // HunterClaw: hook system is a future integration point.
-            // When hook_runner is available, call:
-            //   auto hook_result = hook_runner->run_message_sending(payload_summary, channel_id);
-            //   if (hook_result.cancelled) continue;
-            //   if (!hook_result.content.empty()) { payload_summary.text = hook_result.content; }
-            // For now, log the intent and proceed.
-            log()->debug("deliver_outbound_payloads_core: [hook] message_sending channel={}",
-                         channel_id);
+            // ── message_sending hook (🎯 对齐 OpenClaw: deliver.ts L410-412) ──────────
+            // hookRunner.runMessageSending({to, content}, {channelId, accountId, conversationId})
+            // May cancel delivery or modify content.
+            {
+                auto* hook_mgr = tools::get_global_hook_manager();
+                if (hook_mgr && hook_mgr->has_hooks(plugins::PluginHookName::MESSAGE_SENDING)) {
+                    plugins::PluginHookMessageSendingEvent ms_event;
+                    ms_event.to      = to;
+                    ms_event.content = payload_summary.text;
+
+                    plugins::PluginHookMessageContext ms_ctx;
+                    ms_ctx.channel_id      = channel_id;
+                    ms_ctx.account_id      = params.account_id;
+                    ms_ctx.conversation_id = to.empty()
+                        ? std::nullopt : std::make_optional(to);
+                    try {
+                        auto ms_result = hook_mgr->run_message_sending(ms_event, ms_ctx);
+                        if (ms_result) {
+                            if (ms_result->cancel) {
+                                log()->info("deliver: message_sending hook cancelled payload");
+                                continue;  // skip this payload
+                            }
+                            if (ms_result->content) {
+                                payload_summary.text = *ms_result->content;
+                            }
+                        }
+                    } catch (const std::exception& e) {
+                        log()->warn("deliver: message_sending hook failed: {}", e.what());
+                    }
+                }
+            }
 
             // Notify caller about this payload (aligned with openclaw: onPayload)
             if (params.on_payload) {
@@ -442,9 +484,8 @@ core::Result<std::vector<OutboundDeliveryResult>> deliver_outbound_payloads_core
                 }
                 const auto& delivery = send_payload_result.get();
                 results.push_back(delivery);
-                // Aligned with openclaw: emitMessageSent after sendPayload
-                log()->debug("deliver_outbound_payloads_core: [hook] message_sent channel={} "
-                             "messageId={} success=true", channel_id, delivery.message_id);
+                // 🎯 对齐 OpenClaw: emitMessageSent after sendPayload
+                emit_message_sent_hook(payload.text, true, delivery.message_id, "");
                 continue;
             }
 
@@ -458,9 +499,9 @@ core::Result<std::vector<OutboundDeliveryResult>> deliver_outbound_payloads_core
                 // Aligned with openclaw: emitMessageSent after sendTextChunks
                 const std::string last_msg_id = results.size() > before_count
                     ? results.back().message_id : "";
-                log()->debug("deliver_outbound_payloads_core: [hook] message_sent channel={} "
-                             "messageId={} success={}", channel_id, last_msg_id,
-                             results.size() > before_count);
+                // 🎯 对齐 OpenClaw: emitMessageSent after sendTextChunks
+                emit_message_sent_hook(payload_summary.text,
+                    results.size() > before_count, last_msg_id, "");
                 continue;
             }
 
@@ -508,16 +549,14 @@ core::Result<std::vector<OutboundDeliveryResult>> deliver_outbound_payloads_core
                 last_media_msg_id = r.get().message_id;
                 results.push_back(r.get());
             }
-            // Aligned with openclaw: emitMessageSent after media loop
-            log()->debug("deliver_outbound_payloads_core: [hook] message_sent channel={} "
-                         "messageId={} success=true", channel_id, last_media_msg_id);
+            // 🎯 对齐 OpenClaw: emitMessageSent after media loop
+            emit_message_sent_hook(payload_summary.text, true, last_media_msg_id, "");
 
         } catch (const std::exception& e) {
             std::string error_msg = e.what();
 
-            // Aligned with openclaw: emitMessageSent(success=false) on error
-            log()->debug("deliver_outbound_payloads_core: [hook] message_sent channel={} "
-                         "success=false error={}", channel_id, error_msg);
+            // 🎯 对齐 OpenClaw: emitMessageSent(success=false) on error
+            emit_message_sent_hook(payload_summary.text, false, "", error_msg);
 
             if (!params.best_effort) {
                 // Re-throw (aligned with openclaw: if (!bestEffort) throw err)
