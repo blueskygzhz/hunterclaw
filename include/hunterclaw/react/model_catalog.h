@@ -1,107 +1,126 @@
 #pragma once
+// ============================================================================
+// model_catalog.h
+// ✅ 严格对齐 OpenClaw: src/agents/model-catalog.ts
+// ============================================================================
 
-#include "hunterclaw/react/verbose_reasoning_config.h"
 #include <string>
 #include <vector>
-#include <unordered_map>
-#include <memory>
+#include <optional>
+#include <set>
+#include <mutex>
+#include <algorithm>
 
 namespace hunterclaw {
 namespace react {
 
-/**
- * 模型目录管理器 (OpenClaw 对齐)
- * 
- * 对应 OpenClaw: ModelCatalogEntry[]
- * 参考: openclaw-analysis/src/agents/model-selection.ts
- * 
- * 管理模型能力信息,用于自动检测 reasoning 支持
- */
+// ── ModelInputType ────────────────────────────────────────────────────────────
+// ✅ 对齐 OpenClaw: ModelInputType = "text" | "image" | "document"
+// 用字符串存储（对齐 JSON 格式，方便序列化/比较）
+
+// ── ModelCatalogEntry ─────────────────────────────────────────────────────────
+// ✅ 严格对齐 OpenClaw: ModelCatalogEntry (model-catalog.ts:11-18)
+// {
+//   id: string;
+//   name: string;
+//   provider: string;
+//   contextWindow?: number;
+//   reasoning?: boolean;
+//   input?: ModelInputType[];
+// }
+//
+// HunterClaw 扩展: max_output_tokens（对齐 ModelDefinitionConfig.maxTokens）
+struct ModelCatalogEntry {
+    std::string id;                          // ✅ OpenClaw: id
+    std::string name;                        // ✅ OpenClaw: name
+    std::string provider;                    // ✅ OpenClaw: provider
+    std::optional<int> context_window;       // ✅ OpenClaw: contextWindow?
+    std::optional<int> max_output_tokens;    // ✅ OpenClaw: ModelDefinitionConfig.maxTokens
+    std::optional<bool> reasoning;           // ✅ OpenClaw: reasoning?
+    std::vector<std::string> input;          // ✅ OpenClaw: input? ("text"|"image"|"document")
+};
+
+// ── ModelCatalog ──────────────────────────────────────────────────────────────
+// ✅ 对齐 OpenClaw: loadModelCatalog() 的 C++ 实现
+// OpenClaw: 动态加载（pi-sdk ModelRegistry + models.json）
+// HunterClaw: 单例，内置静态列表 + 可选从 models.json 覆盖加载
 class ModelCatalog {
 public:
-    /**
-     * 获取全局模型目录实例 (单例)
-     */
+    // ✅ 对齐 OpenClaw: 进程级单例（模拟 module-scope promise cache）
     static ModelCatalog& instance();
-    
-    /**
-     * 注册模型能力
-     */
-    void register_model(const ModelCapabilities& caps);
-    
-    /**
-     * 查找模型能力
-     * 
-     * @param provider 提供商 (anthropic, openai, etc.)
-     * @param model_id 模型 ID
-     * @return 模型能力,如果不存在则返回默认能力
-     */
-    ModelCapabilities get_capabilities(
-        const std::string& provider, 
+
+    // ── 核心查询接口 ──────────────────────────────────────────────────────────
+
+    // ✅ 对齐 OpenClaw: loadModelCatalog() → ModelCatalogEntry[]（已排序）
+    // 按 provider ASC, name ASC 排序
+    std::vector<ModelCatalogEntry> get_all() const;
+
+    // ✅ 对齐 OpenClaw: findModelInCatalog(catalog, provider, modelId)
+    // 大小写不敏感
+    std::optional<ModelCatalogEntry> find_model(
+        const std::string& provider,
         const std::string& model_id
     ) const;
-    
-    /**
-     * 检查模型是否支持 reasoning
-     * 
-     * 对应 OpenClaw: resolveReasoningDefault()
-     */
+
+    // ✅ 对齐 OpenClaw: entry?.reasoning ?? false
     bool supports_reasoning(
-        const std::string& provider, 
+        const std::string& provider,
         const std::string& model_id
     ) const;
-    
-    /**
-     * 列出所有已注册的模型
-     */
-    std::vector<ModelCapabilities> list_all_models() const;
-    
-    /**
-     * 清空目录
-     */
-    void clear();
-    
-    /**
-     * 从配置文件加载模型目录
-     */
-    bool load_from_config(const std::string& config_path);
-    
+
+    // ✅ 对齐 OpenClaw: modelSupportsVision(entry) (model-catalog.ts:287)
+    bool model_supports_vision(
+        const std::string& provider,
+        const std::string& model_id
+    ) const;
+
+    // ✅ 对齐 OpenClaw: modelSupportsDocument(entry) (model-catalog.ts:293)
+    bool model_supports_document(
+        const std::string& provider,
+        const std::string& model_id
+    ) const;
+
+    // ── 加载接口 ──────────────────────────────────────────────────────────────
+
+    // ✅ 对齐 OpenClaw: loadModelCatalog — 从 models.json 加载
+    // 失败时不清除已有内置模型（对齐 OpenClaw: 不污染 cache）
+    bool load_from_models_json(const std::string& models_json_path);
+
+    // ✅ 对齐 OpenClaw: mergeConfiguredOptInProviderModels
+    // 合并外部配置的模型（如 kilocode），去重
+    void merge_provider_models(const std::vector<ModelCatalogEntry>& extra);
+
+    // ── 测试接口 ──────────────────────────────────────────────────────────────
+    // ✅ 对齐 OpenClaw: resetModelCatalogCacheForTest()
+    void reset_for_test();
+
 private:
     ModelCatalog();
     ~ModelCatalog() = default;
-    
-    // 禁止拷贝和赋值
     ModelCatalog(const ModelCatalog&) = delete;
     ModelCatalog& operator=(const ModelCatalog&) = delete;
-    
-    // 注册内置模型能力
-    void register_builtin_models();
-    
-    // 生成模型键值 (provider/model_id)
-    static std::string make_key(const std::string& provider, const std::string& model_id);
-    
-    // 模型能力映射
-    std::unordered_map<std::string, ModelCapabilities> catalog_;
+
+    void load_builtin_models();
+    void load_builtin_models_locked();  // 调用方持锁时使用
+
+    mutable std::mutex mutex_;
+    std::vector<ModelCatalogEntry> entries_;
+    bool has_logged_error_ = false;
 };
 
-/**
- * 注册常见模型的能力信息
- * 
- * 默认包含:
- * - Anthropic Claude 系列
- * - OpenAI GPT 系列
- * - Google Gemini 系列
- * - Deepseek 系列
- */
-void register_common_models();
+// ── 自由函数（对齐 OpenClaw 导出的函数） ──────────────────────────────────────
 
-/**
- * 创建默认模型能力 (当模型未在目录中时)
- */
-ModelCapabilities create_default_capabilities(
-    const std::string& provider,
-    const std::string& model_id
-);
+// ✅ 对齐 OpenClaw: modelSupportsVision(entry)
+inline bool model_supports_vision(const ModelCatalogEntry* entry) {
+    if (!entry) return false;
+    return std::find(entry->input.begin(), entry->input.end(), "image") != entry->input.end();
+}
+
+// ✅ 对齐 OpenClaw: modelSupportsDocument(entry)
+inline bool model_supports_document(const ModelCatalogEntry* entry) {
+    if (!entry) return false;
+    return std::find(entry->input.begin(), entry->input.end(), "document") != entry->input.end();
+}
 
 } // namespace react
 } // namespace hunterclaw

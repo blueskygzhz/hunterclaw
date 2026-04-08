@@ -1,19 +1,34 @@
+// ============================================================================
+// loop_detection.cc
+// ✅ 严格对齐 OpenClaw: src/agents/tool-loop-detection.ts
+// ============================================================================
+
 #include "hunterclaw/react/loop_detection.h"
 #include <sstream>
 #include <algorithm>
 #include <openssl/sha.h>
 #include <iomanip>
+#include <spdlog/spdlog.h>
 
 namespace hunterclaw {
 namespace react {
 
 namespace {
 
-// SHA256 哈希计算
+auto log() {
+    static auto logger = spdlog::get("loop-detection");
+    if (!logger) {
+        logger = spdlog::stdout_logger_mt("loop-detection");
+    }
+    return logger;
+}
+
+// ── SHA256 ────────────────────────────────────────────────────────────────────
+// ✅ 对齐 OpenClaw: createHash("sha256").update(serialized).digest("hex")
+
 std::string compute_sha256(const std::string& data) {
     unsigned char hash[SHA256_DIGEST_LENGTH];
     SHA256(reinterpret_cast<const unsigned char*>(data.c_str()), data.size(), hash);
-    
     std::ostringstream oss;
     for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
         oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(hash[i]);
@@ -21,19 +36,306 @@ std::string compute_sha256(const std::string& data) {
     return oss.str();
 }
 
-// JSON 序列化 (对齐 OpenClaw)
-std::string serialize_json(const core::JsonValue& json) {
-    // ✅ 对齐 OpenClaw: 使用 to_json() 转换为 nlohmann::json 再序列化
-    try {
-        return json.to_json().dump();
-    } catch (...) {
-        return "null";
+// ── stableStringify ───────────────────────────────────────────────────────────
+// ✅ 对齐 OpenClaw: stableStringify — keys 按字母序排序，保证相同结构不同 key 顺序产生相同 hash
+
+std::string stable_stringify(const nlohmann::json& j) {
+    if (j.is_null())    return "null";
+    if (j.is_boolean()) return j.get<bool>() ? "true" : "false";
+    if (j.is_number())  return j.dump();
+    if (j.is_string())  return j.dump();  // JSON quoted
+    if (j.is_array()) {
+        std::ostringstream oss;
+        oss << "[";
+        bool first = true;
+        for (const auto& item : j) {
+            if (!first) oss << ",";
+            oss << stable_stringify(item);
+            first = false;
+        }
+        oss << "]";
+        return oss.str();
     }
+    if (j.is_object()) {
+        // ✅ keys 按字母序排序 (对齐 OpenClaw: Object.keys(obj).toSorted())
+        std::vector<std::string> keys;
+        for (auto it = j.begin(); it != j.end(); ++it) {
+            keys.push_back(it.key());
+        }
+        std::sort(keys.begin(), keys.end());
+        std::ostringstream oss;
+        oss << "{";
+        bool first = true;
+        for (const auto& k : keys) {
+            if (!first) oss << ",";
+            // key 以 JSON 字符串形式输出
+            oss << nlohmann::json(k).dump() << ":" << stable_stringify(j[k]);
+            first = false;
+        }
+        oss << "}";
+        return oss.str();
+    }
+    return "null";
+}
+
+// ✅ 对齐 OpenClaw: stableStringifyFallback — 序列化失败时的降级处理
+std::string stable_stringify_fallback(const core::JsonValue& params) {
+    try {
+        return stable_stringify(params.to_json());
+    } catch (...) {
+        // 降级: 直接 dump（不保证 key 顺序，但总比崩溃好）
+        try {
+            return params.to_json().dump();
+        } catch (...) {
+            return "null";
+        }
+    }
+}
+
+// ✅ 对齐 OpenClaw: hashToolCall = "${toolName}:${digestStable(params)}"
+std::string hash_tool_call(const std::string& tool_name, const core::JsonValue& params) {
+    std::string serialized = stable_stringify_fallback(params);
+    return tool_name + ":" + compute_sha256(serialized);
+}
+
+// ── hashToolOutcome ───────────────────────────────────────────────────────────
+// ✅ 对齐 OpenClaw: hashToolOutcome
+// 对 error、已知轮询工具(process.poll/process.log)、通用结果分别处理
+
+std::string extract_text_content(const tools::ToolResult& result) {
+    // ✅ 对齐 OpenClaw: extractTextContent — 提取 content[].text 拼接
+    std::ostringstream oss;
+    bool first = true;
+    for (const auto& content : result.content) {
+        if (content.type == tools::ToolResultContent::Type::Text && !content.text.empty()) {
+            if (!first) oss << "\n";
+            oss << content.text;
+            first = false;
+        }
+    }
+    std::string text = oss.str();
+    // trim trailing whitespace
+    while (!text.empty() && (text.back() == ' ' || text.back() == '\n' || text.back() == '\r')) {
+        text.pop_back();
+    }
+    return text;
+}
+
+// ✅ 对齐 OpenClaw: hashToolOutcome(toolName, params, result, error)
+// error 有值 → "error:" + hash(error消息)
+// process.poll/process.log → 只取关键字段 hash（过滤流式输出变化）
+// 其他 → hash(details + text)
+std::string hash_tool_outcome(
+    const std::string& tool_name,
+    const core::JsonValue& params,
+    const tools::ToolResult& result,
+    const std::string& error
+) {
+    // ① error 路径: hash(error 字符串)
+    if (!error.empty()) {
+        return "error:" + compute_sha256(error);
+    }
+
+    // ② 通用路径
+    std::string text = extract_text_content(result);
+    nlohmann::json details_j;
+    // 尝试从 result.details 获取
+    try {
+        if (!result.details.is_null()) {
+            details_j = result.details.to_json();
+        }
+    } catch (...) {}
+
+    // ✅ 对齐 OpenClaw: process.poll / process.log 特殊处理
+    // 只取状态字段，过滤掉每次不同的流式日志输出
+    bool is_process_tool = (tool_name == "process");
+    if (is_process_tool) {
+        std::string action;
+        try {
+            nlohmann::json params_j = params.to_json();
+            if (params_j.contains("action") && params_j["action"].is_string()) {
+                action = params_j["action"].get<std::string>();
+            }
+        } catch (...) {}
+
+        if (action == "poll") {
+            nlohmann::json h;
+            h["action"] = "poll";
+            h["status"]     = details_j.contains("status")     ? details_j["status"]     : nlohmann::json(nullptr);
+            h["exitCode"]   = details_j.contains("exitCode")   ? details_j["exitCode"]   : nlohmann::json(nullptr);
+            h["exitSignal"] = details_j.contains("exitSignal") ? details_j["exitSignal"] : nlohmann::json(nullptr);
+            h["aggregated"] = details_j.contains("aggregated") ? details_j["aggregated"] : nlohmann::json(nullptr);
+            h["text"]       = text;
+            return compute_sha256(stable_stringify(h));
+        }
+        if (action == "log") {
+            nlohmann::json h;
+            h["action"]     = "log";
+            h["status"]     = details_j.contains("status")     ? details_j["status"]     : nlohmann::json(nullptr);
+            h["totalLines"] = details_j.contains("totalLines") ? details_j["totalLines"] : nlohmann::json(nullptr);
+            h["totalChars"] = details_j.contains("totalChars") ? details_j["totalChars"] : nlohmann::json(nullptr);
+            h["truncated"]  = details_j.contains("truncated")  ? details_j["truncated"]  : nlohmann::json(nullptr);
+            h["exitCode"]   = details_j.contains("exitCode")   ? details_j["exitCode"]   : nlohmann::json(nullptr);
+            h["exitSignal"] = details_j.contains("exitSignal") ? details_j["exitSignal"] : nlohmann::json(nullptr);
+            h["text"]       = text;
+            return compute_sha256(stable_stringify(h));
+        }
+    }
+
+    // ③ 通用结果: hash(details + text)
+    nlohmann::json generic;
+    generic["details"] = details_j;
+    generic["text"]    = text;
+    return compute_sha256(stable_stringify(generic));
+}
+
+// ── getNoProgressStreak ───────────────────────────────────────────────────────
+// ✅ 对齐 OpenClaw: getNoProgressStreak
+// 倒序遍历 history，找到 tool_name+args_hash 匹配且有 result_hash 的条目
+// 统计连续相同 result_hash 的次数（中途变化则 break）
+struct NoProgressResult {
+    int count = 0;
+    std::string latest_result_hash;
+};
+
+NoProgressResult get_no_progress_streak(
+    const std::vector<ToolCallRecord>& history,
+    const std::string& tool_name,
+    const std::string& args_hash
+) {
+    NoProgressResult r;
+    for (int i = static_cast<int>(history.size()) - 1; i >= 0; i--) {
+        const auto& record = history[i];
+        if (record.tool_name != tool_name || record.args_hash != args_hash) {
+            continue;  // ✅ 对齐 OpenClaw: continue (不是 break)，跳过不匹配的
+        }
+        if (record.result_hash.empty()) {
+            continue;  // 还没有结果
+        }
+        if (r.latest_result_hash.empty()) {
+            r.latest_result_hash = record.result_hash;
+            r.count = 1;
+            continue;
+        }
+        if (record.result_hash != r.latest_result_hash) {
+            break;  // 结果变化了，中断
+        }
+        r.count++;
+    }
+    return r;
+}
+
+// ── getPingPongStreak ─────────────────────────────────────────────────────────
+// ✅ 严格对齐 OpenClaw: getPingPongStreak
+// 基于 argsHash（工具名+参数）而非工具名检测交替模式
+// 只有双边结果都稳定（noProgressEvidence）才触发 Critical
+
+struct PingPongResult {
+    int count = 0;
+    std::string paired_tool_name;
+    std::string paired_signature;
+    bool no_progress_evidence = false;
+};
+
+PingPongResult get_ping_pong_streak(
+    const std::vector<ToolCallRecord>& history,
+    const std::string& current_signature  // argsHash of current call
+) {
+    PingPongResult r;
+    if (history.empty()) return r;
+
+    const auto& last = history.back();
+
+    // 找到上一个不同 argsHash 的条目（otherSignature）
+    std::string other_signature;
+    std::string other_tool_name;
+    for (int i = static_cast<int>(history.size()) - 2; i >= 0; i--) {
+        const auto& call = history[i];
+        if (call.args_hash != last.args_hash) {
+            other_signature = call.args_hash;
+            other_tool_name = call.tool_name;
+            break;
+        }
+    }
+
+    if (other_signature.empty()) return r;
+
+    // 统计尾部交替次数
+    int alternating_tail_count = 0;
+    for (int i = static_cast<int>(history.size()) - 1; i >= 0; i--) {
+        const auto& call = history[i];
+        // ✅ 对齐 OpenClaw: expected 取决于 alternatingTailCount % 2
+        const std::string& expected = (alternating_tail_count % 2 == 0)
+            ? last.args_hash : other_signature;
+        if (call.args_hash != expected) break;
+        alternating_tail_count++;
+    }
+
+    if (alternating_tail_count < 2) return r;
+
+    // ✅ 对齐 OpenClaw: currentSignature 必须等于 expectedCurrentSignature (otherSignature)
+    if (current_signature != other_signature) return r;
+
+    // ── noProgressEvidence 检查 ──
+    // ✅ 对齐 OpenClaw: 双边（A 侧和 B 侧）result_hash 都必须稳定才视为无进展
+    int tail_start = std::max(0, static_cast<int>(history.size()) - alternating_tail_count);
+    std::string first_hash_a;
+    std::string first_hash_b;
+    bool no_progress = true;
+
+    for (int i = tail_start; i < static_cast<int>(history.size()); i++) {
+        const auto& call = history[i];
+        if (call.result_hash.empty()) {
+            no_progress = false;
+            break;
+        }
+        if (call.args_hash == last.args_hash) {
+            if (first_hash_a.empty()) {
+                first_hash_a = call.result_hash;
+            } else if (first_hash_a != call.result_hash) {
+                no_progress = false;
+                break;
+            }
+            continue;
+        }
+        if (call.args_hash == other_signature) {
+            if (first_hash_b.empty()) {
+                first_hash_b = call.result_hash;
+            } else if (first_hash_b != call.result_hash) {
+                no_progress = false;
+                break;
+            }
+            continue;
+        }
+        no_progress = false;
+        break;
+    }
+
+    // ✅ 对齐 OpenClaw: 两侧都需要有稳定 hash 才视为 no-progress
+    if (first_hash_a.empty() || first_hash_b.empty()) {
+        no_progress = false;
+    }
+
+    r.count = alternating_tail_count + 1;  // ✅ 对齐 OpenClaw: +1
+    r.paired_tool_name = last.tool_name;
+    r.paired_signature = last.args_hash;
+    r.no_progress_evidence = no_progress;
+    return r;
+}
+
+// ── canonicalPairKey ──────────────────────────────────────────────────────────
+// ✅ 对齐 OpenClaw: canonicalPairKey — 排序后用 | 连接，防止 A:B vs B:A 不同
+std::string canonical_pair_key(const std::string& a, const std::string& b) {
+    if (a <= b) return a + "|" + b;
+    return b + "|" + a;
 }
 
 } // namespace
 
+// ============================================================================
 // LoopDetectionState 实现
+// ============================================================================
+
 std::shared_ptr<LoopDetectionState> LoopDetectionState::create(
     const LoopDetectionConfig& config
 ) {
@@ -44,6 +346,23 @@ LoopDetectionState::LoopDetectionState(const LoopDetectionConfig& config)
     : config_(config) {
 }
 
+// ── detect_tool_call_loop ─────────────────────────────────────────────────────
+// ✅ 严格对齐 OpenClaw: detectToolCallLoop (tool-loop-detection.ts:372-494)
+//
+// 检测顺序 (与 OpenClaw 完全一致):
+//   1. global_circuit_breaker      (noProgressStreak >= globalBreakerThreshold)
+//   2. known_poll_no_progress      critical  (knownPollTool && noProgressStreak >= criticalThreshold)
+//   3. known_poll_no_progress      warning   (knownPollTool && noProgressStreak >= warningThreshold)
+//   4. ping_pong                   critical  (count >= criticalThreshold && noProgressEvidence)
+//   5. ping_pong                   warning   (count >= warningThreshold)
+//   6. generic_repeat              warning   (!knownPollTool && recentCount >= warningThreshold)
+//
+// 关键差异（相较旧实现）:
+//   • generic_repeat 只有 Warning，无 Critical（对齐 OpenClaw）
+//   • global_circuit_breaker 基于 noProgressStreak，不是 history_.size()
+//   • ping_pong 基于 argsHash（非工具名），且需要 noProgressEvidence
+//   • params hash 使用 stableStringify（key 字母序排序）
+
 LoopDetectionResult LoopDetectionState::detect_tool_call_loop(
     const std::string& tool_name,
     const core::JsonValue& params
@@ -51,41 +370,141 @@ LoopDetectionResult LoopDetectionState::detect_tool_call_loop(
     if (!config_.enabled) {
         return LoopDetectionResult{};
     }
-    
-    // 1. 全局断路器 (最高优先级)
-    auto global_result = detect_global_circuit_breaker();
-    if (global_result.stuck) {
-        return global_result;
+
+    const std::string current_hash = hash_tool_call(tool_name, params);
+    const auto no_progress = get_no_progress_streak(history_, tool_name, current_hash);
+    const int no_progress_streak = no_progress.count;
+    const bool known_poll_tool = loop_detection::is_known_polling_tool(tool_name, params);
+    const auto ping_pong = get_ping_pong_streak(history_, current_hash);
+
+    // ── 1. global circuit breaker ──────────────────────────────────────────
+    // ✅ 对齐 OpenClaw: noProgressStreak >= globalCircuitBreakerThreshold
+    if (no_progress_streak >= config_.global_circuit_breaker_threshold) {
+        log()->error("Global circuit breaker triggered: {} repeated {} times with no progress",
+                     tool_name, no_progress_streak);
+        LoopDetectionResult r;
+        r.stuck = true;
+        r.level = LoopDetectionResult::Level::Critical;
+        r.detector = LoopDetectorKind::GlobalCircuitBreaker;
+        r.count = no_progress_streak;
+        r.message = "CRITICAL: " + tool_name + " has repeated identical no-progress outcomes " +
+                    std::to_string(no_progress_streak) + " times. Session execution blocked by "
+                    "global circuit breaker to prevent runaway loops.";
+        r.warning_key = "global:" + tool_name + ":" + current_hash + ":" +
+                        (no_progress.latest_result_hash.empty() ? "none" : no_progress.latest_result_hash);
+        return r;
     }
-    
-    std::string params_hash = compute_params_hash(params);
-    
-    // 2. 通用重复检测
-    if (config_.detectors.generic_repeat) {
-        auto repeat_result = detect_generic_repeat(tool_name, params_hash);
-        if (repeat_result.stuck && repeat_result.level == LoopDetectionResult::Level::Critical) {
-            return repeat_result;
+
+    // ── 2. known_poll_no_progress critical ────────────────────────────────
+    // ✅ 对齐 OpenClaw: knownPollTool && detectors.knownPollNoProgress && noProgressStreak >= criticalThreshold
+    if (known_poll_tool && config_.detectors.known_poll_no_progress &&
+        no_progress_streak >= config_.critical_threshold) {
+        log()->error("Critical polling loop detected: {} repeated {} times", tool_name, no_progress_streak);
+        LoopDetectionResult r;
+        r.stuck = true;
+        r.level = LoopDetectionResult::Level::Critical;
+        r.detector = LoopDetectorKind::KnownPollNoProgress;
+        r.count = no_progress_streak;
+        r.message = "CRITICAL: Called " + tool_name + " with identical arguments and no progress " +
+                    std::to_string(no_progress_streak) + " times. This appears to be a stuck "
+                    "polling loop. Session execution blocked to prevent resource waste.";
+        r.warning_key = "poll:" + tool_name + ":" + current_hash + ":" +
+                        (no_progress.latest_result_hash.empty() ? "none" : no_progress.latest_result_hash);
+        return r;
+    }
+
+    // ── 3. known_poll_no_progress warning ────────────────────────────────
+    if (known_poll_tool && config_.detectors.known_poll_no_progress &&
+        no_progress_streak >= config_.warning_threshold) {
+        log()->warn("Polling loop warning: {} repeated {} times", tool_name, no_progress_streak);
+        LoopDetectionResult r;
+        r.stuck = true;
+        r.level = LoopDetectionResult::Level::Warning;
+        r.detector = LoopDetectorKind::KnownPollNoProgress;
+        r.count = no_progress_streak;
+        r.message = "WARNING: You have called " + tool_name + " " +
+                    std::to_string(no_progress_streak) + " times with identical arguments and no "
+                    "progress. Stop polling and either (1) increase wait time between checks, or "
+                    "(2) report the task as failed if the process is stuck.";
+        r.warning_key = "poll:" + tool_name + ":" + current_hash + ":" +
+                        (no_progress.latest_result_hash.empty() ? "none" : no_progress.latest_result_hash);
+        return r;
+    }
+
+    // ── 4. ping_pong critical ─────────────────────────────────────────────
+    // ✅ 对齐 OpenClaw: pingPong.count >= criticalThreshold && pingPong.noProgressEvidence
+    const std::string ping_pong_warning_key = !ping_pong.paired_signature.empty()
+        ? "pingpong:" + canonical_pair_key(current_hash, ping_pong.paired_signature)
+        : "pingpong:" + tool_name + ":" + current_hash;
+
+    if (config_.detectors.ping_pong &&
+        ping_pong.count >= config_.critical_threshold &&
+        ping_pong.no_progress_evidence) {
+        log()->error("Critical ping-pong loop detected: alternating calls count={} currentTool={}",
+                     ping_pong.count, tool_name);
+        LoopDetectionResult r;
+        r.stuck = true;
+        r.level = LoopDetectionResult::Level::Critical;
+        r.detector = LoopDetectorKind::PingPong;
+        r.count = ping_pong.count;
+        r.message = "CRITICAL: You are alternating between repeated tool-call patterns (" +
+                    std::to_string(ping_pong.count) + " consecutive calls) with no progress. "
+                    "This appears to be a stuck ping-pong loop. Session execution blocked to "
+                    "prevent resource waste.";
+        r.paired_tool_name = ping_pong.paired_tool_name;
+        r.warning_key = ping_pong_warning_key;
+        return r;
+    }
+
+    // ── 5. ping_pong warning ──────────────────────────────────────────────
+    if (config_.detectors.ping_pong && ping_pong.count >= config_.warning_threshold) {
+        log()->warn("Ping-pong loop warning: alternating calls count={} currentTool={}",
+                    ping_pong.count, tool_name);
+        LoopDetectionResult r;
+        r.stuck = true;
+        r.level = LoopDetectionResult::Level::Warning;
+        r.detector = LoopDetectorKind::PingPong;
+        r.count = ping_pong.count;
+        r.message = "WARNING: You are alternating between repeated tool-call patterns (" +
+                    std::to_string(ping_pong.count) + " consecutive calls). This looks like a "
+                    "ping-pong loop; stop retrying and report the task as failed.";
+        r.paired_tool_name = ping_pong.paired_tool_name;
+        r.warning_key = ping_pong_warning_key;
+        return r;
+    }
+
+    // ── 6. generic_repeat warning (warn-only) ────────────────────────────
+    // ✅ 对齐 OpenClaw: !knownPollTool && recentCount >= warningThreshold
+    // ✅ 对齐 OpenClaw: generic_repeat 只有 Warning，无 Critical
+    if (!known_poll_tool && config_.detectors.generic_repeat) {
+        int recent_count = 0;
+        for (const auto& record : history_) {
+            if (record.tool_name == tool_name && record.args_hash == current_hash) {
+                recent_count++;
+            }
+        }
+        if (recent_count >= config_.warning_threshold) {
+            log()->warn("Loop warning: {} called {} times with identical arguments",
+                        tool_name, recent_count);
+            LoopDetectionResult r;
+            r.stuck = true;
+            r.level = LoopDetectionResult::Level::Warning;
+            r.detector = LoopDetectorKind::GenericRepeat;
+            r.count = recent_count;
+            r.message = "WARNING: You have called " + tool_name + " " +
+                        std::to_string(recent_count) + " times with identical arguments. "
+                        "If this is not making progress, stop retrying and report the task as failed.";
+            r.warning_key = "generic:" + tool_name + ":" + current_hash;
+            return r;
         }
     }
-    
-    // 3. 无进展轮询检测
-    if (config_.detectors.known_poll_no_progress) {
-        auto poll_result = detect_known_poll_no_progress(tool_name, params_hash);
-        if (poll_result.stuck && poll_result.level == LoopDetectionResult::Level::Critical) {
-            return poll_result;
-        }
-    }
-    
-    // 4. 乒乓循环检测
-    if (config_.detectors.ping_pong) {
-        auto ping_pong_result = detect_ping_pong(tool_name);
-        if (ping_pong_result.stuck) {
-            return ping_pong_result;
-        }
-    }
-    
+
     return LoopDetectionResult{};
 }
+
+// ── record_tool_call ──────────────────────────────────────────────────────────
+// ✅ 对齐 OpenClaw: recordToolCall (tool-loop-detection.ts:501-523)
+// 维护滑动窗口，记录 argsHash（工具名+参数 hash 的组合 hash）
 
 void LoopDetectionState::record_tool_call(
     const std::string& tool_name,
@@ -93,262 +512,106 @@ void LoopDetectionState::record_tool_call(
     const std::string& tool_call_id
 ) {
     ToolCallRecord record;
-    record.tool_name = tool_name;
-    record.params_hash = compute_params_hash(params);
+    record.tool_name    = tool_name;
+    record.args_hash    = hash_tool_call(tool_name, params);  // ✅ toolName:SHA256(stableStringify(params))
+    record.tool_call_id = tool_call_id;
     record.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()
     ).count();
-    record.tool_call_id = tool_call_id;
-    record.executed = false;
-    
+    // result_hash 留空，由 record_tool_call_outcome 回填
+
     history_.push_back(record);
-    
-    // 维护滑动窗口
-    if (history_.size() > config_.history_size) {
+
+    // ✅ 对齐 OpenClaw: 维护滑动窗口 history_size
+    if (static_cast<int>(history_.size()) > config_.history_size) {
         history_.erase(history_.begin());
     }
-    
-    // 更新计数
-    tool_name_counts_[tool_name]++;
-    
-    std::string key = tool_name + ":" + record.params_hash;
-    tool_params_counts_[key]++;
 }
 
+// ── record_tool_call_outcome ──────────────────────────────────────────────────
+// ✅ 对齐 OpenClaw: recordToolCallOutcome (tool-loop-detection.ts:528-588)
+// 回填 result_hash 到最近匹配的未回填记录
+// 如果没找到匹配记录，追加一条新记录
+
+void LoopDetectionState::record_tool_call_outcome(
+    const std::string& tool_name,
+    const tools::ToolResult& result,
+    const std::string& error,
+    const std::string& tool_call_id,
+    const core::JsonValue& params
+) {
+    // ✅ 对齐 OpenClaw: hashToolOutcome(toolName, toolParams, result, error)
+    std::string result_hash = hash_tool_outcome(tool_name, params, result, error);
+    if (result_hash.empty()) return;
+
+    const std::string args_hash = hash_tool_call(tool_name, params);
+    bool matched = false;
+
+    // ✅ 对齐 OpenClaw: 倒序查找匹配且未回填 result_hash 的记录
+    for (int i = static_cast<int>(history_.size()) - 1; i >= 0; i--) {
+        auto& call = history_[i];
+        // ✅ 对齐 OpenClaw: toolCallId 优先匹配
+        if (!tool_call_id.empty() && call.tool_call_id != tool_call_id) {
+            continue;
+        }
+        if (call.tool_name != tool_name || call.args_hash != args_hash) {
+            continue;
+        }
+        if (!call.result_hash.empty()) {
+            continue;  // 已经有 result_hash，跳过
+        }
+        call.result_hash = result_hash;
+        matched = true;
+        break;
+    }
+
+    // ✅ 对齐 OpenClaw: 没找到匹配记录时，追加一条新记录
+    if (!matched) {
+        ToolCallRecord record;
+        record.tool_name    = tool_name;
+        record.args_hash    = args_hash;
+        record.tool_call_id = tool_call_id;
+        record.result_hash  = result_hash;
+        record.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count();
+        history_.push_back(record);
+    }
+
+    // ✅ 对齐 OpenClaw: splice 维护滑动窗口（outcome 也受 history_size 限制）
+    if (static_cast<int>(history_.size()) > config_.history_size) {
+        int excess = static_cast<int>(history_.size()) - config_.history_size;
+        history_.erase(history_.begin(), history_.begin() + excess);
+    }
+}
+
+// ── 向后兼容的旧签名 ──────────────────────────────────────────────────────────
 void LoopDetectionState::record_tool_call_outcome(
     const std::string& tool_name,
     const tools::ToolResult& result,
     const std::string& error
 ) {
-    // 查找最近的未执行记录
-    for (auto it = history_.rbegin(); it != history_.rend(); ++it) {
-        if (it->tool_name == tool_name && !it->executed) {
-            it->executed = true;
-            it->success = result.success;
-            it->result_hash = compute_result_hash(result);
-            it->error = error;
-            
-            // 检查无进展 (相同参数 + 相同结果)
-            if (loop_detection::is_known_polling_tool(tool_name)) {
-                std::string no_progress_key = tool_name + ":" + it->params_hash + ":" + it->result_hash;
-                no_progress_counts_[no_progress_key]++;
-            }
-            
-            break;
-        }
-    }
+    // 无 tool_call_id 和 params，用空参数调新签名
+    record_tool_call_outcome(tool_name, result, error, "", core::JsonValue{});
 }
 
 void LoopDetectionState::reset() {
     history_.clear();
-    tool_name_counts_.clear();
-    tool_params_counts_.clear();
-    no_progress_counts_.clear();
 }
 
 std::vector<std::string> LoopDetectionState::recent_tool_names(int count) const {
     std::vector<std::string> result;
     int start = std::max(0, static_cast<int>(history_.size()) - count);
-    
     for (size_t i = start; i < history_.size(); i++) {
         result.push_back(history_[i].tool_name);
     }
-    
     return result;
 }
 
-// 检测器实现
-LoopDetectionResult LoopDetectionState::detect_generic_repeat(
-    const std::string& tool_name,
-    const std::string& params_hash
-) {
-    std::string key = tool_name + ":" + params_hash;
-    int count = tool_params_counts_[key];
-    
-    LoopDetectionResult result;
-    result.detector = LoopDetectorKind::GenericRepeat;
-    result.count = count;
-    
-    if (count >= config_.critical_threshold) {
-        result.stuck = true;
-        result.level = LoopDetectionResult::Level::Critical;
-        result.message = "Tool '" + tool_name + "' called " + std::to_string(count) + 
-                        " times with identical parameters. This appears to be a loop.";
-        result.warning_key = "generic_repeat:" + key;
-    } else if (count >= config_.warning_threshold) {
-        result.stuck = true;
-        result.level = LoopDetectionResult::Level::Warning;
-        result.message = "Tool '" + tool_name + "' has been called " + std::to_string(count) + 
-                        " times with the same parameters. Consider a different approach.";
-        result.warning_key = "generic_repeat:" + key;
-    }
-    
-    return result;
-}
+// ============================================================================
+// 辅助函数
+// ============================================================================
 
-LoopDetectionResult LoopDetectionState::detect_known_poll_no_progress(
-    const std::string& tool_name,
-    const std::string& params_hash
-) {
-    if (!loop_detection::is_known_polling_tool(tool_name)) {
-        return LoopDetectionResult{};
-    }
-    
-    // 检查最近的调用是否有相同的结果
-    int no_progress_count = 0;
-    std::string last_result_hash;
-    
-    for (auto it = history_.rbegin(); it != history_.rend(); ++it) {
-        if (it->tool_name == tool_name && 
-            it->params_hash == params_hash && 
-            it->executed) {
-            
-            if (last_result_hash.empty()) {
-                last_result_hash = it->result_hash;
-                no_progress_count = 1;
-            } else if (it->result_hash == last_result_hash) {
-                no_progress_count++;
-            } else {
-                break;  // 结果变化了
-            }
-        }
-    }
-    
-    LoopDetectionResult result;
-    result.detector = LoopDetectorKind::KnownPollNoProgress;
-    result.count = no_progress_count;
-    
-    if (no_progress_count >= config_.critical_threshold / 2) {  // 更严格的阈值
-        result.stuck = true;
-        result.level = LoopDetectionResult::Level::Critical;
-        result.message = "Tool '" + tool_name + "' has been polling " + std::to_string(no_progress_count) + 
-                        " times with no change in results. This appears to be stuck.";
-        result.warning_key = "no_progress:" + tool_name + ":" + params_hash;
-    } else if (no_progress_count >= config_.warning_threshold / 2) {
-        result.stuck = true;
-        result.level = LoopDetectionResult::Level::Warning;
-        result.message = "Tool '" + tool_name + "' has been polling " + std::to_string(no_progress_count) + 
-                        " times with no progress. Consider a different approach.";
-        result.warning_key = "no_progress:" + tool_name + ":" + params_hash;
-    }
-    
-    return result;
-}
-
-LoopDetectionResult LoopDetectionState::detect_global_circuit_breaker() {
-    int total_calls = history_.size();
-    
-    LoopDetectionResult result;
-    result.detector = LoopDetectorKind::GlobalCircuitBreaker;
-    result.count = total_calls;
-    
-    if (total_calls >= config_.global_circuit_breaker_threshold) {
-        result.stuck = true;
-        result.level = LoopDetectionResult::Level::Critical;
-        result.message = "Global circuit breaker triggered: " + std::to_string(total_calls) + 
-                        " tool calls in this session. Stopping to prevent infinite loops.";
-        result.warning_key = "global_circuit_breaker";
-    }
-    
-    return result;
-}
-
-LoopDetectionResult LoopDetectionState::detect_ping_pong(
-    const std::string& tool_name
-) {
-    // 检查乒乓模式: A→B→A→B→A→B...
-    // 至少需要 6 次调用 (3个完整周期)
-    if (history_.size() < 6) {
-        return LoopDetectionResult{};
-    }
-    
-    // 获取最近的工具调用序列
-    std::vector<std::string> recent;
-    int look_back = std::min(12, static_cast<int>(history_.size()));
-    
-    for (int i = history_.size() - look_back; i < history_.size(); i++) {
-        recent.push_back(history_[i].tool_name);
-    }
-    
-    // 检查交替模式
-    if (recent.size() >= 6) {
-        std::string tool_a = recent[recent.size() - 1];
-        std::string tool_b;
-        
-        // 找到配对工具
-        for (int i = recent.size() - 2; i >= 0; i--) {
-            if (recent[i] != tool_a) {
-                tool_b = recent[i];
-                break;
-            }
-        }
-        
-        if (!tool_b.empty()) {
-            // 计算交替次数
-            int alternations = 0;
-            std::string expected = tool_a;
-            
-            for (auto it = recent.rbegin(); it != recent.rend(); ++it) {
-                if (*it == expected) {
-                    alternations++;
-                    expected = (expected == tool_a) ? tool_b : tool_a;
-                } else {
-                    break;
-                }
-            }
-            
-            LoopDetectionResult result;
-            result.detector = LoopDetectorKind::PingPong;
-            result.count = alternations;
-            result.paired_tool_name = tool_b;
-            
-            if (alternations >= 8) {  // 4 个完整周期
-                result.stuck = true;
-                result.level = LoopDetectionResult::Level::Critical;
-                result.message = "Ping-pong loop detected between '" + tool_a + "' and '" + tool_b + 
-                                "' (" + std::to_string(alternations) + " alternations). " +
-                                "These tools are calling each other repeatedly without progress.";
-                result.warning_key = "ping_pong:" + tool_a + ":" + tool_b;
-                return result;
-            } else if (alternations >= 6) {  // 3 个完整周期
-                result.stuck = true;
-                result.level = LoopDetectionResult::Level::Warning;
-                result.message = "Possible ping-pong loop between '" + tool_a + "' and '" + tool_b + 
-                                "' (" + std::to_string(alternations) + " alternations).";
-                result.warning_key = "ping_pong:" + tool_a + ":" + tool_b;
-                return result;
-            }
-        }
-    }
-    
-    return LoopDetectionResult{};
-}
-
-std::string LoopDetectionState::compute_params_hash(const core::JsonValue& params) {
-    std::string serialized = serialize_json(params);
-    return compute_sha256(serialized);
-}
-
-std::string LoopDetectionState::compute_result_hash(const tools::ToolResult& result) {
-    std::ostringstream oss;
-    oss << (result.success ? "success" : "failure");
-    
-    for (const auto& content : result.content) {
-        if (content.type == tools::ToolResultContent::Type::Text) {
-            oss << content.text;
-        } else if (content.type == tools::ToolResultContent::Type::Json) {
-            oss << content.text;
-        }
-    }
-    
-    if (!result.error.empty()) {
-        oss << "error:" << result.error;
-    }
-    
-    return compute_sha256(oss.str());
-}
-
-// 辅助函数实现
 namespace loop_detection {
 
 std::string create_loop_summary(
@@ -358,51 +621,58 @@ std::string create_loop_summary(
     std::ostringstream oss;
     oss << "Loop detected (" << result.count << " occurrences):\n";
     oss << "Detector: ";
-    
     switch (result.detector) {
-        case LoopDetectorKind::GenericRepeat:
-            oss << "Generic Repeat\n";
-            break;
-        case LoopDetectorKind::KnownPollNoProgress:
-            oss << "Known Poll (No Progress)\n";
-            break;
-        case LoopDetectorKind::GlobalCircuitBreaker:
-            oss << "Global Circuit Breaker\n";
-            break;
+        case LoopDetectorKind::GenericRepeat:       oss << "generic_repeat\n"; break;
+        case LoopDetectorKind::KnownPollNoProgress: oss << "known_poll_no_progress\n"; break;
+        case LoopDetectorKind::GlobalCircuitBreaker:oss << "global_circuit_breaker\n"; break;
         case LoopDetectorKind::PingPong:
-            oss << "Ping-Pong (alternating between tools)\n";
+            oss << "ping_pong\n";
             if (!result.paired_tool_name.empty()) {
                 oss << "Paired tool: " << result.paired_tool_name << "\n";
             }
             break;
     }
-    
     oss << "\nRecent tool calls:\n";
-    int count = std::min(10, static_cast<int>(recent_calls.size()));
-    for (int i = recent_calls.size() - count; i < recent_calls.size(); i++) {
+    int n = std::min(10, static_cast<int>(recent_calls.size()));
+    for (int i = static_cast<int>(recent_calls.size()) - n;
+         i < static_cast<int>(recent_calls.size()); i++) {
         oss << "  " << (i + 1) << ". " << recent_calls[i].tool_name;
-        if (recent_calls[i].executed) {
-            oss << " (" << (recent_calls[i].success ? "success" : "failed") << ")";
+        if (!recent_calls[i].result_hash.empty()) {
+            oss << " (result_hash=" << recent_calls[i].result_hash.substr(0, 8) << "...)";
         }
         oss << "\n";
     }
-    
     return oss.str();
 }
 
+// ✅ 严格对齐 OpenClaw: isKnownPollToolCall(toolName, params)
+// OpenClaw 只识别:
+//   - "command_status" (任意参数)
+//   - "process" + params.action == "poll" 或 "log"
+// HunterClaw 额外支持 execute_command 等（作为扩展保留）
+bool is_known_polling_tool(const std::string& tool_name, const core::JsonValue& params) {
+    // ✅ 对齐 OpenClaw: command_status 总是轮询工具
+    if (tool_name == "command_status") {
+        return true;
+    }
+    // ✅ 对齐 OpenClaw: process.poll / process.log
+    if (tool_name == "process") {
+        try {
+            nlohmann::json params_j = params.to_json();
+            if (params_j.contains("action") && params_j["action"].is_string()) {
+                std::string action = params_j["action"].get<std::string>();
+                return action == "poll" || action == "log";
+            }
+        } catch (...) {}
+        return false;
+    }
+    return false;
+}
+
+// 向后兼容的无参数版本（只用工具名判断，对 execute_command 等返回 false）
 bool is_known_polling_tool(const std::string& tool_name) {
-    // 对齐 OpenClaw 的已知轮询工具
-    static const std::vector<std::string> polling_tools = {
-        "read_file",
-        "list_dir",
-        "search_file",
-        "search_content",
-        "execute_command",  // 检查命令状态
-        "get_process_status",
-        "check_file_exists"
-    };
-    
-    return std::find(polling_tools.begin(), polling_tools.end(), tool_name) != polling_tools.end();
+    // 只保留 OpenClaw 原有的两个，其余返回 false
+    return tool_name == "command_status";
 }
 
 } // namespace loop_detection

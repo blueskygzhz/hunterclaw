@@ -7,6 +7,7 @@
 #include "hunterclaw/llm/provider.h"  // For Response, ToolCall, Usage
 #include "hunterclaw/memory/compaction_manager.h"  // ✅ Compaction 支持
 #include "hunterclaw/context/context_engine.h"    // ✅ Context Engine 支持
+#include "hunterclaw/react/loop_detection.h"       // ✅ 对齐 OpenClaw: tool loop detection
 #include <string>
 #include <vector>
 #include <memory>
@@ -198,6 +199,11 @@ struct ReactConfig {
     bool parallel_tool_calls = false;  // 是否并行执行工具
     bool verbose_tool_output = true;   // 是否显示详细工具输出
     int thread_pool_size = 4;          // 全局线程池大小 (0=auto)
+
+    // ✅ 对齐 OpenClaw: tool loop detection config (types.tools.ts ToolLoopDetectionConfig)
+    // 默认 disabled=false 以对齐 OpenClaw 的 DEFAULT_LOOP_DETECTION_CONFIG.enabled=false
+    // 需要在 agent 配置中显式开启: loop_detection.enabled = true
+    LoopDetectionConfig loop_detection;
 };
 
 // ReAct 引擎 - 对齐 OpenClaw
@@ -427,6 +433,10 @@ private:
     std::shared_ptr<llm::LLMClient> llm_client_;  // 向后兼容
     std::shared_ptr<llm::Provider> provider_;     // ✅ 直接 Provider 支持
     ReactConfig config_;
+
+    // ✅ 对齐 OpenClaw: tool loop detection state (pi-tools.before-tool-call.ts)
+    // 每次 run() 调用时重置，跨工具调用之间保持状态
+    std::shared_ptr<LoopDetectionState> loop_detection_state_;
     
     // 运行状态
     std::atomic<bool> cancelled_{false};

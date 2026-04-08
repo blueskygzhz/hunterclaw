@@ -83,7 +83,7 @@ ReasoningLevel resolve_reasoning_level(
     const MessageDirectives& directives,
     const SessionLevelOverrides* session_overrides,
     const AgentDefaultsConfig& agent_defaults,
-    const ModelCapabilities& model_caps,
+    const ModelCatalogEntry& model_entry,
     bool thinking_active
 ) {
     bool explicitly_set = false;
@@ -105,20 +105,19 @@ ReasoningLevel resolve_reasoning_level(
     }
     
     // 优先级 3: 模型能力自动检测 ✅
-    // 只有在以下条件都满足时才自动启用:
-    // 1. 用户没有显式设置 reasoning
-    // 2. thinking 未激活
-    // 3. 全局配置允许自动启用
-    // 4. 模型支持 reasoning
+    // ✅ 对齐 OpenClaw: get-reply-directives.ts:417
+    // if (!reasoningExplicitlySet && resolvedReasoningLevel === "off" && !thinkingActive) {
+    //   resolvedReasoningLevel = await modelState.resolveDefaultReasoningLevel();
+    // }
     if (!explicitly_set && 
         resolved == ReasoningLevel::Off && 
         !thinking_active &&
         agent_defaults.auto_enable_reasoning_for_capable_models &&
-        model_supports_reasoning(model_caps)) {
+        model_supports_reasoning(model_entry)) {
         
-        resolved = ReasoningLevel::On;  // 自动启用 ✅
+        resolved = ReasoningLevel::On;
         log()->info("[ReasoningConfig] Auto-enabled reasoning for capable model: {}/{}",
-            model_caps.provider, model_caps.model_id);
+            model_entry.provider, model_entry.id);  // ✅ model_entry.id (不是 model_id)
     }
     
     if (resolved == ReasoningLevel::Off) {
@@ -132,19 +131,22 @@ ReasoningLevel resolve_reasoning_level(
 /**
  * 检查模型是否支持 reasoning
  * 
- * 对应 OpenClaw: src/agents/model-selection.ts:669-681
+ * ✅ 严格对齐 OpenClaw: resolveReasoningDefault (model-selection.ts:669-681)
  * 
  * export function resolveReasoningDefault(params: {
  *   provider: string;
  *   model: string;
  *   catalog?: ModelCatalogEntry[];
  * }): "on" | "off" {
- *   const entry = catalog?.find(...);
- *   return entry?.reasoning === true ? "on" : "off";  // ✅ 检查 reasoning 属性
+ *   const candidate = catalog?.find(entry =>
+ *     entry.provider === params.provider && entry.id === params.model
+ *   );
+ *   return candidate?.reasoning === true ? "on" : "off";
  * }
  */
-bool model_supports_reasoning(const ModelCapabilities& caps) {
-    return caps.supports_reasoning;  // ✅ 直接返回模型能力标志
+bool model_supports_reasoning(const ModelCatalogEntry& entry) {
+    // ✅ 对齐 OpenClaw: entry?.reasoning === true
+    return entry.reasoning.value_or(false);
 }
 
 /**
@@ -154,7 +156,7 @@ ResolvedVerboseReasoningConfig resolve_verbose_reasoning_config(
     const MessageDirectives& directives,
     const SessionLevelOverrides* session_overrides,
     const AgentDefaultsConfig& agent_defaults,
-    const ModelCapabilities& model_caps,
+    const ModelCatalogEntry& model_entry,
     bool thinking_active
 ) {
     ResolvedVerboseReasoningConfig config;
@@ -166,7 +168,7 @@ ResolvedVerboseReasoningConfig resolve_verbose_reasoning_config(
     // 解析 reasoning 级别
     config.reasoning_level = resolve_reasoning_level(
         directives, session_overrides, agent_defaults, 
-        model_caps, thinking_active);
+        model_entry, thinking_active);
     
     // 解析 block streaming 配置
     config.block_streaming_enabled = agent_defaults.block_streaming_default;

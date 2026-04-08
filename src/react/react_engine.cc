@@ -320,6 +320,13 @@ ReactResult ReactEngine::execute_loop(
     ReactResult result;
     result.success = true;
 
+    // ✅ 对齐 OpenClaw: tool loop detection — 每次 run 重置状态
+    // OpenClaw: getDiagnosticSessionState() 返回 per-session 的持久 state
+    // HunterClaw: 每次 run() 创建全新 state (per-run 语义，更简单)
+    // 差异: OpenClaw 跨多次 run 累积历史，HunterClaw 每次 run 从头开始
+    // 对于绝大多数场景（单次对话 turn）行为一致。
+    loop_detection_state_ = LoopDetectionState::create(config_.loop_detection);
+
     // =========================================================================
     // Hook: before_model_resolve
     // Aligned with OpenClaw run.ts:329 — runs before resolveModel()
@@ -1036,6 +1043,40 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
             if (callbacks.on_tool_start) {
                 callbacks.on_tool_start(tool_call.name, tool_call.input);
             }
+
+            // ✅ 对齐 OpenClaw: runBeforeToolCallHook — loop detection (before execute)
+            // pi-tools.before-tool-call.ts:108 — detectToolCallLoop + recordToolCall
+            if (loop_detection_state_) {
+                auto loop_result = loop_detection_state_->detect_tool_call_loop(
+                    tool_call.name, tool_call.input);
+
+                if (loop_result.stuck) {
+                    if (loop_result.level == LoopDetectionResult::Level::Critical) {
+                        // ✅ 对齐 OpenClaw: Critical → blocked=true → throw Error
+                        // before-tool-call.ts:111-127: log.error + return { blocked: true }
+                        log()->error("Loop detection: blocking tool '{}' — {}",
+                                     tool_call.name, loop_result.message);
+                        tools::ToolResult blocked_result;
+                        blocked_result.success = false;
+                        blocked_result.error = loop_result.message;
+                        results[tool_call.id] = blocked_result;
+                        // ✅ 仍然 record 这次调用（但跳过实际执行）
+                        loop_detection_state_->record_tool_call(
+                            tool_call.name, tool_call.input, tool_call.id);
+                        continue;  // 跳过工具执行，进入下一个 tool_call
+                    } else {
+                        // Warning: 只记日志，工具继续执行 (对齐 OpenClaw: warn-only)
+                        log()->warn("Loop detection: warning for tool '{}' — {}",
+                                    tool_call.name, loop_result.message);
+                    }
+                }
+
+                // ✅ 对齐 OpenClaw: recordToolCall — 记录本次调用到滑动窗口
+                // before-tool-call.ts:147: recordToolCall(sessionState, toolName, params, ...)
+                loop_detection_state_->record_tool_call(
+                    tool_call.name, tool_call.input, tool_call.id);
+            }
+
             std::unique_ptr<observability::Span> span;
             try {
                 span = observability::Tracer::instance().start_span(
@@ -1048,6 +1089,13 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                 if (span) span->set_status(result.success, result.error);
                 if (callbacks.on_tool_end) callbacks.on_tool_end(tool_call.name, result);
                 results[tool_call.id] = result;
+
+                // ✅ 对齐 OpenClaw: recordLoopOutcome (success path)
+                // before-tool-call.ts:230-236: recordToolCallOutcome with result
+                if (loop_detection_state_) {
+                    loop_detection_state_->record_tool_call_outcome(
+                        tool_call.name, result, "");
+                }
             } catch (const std::exception& e) {
                 if (span) { span->set_status(false, e.what()); }
                 tools::ToolResult error_result;
@@ -1055,6 +1103,13 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                 error_result.error = std::string("Tool execution failed: ") + e.what();
                 if (callbacks.on_tool_end) callbacks.on_tool_end(tool_call.name, error_result);
                 results[tool_call.id] = error_result;
+
+                // ✅ 对齐 OpenClaw: recordLoopOutcome (error path)
+                // before-tool-call.ts:239-245: recordToolCallOutcome with error
+                if (loop_detection_state_) {
+                    loop_detection_state_->record_tool_call_outcome(
+                        tool_call.name, error_result, e.what());
+                }
             }
         }
         return results;
@@ -1075,6 +1130,38 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                 
                 if (!callbacks.session_id.empty()) {
                 }
+            }
+
+            // ✅ 对齐 OpenClaw: loop detection (before execute) — 并行路径
+            // 注意: 并行路径的 loop detection 在主线程顺序执行（并行工具共享同一 state）
+            if (loop_detection_state_) {
+                auto loop_result = loop_detection_state_->detect_tool_call_loop(
+                    tool_call.name, tool_call.input);
+                if (loop_result.stuck) {
+                    if (loop_result.level == LoopDetectionResult::Level::Critical) {
+                        log()->error("Loop detection (parallel): blocking tool '{}' — {}",
+                                     tool_call.name, loop_result.message);
+                        // blocked: 提交一个直接返回错误的 future
+                        std::string blocked_msg = loop_result.message;
+                        std::string tool_id = tool_call.id;
+                        auto f = std::async(std::launch::deferred,
+                            [tool_id, blocked_msg]() -> std::pair<std::string, tools::ToolResult> {
+                                tools::ToolResult r;
+                                r.success = false;
+                                r.error = blocked_msg;
+                                return {tool_id, r};
+                            });
+                        futures.push_back(std::move(f));
+                        loop_detection_state_->record_tool_call(
+                            tool_call.name, tool_call.input, tool_call.id);
+                        continue;
+                    } else {
+                        log()->warn("Loop detection (parallel): warning for tool '{}' — {}",
+                                    tool_call.name, loop_result.message);
+                    }
+                }
+                loop_detection_state_->record_tool_call(
+                    tool_call.name, tool_call.input, tool_call.id);
             }
             
             // ✅ 提交任务到全局线程池 (避免频繁创建/销毁线程)
@@ -1134,12 +1221,23 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                 auto [call_id, result] = futures[i].get();
                 if (callbacks.on_tool_end) callbacks.on_tool_end(tool_call.name, result);
                 results[call_id] = result;
+
+                // ✅ 对齐 OpenClaw: recordLoopOutcome — 并行路径收集结果后记录
+                if (loop_detection_state_) {
+                    loop_detection_state_->record_tool_call_outcome(
+                        tool_call.name, result, result.success ? "" : result.error);
+                }
             } catch (const std::exception& e) {
                 log()->error("Failed to get tool execution result: {}", e.what());
                 tools::ToolResult error_result;
                 error_result.success = false;
                 error_result.error = std::string("Tool execution failed: ") + e.what();
                 results[tool_call.id] = error_result;
+
+                if (loop_detection_state_) {
+                    loop_detection_state_->record_tool_call_outcome(
+                        tool_call.name, error_result, e.what());
+                }
             }
         }
     }
