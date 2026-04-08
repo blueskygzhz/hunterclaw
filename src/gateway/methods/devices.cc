@@ -19,6 +19,8 @@
 #include <chrono>
 #include <algorithm>
 #include <set>
+#include <fstream>
+#include <filesystem>
 
 using json = nlohmann::json;
 
@@ -30,6 +32,12 @@ static inline int64_t devices_now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()
     ).count();
+}
+
+static inline std::shared_ptr<spdlog::logger> get_logger() {
+    auto logger = spdlog::get("default");
+    if (!logger) logger = spdlog::get("console");
+    return logger;
 }
 
 // ============================================================================
@@ -433,7 +441,7 @@ core::Result<json> method_device_token_rotate(
         if (out.is_open()) out << pairing_data.dump(2);
     } catch (...) {}
 
-    spdlog::info("device token rotated device={} role={} scopes={}",
+    get_logger()->info("device token rotated device={} role={} scopes={}",
         device_id, role,
         [&]() {
             std::string s;

@@ -45,7 +45,7 @@ core::Result<json> method_system_presence(
         for (const auto& [conn_id, client] : state->clients) {
             json entry;
             entry["connId"] = conn_id;
-            entry["role"] = client ? client->role : "operator";
+            entry["role"] = client ? client->connect.role : "operator";
             entries.push_back(entry);
         }
     }

@@ -58,44 +58,16 @@ core::Result<json> method_browser_request(
     }
 
     // Try node proxy first
-    auto conn_pool = server->connection_pool();
-    if (conn_pool) {
-        auto nodes = conn_pool->list_node_sessions();
-        for (const auto& node : nodes) {
-            // Check for browser-capable node
-            bool has_browser = false;
-            if (node.contains("caps") && node["caps"].is_array()) {
-                for (const auto& cap : node["caps"]) {
-                    if (cap.is_string() && cap.get<std::string>() == "browser") {
-                        has_browser = true;
-                        break;
-                    }
-                }
-            }
-            if (has_browser) {
-                // Forward to node via browser.proxy
-                json proxy_params;
-                proxy_params["method"] = method;
-                proxy_params["path"] = path;
-                if (params.contains("query")) proxy_params["query"] = params["query"];
-                if (params.contains("body")) proxy_params["body"] = params["body"];
-
-                auto result = conn_pool->invoke_node(
-                    node.value("nodeId", ""),
-                    "browser.proxy",
-                    proxy_params,
-                    params.value("timeoutMs", 30000),
-                    core::utils::generate_uuid()
-                );
-                if (result.has_value()) {
-                    auto& res = result.value();
-                    if (res.contains("payload")) {
-                        auto& payload = res["payload"];
-                        if (payload.contains("result")) {
-                            return core::Result<json>::Ok(payload["result"]);
-                        }
-                    }
-                }
+    // 🎯 OpenClaw 对齐: browser.ts L162-297 forwards to browser-capable node
+    // In HunterClaw, node invoke is done through runtime_state connected clients
+    auto state = server->runtime_state();
+    if (state) {
+        for (const auto& [conn_id, client] : state->clients) {
+            if (client && client->connect.role == "node") {
+                // Found a node client - browser proxy would forward through it
+                // Currently not fully implemented: node invoke via WebSocket RPC
+                // would require a request/response flow to the node client
+                break;
             }
         }
     }

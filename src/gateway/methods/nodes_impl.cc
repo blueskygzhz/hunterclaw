@@ -48,6 +48,12 @@ static inline int64_t nodes_now_ms() {
     ).count();
 }
 
+static inline std::shared_ptr<spdlog::logger> get_logger() {
+    auto logger = spdlog::get("default");
+    if (!logger) logger = spdlog::get("console");
+    return logger;
+}
+
 // ============================================================================
 // Constants (对齐 OpenClaw nodes.ts L53-59)
 // ============================================================================
@@ -484,7 +490,7 @@ core::Result<json> method_node_list(
     std::map<std::string, json> connected_by_id;
     if (state) {
         for (const auto& [conn_id, client] : state->clients) {
-            if (client && client->role == "node") {
+            if (client && client->connect.role == "node") {
                 std::string nid = conn_id;  // use connId as nodeId
                 json n;
                 n["nodeId"] = nid;
@@ -598,7 +604,7 @@ core::Result<json> method_node_describe(
     auto state = server->runtime_state();
     if (state) {
         for (const auto& [conn_id, client] : state->clients) {
-            if (client && client->role == "node" && conn_id == node_id) {
+            if (client && client->connect.role == "node" && conn_id == node_id) {
                 live_entry["nodeId"] = conn_id;
                 live_entry["connected"] = true;
                 found_live = true;
@@ -771,7 +777,7 @@ core::Result<json> method_node_invoke(
     bool node_connected = false;
     if (state) {
         for (const auto& [conn_id, client] : state->clients) {
-            if (client && client->role == "node" && conn_id == node_id) {
+            if (client && client->connect.role == "node" && conn_id == node_id) {
                 node_connected = true;
                 break;
             }

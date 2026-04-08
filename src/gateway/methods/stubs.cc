@@ -71,7 +71,12 @@ core::Result<json> method_agent_identity_get(
     auto cfg = server->config();
     json result;
     result["agentId"] = "main";
-    result["name"] = cfg ? cfg->agent_name : "HunterClaw";
+    std::string name = "HunterClaw";
+    if (cfg && cfg->data.contains("agent") && cfg->data["agent"].contains("name") &&
+        cfg->data["agent"]["name"].is_string()) {
+        name = cfg->data["agent"]["name"].get<std::string>();
+    }
+    result["name"] = name;
     return core::Result<json>::Ok(result);
 }
 
