@@ -54,7 +54,10 @@ core::Result<json> method_talk_mode(
     json event;
     event["mode"] = mode;
     event["ts"] = talk_now_ms();
-    server->broadcast("talk.mode", event);
+    core::EventFrame ef;
+    ef.event = "talk.mode";
+    ef.payload = core::JsonValue(event);
+    server->broadcast(ef);
 
     json result;
     result["ok"] = true;

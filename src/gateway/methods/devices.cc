@@ -197,9 +197,9 @@ core::Result<json> method_device_pair_approve(
     broadcast_payload["deviceId"] = approved_device.value("deviceId", "");
     broadcast_payload["decision"] = "approved";
     broadcast_payload["ts"] = devices_now_ms();
-    server->broadcast("device.pair.resolved", broadcast_payload);
+    { core::EventFrame ef; ef.event = "device.pair.resolved"; ef.payload = core::JsonValue(broadcast_payload); server->broadcast(ef); }
 
-    spdlog::info("device pairing approved device={} role={}",
+    get_logger()->info("device pairing approved device={} role={}",
         approved_device.value("deviceId", ""),
         approved_device.value("role", "unknown"));
 
@@ -274,7 +274,7 @@ core::Result<json> method_device_pair_reject(
     broadcast_payload["deviceId"] = rejected_entry.value("deviceId", "");
     broadcast_payload["decision"] = "rejected";
     broadcast_payload["ts"] = devices_now_ms();
-    server->broadcast("device.pair.resolved", broadcast_payload);
+    { core::EventFrame ef; ef.event = "device.pair.resolved"; ef.payload = core::JsonValue(broadcast_payload); server->broadcast(ef); }
 
     return core::Result<json>::Ok(rejected_entry);
 }
@@ -511,7 +511,7 @@ core::Result<json> method_device_token_revoke(
         if (out.is_open()) out << pairing_data.dump(2);
     } catch (...) {}
 
-    spdlog::info("device token revoked device={} role={}", device_id, role);
+    get_logger()->info("device token revoked device={} role={}", device_id, role);
 
     json result;
     result["deviceId"] = device_id;

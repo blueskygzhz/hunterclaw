@@ -57,7 +57,10 @@ core::Result<json> method_voicewake_set(
     json event;
     event["enabled"] = s_voicewake_enabled;
     event["phrase"] = s_voicewake_phrase.empty() ? json(nullptr) : json(s_voicewake_phrase);
-    server->broadcast("voicewake.changed", event);
+    core::EventFrame ef;
+    ef.event = "voicewake.changed";
+    ef.payload = core::JsonValue(event);
+    server->broadcast(ef);
 
     json result;
     result["ok"] = true;

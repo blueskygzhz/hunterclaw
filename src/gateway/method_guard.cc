@@ -8,6 +8,10 @@
 namespace hunterclaw {
 namespace gateway {
 
+// Forward declarations
+static const std::set<std::string>& node_role_methods();
+static const std::vector<std::string>& admin_method_prefixes();
+
 // Helper function to get logger
 static inline std::shared_ptr<spdlog::logger> get_logger() {
     auto logger = spdlog::get("console");

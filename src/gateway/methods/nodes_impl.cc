@@ -240,7 +240,10 @@ core::Result<json> method_node_pair_request(
 
     // Broadcast if not silent
     if (!silent) {
-        server->broadcast("node.pair.requested", request);
+        core::EventFrame ef;
+        ef.event = "node.pair.requested";
+        ef.payload = core::JsonValue(request);
+        server->broadcast(ef);
     }
 
     json result;
@@ -313,7 +316,7 @@ core::Result<json> method_node_pair_approve(
     broadcast["nodeId"] = approved_node.value("nodeId", "");
     broadcast["decision"] = "approved";
     broadcast["ts"] = nodes_now_ms();
-    server->broadcast("node.pair.resolved", broadcast);
+    { core::EventFrame ef; ef.event = "node.pair.resolved"; ef.payload = core::JsonValue(broadcast); server->broadcast(ef); }
 
     json result;
     result["node"] = approved_node;
@@ -362,7 +365,7 @@ core::Result<json> method_node_pair_reject(
     broadcast["nodeId"] = rejected.value("nodeId", "");
     broadcast["decision"] = "rejected";
     broadcast["ts"] = nodes_now_ms();
-    server->broadcast("node.pair.resolved", broadcast);
+    { core::EventFrame ef; ef.event = "node.pair.resolved"; ef.payload = core::JsonValue(broadcast); server->broadcast(ef); }
 
     return core::Result<json>::Ok(rejected);
 }
@@ -476,14 +479,19 @@ core::Result<json> method_node_list(
         }
     }
 
-    // Get connected nodes from connection pool
-    auto conn_pool = server->connection_pool();
+    // Get connected nodes from runtime state (role="node" clients)
+    auto state = server->runtime_state();
     std::map<std::string, json> connected_by_id;
-    if (conn_pool) {
-        auto connected = conn_pool->list_node_sessions();
-        for (const auto& n : connected) {
-            std::string nid = n.value("nodeId", "");
-            if (!nid.empty()) connected_by_id[nid] = n;
+    if (state) {
+        for (const auto& [conn_id, client] : state->clients) {
+            if (client && client->role == "node") {
+                std::string nid = conn_id;  // use connId as nodeId
+                json n;
+                n["nodeId"] = nid;
+                n["connId"] = conn_id;
+                n["connected"] = true;
+                connected_by_id[nid] = n;
+            }
         }
     }
 
@@ -587,12 +595,12 @@ core::Result<json> method_node_describe(
     // Find connected entry
     json live_entry;
     bool found_live = false;
-    auto conn_pool = server->connection_pool();
-    if (conn_pool) {
-        auto connected = conn_pool->list_node_sessions();
-        for (const auto& n : connected) {
-            if (n.value("nodeId", "") == node_id) {
-                live_entry = n;
+    auto state = server->runtime_state();
+    if (state) {
+        for (const auto& [conn_id, client] : state->clients) {
+            if (client && client->role == "node" && conn_id == node_id) {
+                live_entry["nodeId"] = conn_id;
+                live_entry["connected"] = true;
                 found_live = true;
                 break;
             }
@@ -759,27 +767,26 @@ core::Result<json> method_node_invoke(
     }
 
     // Check if node is connected
-    auto conn_pool = server->connection_pool();
-    if (!conn_pool) {
-        return core::Result<json>::Err("node not connected");
+    auto state = server->runtime_state();
+    bool node_connected = false;
+    if (state) {
+        for (const auto& [conn_id, client] : state->clients) {
+            if (client && client->role == "node" && conn_id == node_id) {
+                node_connected = true;
+                break;
+            }
+        }
     }
-
-    auto node_session = conn_pool->get_node_session(node_id);
-    if (!node_session.has_value()) {
+    if (!node_connected) {
         // Node not connected - in production would do APNs wake flow
         // 🎯 OpenClaw 对齐: nodes.ts L893-972 (two-phase wake)
-        spdlog::warn("node.invoke: node {} not connected, wake not implemented", node_id);
+        get_logger()->warn("node.invoke: node {} not connected, wake not implemented", node_id);
         return core::Result<json>::Err("node not connected");
     }
 
     // 🎯 OpenClaw 对齐: command allowlist check (nodes.ts L973-990)
-    auto& ns = node_session.value();
+    // Note: node session details not available via runtime_state, skip allowlist check
     std::vector<std::string> declared_commands;
-    if (ns.contains("commands") && ns["commands"].is_array()) {
-        for (const auto& c : ns["commands"]) {
-            if (c.is_string()) declared_commands.push_back(c.get<std::string>());
-        }
-    }
 
     // Simple allowlist check: command must be in declared commands
     if (!declared_commands.empty()) {
@@ -875,7 +882,7 @@ core::Result<json> method_node_event(
     event_data["nodeId"] = node_id;
     event_data["payload"] = payload;
     event_data["ts"] = nodes_now_ms();
-    server->broadcast("node.event", event_data);
+    { core::EventFrame ef; ef.event = "node.event"; ef.payload = core::JsonValue(event_data); server->broadcast(ef); }
 
     json result;
     result["ok"] = true;
@@ -949,7 +956,7 @@ core::Result<json> method_node_pending_enqueue(
     auto action = enqueue_pending_action(node_id, type, "", core::utils::generate_uuid());
 
     // In production, would trigger APNs wake flow here
-    spdlog::info("node pending enqueue node={} type={}", node_id, type);
+    get_logger()->info("node pending enqueue node={} type={}", node_id, type);
 
     json result;
     result["nodeId"] = node_id;

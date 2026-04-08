@@ -22,6 +22,12 @@ static inline int64_t system_now_ms() {
     ).count();
 }
 
+static inline std::shared_ptr<spdlog::logger> get_system_logger() {
+    auto logger = spdlog::get("default");
+    if (!logger) logger = spdlog::get("console");
+    return logger;
+}
+
 // system-presence
 // 🎯 OpenClaw 对齐: system.ts L45-48
 core::Result<json> method_system_presence(
@@ -34,14 +40,12 @@ core::Result<json> method_system_presence(
 
     // List all connected clients as presence entries
     json entries = json::array();
-    auto conn_pool = server->connection_pool();
-    if (conn_pool) {
-        auto clients = conn_pool->list_connected_clients();
-        for (const auto& c : clients) {
+    auto state = server->runtime_state();
+    if (state) {
+        for (const auto& [conn_id, client] : state->clients) {
             json entry;
-            entry["connId"] = c.value("connId", "");
-            entry["role"] = c.value("role", "operator");
-            entry["connectedAtMs"] = c.value("connectedAtMs", (int64_t)0);
+            entry["connId"] = conn_id;
+            entry["role"] = client ? client->role : "operator";
             entries.push_back(entry);
         }
     }
@@ -70,34 +74,32 @@ core::Result<json> method_system_event(
         return core::Result<json>::Err("text required");
     }
 
+    auto logger = get_system_logger();
+
     // 🎯 OpenClaw 对齐: Node state change detection (system.ts L100-138)
     bool is_node_line = text.find("Node:") == 0;
 
     if (is_node_line) {
-        // Extract key fields for change detection
-        std::string host = params.value("host", "");
-        std::string ip = params.value("ip", "");
-        std::string version = params.value("version", "");
-        std::string mode = params.value("mode", "");
         std::string reason = params.value("reason", "");
-
-        // Ignore periodic/heartbeat reasons
         std::string reason_lower = reason;
         std::transform(reason_lower.begin(), reason_lower.end(), reason_lower.begin(), ::tolower);
         if (reason_lower.find("periodic") == 0 || reason_lower == "heartbeat") {
             // Still update presence but don't enqueue system event
         } else {
-            spdlog::info("system-event (node): {}", text);
+            if (logger) logger->info("system-event (node): {}", text);
         }
     } else {
-        spdlog::info("system-event: {}", text);
+        if (logger) logger->info("system-event: {}", text);
     }
 
     // Broadcast presence update
     json presence_data;
     presence_data["text"] = text;
     presence_data["ts"] = system_now_ms();
-    server->broadcast("presence", presence_data);
+    core::EventFrame ef;
+    ef.event = "presence";
+    ef.payload = core::JsonValue(presence_data);
+    server->broadcast(ef);
 
     json result;
     result["ok"] = true;
