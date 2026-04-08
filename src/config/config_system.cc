@@ -1174,30 +1174,53 @@ bool configs_equal(const json& a, const json& b) {
 }
 
 json redact_config_secrets(const json& config) {
+    // 🎯 严格对齐 OpenClaw: redactConfigObject()
+    // 使用路径名启发式 + REDACTED_SENTINEL 双向脱敏
+    // 委托到 redact_snapshot.cc 的统一实现
     json result = config;
     
-    std::vector<std::string> secret_keys = {
-        "token", "password", "apiKey", "api_key", "secret", "privateKey"
+    // 递归遍历，基于路径名模式检测敏感字段
+    std::vector<std::string> secret_path_keywords = {
+        "token", "password", "apikey", "api_key", "secret", "privatekey",
+        "private_key", "passwd", "accesstoken", "access_token",
+        "refreshtoken", "refresh_token", "credentials",
     };
     
-    std::function<void(json&)> redact_recursive;
-    redact_recursive = [&](json& node) {
+    std::function<void(json&, const std::string&)> redact_recursive;
+    redact_recursive = [&](json& node, const std::string& prefix) {
         if (node.is_object()) {
             for (auto it = node.begin(); it != node.end(); ++it) {
-                if (std::find(secret_keys.begin(), secret_keys.end(), it.key()) != secret_keys.end()) {
-                    it.value() = "***REDACTED***";
+                std::string path = prefix.empty() ? it.key() : prefix + "." + it.key();
+                std::string lower_path = path;
+                std::transform(lower_path.begin(), lower_path.end(), lower_path.begin(), ::tolower);
+                
+                bool is_sensitive = false;
+                for (const auto& kw : secret_path_keywords) {
+                    if (lower_path.find(kw) != std::string::npos) {
+                        is_sensitive = true;
+                        break;
+                    }
+                }
+                
+                if (is_sensitive && it.value().is_string()) {
+                    // 🎯 对齐 OpenClaw: 使用 __OPENCLAW_REDACTED__ 哨兵值
+                    std::string val = it.value().get<std::string>();
+                    // 跳过 ${...} 环境变量占位符
+                    if (!(val.size() >= 4 && val[0] == '$' && val[1] == '{' && val.back() == '}')) {
+                        it.value() = "__OPENCLAW_REDACTED__";
+                    }
                 } else {
-                    redact_recursive(it.value());
+                    redact_recursive(it.value(), path);
                 }
             }
         } else if (node.is_array()) {
             for (auto& item : node) {
-                redact_recursive(item);
+                redact_recursive(item, prefix + "[]");
             }
         }
     };
     
-    redact_recursive(result);
+    redact_recursive(result, "");
     return result;
 }
 

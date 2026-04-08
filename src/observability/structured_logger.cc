@@ -134,13 +134,15 @@ void StructuredLogger::log(LogLevel level, const std::string& event,
         if (!current_agent_id_.empty()) entry.agent_id = current_agent_id_;
     }
     
-    // 敏感信息过滤
+    // 🎯 严格对齐 OpenClaw: 统一调用 logging::redact_sensitive_text
     std::string json_str = entry.to_json();
     if (config_.redact_sensitive) {
-        for (const auto& pattern : config_.redact_patterns) {
-            std::regex re(pattern);
-            json_str = std::regex_replace(json_str, re, "[REDACTED]");
+        logging::RedactOptions opts;
+        opts.mode = "tools";
+        if (!config_.redact_patterns.empty()) {
+            opts.patterns = config_.redact_patterns;
         }
+        json_str = logging::redact_sensitive_text(json_str, opts);
     }
     
     // 写入日志 (JSON Lines 格式)

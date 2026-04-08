@@ -60,12 +60,11 @@ std::string normalize_session_text(const std::string& value) {
 }
 
 // ============================================================================
-// redact_sensitive_text (简化版)
+// redact_sensitive_text — 严格对齐 OpenClaw session-files.ts:112
+// 🎯 统一调用 logging::redact_sensitive_text，mode="tools"
 // ============================================================================
 std::string redact_sensitive_text(const std::string& text) {
-    // Simplified version - just return original text
-    // TODO: Implement proper redaction logic
-    return text;
+    return logging::redact_sensitive_text(text, {std::string("tools"), std::nullopt});
 }
 
 // ============================================================================

@@ -13,6 +13,7 @@
 //   src/agents/acp-spawn.ts (spawnAcpDirect)
 
 #include "hunterclaw/tools/sessions_tool.h"
+#include "hunterclaw/logging/redact.h"
 #include "hunterclaw/agents/acp_spawn.h"
 #include "hunterclaw/sessions/session_key_utils.h"
 #include "hunterclaw/routing/session_key.h"

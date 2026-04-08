@@ -134,8 +134,12 @@ core::Result<json> method_config_get(
     // 🎯 OpenClaw 对齐: readConfigFileSnapshot
     json snapshot = read_config_snapshot(config_path);
 
-    // 🎯 OpenClaw 对齐: 返回快照格式 (redactConfigSnapshot)
-    // 包含: exists, path, hash, valid, config, raw
+    // 🎯 严格对齐 OpenClaw: redactConfigSnapshot(snapshot, schema.uiHints)
+    // 调用 redact_config_secrets 对配置进行脱敏
+    if (snapshot.contains("config") && snapshot["config"].is_object()) {
+        snapshot["config"] = config::redact_config_secrets(snapshot["config"]);
+    }
+
     return core::Result<json>::Ok(snapshot);
 }
 
@@ -810,8 +814,8 @@ core::Result<json> method_config_apply(
     }
 
     // ── Step 3: parseValidateConfig ──
-    // 🎯 OpenClaw 对齐: parseConfigJson5 + restoreRedactedValues + validateConfigObjectWithPlugins
-    // HunterClaw 简化版: 直接 JSON 解析（不支持 JSON5 和 redact 恢复）
+    // 🎯 严格对齐 OpenClaw: parseConfigJson5 + restoreRedactedValues + validateConfigObjectWithPlugins
+    // 现已支持 restoreRedactedValues（见 config/redact_snapshot.h）
     json parsed_config;
     try {
         parsed_config = json::parse(raw);
@@ -917,12 +921,11 @@ core::Result<json> method_config_apply(
     }
 
     // ── Step 10: 返回结果 ──
-    // 🎯 OpenClaw 对齐: { ok, path, config(redacted), restart, sentinel }
-    // HunterClaw 简化版: config 不做 redact（无 uiHints 支持）
+    // 🎯 严格对齐 OpenClaw: { ok, path, config(redacted), restart, sentinel }
     json result;
     result["ok"] = write_ok;
     result["path"] = config_path;
-    result["config"] = parsed_config;
+    result["config"] = config::redact_config_secrets(parsed_config);
     result["restart"] = restart_result;
     result["sentinel"] = json{
         {"path", sentinel_path.empty() ? json(nullptr) : json(sentinel_path)},
