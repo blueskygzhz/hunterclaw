@@ -83,6 +83,43 @@ core::Result<json> method_agent(
         return core::Result<json>::Err("Missing required parameter: message");
     }
 
+    // 🎯 OpenClaw 对齐: /new /reset 命令检测 (agent.ts L316-340)
+    // RESET_COMMAND_RE = /^\/(new|reset)(?:\s+([\s\S]*))?$/i
+    {
+        std::string trimmed_msg = message;
+        while (!trimmed_msg.empty() && trimmed_msg.front() == ' ') trimmed_msg.erase(0, 1);
+        if (trimmed_msg.size() >= 4 && trimmed_msg[0] == '/') {
+            std::string cmd_word;
+            size_t space_pos = trimmed_msg.find(' ', 1);
+            if (space_pos != std::string::npos) {
+                cmd_word = trimmed_msg.substr(1, space_pos - 1);
+            } else {
+                cmd_word = trimmed_msg.substr(1);
+            }
+            std::transform(cmd_word.begin(), cmd_word.end(), cmd_word.begin(), ::tolower);
+            if (cmd_word == "new" || cmd_word == "reset") {
+                // Extract post-reset message (if any)
+                std::string post_msg;
+                if (space_pos != std::string::npos) {
+                    post_msg = trimmed_msg.substr(space_pos + 1);
+                    while (!post_msg.empty() && post_msg.front() == ' ') post_msg.erase(0, 1);
+                    while (!post_msg.empty() && post_msg.back() == ' ') post_msg.pop_back();
+                }
+                // Perform session reset
+                auto agent_pool_reset = server->agent_pool();
+                if (agent_pool_reset) {
+                    agent_pool_reset->remove_agent(session_key);
+                    spdlog::get("default")->info("[method_agent] Session reset via /{}: session={}", cmd_word, session_key);
+                }
+                if (!post_msg.empty()) {
+                    message = post_msg;
+                } else {
+                    message = "Hello! I'm ready to help. What would you like to work on?";
+                }
+            }
+        }
+    }
+
     // ✅ 对齐 OpenClaw: const idem = request.idempotencyKey
     std::string idem = get_str("idempotencyKey", "idempotency_key");
     if (idem.empty()) {

@@ -707,6 +707,8 @@ core::Result<json> method_voicewake_set(std::shared_ptr<GatewayServer>, std::sha
 // 🎯 OpenClaw 对齐: "send" (SendParams)
 core::Result<json> method_send(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
 core::Result<json> method_send_message(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
+// 🎯 OpenClaw 对齐: "poll" (PollParams)
+core::Result<json> method_poll(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
 
 // ============================================================================
 // Agent (top-level) Methods (stubs.cc)

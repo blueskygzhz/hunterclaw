@@ -238,9 +238,10 @@ create_method_handler(std::shared_ptr<GatewayServer> server) {
 
         // ── Send (send.ts) ──────────────────────────────────────────────────
         // 🎯 OpenClaw 对齐: sendHandlers
-        // OpenClaw BASE_METHODS 中有 "send" (SendParams) 和 "send.message"
+        // OpenClaw BASE_METHODS 中有 "send" (SendParams), "send.message", "poll" (PollParams)
         {"send",                            methods::method_send},
         {"send.message",                    methods::method_send_message},
+        {"poll",                            methods::method_poll},
 
         // ── Agent top-level (agent.ts) ──────────────────────────────────────
         // 🎯 OpenClaw 对齐: agentHandlers["agent"] (AgentParams)

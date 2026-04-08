@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <future>
 #include <thread>
+#include <set>
 #include <spdlog/spdlog.h>
 
 namespace hunterclaw {
@@ -414,14 +415,61 @@ ReactResult ReactEngine::execute_loop(
             }
         }
     }
-    // (hook_system_prompt / hook_prepend_context etc. are available for use
-    //  when building the actual LLM prompt — passed to call_llm via config)
-    (void)hook_system_prompt;
-    (void)hook_prepend_context;
-    (void)hook_prepend_system_context;
-    (void)hook_append_system_context;
-    (void)effective_model_override;
-    (void)effective_provider_override;
+    // 🎯 对齐 OpenClaw: 将 hook 返回的 prompt 修改注入到消息列表
+    // before_prompt_build / before_agent_start hooks 可以覆盖 system prompt 或注入上下文
+    if (hook_system_prompt.has_value() || hook_prepend_context.has_value() ||
+        hook_prepend_system_context.has_value() || hook_append_system_context.has_value()) {
+        // Find or create system message
+        bool found_system = false;
+        for (auto& msg : messages) {
+            if (msg.role == llm::LLMMessageRole::System) {
+                found_system = true;
+                // Override system prompt if hook provided one
+                if (hook_system_prompt.has_value()) {
+                    msg.content = *hook_system_prompt;
+                }
+                // Prepend system context
+                if (hook_prepend_system_context.has_value()) {
+                    msg.content = *hook_prepend_system_context + "\n\n" + msg.content;
+                }
+                // Append system context
+                if (hook_append_system_context.has_value()) {
+                    msg.content = msg.content + "\n\n" + *hook_append_system_context;
+                }
+                break;
+            }
+        }
+        // If no system message exists and hook wants to inject one, create it
+        if (!found_system && hook_system_prompt.has_value()) {
+            llm::LLMMessage sys_msg;
+            sys_msg.role = llm::LLMMessageRole::System;
+            sys_msg.content = *hook_system_prompt;
+            if (hook_prepend_system_context.has_value()) {
+                sys_msg.content = *hook_prepend_system_context + "\n\n" + sys_msg.content;
+            }
+            if (hook_append_system_context.has_value()) {
+                sys_msg.content = sys_msg.content + "\n\n" + *hook_append_system_context;
+            }
+            messages.insert(messages.begin(), sys_msg);
+        }
+        // Prepend context as user message (if hook provided)
+        if (hook_prepend_context.has_value()) {
+            llm::LLMMessage ctx_msg;
+            ctx_msg.role = llm::LLMMessageRole::User;
+            ctx_msg.content = *hook_prepend_context;
+            // Insert after system message (if any) but before conversation
+            auto insert_pos = messages.begin();
+            if (!messages.empty() && messages[0].role == llm::LLMMessageRole::System) {
+                ++insert_pos;
+            }
+            messages.insert(insert_pos, ctx_msg);
+        }
+    }
+    // Apply model override from hooks
+    if (!effective_model_override.empty() && llm_client_) {
+        llm_client_->set_model_override(effective_model_override);
+    }
+    (void)effective_provider_override;  // Provider override needs LLMClientFactory support
 
     // 🎯 OpenClaw 对齐: 重置流式状态 (pi-embedded-subscribe.ts: state init)
     streaming_state_.reset();
@@ -437,6 +485,22 @@ ReactResult ReactEngine::execute_loop(
     user_msg.role = llm::LLMMessageRole::User;
     user_msg.content = user_input;
     messages.push_back(user_msg);
+
+    // 🎯 对齐 OpenClaw run.ts:97-109: scrubAnthropicRefusalMagic
+    // Avoid Anthropic's refusal test token poisoning session transcripts
+    {
+        static const std::string ANTHROPIC_MAGIC = "ANTHROPIC_MAGIC_STRING_TRIGGER_REFUSAL";
+        static const std::string ANTHROPIC_REPLACEMENT = "ANTHROPIC MAGIC STRING TRIGGER REFUSAL (redacted)";
+        for (auto& msg : messages) {
+            if (msg.content.find(ANTHROPIC_MAGIC) != std::string::npos) {
+                size_t pos = 0;
+                while ((pos = msg.content.find(ANTHROPIC_MAGIC, pos)) != std::string::npos) {
+                    msg.content.replace(pos, ANTHROPIC_MAGIC.size(), ANTHROPIC_REPLACEMENT);
+                    pos += ANTHROPIC_REPLACEMENT.size();
+                }
+            }
+        }
+    }
 
     // ✅ ContextEngine: assemble (对齐 OpenClaw attempt.ts:2094-2102)
     // 让 context engine 在 token 预算内组装上下文
@@ -481,6 +545,12 @@ ReactResult ReactEngine::execute_loop(
     // 🎯 对齐 OpenClaw: handleAgentStart — emit lifecycle start event
     if (callbacks.on_start) {
         callbacks.on_start();
+    }
+    // 🎯 对齐 OpenClaw handlers.lifecycle.ts:17-31: emit lifecycle start AgentEvent
+    if (callbacks.on_agent_event) {
+        core::JsonValue data;
+        data["phase"] = "start";
+        callbacks.on_agent_event({"lifecycle", std::move(data)});
     }
 
     ReactStep observe_step;
@@ -538,6 +608,13 @@ ReactResult ReactEngine::execute_loop(
                 bool compaction_succeeded = false;
                 
                 while (compaction_attempts < max_compaction_retries) {
+                    // 🎯 对齐 OpenClaw handlers.compaction.ts:7-38: emit compaction start AgentEvent
+                    if (callbacks.on_agent_event) {
+                        core::JsonValue data;
+                        data["phase"] = "start";
+                        callbacks.on_agent_event({"compaction", std::move(data)});
+                    }
+
                     auto compact_result = trigger_compaction(messages);
                     compaction_attempts++;
                     
@@ -545,12 +622,26 @@ ReactResult ReactEngine::execute_loop(
                         log()->info("[ReactEngine] Compaction completed (attempt {}), continuing with {} messages",
                                    compaction_attempts, messages.size());
                         compaction_succeeded = true;
+                        // 🎯 对齐 OpenClaw handlers.compaction.ts:64-72: emit compaction end AgentEvent
+                        if (callbacks.on_agent_event) {
+                            core::JsonValue data;
+                            data["phase"] = "end";
+                            data["willRetry"] = false;
+                            callbacks.on_agent_event({"compaction", std::move(data)});
+                        }
                         break;
                     } else {
                         log()->warn("[ReactEngine] Compaction attempt {} failed: {}",
                                    compaction_attempts, compact_result.reason);
-                        if (compaction_attempts < max_compaction_retries) {
-                            // 对齐 OpenClaw: resetForCompactionRetry — clear state before retry
+                        bool will_retry = (compaction_attempts < max_compaction_retries);
+                        // 🎯 对齐 OpenClaw: compaction end event with willRetry
+                        if (callbacks.on_agent_event) {
+                            core::JsonValue data;
+                            data["phase"] = "end";
+                            data["willRetry"] = will_retry;
+                            callbacks.on_agent_event({"compaction", std::move(data)});
+                        }
+                        if (will_retry) {
                             log()->info("[ReactEngine] Retrying compaction (attempt {})", compaction_attempts + 1);
                         }
                     }
@@ -605,13 +696,38 @@ ReactResult ReactEngine::execute_loop(
 
         // 步骤 1: Reason (推理)
         auto llm_response = call_llm(messages, callbacks);
+
+        // 🎯 对齐 OpenClaw: context overflow from LLM error → compaction → retry
+        if (llm_response.context_overflow && compaction_mgr_) {
+            log()->warn("[ReactEngine] LLM returned context overflow, triggering emergency compaction");
+            if (callbacks.on_agent_event) {
+                core::JsonValue data;
+                data["phase"] = "start";
+                callbacks.on_agent_event({"compaction", std::move(data)});
+            }
+            auto compact_result = trigger_compaction(messages);
+            if (callbacks.on_agent_event) {
+                core::JsonValue data;
+                data["phase"] = "end";
+                data["willRetry"] = compact_result.compacted;
+                callbacks.on_agent_event({"compaction", std::move(data)});
+            }
+            if (compact_result.compacted) {
+                log()->info("[ReactEngine] Emergency compaction succeeded, retrying LLM call");
+                streaming_state_.reset_assistant_message_state(
+                    static_cast<int>(assistant_texts.size()));
+                llm_response = call_llm(messages, callbacks);
+            }
+        }
         
         // 更新 token 统计
         result.usage.input_tokens += llm_response.input_tokens;
         result.usage.output_tokens += llm_response.output_tokens;
-        result.usage.total_tokens += llm_response.input_tokens + llm_response.output_tokens;
         result.usage.cache_read_tokens += llm_response.cache_read_tokens;
         result.usage.cache_write_tokens += llm_response.cache_write_tokens;
+        // 🎯 对齐 OpenClaw: total = input + output + cacheRead + cacheWrite
+        result.usage.total_tokens += llm_response.input_tokens + llm_response.output_tokens
+            + llm_response.cache_read_tokens + llm_response.cache_write_tokens;
         
         // 记录推理步骤
         ReactStep reason_step;
@@ -742,14 +858,26 @@ ReactResult ReactEngine::execute_loop(
         // 🎯 OpenClaw 对齐: 根据 reasoning_mode 决定 final_response 内容
         switch (config_.reasoning_mode) {
             case ReactConfig::ReasoningMode::Off:
-                // 用户不想看到 thinking - 使用过滤后的 block_buffer
                 result.final_response = streaming_state_.block_buffer;
                 break;
             case ReactConfig::ReasoningMode::On:
             case ReactConfig::ReasoningMode::Stream:
-                // 用户想看到 thinking - 使用原始 delta_buffer (包含 <thinking>)
                 result.final_response = streaming_state_.delta_buffer;
                 break;
+        }
+
+        // 🎯 对齐 OpenClaw handlers.messages.ts:282-285: resolveSilentReplyFallbackText
+        // When assistant replies "NO_REPLY", fall back to the last messaging tool sent text
+        {
+            std::string trimmed = result.final_response;
+            auto start = trimmed.find_first_not_of(" \t\n\r");
+            auto end = trimmed.find_last_not_of(" \t\n\r");
+            if (start != std::string::npos) trimmed = trimmed.substr(start, end - start + 1);
+            else trimmed.clear();
+            if (trimmed == "NO_REPLY" && !streaming_state_.messaging_tool_sent_texts.empty()) {
+                result.final_response = streaming_state_.messaging_tool_sent_texts.back();
+                log()->debug("[ReactEngine] Resolved NO_REPLY to last messaging tool text");
+            }
         }
 
         // 🎯 对齐 OpenClaw: handleAgentEnd — flush block reply buffer
@@ -794,6 +922,20 @@ ReactResult ReactEngine::execute_loop(
         std::chrono::steady_clock::now() - start_time_
     ).count();
 
+    // 🎯 对齐 OpenClaw handlers.lifecycle.ts:33-95: emit lifecycle end/error AgentEvent
+    if (callbacks.on_agent_event) {
+        if (!result.success && !result.error.empty()) {
+            core::JsonValue data;
+            data["phase"] = "error";
+            data["error"] = result.error;
+            callbacks.on_agent_event({"lifecycle", std::move(data)});
+        } else {
+            core::JsonValue data;
+            data["phase"] = "end";
+            callbacks.on_agent_event({"lifecycle", std::move(data)});
+        }
+    }
+
     // =========================================================================
     // Hook: agent_end
     // Aligned with OpenClaw attempt.ts:2678 — fire-and-forget, runs even on error
@@ -810,6 +952,12 @@ ReactResult ReactEngine::execute_loop(
         tools::PluginHookAgentContext ae_ctx;
         ae_ctx.session_id = callbacks.session_id.empty()
             ? std::nullopt : std::make_optional(callbacks.session_id);
+        // 🎯 对齐 OpenClaw attempt.ts:2685-2693: full hook context
+        if (!callbacks.agent_id.empty())      ae_ctx.agent_id        = callbacks.agent_id;
+        if (!callbacks.session_key.empty())   ae_ctx.session_key     = callbacks.session_key;
+        if (!callbacks.workspace_dir.empty()) ae_ctx.workspace_dir   = callbacks.workspace_dir;
+        if (!callbacks.trigger.empty())       ae_ctx.trigger         = callbacks.trigger;
+        if (!callbacks.channel_id.empty())    ae_ctx.channel_id      = callbacks.channel_id;
         try {
             hook_mgr->run_agent_end(ae_event, ae_ctx);
         } catch (const std::exception& e) {
@@ -834,11 +982,174 @@ ReactResult ReactEngine::execute_loop(
 }
 
 ReactEngine::LLMResponseData ReactEngine::call_llm(
-    const std::vector<llm::LLMMessage>& messages,
+    const std::vector<llm::LLMMessage>& messages_in,
     const StreamCallbacks& callbacks,
     const std::vector<llm::ToolDefinition>& tools
 ) {
     LLMResponseData response;
+
+    // =========================================================================
+    // 🎯 对齐 OpenClaw attempt.ts:2073-2093: Message Preprocessing Pipeline
+    // Order: validateTurns → limitHistory → sanitizeToolUseResultPairing
+    //        → dropThinkingBlocks → truncateOversizedToolResults
+    // =========================================================================
+    std::vector<llm::LLMMessage> sanitized_messages = messages_in;
+
+    // 1. 🎯 对齐 OpenClaw: validateAnthropicTurns / validateGeminiTurns
+    //    Merge consecutive user messages (Anthropic requirement)
+    //    Merge consecutive assistant messages (Gemini requirement)
+    {
+        std::vector<llm::LLMMessage> validated;
+        llm::LLMMessageRole last_role = llm::LLMMessageRole::System;
+        for (const auto& msg : sanitized_messages) {
+            if (!validated.empty() && msg.role == last_role) {
+                // Merge consecutive same-role messages (except system)
+                if (msg.role == llm::LLMMessageRole::User ||
+                    msg.role == llm::LLMMessageRole::Assistant) {
+                    validated.back().content += "\n" + msg.content;
+                    continue;
+                }
+            }
+            validated.push_back(msg);
+            last_role = msg.role;
+        }
+        sanitized_messages = std::move(validated);
+    }
+
+    // 2. 🎯 对齐 OpenClaw: limitHistoryTurns — limit DM/channel history
+    if (config_.max_history_turns > 0 && sanitized_messages.size() > 2) {
+        int user_count = 0;
+        size_t cut_point = sanitized_messages.size();
+        for (int i = static_cast<int>(sanitized_messages.size()) - 1; i >= 0; --i) {
+            if (sanitized_messages[i].role == llm::LLMMessageRole::User) {
+                user_count++;
+                if (user_count > config_.max_history_turns) {
+                    cut_point = i;
+                    // Keep system message(s) at the front
+                    break;
+                }
+            }
+        }
+        if (cut_point > 0 && cut_point < sanitized_messages.size()) {
+            // Preserve system messages, then take from cut_point
+            std::vector<llm::LLMMessage> limited;
+            for (size_t i = 0; i < sanitized_messages.size(); ++i) {
+                if (i < cut_point && sanitized_messages[i].role == llm::LLMMessageRole::System) {
+                    limited.push_back(sanitized_messages[i]);
+                } else if (i >= cut_point) {
+                    limited.push_back(sanitized_messages[i]);
+                }
+            }
+            sanitized_messages = std::move(limited);
+        }
+    }
+
+    // 3. 🎯 对齐 OpenClaw: sanitizeToolUseResultPairing
+    //    Ensure every assistant tool call has a matching tool result.
+    //    Insert synthetic error result for missing tool results.
+    {
+        std::vector<llm::LLMMessage> repaired;
+        for (size_t i = 0; i < sanitized_messages.size(); ++i) {
+            const auto& msg = sanitized_messages[i];
+            repaired.push_back(msg);
+
+            // After an assistant message with tool calls, check if next messages
+            // are tool results. If tool results are missing, they were already
+            // appended in execute_loop, so this is mainly a safety net for
+            // corrupted history.
+            if (msg.role == llm::LLMMessageRole::Assistant && !msg.tool_calls.empty()) {
+                // Collect expected tool call IDs from JsonValue tool_calls
+                std::set<std::string> expected_ids;
+                for (const auto& tc : msg.tool_calls) {
+                    // tool_calls are JsonValue; try to extract "id" field
+                    if (tc.is_object() && tc.contains("id") && tc["id"].is_string()) {
+                        expected_ids.insert(tc["id"].get_string());
+                    }
+                }
+                // Check which are satisfied by subsequent tool results
+                for (size_t j = i + 1; j < sanitized_messages.size(); ++j) {
+                    if (sanitized_messages[j].role == llm::LLMMessageRole::Tool) {
+                        expected_ids.erase(sanitized_messages[j].tool_call_id);
+                    } else if (sanitized_messages[j].role == llm::LLMMessageRole::Assistant) {
+                        break;
+                    }
+                }
+                // Insert synthetic error results for missing tool results
+                for (const auto& missing_id : expected_ids) {
+                    llm::LLMMessage synthetic;
+                    synthetic.role = llm::LLMMessageRole::Tool;
+                    synthetic.tool_call_id = missing_id;
+                    synthetic.content = "[missing tool result in session history]";
+                    repaired.push_back(synthetic);
+                    log()->debug("[Sanitize] Inserted synthetic tool result for missing id: {}", missing_id);
+                }
+            }
+        }
+        sanitized_messages = std::move(repaired);
+    }
+
+    // 4. 🎯 对齐 OpenClaw thinking.ts:25-53: dropThinkingBlocks
+    //    Strip <think>...</think> content from assistant messages when
+    //    replaying to non-reasoning-capable models (prevents provider rejection)
+    if (config_.drop_thinking_blocks) {
+        for (auto& msg : sanitized_messages) {
+            if (msg.role == llm::LLMMessageRole::Assistant && !msg.content.empty()) {
+                std::string stripped = strip_thinking_tags(msg.content);
+                stripped = trim_end(stripped);
+                if (stripped.empty() && !msg.content.empty()) {
+                    // Preserve turn structure even if all content was thinking
+                    msg.content = "";
+                } else {
+                    msg.content = stripped;
+                }
+            }
+        }
+    }
+
+    // 5. 🎯 对齐 OpenClaw tool-result-truncation.ts: truncateOversizedToolResults
+    //    Prevent single tool results from consuming >30% of context window
+    {
+        int context_window = context_window_config_.context_window_tokens;
+        int max_tool_result_chars = static_cast<int>(context_window * 0.3 * 4);  // ~30% of window, 4 chars/token
+        if (max_tool_result_chars < 2000) max_tool_result_chars = 2000;
+        if (max_tool_result_chars > 400000) max_tool_result_chars = 400000;
+
+        for (auto& msg : sanitized_messages) {
+            if (msg.role == llm::LLMMessageRole::Tool &&
+                static_cast<int>(msg.content.size()) > max_tool_result_chars) {
+                log()->debug("[Sanitize] Truncating oversized tool result: {} chars → {} chars",
+                            msg.content.size(), max_tool_result_chars);
+                // Head+tail strategy when tail looks important (errors/summaries)
+                std::string tail = msg.content.substr(
+                    msg.content.size() > 2000 ? msg.content.size() - 2000 : 0);
+                std::string lower_tail = tail;
+                std::transform(lower_tail.begin(), lower_tail.end(), lower_tail.begin(), ::tolower);
+                bool important_tail = (
+                    lower_tail.find("error") != std::string::npos ||
+                    lower_tail.find("exception") != std::string::npos ||
+                    lower_tail.find("failed") != std::string::npos ||
+                    lower_tail.find("traceback") != std::string::npos ||
+                    lower_tail.find("summary") != std::string::npos ||
+                    lower_tail.find("result") != std::string::npos
+                );
+                if (important_tail && max_tool_result_chars > 4000) {
+                    // Head 70% + tail 30%
+                    int tail_budget = std::min(max_tool_result_chars * 3 / 10, 4000);
+                    int head_budget = max_tool_result_chars - tail_budget - 80;  // 80 for marker
+                    std::string marker = "\n\n⚠️ [... middle content omitted — showing head and tail ...]\n\n";
+                    msg.content = msg.content.substr(0, head_budget) + marker +
+                                  msg.content.substr(msg.content.size() - tail_budget) +
+                                  "\n\n⚠️ [Content truncated]";
+                } else {
+                    msg.content = msg.content.substr(0, max_tool_result_chars) +
+                                  "\n\n⚠️ [Content truncated — original was too large for context window]";
+                }
+            }
+        }
+    }
+
+    // Use sanitized messages for the rest of the call
+    const auto& messages = sanitized_messages;
     
     // 使用流式接口 (对齐 OpenClaw)
     std::string accumulated_text;
@@ -877,6 +1188,13 @@ ReactEngine::LLMResponseData ReactEngine::call_llm(
 
             if (!delta_reasoning.empty()) {
                 streaming_state_.reasoning_stream_open = true;
+                // 🎯 对齐 OpenClaw pi-embedded-subscribe.ts:574-581: emit thinking AgentEvent
+                if (callbacks.on_agent_event) {
+                    core::JsonValue data;
+                    data["text"] = formatted;
+                    data["delta"] = delta_reasoning;
+                    callbacks.on_agent_event({"thinking", std::move(data)});
+                }
                 callbacks.on_reasoning_stream(delta_reasoning);
             }
             accumulated_reasoning += extraction.reasoning;
@@ -893,9 +1211,17 @@ ReactEngine::LLMResponseData ReactEngine::call_llm(
         }
 
         // 2. 发送助手输出流 (on_assistant_delta / onPartialReply)
-        if (!extraction.remaining_text.empty()) {
+        // 🎯 对齐 OpenClaw handlers.messages.ts:88: suppress if deterministicApprovalPromptSent
+        if (!extraction.remaining_text.empty() && !streaming_state_.deterministic_approval_prompt_sent) {
             if (callbacks.on_assistant_delta) {
                 callbacks.on_assistant_delta(extraction.remaining_text);
+            }
+            // 🎯 对齐 OpenClaw handlers.messages.ts:218-235: emit assistant AgentEvent
+            if (callbacks.on_agent_event) {
+                core::JsonValue data;
+                data["text"] = accumulated_text + extraction.remaining_text;
+                data["delta"] = extraction.remaining_text;
+                callbacks.on_agent_event({"assistant", std::move(data)});
             }
         }
 
@@ -975,7 +1301,7 @@ ReactEngine::LLMResponseData ReactEngine::call_llm(
     auto* llm_hook_mgr = tools::get_global_hook_manager();
     if (llm_hook_mgr && llm_hook_mgr->has_hooks(plugins::PluginHookName::LLM_INPUT)) {
         tools::PluginHookLlmInputEvent li_event;
-        li_event.run_id     = callbacks.session_id + "-run";  // approximate run_id
+        li_event.run_id     = callbacks.run_id.empty() ? callbacks.session_id : callbacks.run_id;
         li_event.session_id = callbacks.session_id;
         li_event.provider   = llm_client_ ? llm_client_->get_config().provider : "unknown";
         li_event.model      = llm_client_ ? llm_client_->get_config().model    : "unknown";
@@ -1047,7 +1373,18 @@ ReactEngine::LLMResponseData ReactEngine::call_llm(
     }
     
     if (!result.ok) {
-        // 失败时返回错误
+        // 🎯 对齐 OpenClaw: isLikelyContextOverflowError → signal for auto-compaction
+        // If the LLM failed due to context overflow, mark the response so execute_loop
+        // can trigger compaction and retry
+        if (is_context_overflow_error(result.error)) {
+            response.context_overflow = true;
+            auto overflow_tokens = extract_overflow_token_count(result.error);
+            if (overflow_tokens.has_value()) {
+                log()->warn("[call_llm] Context overflow detected: {} tokens observed", *overflow_tokens);
+            } else {
+                log()->warn("[call_llm] Context overflow detected from error: {}", result.error);
+            }
+        }
         response.text = "Error: " + result.error;
         return response;
     }
@@ -1086,7 +1423,7 @@ ReactEngine::LLMResponseData ReactEngine::call_llm(
     // =========================================================================
     if (llm_hook_mgr && llm_hook_mgr->has_hooks(plugins::PluginHookName::LLM_OUTPUT)) {
         tools::PluginHookLlmOutputEvent lo_event;
-        lo_event.run_id     = callbacks.session_id + "-run";
+        lo_event.run_id     = callbacks.run_id.empty() ? callbacks.session_id : callbacks.run_id;
         lo_event.session_id = callbacks.session_id;
         lo_event.provider   = llm_client_ ? llm_client_->get_config().provider : "unknown";
         lo_event.model      = llm_client_ ? llm_client_->get_config().model    : "unknown";

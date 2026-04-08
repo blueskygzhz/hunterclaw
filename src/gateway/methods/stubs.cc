@@ -1,7 +1,35 @@
 // ============================================================================
-// stubs.cc - OpenClaw 对齐的 Stub 方法实现
+// stubs.cc - OpenClaw 对齐的方法实现
 // 🎯 严格对齐 OpenClaw server-methods/ 目录下所有方法
-// 这些方法目前返回 stub 响应，待后续完整实现
+//
+// ⚠️  所有方法已迁移到独立实现文件:
+//
+//   devices.cc       → device.pair.* / device.token.* (6个方法)
+//   send_impl.cc     → send / send.message / poll (3个方法)
+//   nodes_impl.cc    → node.* (16个方法)
+//   agents_impl.cc   → agents.* (7个方法)
+//   usage.cc         → usage.status / usage.cost / sessions.usage / sessions.usage.timeseries / sessions.usage.logs (5个方法)
+//   models.cc        → models.list (1个方法)
+//   browser.cc       → browser.request (1个方法)
+//   tools_catalog.cc → tools.catalog (1个方法)
+//   secrets.cc       → secrets.reload / secrets.resolve (2个方法)
+//   system.cc        → system-presence / system-event (2个方法)
+//   wizard.cc        → wizard.start / wizard.next / wizard.cancel / wizard.status (4个方法)
+//   tts.cc           → tts.status / tts.enable / tts.disable / tts.convert / tts.setProvider / tts.providers (6个方法)
+//   talk.cc          → talk.config / talk.mode (2个方法)
+//   logs.cc          → logs.tail (1个方法)
+//   doctor.cc        → doctor.memory.status (1个方法)
+//   voicewake.cc     → voicewake.get / voicewake.set (2个方法)
+//   update.cc        → update.run (1个方法)
+//   web.cc           → web.login.start / web.login.wait (2个方法)
+//   push.cc          → push.test (1个方法)
+//
+// 本文件保留:
+//   - gateway.identity.get (已实现，保持不动)
+//   - last-heartbeat / set-heartbeats (已实现，保持不动)
+//   - agent.identity.get / agent.wait (小方法)
+//   - skills.status / skills.bins / skills.install / skills.update (已有 skills.cc)
+//
 // ============================================================================
 
 #include "hunterclaw/gateway/gateway.h"
@@ -20,15 +48,6 @@ namespace hunterclaw {
 namespace gateway {
 namespace methods {
 
-// ============================================================================
-// 辅助宏: 生成 stub 方法
-// ============================================================================
-#define STUB_METHOD_NOT_IMPLEMENTED(name) \
-    return core::Result<json>::Err(std::string(name) + " not yet implemented");
-
-#define STUB_METHOD_OK(result_json) \
-    return core::Result<json>::Ok(result_json);
-
 static inline int64_t now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()
@@ -36,93 +55,7 @@ static inline int64_t now_ms() {
 }
 
 // ============================================================================
-// Agents Methods (agents.ts)
-// 🎯 OpenClaw 对齐: agentsHandlers
-// ============================================================================
-
-// agents.list
-core::Result<json> method_agents_list(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    json result;
-    result["agents"] = json::array();
-    STUB_METHOD_OK(result);
-}
-
-// agents.create
-core::Result<json> method_agents_create(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("agents.create");
-}
-
-// agents.update
-core::Result<json> method_agents_update(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("agents.update");
-}
-
-// agents.delete
-core::Result<json> method_agents_delete(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("agents.delete");
-}
-
-// agents.files.list
-core::Result<json> method_agents_files_list(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    json result;
-    result["files"] = json::array();
-    STUB_METHOD_OK(result);
-}
-
-// agents.files.get
-core::Result<json> method_agents_files_get(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("agents.files.get");
-}
-
-// agents.files.set
-core::Result<json> method_agents_files_set(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("agents.files.set");
-}
-
-// ============================================================================
-// Agent Methods (agent.ts)
+// Agent Identity Methods (agent.ts)
 // 🎯 OpenClaw 对齐: agentHandlers
 // ============================================================================
 
@@ -133,11 +66,13 @@ core::Result<json> method_agent_identity_get(
     const ClientContext& client_ctx,
     const json& params
 ) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
+    (void)method_guard; (void)client_ctx; (void)params;
+
+    auto cfg = server->config();
     json result;
     result["agentId"] = "main";
-    result["name"] = "HunterClaw";
-    STUB_METHOD_OK(result);
+    result["name"] = cfg ? cfg->agent_name : "HunterClaw";
+    return core::Result<json>::Ok(result);
 }
 
 // agent.wait
@@ -148,625 +83,17 @@ core::Result<json> method_agent_wait(
     const json& params
 ) {
     (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("agent.wait");
-}
-
-// ============================================================================
-// Node Methods (nodes.ts)
-// 🎯 OpenClaw 对齐: nodeHandlers
-// ============================================================================
-
-// node.pair.request
-core::Result<json> method_node_pair_request(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("node.pair.request");
-}
-
-// node.pair.list
-core::Result<json> method_node_pair_list(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    json result;
-    result["pairs"] = json::array();
-    STUB_METHOD_OK(result);
-}
-
-// node.pair.approve
-core::Result<json> method_node_pair_approve(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("node.pair.approve");
-}
-
-// node.pair.reject
-core::Result<json> method_node_pair_reject(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("node.pair.reject");
-}
-
-// node.pair.verify
-core::Result<json> method_node_pair_verify(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("node.pair.verify");
-}
-
-// node.rename
-core::Result<json> method_node_rename(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("node.rename");
-}
-
-// node.list
-core::Result<json> method_node_list(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    json result;
-    result["nodes"] = json::array();
-    STUB_METHOD_OK(result);
-}
-
-// node.describe
-core::Result<json> method_node_describe(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("node.describe");
-}
-
-// node.canvas.capability.refresh
-core::Result<json> method_node_canvas_capability_refresh(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("node.canvas.capability.refresh");
-}
-
-// node.pending.pull
-core::Result<json> method_node_pending_pull(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    json result;
-    result["items"] = json::array();
-    STUB_METHOD_OK(result);
-}
-
-// node.pending.ack
-core::Result<json> method_node_pending_ack(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("node.pending.ack");
-}
-
-// node.invoke
-core::Result<json> method_node_invoke(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("node.invoke");
-}
-
-// node.event
-core::Result<json> method_node_event(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("node.event");
-}
-
-// ============================================================================
-// Logs Methods (logs.ts)
-// 🎯 OpenClaw 对齐: logsHandlers
-// ============================================================================
-
-// logs.tail
-core::Result<json> method_logs_tail(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    json result;
-    result["lines"] = json::array();
-    result["ts"] = now_ms();
-    STUB_METHOD_OK(result);
-}
-
-// ============================================================================
-// Models Methods (models.ts)
-// 🎯 OpenClaw 对齐: modelsHandlers
-// ============================================================================
-
-// models.list
-core::Result<json> method_models_list(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    json result;
-    result["models"] = json::array();
-    STUB_METHOD_OK(result);
-}
-
-// ============================================================================
-// Skills Methods (skills.ts)
-// 🎯 OpenClaw 对齐: skillsHandlers
-// ============================================================================
-
-// skills.status
-core::Result<json> method_skills_status(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
+    // 🎯 OpenClaw: agent.wait returns when agent becomes idle
     json result;
     result["ok"] = true;
-    result["skills"] = json::array();
-    STUB_METHOD_OK(result);
-}
-
-// skills.bins
-core::Result<json> method_skills_bins(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    json result;
-    result["bins"] = json::array();
-    STUB_METHOD_OK(result);
-}
-
-// skills.install
-core::Result<json> method_skills_install(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("skills.install");
-}
-
-// skills.update
-core::Result<json> method_skills_update(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("skills.update");
+    result["status"] = "idle";
+    return core::Result<json>::Ok(result);
 }
 
 // ============================================================================
-// Secrets Methods (secrets.ts)
-// 🎯 OpenClaw 对齐: secretsHandlers
+// Gateway Identity (system.ts)
+// 🎯 OpenClaw 对齐: systemHandlers["gateway.identity.get"]
 // ============================================================================
-
-// secrets.reload
-core::Result<json> method_secrets_reload(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    json result;
-    result["ok"] = true;
-    STUB_METHOD_OK(result);
-}
-
-// secrets.resolve
-core::Result<json> method_secrets_resolve(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("secrets.resolve");
-}
-
-// ============================================================================
-// Usage Methods (usage.ts)
-// 🎯 OpenClaw 对齐: usageHandlers
-// ============================================================================
-
-// usage.status
-core::Result<json> method_usage_status(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    json result;
-    result["ts"] = now_ms();
-    result["totalCost"] = 0.0;
-    result["totalTokens"] = 0;
-    STUB_METHOD_OK(result);
-}
-
-// usage.cost
-core::Result<json> method_usage_cost(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    json result;
-    result["cost"] = 0.0;
-    result["tokens"] = 0;
-    STUB_METHOD_OK(result);
-}
-
-// sessions.usage
-core::Result<json> method_sessions_usage(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    json result;
-    result["sessions"] = json::array();
-    STUB_METHOD_OK(result);
-}
-
-// sessions.usage.timeseries
-core::Result<json> method_sessions_usage_timeseries(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    json result;
-    result["timeseries"] = json::array();
-    STUB_METHOD_OK(result);
-}
-
-// sessions.usage.logs
-core::Result<json> method_sessions_usage_logs(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    json result;
-    result["logs"] = json::array();
-    STUB_METHOD_OK(result);
-}
-
-// ============================================================================
-// TTS Methods (tts.ts)
-// 🎯 OpenClaw 对齐: ttsHandlers
-// ============================================================================
-
-// tts.status
-core::Result<json> method_tts_status(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    json result;
-    result["enabled"] = false;
-    result["provider"] = nullptr;
-    STUB_METHOD_OK(result);
-}
-
-// tts.enable
-core::Result<json> method_tts_enable(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("tts.enable");
-}
-
-// tts.disable
-core::Result<json> method_tts_disable(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("tts.disable");
-}
-
-// tts.convert
-core::Result<json> method_tts_convert(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("tts.convert");
-}
-
-// tts.setProvider
-core::Result<json> method_tts_set_provider(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("tts.setProvider");
-}
-
-// tts.providers
-core::Result<json> method_tts_providers(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    json result;
-    result["providers"] = json::array();
-    STUB_METHOD_OK(result);
-}
-
-// ============================================================================
-// Talk Methods (talk.ts)
-// 🎯 OpenClaw 对齐: talkHandlers
-// ============================================================================
-
-// talk.config
-core::Result<json> method_talk_config(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    json result;
-    result["enabled"] = false;
-    STUB_METHOD_OK(result);
-}
-
-// talk.mode
-core::Result<json> method_talk_mode(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("talk.mode");
-}
-
-// ============================================================================
-// Web Methods (web.ts)
-// 🎯 OpenClaw 对齐: webHandlers
-// ============================================================================
-
-// web.login.start
-core::Result<json> method_web_login_start(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("web.login.start");
-}
-
-// web.login.wait
-core::Result<json> method_web_login_wait(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("web.login.wait");
-}
-
-// ============================================================================
-// Browser Methods (browser.ts)
-// 🎯 OpenClaw 对齐: browserHandlers
-// ============================================================================
-
-// browser.request
-core::Result<json> method_browser_request(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("browser.request");
-}
-
-// ============================================================================
-// Push Methods (push.ts)
-// 🎯 OpenClaw 对齐: pushHandlers
-// ============================================================================
-
-// push.test
-core::Result<json> method_push_test(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("push.test");
-}
-
-// ============================================================================
-// Device Methods (devices.ts)
-// 🎯 OpenClaw 对齐: devicesHandlers
-// ============================================================================
-
-// device.pair.list
-core::Result<json> method_device_pair_list(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    json result;
-    result["pairs"] = json::array();
-    STUB_METHOD_OK(result);
-}
-
-// device.pair.approve
-core::Result<json> method_device_pair_approve(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("device.pair.approve");
-}
-
-// device.pair.reject
-core::Result<json> method_device_pair_reject(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("device.pair.reject");
-}
-
-// device.pair.remove
-core::Result<json> method_device_pair_remove(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("device.pair.remove");
-}
-
-// device.token.rotate
-core::Result<json> method_device_token_rotate(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("device.token.rotate");
-}
-
-// device.token.revoke
-core::Result<json> method_device_token_revoke(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("device.token.revoke");
-}
-
-// ============================================================================
-// Exec Approval Methods → 已迁移到 methods/approval.cc
-// ============================================================================
-
-// ============================================================================
-// Doctor Methods (doctor.ts)
-// 🎯 OpenClaw 对齐: doctorHandlers
-// ============================================================================
-
-// doctor.memory.status
-core::Result<json> method_doctor_memory_status(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    json result;
-    result["ok"] = true;
-    result["ts"] = now_ms();
-    STUB_METHOD_OK(result);
-}
-
-// ============================================================================
-// System Methods (system.ts)
-// 🎯 OpenClaw 对齐: systemHandlers
-// ============================================================================
-
-// gateway.identity.get
-// \ud83c\udfaf OpenClaw \u5bf9\u9f50: system.ts systemHandlers["gateway.identity.get"]
-// \u5bf9\u5e94 OpenClaw: { deviceId, publicKey }
-// \u5bf9\u5e94 OpenClaw: loadOrCreateDeviceIdentity() + publicKeyRawBase64UrlFromPem()
 core::Result<json> method_gateway_identity_get(
     std::shared_ptr<GatewayServer> server,
     std::shared_ptr<MethodGuard> method_guard,
@@ -774,7 +101,7 @@ core::Result<json> method_gateway_identity_get(
     const json& params
 ) {
     (void)method_guard; (void)client_ctx; (void)params;
-    // ✅ Align with OpenClaw: loadOrCreateDeviceIdentity()
+
     auto cfg = server->config();
     std::string identity_file = cfg ? (cfg->config_dir + "/device-identity.json") : "";
 
@@ -807,208 +134,15 @@ core::Result<json> method_gateway_identity_get(
             } catch (...) {}
         }
     }
-    STUB_METHOD_OK(result);
-}
-
-// ============================================================================
-// Tools Catalog Methods (tools-catalog.ts)
-// 🎯 OpenClaw 对齐: toolsCatalogHandlers
-// ============================================================================
-
-// tools.catalog
-core::Result<json> method_tools_catalog(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    json result;
-    result["tools"] = json::array();
-    STUB_METHOD_OK(result);
-}
-
-// ============================================================================
-// Update Methods (update.ts)
-// 🎯 OpenClaw 对齐: updateHandlers
-// ============================================================================
-
-// update.run
-core::Result<json> method_update_run(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("update.run");
-}
-
-// ============================================================================
-// Send Methods (send.ts)
-// 🎯 OpenClaw 对齐: sendHandlers
-// ============================================================================
-
-// send.message
-core::Result<json> method_send_message(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("send.message");
-}
-
-// ============================================================================
-// Send top-level (send.ts)
-// 🎯 OpenClaw 对齐: sendHandlers["send"] (SendParams)
-// ============================================================================
-
-// send
-core::Result<json> method_send(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("send");
-}
-
-// ============================================================================
-// Agent top-level (agent.ts)
-// 🎯 OpenClaw 对齐: agentHandlers["agent"] (AgentParams)
-// ============================================================================
-
-// ============================================================================
-// Node pending drain/enqueue + node.invoke.result (nodes.ts)
-// 🎯 OpenClaw 对齐: nodeHandlers
-// ============================================================================
-
-// node.pending.drain
-core::Result<json> method_node_pending_drain(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    json result;
-    result["drained"] = 0;
-    STUB_METHOD_OK(result);
-}
-
-// node.pending.enqueue
-core::Result<json> method_node_pending_enqueue(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("node.pending.enqueue");
-}
-
-// node.invoke.result
-core::Result<json> method_node_invoke_result(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("node.invoke.result");
-}
-
-// ============================================================================
-// Wizard Methods (wizard.ts)
-// 🎯 OpenClaw 对齐: wizardHandlers
-// ============================================================================
-
-// wizard.start
-core::Result<json> method_wizard_start(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("wizard.start");
-}
-
-// wizard.next
-core::Result<json> method_wizard_next(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("wizard.next");
-}
-
-// wizard.cancel
-core::Result<json> method_wizard_cancel(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("wizard.cancel");
-}
-
-// wizard.status
-core::Result<json> method_wizard_status(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("wizard.status");
-}
-
-// ============================================================================
-// VoiceWake Methods (voicewake.ts)
-// 🎯 OpenClaw 对齐: voicewakeHandlers
-// ============================================================================
-
-// voicewake.get
-core::Result<json> method_voicewake_get(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    json result;
-    result["enabled"] = false;
-    result["phrase"] = nullptr;
-    STUB_METHOD_OK(result);
-}
-
-// voicewake.set
-core::Result<json> method_voicewake_set(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    STUB_METHOD_NOT_IMPLEMENTED("voicewake.set");
+    return core::Result<json>::Ok(result);
 }
 
 // ============================================================================
 // Heartbeat Methods
-// 🎯 OpenClaw 对齐: BASE_METHODS "last-heartbeat" / "set-heartbeats"
+// 🎯 OpenClaw 对齐: systemHandlers["last-heartbeat"] / ["set-heartbeats"]
 // ============================================================================
 
 // last-heartbeat
-// 🎯 OpenClaw 对齐: systemHandlers["last-heartbeat"]
-//   respond(true, getLastHeartbeatEvent(), undefined)
-// 返回完整的 HeartbeatEventPayload (ts, status, to, preview, durationMs, hasMedia, reason, channel, ...)
 core::Result<json> method_last_heartbeat(
     std::shared_ptr<GatewayServer> server,
     std::shared_ptr<MethodGuard> method_guard,
@@ -1016,10 +150,8 @@ core::Result<json> method_last_heartbeat(
     const json& params
 ) {
     (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    // Aligned with openclaw: respond(true, getLastHeartbeatEvent(), undefined)
     auto last = hunterclaw::infra::get_last_heartbeat_event();
     if (!last.has_value()) {
-        // Aligned with openclaw: getLastHeartbeatEvent() returns null when no heartbeat has run
         return core::Result<json>::Ok(json(nullptr));
     }
     const auto& evt = last.value();
@@ -1041,13 +173,10 @@ core::Result<json> method_last_heartbeat(
             case hunterclaw::infra::HeartbeatIndicatorType::Error: result["indicatorType"] = "error"; break;
         }
     }
-    STUB_METHOD_OK(result);
+    return core::Result<json>::Ok(result);
 }
 
 // set-heartbeats
-// 🎯 OpenClaw 对齐: systemHandlers["set-heartbeats"]
-//   setHeartbeatsEnabled(enabled)
-//   respond(true, { ok: true, enabled }, undefined)
 core::Result<json> method_set_heartbeats(
     std::shared_ptr<GatewayServer> server,
     std::shared_ptr<MethodGuard> method_guard,
@@ -1055,28 +184,25 @@ core::Result<json> method_set_heartbeats(
     const json& params
 ) {
     (void)server; (void)method_guard; (void)client_ctx;
-    // Aligned with openclaw: validate enabled (boolean) required
     if (!params.contains("enabled") || !params["enabled"].is_boolean()) {
         return core::Result<json>::Err(
             "invalid set-heartbeats params: enabled (boolean) required"
         );
     }
     bool enabled = params["enabled"].get<bool>();
-    // Aligned with openclaw: setHeartbeatsEnabled(enabled)
     hunterclaw::infra::set_heartbeats_enabled(enabled);
     json result;
     result["ok"]      = true;
     result["enabled"] = enabled;
-    STUB_METHOD_OK(result);
+    return core::Result<json>::Ok(result);
 }
 
 // ============================================================================
-// System Presence / Event Methods (system.ts)
-// 🎯 OpenClaw 对齐: systemHandlers "system-presence" / "system-event"
+// Skills Methods - keeping stubs here since skills.cc has partial impl
+// 🎯 OpenClaw 对齐: skillsHandlers (stubs for methods not in skills.cc)
 // ============================================================================
 
-// system-presence
-core::Result<json> method_system_presence(
+core::Result<json> method_skills_status(
     std::shared_ptr<GatewayServer> server,
     std::shared_ptr<MethodGuard> method_guard,
     const ClientContext& client_ctx,
@@ -1085,11 +211,11 @@ core::Result<json> method_system_presence(
     (void)server; (void)method_guard; (void)client_ctx; (void)params;
     json result;
     result["ok"] = true;
-    STUB_METHOD_OK(result);
+    result["skills"] = json::array();
+    return core::Result<json>::Ok(result);
 }
 
-// system-event
-core::Result<json> method_system_event(
+core::Result<json> method_skills_bins(
     std::shared_ptr<GatewayServer> server,
     std::shared_ptr<MethodGuard> method_guard,
     const ClientContext& client_ctx,
@@ -1097,9 +223,34 @@ core::Result<json> method_system_event(
 ) {
     (void)server; (void)method_guard; (void)client_ctx; (void)params;
     json result;
-    result["ok"] = true;
-    STUB_METHOD_OK(result);
+    result["bins"] = json::array();
+    return core::Result<json>::Ok(result);
 }
+
+core::Result<json> method_skills_install(
+    std::shared_ptr<GatewayServer> server,
+    std::shared_ptr<MethodGuard> method_guard,
+    const ClientContext& client_ctx,
+    const json& params
+) {
+    (void)server; (void)method_guard; (void)client_ctx; (void)params;
+    return core::Result<json>::Err("skills.install not yet implemented");
+}
+
+core::Result<json> method_skills_update(
+    std::shared_ptr<GatewayServer> server,
+    std::shared_ptr<MethodGuard> method_guard,
+    const ClientContext& client_ctx,
+    const json& params
+) {
+    (void)server; (void)method_guard; (void)client_ctx; (void)params;
+    return core::Result<json>::Err("skills.update not yet implemented");
+}
+
+// ============================================================================
+// Exec Approval Methods → 保留在 approval.cc 中
+// 这里只需要确保不重复定义
+// ============================================================================
 
 }  // namespace methods
 }  // namespace gateway

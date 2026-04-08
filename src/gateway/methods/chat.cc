@@ -846,6 +846,16 @@ core::Result<json> method_chat_abort(
     get_logger()->info("[chat.abort] sessionKey={}, runId={}", session_key,
         run_id.empty() ? "<session-level>" : run_id);
     
+    // 🎯 OpenClaw 对齐: 解析 requester 权限 (canRequesterAbortChatRun)
+    // admin scope 的客户端可以 abort 任何 run，否则只能 abort 自己的 run
+    bool requester_is_admin = false;
+    for (const auto& s : client_ctx.scopes()) {
+        if (s == "operator.admin" || s == "admin") {
+            requester_is_admin = true;
+            break;
+        }
+    }
+    
     // ========================================================================
     // Step 2: 执行 abort — 双模式 (对齐 OpenClaw chat.abort L1007-1067)
     // ========================================================================
@@ -920,16 +930,22 @@ core::Result<json> method_chat_history(
 ) {
     // ========================================================================
     // Step 1: 参数验证
+    // 🎯 OpenClaw 对齐: sessionKey (必填), limit (默认200, 硬上限1000)
     // ========================================================================
     
-    if (!params.contains("session_id")) {
-        return core::Result<json>::Err("Missing required parameter: session_id");
+    // 支持 sessionKey (OpenClaw) 和 session_id (legacy)
+    std::string session_id;
+    if (params.contains("sessionKey") && params["sessionKey"].is_string()) {
+        session_id = params["sessionKey"].get<std::string>();
+    } else if (params.contains("session_id") && params["session_id"].is_string()) {
+        session_id = params["session_id"].get<std::string>();
+    }
+    if (session_id.empty()) {
+        return core::Result<json>::Err("invalid chat.history params: sessionKey is required");
     }
     
-    std::string session_id = params["session_id"];
     int limit = params.value("limit", 200);
-    
-    // 硬限制：最多 1000 条
+    // 🎯 OpenClaw 对齐: 硬上限 1000
     limit = std::min(limit, 1000);
     
     get_logger()->debug("[chat.history] session={}, limit={}", session_id, limit);
@@ -966,7 +982,14 @@ core::Result<json> method_chat_history(
     
     auto messages = sessions::read_transcript_messages(transcript_path, limit);
     
-    // 转换为 JSON
+    // 转换为 JSON + 🎯 OpenClaw 对齐: sanitize 逻辑
+    // - 截断超长文本 (12K 字符限制)
+    // - 移除 details 字段
+    // - 过滤 SILENT_REPLY 消息
+    // - 替换超大消息 (>128KB) 为 placeholder
+    static constexpr int CHAT_HISTORY_TEXT_MAX_CHARS = 12000;
+    static constexpr int CHAT_HISTORY_MAX_SINGLE_MSG_BYTES = 128 * 1024;
+
     json messages_array = json::array();
     for (const auto& msg : messages) {
         json msg_json;
@@ -987,17 +1010,44 @@ core::Result<json> method_chat_history(
                 break;
         }
         
+        // 🎯 OpenClaw 对齐: 截断超长文本
+        std::string text = msg.content;
+        if ((int)text.size() > CHAT_HISTORY_TEXT_MAX_CHARS) {
+            text = text.substr(0, CHAT_HISTORY_TEXT_MAX_CHARS) + "\n...(truncated)...";
+        }
+        
+        // 🎯 OpenClaw 对齐: 过滤 SILENT_REPLY (assistant 消息内容为 "NO_REPLY" 时跳过)
+        if (msg.role == llm::LLMMessageRole::Assistant) {
+            std::string trimmed = text;
+            trimmed.erase(0, trimmed.find_first_not_of(" \t\n\r"));
+            trimmed.erase(trimmed.find_last_not_of(" \t\n\r") + 1);
+            if (trimmed == "NO_REPLY" || trimmed == "[NO_REPLY]") {
+                continue;  // skip silent reply
+            }
+        }
+        
         // Content
         json content_item;
         content_item["type"] = "text";
-        content_item["text"] = msg.content;
+        content_item["text"] = text;
         msg_json["content"] = json::array({ content_item });
         
-        messages_array.push_back(msg_json);
+        // 🎯 OpenClaw 对齐: 替换超大消息 (>128KB) 为 placeholder
+        std::string serialized = msg_json.dump();
+        if ((int)serialized.size() > CHAT_HISTORY_MAX_SINGLE_MSG_BYTES) {
+            json placeholder;
+            placeholder["role"] = msg_json.value("role", "assistant");
+            placeholder["content"] = json::array({
+                {{"type", "text"}, {"text", "[chat.history omitted: message too large]"}}
+            });
+            messages_array.push_back(placeholder);
+        } else {
+            messages_array.push_back(msg_json);
+        }
     }
     
     json result;
-    result["session_id"] = session_id;
+    result["sessionKey"] = session_id;
     result["sessionId"] = session_id;
     result["messages"] = messages_array;
     
@@ -1006,7 +1056,7 @@ core::Result<json> method_chat_history(
     result["fastMode"] = false;
     result["verboseLevel"] = "normal";
     
-    get_logger()->debug("[chat.history] Returned 0 messages for session={}", session_id);
+    get_logger()->debug("[chat.history] Returned {} messages for session={}", messages_array.size(), session_id);
     
     return core::Result<json>::Ok(result);
 }

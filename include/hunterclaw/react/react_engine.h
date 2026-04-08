@@ -140,6 +140,13 @@ struct StreamCallbacks {
     // In Discord/channel path: generated in run_prepared_reply and stored in GenerateResult.
     std::string run_id;
 
+    // 🎯 对齐 OpenClaw: hook context 字段 (attempt.ts:2685-2693)
+    std::string agent_id;       // e.g. "default" or custom agent id
+    std::string session_key;    // stable session key (survives /reset)
+    std::string workspace_dir;  // agent workspace directory
+    std::string trigger;        // "user", "heartbeat", "cron", "memory"
+    std::string channel_id;     // "telegram", "discord", "whatsapp", etc.
+
     // 🎯 OpenClaw 对齐: transcript 路径 (用于 tool_result_persist hook)
     // 如果非空，工具结果将通过 append_tool_result_to_transcript 写入
     std::string transcript_path;
@@ -208,6 +215,15 @@ struct ReactConfig {
     bool parallel_tool_calls = false;  // 是否并行执行工具
     bool verbose_tool_output = true;   // 是否显示详细工具输出
     int thread_pool_size = 4;          // 全局线程池大小 (0=auto)
+
+    // 🎯 对齐 OpenClaw: limitHistoryTurns — 限制 DM/channel 会话的历史轮数
+    // 0 = 不限制 (default); >0 = 只保留最近 N 轮 user 消息及其关联的 assistant 响应
+    int max_history_turns = 0;
+
+    // 🎯 对齐 OpenClaw thinking.ts: dropThinkingBlocks
+    // 当模型切换到不支持推理的模型时，自动剥离 <think> 块以避免 provider 拒绝
+    // 对齐 OpenClaw transcript-policy.ts: shouldDropThinkingBlocksForModel
+    bool drop_thinking_blocks = false;
 
     // ✅ 对齐 OpenClaw: tool loop detection config (types.tools.ts ToolLoopDetectionConfig)
     // 默认 disabled=false 以对齐 OpenClaw 的 DEFAULT_LOOP_DETECTION_CONFIG.enabled=false
@@ -340,6 +356,8 @@ private:
         int output_tokens = 0;
         int cache_read_tokens = 0;
         int cache_write_tokens = 0;
+        // 🎯 对齐 OpenClaw: isLikelyContextOverflowError → triggers auto-compaction
+        bool context_overflow = false;
     };
     
     // ✅ call_llm 支持 tools 参数 (对齐 OpenClaw)
@@ -404,6 +422,10 @@ private:
         int assistant_text_baseline = 0;
         // 🎯 对齐 OpenClaw: noteLastAssistant — tracks last assistant message for agent_end error detection
         std::string last_assistant_full_text;
+        // 🎯 对齐 OpenClaw: deterministicApprovalPromptSent
+        // Set when an exec approval prompt is deterministically delivered.
+        // When true, assistant text output is suppressed (handlers.messages.ts:88,267)
+        bool deterministic_approval_prompt_sent = false;
         // 🎯 对齐 OpenClaw: partialBlockState (thinking/final stateful tracking)
         struct BlockState {
             bool thinking = false;
@@ -454,6 +476,10 @@ private:
             assistant_text_baseline = 0;
             block_state = {};
             partial_block_state = {};
+            in_code_fence = false;
+            code_fence_marker.clear();
+            last_assistant_full_text.clear();
+            deterministic_approval_prompt_sent = false;
             messaging_tool_sent_texts.clear();
             messaging_tool_sent_texts_normalized.clear();
         }
