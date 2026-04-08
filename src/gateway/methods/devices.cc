@@ -343,7 +343,7 @@ core::Result<json> method_device_pair_remove(
         if (out.is_open()) out << pairing_data.dump(2);
     } catch (...) {}
 
-    spdlog::info("device pairing removed device={}", removed_entry.value("deviceId", ""));
+    if (auto lg = get_logger()) lg->info("device pairing removed device={}", removed_entry.value("deviceId", ""));
     return core::Result<json>::Ok(removed_entry);
 }
 

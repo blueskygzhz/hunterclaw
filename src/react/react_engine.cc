@@ -417,6 +417,8 @@ ReactResult ReactEngine::execute_loop(
     }
     // 🎯 对齐 OpenClaw: 将 hook 返回的 prompt 修改注入到消息列表
     // before_prompt_build / before_agent_start hooks 可以覆盖 system prompt 或注入上下文
+    // Note: messages 需要在此处提前声明，因为 hook 块需要修改它
+    std::vector<llm::LLMMessage> messages = history;
     if (hook_system_prompt.has_value() || hook_prepend_context.has_value() ||
         hook_prepend_system_context.has_value() || hook_append_system_context.has_value()) {
         // Find or create system message
@@ -477,8 +479,7 @@ ReactResult ReactEngine::execute_loop(
     accumulated_reasoning_raw_.clear();
     accumulated_reasoning_formatted_.clear();
 
-    // 构建消息列表
-    std::vector<llm::LLMMessage> messages = history;
+    // 构建消息列表 (messages 已在 hook 块之前声明)
     
     // 添加用户输入 (Observe)
     llm::LLMMessage user_msg;
@@ -1063,7 +1064,7 @@ ReactEngine::LLMResponseData ReactEngine::call_llm(
                 for (const auto& tc : msg.tool_calls) {
                     // tool_calls are JsonValue; try to extract "id" field
                     if (tc.is_object() && tc.contains("id") && tc["id"].is_string()) {
-                        expected_ids.insert(tc["id"].get_string());
+                        expected_ids.insert(tc["id"].as_string());
                     }
                 }
                 // Check which are satisfied by subsequent tool results
@@ -1272,17 +1273,17 @@ ReactEngine::LLMResponseData ReactEngine::call_llm(
             bool should_flush = false;
             if (streaming_state_.in_code_fence) {
                 // Inside a code fence — only flush if max_chars exceeded (emergency)
-                should_flush = ((int)buf.size() >= config_.block_reply.max_chars * 2);
-            } else if ((int)buf.size() >= config_.block_reply.max_chars) {
+                should_flush = ((int)streaming_state_.block_buffer.size() >= config_.block_reply.max_chars * 2);
+            } else if ((int)streaming_state_.block_buffer.size() >= config_.block_reply.max_chars) {
                 should_flush = true;
-            } else if ((int)buf.size() >= config_.block_reply.min_chars) {
+            } else if ((int)streaming_state_.block_buffer.size() >= config_.block_reply.min_chars) {
                 switch (config_.block_reply.break_preference) {
                     case ReactConfig::BlockReply::BreakPreference::Paragraph:
                     case ReactConfig::BlockReply::BreakPreference::Newline:
-                        should_flush = (buf.back() == '\n');
+                        should_flush = (streaming_state_.block_buffer.back() == '\n');
                         break;
                     case ReactConfig::BlockReply::BreakPreference::Sentence:
-                        should_flush = is_sentence_boundary(buf, buf.size() - 1);
+                        should_flush = is_sentence_boundary(streaming_state_.block_buffer, streaming_state_.block_buffer.size() - 1);
                         break;
                 }
             }
@@ -1555,7 +1556,7 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                         // 构建 event + context (对齐 OpenClaw before-tool-call.ts:156-172)
                         plugins::PluginHookBeforeToolCallEvent hook_event;
                         hook_event.tool_name = tool_call.name;
-                        hook_event.params_json = tool_call.input.dump();
+                        hook_event.params_json = tool_call.input.to_string();
                         if (!callbacks.run_id.empty()) hook_event.run_id = callbacks.run_id;
                         hook_event.tool_call_id = tool_call.id;
 
@@ -1638,10 +1639,10 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
 
                             plugins::PluginHookAfterToolCallEvent after_event;
                             after_event.tool_name = tool_call.name;
-                            after_event.params_json = effective_params.dump();
+                            after_event.params_json = effective_params.to_string();
                             if (!callbacks.run_id.empty()) after_event.run_id = callbacks.run_id;
                             after_event.tool_call_id = tool_call.id;
-                            after_event.result_json = result.output.dump();
+                            after_event.result_json = result.details.to_string();
                             after_event.duration_ms = static_cast<int>(duration_ms);
 
                             plugins::PluginHookToolContext after_ctx;
@@ -1691,7 +1692,7 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
 
                             plugins::PluginHookAfterToolCallEvent after_event;
                             after_event.tool_name = tool_call.name;
-                            after_event.params_json = effective_params.dump();
+                            after_event.params_json = effective_params.to_string();
                             if (!callbacks.run_id.empty()) after_event.run_id = callbacks.run_id;
                             after_event.tool_call_id = tool_call.id;
                             after_event.error = e.what();
@@ -1764,11 +1765,11 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                         std::string blocked_msg = loop_result.message;
                         std::string tool_id = tool_call.id;
                         auto f = std::async(std::launch::deferred,
-                            [tool_id, blocked_msg]() -> std::pair<std::string, tools::ToolResult> {
+                            [tool_id, blocked_msg]() -> ParallelToolResultOuter {
                                 tools::ToolResult r;
                                 r.success = false;
                                 r.error = blocked_msg;
-                                return {tool_id, r};
+                                return {tool_id, r, 0.0};
                             });
                         futures.push_back(std::move(f));
                         loop_detection_state_->record_tool_call(
@@ -1792,7 +1793,7 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                     try {
                         plugins::PluginHookBeforeToolCallEvent hook_event;
                         hook_event.tool_name = tool_call.name;
-                        hook_event.params_json = tool_call.input.dump();
+                        hook_event.params_json = tool_call.input.to_string();
                         if (!callbacks.run_id.empty()) hook_event.run_id = callbacks.run_id;
                         hook_event.tool_call_id = tool_call.id;
 
@@ -1909,11 +1910,11 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                         try {
                             plugins::PluginHookAfterToolCallEvent after_event;
                             after_event.tool_name = tool_call.name;
-                            after_event.params_json = tool_call.input.dump();
+                            after_event.params_json = tool_call.input.to_string();
                             if (!callbacks.run_id.empty()) after_event.run_id = callbacks.run_id;
                             after_event.tool_call_id = tool_call.id;
                             if (result.success) {
-                                after_event.result_json = result.output.dump();
+                                after_event.result_json = result.details.to_string();
                             } else {
                                 after_event.error = result.error;
                             }

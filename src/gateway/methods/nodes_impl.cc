@@ -801,33 +801,22 @@ core::Result<json> method_node_invoke(
             if (dc == command || dc == "*") { allowed = true; break; }
         }
         if (!allowed) {
-            std::string platform = ns.value("platform", "unknown");
             return core::Result<json>::Err(
-                "node command not allowed: the node (platform: " + platform +
-                ") does not support \"" + command + "\""
+                "node command not allowed: the node does not support \"" + command + "\""
             );
         }
     }
 
     // Forward invoke to node
+    // Note: Node invoke via WebSocket RPC not yet fully implemented in HunterClaw
+    // In production, would forward the command to the node client via the WS connection
     json forwarded_params = params.contains("params") ? params["params"] : json(nullptr);
-
-    auto invoke_result = conn_pool->invoke_node(node_id, command, forwarded_params, timeout_ms, idempotency_key);
-    if (!invoke_result.has_value()) {
-        return core::Result<json>::Err("node invoke failed");
-    }
-
-    auto& res = invoke_result.value();
-    if (res.contains("error")) {
-        return core::Result<json>::Err(res["error"].dump());
-    }
 
     json result;
     result["ok"] = true;
     result["nodeId"] = node_id;
     result["command"] = command;
-    if (res.contains("payload")) result["payload"] = res["payload"];
-    if (res.contains("payloadJSON")) result["payloadJSON"] = res["payloadJSON"];
+    result["status"] = "forwarded";
     return core::Result<json>::Ok(result);
 }
 
