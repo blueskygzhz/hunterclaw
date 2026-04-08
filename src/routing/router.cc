@@ -1,38 +1,36 @@
+// ============================================================================
+// router.cc
+// ✅ 薄包装层，将旧 MessageRouter 接口委托给 resolver.cc 的规范实现
+// ============================================================================
+
 #include "hunterclaw/routing/router.h"
+#include "hunterclaw/routing/resolver.h"
 #include <algorithm>
 #include <sstream>
 
 namespace hunterclaw {
 namespace routing {
 
-// ============================================================================
-// Utility Functions
-// ============================================================================
+namespace {
 
-static std::string to_lower(const std::string& str) {
-    std::string result = str;
-    std::transform(result.begin(), result.end(), result.begin(), ::tolower);
-    return result;
-}
+// router.h 中的 ChatType（通过 resolver.h 的 ChatType::DIRECT 等）
+// 和 resolver.h 是同一个枚举，直接使用，不需要转换
 
-static std::string trim(const std::string& str) {
-    auto start = str.find_first_not_of(" \t\n\r");
-    if (start == std::string::npos) return "";
-    auto end = str.find_last_not_of(" \t\n\r");
-    return str.substr(start, end - start + 1);
-}
-
-static std::string chat_type_to_string(ChatType type) {
-    switch (type) {
-        case ChatType::Direct: return "direct";
-        case ChatType::Group: return "group";
-        case ChatType::Channel: return "channel";
-        default: return "unknown";
+// DmScope → string
+static std::string dm_scope_to_string(DmScope scope) {
+    switch (scope) {
+        case DmScope::Main:               return "main";
+        case DmScope::PerPeer:            return "per-peer";
+        case DmScope::PerChannelPeer:     return "per-channel-peer";
+        case DmScope::PerAccountChannelPeer: return "per-account-channel-peer";
+        default:                          return "main";
     }
 }
 
+} // namespace
+
 // ============================================================================
-// DefaultMessageRouter Implementation
+// MessageRouter factory
 // ============================================================================
 
 MessageRouter::Ptr MessageRouter::create(const std::string& default_agent_id) {
@@ -40,221 +38,91 @@ MessageRouter::Ptr MessageRouter::create(const std::string& default_agent_id) {
 }
 
 DefaultMessageRouter::DefaultMessageRouter(const std::string& default_agent_id)
-    : default_agent_id_(normalize_agent_id(default_agent_id))
+    : default_agent_id_(::hunterclaw::routing::normalize_agent_id(default_agent_id))
 {
 }
 
-std::string DefaultMessageRouter::normalize_agent_id(const std::string& agent_id) const {
-    std::string normalized = trim(agent_id);
-    if (normalized.empty()) {
-        return "default";
-    }
-    // 移除非法字符，保留 a-z, 0-9, -, _
-    std::string result;
-    for (char c : normalized) {
-        if (std::isalnum(c) || c == '-' || c == '_') {
-            result += std::tolower(c);
-        }
-    }
-    return result.empty() ? "default" : result;
-}
-
-std::string DefaultMessageRouter::normalize_account_id(
-    const std::optional<std::string>& account_id
-) const {
-    if (!account_id || trim(*account_id).empty()) {
-        return DEFAULT_ACCOUNT_ID;
-    }
-    std::string normalized = trim(*account_id);
-    return normalized == "*" ? DEFAULT_ACCOUNT_ID : normalized;
-}
-
-// 路由优先级匹配 (对齐 OpenClaw)
-std::optional<ChannelBinding> DefaultMessageRouter::find_matching_binding(
-    const RouteInput& input
-) const {
-    // Priority 1: Exact peer match
-    if (input.peer) {
-        for (const auto& binding : bindings_) {
-            if (binding.peer && 
-                binding.peer->kind == input.peer->kind &&
-                binding.peer->id == input.peer->id) {
-                return binding;
-            }
-        }
-    }
-    
-    // Priority 2: Parent peer match (thread inheritance)
-    if (input.parent_peer) {
-        for (const auto& binding : bindings_) {
-            if (binding.peer &&
-                binding.peer->kind == input.parent_peer->kind &&
-                binding.peer->id == input.parent_peer->id) {
-                return binding;
-            }
-        }
-    }
-    
-    // Priority 3: Guild + roles match (Discord)
-    if (input.guild_id && !input.member_role_ids.empty()) {
-        for (const auto& binding : bindings_) {
-            if (binding.guild_id && *binding.guild_id == *input.guild_id &&
-                !binding.require_roles.empty()) {
-                // Check if user has required roles
-                bool has_all_roles = true;
-                for (const auto& required_role : binding.require_roles) {
-                    auto it = std::find(input.member_role_ids.begin(),
-                                       input.member_role_ids.end(),
-                                       required_role);
-                    if (it == input.member_role_ids.end()) {
-                        has_all_roles = false;
-                        break;
-                    }
-                }
-                if (has_all_roles) {
-                    return binding;
-                }
-            }
-        }
-    }
-    
-    // Priority 4: Guild match
-    if (input.guild_id) {
-        for (const auto& binding : bindings_) {
-            if (binding.guild_id && *binding.guild_id == *input.guild_id) {
-                return binding;
-            }
-        }
-    }
-    
-    // Priority 5: Team match (Slack)
-    if (input.team_id) {
-        for (const auto& binding : bindings_) {
-            if (binding.team_id && *binding.team_id == *input.team_id) {
-                return binding;
-            }
-        }
-    }
-    
-    // Priority 6: Account match
-    if (input.account_id) {
-        for (const auto& binding : bindings_) {
-            if (binding.account_id && *binding.account_id == *input.account_id) {
-                return binding;
-            }
-        }
-    }
-    
-    // Priority 7: Channel wildcard match
-    for (const auto& binding : bindings_) {
-        if (binding.channel && *binding.channel == input.channel) {
-            return binding;
-        }
-    }
-    
-    // No match found
-    return std::nullopt;
-}
+// ============================================================================
+// resolve_route — 委托给 RouteResolver
+// ============================================================================
 
 core::Result<ResolvedRoute> DefaultMessageRouter::resolve_route(const RouteInput& input) {
-    ResolvedRoute route;
-    route.channel = input.channel;
-    route.account_id = normalize_account_id(input.account_id);
-    
-    // Try to find matching binding
-    auto binding = find_matching_binding(input);
-    
-    if (binding) {
-        route.agent_id = normalize_agent_id(binding->agent_id);
-        
-        // Determine match type
-        if (input.peer && binding->peer &&
-            binding->peer->kind == input.peer->kind &&
-            binding->peer->id == input.peer->id) {
-            route.matched_by = ResolvedRoute::MatchType::BindingPeer;
-        } else if (input.parent_peer && binding->peer &&
-                   binding->peer->kind == input.parent_peer->kind &&
-                   binding->peer->id == input.parent_peer->id) {
-            route.matched_by = ResolvedRoute::MatchType::BindingPeerParent;
-        } else if (binding->guild_id && !binding->require_roles.empty()) {
-            route.matched_by = ResolvedRoute::MatchType::BindingGuildRoles;
-        } else if (binding->guild_id) {
-            route.matched_by = ResolvedRoute::MatchType::BindingGuild;
-        } else if (binding->team_id) {
-            route.matched_by = ResolvedRoute::MatchType::BindingTeam;
-        } else if (binding->account_id) {
-            route.matched_by = ResolvedRoute::MatchType::BindingAccount;
-        } else {
-            route.matched_by = ResolvedRoute::MatchType::BindingChannel;
+    // 构建 RouteResolver（每次调用时按需构建，或考虑缓存）
+    ::hunterclaw::routing::RouteResolver resolver;
+    resolver.set_default_agent_id(default_agent_id_);
+    resolver.set_dm_scope("main");  // DefaultMessageRouter 使用 "main" scope
+
+    // 注入 bindings
+    for (const auto& b : bindings_) {
+        ::hunterclaw::routing::AgentRouteBinding rb;
+        rb.agent_id = b.agent_id;
+        if (b.channel) rb.match.channel = *b.channel;
+        if (b.account_id) rb.match.account_id = *b.account_id;
+        if (b.peer) {
+            rb.match.peer = ::hunterclaw::routing::RoutePeer{
+                b.peer->kind,   // ✅ ChatType 是同一枚举
+                b.peer->id
+            };
         }
-    } else {
-        // Use default agent
-        route.agent_id = default_agent_id_;
-        route.matched_by = ResolvedRoute::MatchType::Default;
+        if (b.guild_id) rb.match.guild_id = *b.guild_id;
+        rb.match.roles = b.require_roles;
+        if (b.team_id) rb.match.team_id = *b.team_id;
+        resolver.add_binding(rb);
     }
-    
-    // Build session keys (默认使用 PerChannelPeer 作用域)
-    route.session_key = build_session_key(
-        route.agent_id,
-        route.channel,
-        route.account_id,
-        input.peer,
-        DmScope::PerChannelPeer
-    );
-    
-    // Main session key (DM collapse)
-    route.main_session_key = "agent:" + route.agent_id + ":main";
-    
+
+    // 构建输入
+    ::hunterclaw::routing::ResolveAgentRouteInput ri;
+    ri.channel = input.channel;
+    ri.account_id = input.account_id;
+    if (input.peer) {
+        ri.peer = ::hunterclaw::routing::RoutePeer{
+            input.peer->kind, input.peer->id
+        };
+    }
+    if (input.parent_peer) {
+        ri.parent_peer = ::hunterclaw::routing::RoutePeer{
+            input.parent_peer->kind, input.parent_peer->id
+        };
+    }
+    ri.guild_id = input.guild_id;
+    ri.team_id  = input.team_id;
+    ri.member_role_ids = input.member_role_ids;
+
+    const auto rr = resolver.resolve_route(ri);
+
+    // 映射回 ResolvedRoute
+    ResolvedRoute route;
+    route.agent_id        = rr.agent_id;
+    route.channel         = rr.channel;
+    route.account_id      = rr.account_id;
+    route.session_key     = rr.session_key;
+    route.main_session_key= rr.main_session_key;
+
+    switch (rr.matched_by) {
+        case ::hunterclaw::routing::RouteMatchSource::BINDING_PEER:
+            route.matched_by = ResolvedRoute::MatchType::BindingPeer; break;
+        case ::hunterclaw::routing::RouteMatchSource::BINDING_PEER_PARENT:
+            route.matched_by = ResolvedRoute::MatchType::BindingPeerParent; break;
+        case ::hunterclaw::routing::RouteMatchSource::BINDING_GUILD_ROLES:
+            route.matched_by = ResolvedRoute::MatchType::BindingGuildRoles; break;
+        case ::hunterclaw::routing::RouteMatchSource::BINDING_GUILD:
+            route.matched_by = ResolvedRoute::MatchType::BindingGuild; break;
+        case ::hunterclaw::routing::RouteMatchSource::BINDING_TEAM:
+            route.matched_by = ResolvedRoute::MatchType::BindingTeam; break;
+        case ::hunterclaw::routing::RouteMatchSource::BINDING_ACCOUNT:
+            route.matched_by = ResolvedRoute::MatchType::BindingAccount; break;
+        case ::hunterclaw::routing::RouteMatchSource::BINDING_CHANNEL:
+            route.matched_by = ResolvedRoute::MatchType::BindingChannel; break;
+        default:
+            route.matched_by = ResolvedRoute::MatchType::Default; break;
+    }
+
     return core::Result<ResolvedRoute>::Ok(route);
 }
 
-std::string DefaultMessageRouter::build_peer_session_key(
-    const std::string& agent_id,
-    const std::string& channel,
-    const std::string& account_id,
-    const std::optional<RoutePeer>& peer,
-    DmScope dm_scope
-) const {
-    std::ostringstream oss;
-    oss << "agent:" << agent_id;
-    
-    if (!peer) {
-        // No peer, use main key
-        oss << ":" << DEFAULT_MAIN_KEY;
-        return oss.str();
-    }
-    
-    // Apply DM scope logic
-    if (peer->kind == ChatType::Direct) {
-        switch (dm_scope) {
-            case DmScope::Main:
-                // All DMs share main session (UNSAFE for multi-user)
-                oss << ":" << DEFAULT_MAIN_KEY;
-                break;
-            
-            case DmScope::PerPeer:
-                // Isolate by sender
-                oss << ":direct:" << peer->id;
-                break;
-            
-            case DmScope::PerChannelPeer:
-                // Isolate by channel + sender (RECOMMENDED)
-                oss << ":" << channel << ":direct:" << peer->id;
-                break;
-            
-            case DmScope::PerAccountChannelPeer:
-                // Full isolation
-                oss << ":" << account_id << ":" << channel << ":direct:" << peer->id;
-                break;
-        }
-    } else {
-        // Group/Channel: always include full path
-        oss << ":" << channel << ":" 
-            << chat_type_to_string(peer->kind) << ":" << peer->id;
-    }
-    
-    return oss.str();
-}
+// ============================================================================
+// build_session_key — 委托给 build_agent_peer_session_key
+// ============================================================================
 
 std::string DefaultMessageRouter::build_session_key(
     const std::string& agent_id,
@@ -262,32 +130,71 @@ std::string DefaultMessageRouter::build_session_key(
     const std::optional<std::string>& account_id,
     const std::optional<RoutePeer>& peer,
     DmScope dm_scope
-) {
-    std::string normalized_account = normalize_account_id(account_id);
-    return build_peer_session_key(
-        normalize_agent_id(agent_id),
-        channel,
-        normalized_account,
-        peer,
-        dm_scope
-    );
+) const {
+    ::hunterclaw::routing::BuildAgentPeerSessionKeyParams p;
+    p.agent_id   = agent_id;
+    p.channel    = channel;
+    p.account_id = account_id;
+    if (peer) {
+        p.peer_kind = [&]{
+            switch (peer->kind) {
+                case ChatType::DIRECT:  return std::string("direct");
+                case ChatType::GROUP:   return std::string("group");
+                case ChatType::CHANNEL: return std::string("channel");
+                case ChatType::THREAD:  return std::string("thread");
+                default:                return std::string("unknown");
+            }
+        }();
+        p.peer_id = peer->id;
+    }
+    p.dm_scope = dm_scope_to_string(dm_scope);
+    return ::hunterclaw::routing::build_agent_peer_session_key(p);
 }
 
+// ============================================================================
+// add_binding / remove_binding
+// ============================================================================
+
 void DefaultMessageRouter::add_binding(const ChannelBinding& binding) {
-    // Remove existing binding for same agent
     remove_binding(binding.agent_id);
     bindings_.push_back(binding);
 }
 
 void DefaultMessageRouter::remove_binding(const std::string& agent_id) {
-    std::string normalized = normalize_agent_id(agent_id);
+    const std::string normalized = ::hunterclaw::routing::normalize_agent_id(agent_id);
     bindings_.erase(
         std::remove_if(bindings_.begin(), bindings_.end(),
             [&](const ChannelBinding& b) {
-                return normalize_agent_id(b.agent_id) == normalized;
+                return ::hunterclaw::routing::normalize_agent_id(b.agent_id) == normalized;
             }),
         bindings_.end()
     );
+}
+
+std::string DefaultMessageRouter::normalize_agent_id(const std::string& agent_id) const {
+    return ::hunterclaw::routing::normalize_agent_id(agent_id);
+}
+
+std::string DefaultMessageRouter::normalize_account_id(
+    const std::optional<std::string>& account_id) const {
+    return ::hunterclaw::routing::normalize_account_id(account_id.value_or(""));
+}
+
+std::optional<ChannelBinding> DefaultMessageRouter::find_matching_binding(
+    const RouteInput& /*input*/) const {
+    // 已被 resolve_route 委托给 RouteResolver，不再需要
+    return std::nullopt;
+}
+
+std::string DefaultMessageRouter::build_peer_session_key(
+    const std::string& agent_id,
+    const std::string& channel,
+    const std::string& account_id,
+    const std::optional<RoutePeer>& peer,
+    DmScope dm_scope) const {
+    return build_session_key(agent_id, channel,
+                             std::optional<std::string>(account_id),
+                             peer, dm_scope);
 }
 
 } // namespace routing

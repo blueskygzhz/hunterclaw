@@ -6,22 +6,24 @@
 #include <vector>
 #include <optional>
 #include "hunterclaw/core/result.h"
+#include "hunterclaw/routing/resolver.h"  // ✅ 复用 resolver 中的类型
 
 namespace hunterclaw {
 namespace routing {
 
-// 对齐 OpenClaw ChatType
-enum class ChatType {
-    Direct,    // 1-on-1 DM
-    Group,     // 群聊
-    Channel    // 频道/主题
-};
+// ✅ router.h 中的 ChatType 复用 resolver.h 中的枚举，
+// 但旧枚举值用大写（DIRECT/GROUP/CHANNEL），这里定义 convenience aliases
+// 注意: resolver.h 里 ChatType 已经定义，不再重复定义
 
-// Peer 标识 (对齐 OpenClaw RoutePeer)
-struct RoutePeer {
-    ChatType kind;
-    std::string id;
-};
+// 旧 ChatType 枚举值兼容 — 通过 constexpr 变量提供
+// router.h 使用者应迁移到 ChatType::DIRECT/GROUP/CHANNEL
+namespace chat_type {
+  inline constexpr ChatType Direct  = ChatType::DIRECT;
+  inline constexpr ChatType Group   = ChatType::GROUP;
+  inline constexpr ChatType Channel = ChatType::CHANNEL;
+}
+
+// RoutePeer 已在 resolver.h 中定义，直接使用
 
 // 路由输入 (对齐 OpenClaw ResolveAgentRouteInput)
 struct RouteInput {
@@ -95,7 +97,7 @@ public:
         const std::optional<std::string>& account_id,
         const std::optional<RoutePeer>& peer,
         DmScope dm_scope = DmScope::Main
-    ) = 0;
+    ) const = 0;
     
     // 添加/移除 binding
     virtual void add_binding(const ChannelBinding& binding) = 0;
@@ -118,7 +120,7 @@ public:
         const std::optional<std::string>& account_id,
         const std::optional<RoutePeer>& peer,
         DmScope dm_scope
-    ) override;
+    ) const override;
     
     void add_binding(const ChannelBinding& binding) override;
     void remove_binding(const std::string& agent_id) override;
@@ -140,9 +142,8 @@ private:
     ) const;
 };
 
-// 常量定义
-constexpr const char* DEFAULT_ACCOUNT_ID = "default";
-constexpr const char* DEFAULT_MAIN_KEY = "main";
+// 常量定义 — 统一使用 resolver.h 中的定义
+// DEFAULT_ACCOUNT_ID, DEFAULT_MAIN_KEY 已在 resolver.h 中定义
 
 } // namespace routing
 } // namespace hunterclaw

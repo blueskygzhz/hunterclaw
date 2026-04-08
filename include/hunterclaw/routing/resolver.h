@@ -1,6 +1,8 @@
 // HunterClaw - Routing System
-// 严格对齐 OpenClaw routing/
-// Purpose: Agent route resolution, session key management, account ID normalization
+// ✅ 严格对齐 OpenClaw routing/
+//   src/routing/account-id.ts
+//   src/routing/session-key.ts
+//   src/routing/resolve-route.ts
 
 #pragma once
 
@@ -17,26 +19,34 @@ namespace routing {
 
 // ============================================================================
 // Account ID Management
+// ✅ 对齐 OpenClaw: account-id.ts
 // ============================================================================
 
 constexpr const char* DEFAULT_ACCOUNT_ID = "default";
 
-// Normalize account ID to canonical form
+// ✅ 对齐 OpenClaw: normalizeAccountId
 std::string normalize_account_id(const std::string& value);
+// ✅ 对齐 OpenClaw: normalizeOptionalAccountId
 std::optional<std::string> normalize_optional_account_id(const std::string& value);
 
 // ============================================================================
 // Agent ID Management
+// ✅ 对齐 OpenClaw: session-key.ts:89-116
 // ============================================================================
 
 constexpr const char* DEFAULT_AGENT_ID = "main";
 constexpr const char* DEFAULT_MAIN_KEY = "main";
 
+// ✅ 对齐 OpenClaw: normalizeAgentId
 std::string normalize_agent_id(const std::string& value);
+// ✅ 对齐 OpenClaw: isValidAgentId (新增)
+bool is_valid_agent_id(const std::string& value);
+// ✅ 对齐 OpenClaw: sanitizeAgentId = normalizeAgentId
 std::string sanitize_agent_id(const std::string& value);
 
 // ============================================================================
 // Session Key Management
+// ✅ 对齐 OpenClaw: session-key.ts
 // ============================================================================
 
 enum class SessionKeyShape {
@@ -51,11 +61,20 @@ struct ParsedAgentSessionKey {
   std::string rest;
 };
 
+// ✅ 对齐 OpenClaw: parseAgentSessionKey
 std::optional<ParsedAgentSessionKey> parse_agent_session_key(const std::string& session_key);
+// ✅ 对齐 OpenClaw: classifySessionKeyShape
 SessionKeyShape classify_session_key_shape(const std::string& session_key);
 
+// ✅ 对齐 OpenClaw: normalizeMainKey
 std::string normalize_main_key(const std::string& value);
+// ✅ 对齐 OpenClaw: toAgentRequestSessionKey
 std::optional<std::string> to_agent_request_session_key(const std::string& store_key);
+// ✅ 对齐 OpenClaw: toAgentStoreSessionKey (新增)
+std::string to_agent_store_session_key(const std::string& agent_id,
+                                       const std::string& request_key,
+                                       const std::string& main_key = "");
+// ✅ 对齐 OpenClaw: resolveAgentIdFromSessionKey
 std::string resolve_agent_id_from_session_key(const std::string& session_key);
 
 struct BuildAgentMainSessionKeyParams {
@@ -63,18 +82,48 @@ struct BuildAgentMainSessionKeyParams {
   std::optional<std::string> main_key;
 };
 
+// ✅ 对齐 OpenClaw: buildAgentMainSessionKey
 std::string build_agent_main_session_key(const BuildAgentMainSessionKeyParams& params);
 
 struct BuildAgentPeerSessionKeyParams {
   std::string agent_id;
+  std::optional<std::string> main_key;       // ✅ 新增（对齐 OpenClaw mainKey 参数）
   std::string channel;
   std::optional<std::string> account_id;
-  std::string peer_kind;  // "direct", "group", "channel", etc.
+  std::string peer_kind;                     // "direct", "group", "channel", "thread", ...
   std::optional<std::string> peer_id;
-  std::string dm_scope;  // "main", "per-peer", "per-channel-peer", "per-account-channel-peer"
+  std::string dm_scope;                      // "main"(默认), "per-peer", "per-channel-peer", "per-account-channel-peer"
+  // identity_links 由调用方预处理后通过 peer_id 传入
 };
 
+// ✅ 对齐 OpenClaw: buildAgentPeerSessionKey
 std::string build_agent_peer_session_key(const BuildAgentPeerSessionKeyParams& params);
+
+// ✅ 对齐 OpenClaw: buildGroupHistoryKey (新增)
+struct BuildGroupHistoryKeyParams {
+  std::string channel;
+  std::optional<std::string> account_id;
+  std::string peer_kind;  // "group" | "channel"
+  std::string peer_id;
+};
+
+std::string build_group_history_key(const BuildGroupHistoryKeyParams& params);
+
+// ✅ 对齐 OpenClaw: resolveThreadSessionKeys (新增)
+struct ResolveThreadSessionKeysParams {
+  std::string base_session_key;
+  std::optional<std::string> thread_id;
+  std::optional<std::string> parent_session_key;
+  std::optional<bool> use_suffix;  // 默认 true
+};
+
+struct ResolvedThreadSessionKeys {
+  std::string session_key;
+  std::optional<std::string> parent_session_key;
+};
+
+ResolvedThreadSessionKeys resolve_thread_session_keys(
+    const ResolveThreadSessionKeysParams& params);
 
 // ============================================================================
 // Route Peer
@@ -117,24 +166,26 @@ struct AgentRouteBinding {
 
 // ============================================================================
 // Resolved Agent Route
+// ✅ 对齐 OpenClaw: ResolvedAgentRoute (resolve-route.ts:39-59)
 // ============================================================================
 
+// ✅ 对齐 OpenClaw: matchedBy 字符串
 enum class RouteMatchSource {
-  BINDING_PEER,
-  BINDING_PEER_PARENT,
-  BINDING_GUILD_ROLES,
-  BINDING_GUILD,
-  BINDING_TEAM,
-  BINDING_ACCOUNT,
-  BINDING_CHANNEL,
-  DEFAULT
+  BINDING_PEER,         // "binding.peer"
+  BINDING_PEER_PARENT,  // "binding.peer.parent"
+  BINDING_GUILD_ROLES,  // "binding.guild+roles"
+  BINDING_GUILD,        // "binding.guild"
+  BINDING_TEAM,         // "binding.team"
+  BINDING_ACCOUNT,      // "binding.account"
+  BINDING_CHANNEL,      // "binding.channel"
+  DEFAULT               // "default"
 };
 
 std::string route_match_source_to_string(RouteMatchSource source);
 
 enum class LastRoutePolicy {
-  MAIN,
-  SESSION
+  MAIN,    // "main"
+  SESSION  // "session"
 };
 
 struct ResolvedAgentRoute {
@@ -147,28 +198,31 @@ struct ResolvedAgentRoute {
   RouteMatchSource matched_by;
 };
 
+// ✅ 对齐 OpenClaw: deriveLastRoutePolicy
 LastRoutePolicy derive_last_route_policy(const std::string& session_key,
                                          const std::string& main_session_key);
-
+// ✅ 对齐 OpenClaw: resolveInboundLastRouteSessionKey
 std::string resolve_inbound_last_route_session_key(const ResolvedAgentRoute& route,
                                                    const std::string& session_key);
 
 // ============================================================================
 // Route Resolution Input
+// ✅ 对齐 OpenClaw: ResolveAgentRouteInput (resolve-route.ts:26-37)
 // ============================================================================
 
 struct ResolveAgentRouteInput {
   std::string channel;
   std::optional<std::string> account_id;
   std::optional<RoutePeer> peer;
-  std::optional<RoutePeer> parent_peer;
+  std::optional<RoutePeer> parent_peer;  // ✅ 对齐 OpenClaw: parentPeer
   std::optional<std::string> guild_id;
   std::optional<std::string> team_id;
-  std::vector<std::string> member_role_ids;
+  std::vector<std::string> member_role_ids;  // ✅ 对齐 OpenClaw: memberRoleIds
 };
 
 // ============================================================================
 // Route Resolver
+// ✅ 对齐 OpenClaw: resolveAgentRoute (resolve-route.ts:614)
 // ============================================================================
 
 class RouteResolver {
@@ -176,21 +230,22 @@ class RouteResolver {
   RouteResolver();
   ~RouteResolver();
 
-  // Configuration
   void set_default_agent_id(const std::string& agent_id);
+  // ✅ dm_scope 对齐 OpenClaw: cfg.session?.dmScope ?? "main"
   void set_dm_scope(const std::string& scope);
   void add_binding(const AgentRouteBinding& binding);
   void clear_bindings();
 
-  // Route resolution
+  // ✅ 对齐 OpenClaw: resolveAgentRoute — 7 层分层匹配
   ResolvedAgentRoute resolve_route(const ResolveAgentRouteInput& input);
 
-  // Binding queries
+  // ✅ 对齐 OpenClaw: listBoundAccountIds (bindings.ts:48)
   std::vector<std::string> list_bound_account_ids(const std::string& channel_id) const;
+  // ✅ 对齐 OpenClaw: resolveDefaultAgentBoundAccountId (bindings.ts:64)
   std::optional<std::string> resolve_default_agent_bound_account_id(
       const std::string& channel_id) const;
 
-  // Agent lookup
+  // ✅ 对齐 OpenClaw: pickFirstExistingAgentId (resolve-route.ts:151)
   std::string pick_first_existing_agent_id(const std::string& agent_id) const;
   void register_agent(const std::string& agent_id);
 
@@ -200,7 +255,7 @@ class RouteResolver {
 };
 
 // ============================================================================
-// Bindings Registry
+// BindingsRegistry
 // ============================================================================
 
 class BindingsRegistry {
@@ -215,7 +270,6 @@ class BindingsRegistry {
   std::vector<AgentRouteBinding> list_by_channel(const std::string& channel) const;
   std::vector<AgentRouteBinding> list_all() const;
 
-  // Query helpers
   std::optional<std::string> find_agent_for_account(const std::string& channel,
                                                     const std::string& account_id) const;
 
@@ -225,7 +279,7 @@ class BindingsRegistry {
 };
 
 // ============================================================================
-// Account Lookup
+// AccountLookup
 // ============================================================================
 
 class AccountLookup {

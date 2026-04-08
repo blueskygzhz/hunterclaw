@@ -801,9 +801,9 @@ ChannelPlugin make_telegram_plugin() {
                     ? body["message"]["chat"].value("type", std::string{"private"})
                     : "private";
                 if (chat_type_str == "private") {
-                    inbound_msg.chat_type = routing::ChatType::Direct;
+                    inbound_msg.chat_type = routing::ChatType::DIRECT;
                 } else {
-                    inbound_msg.chat_type = routing::ChatType::Group;
+                    inbound_msg.chat_type = routing::ChatType::GROUP;
                 }
             }
 

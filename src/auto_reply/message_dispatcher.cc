@@ -212,8 +212,8 @@ static channels::InboundMessage finalize_inbound_context(
         // e.g. "telegram:dm:123456" or "feishu:group:oc_abc"
         const std::string chat_type_str = [&]() -> std::string {
             switch (ctx.chat_type) {
-                case routing::ChatType::Group:   return "group";
-                case routing::ChatType::Channel: return "channel";
+                case routing::ChatType::GROUP:   return "group";
+                case routing::ChatType::CHANNEL: return "channel";
                 default:                         return "dm";
             }
         }();
@@ -472,8 +472,8 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
         // Aligned with openclaw: isAuthorizedSender check
         // In DM context, the sender is always authorized.
         // In group context, only allowFrom senders are authorized.
-        const bool is_dm = (message.chat_type != routing::ChatType::Group &&
-                            message.chat_type != routing::ChatType::Channel);
+        const bool is_dm = (message.chat_type != routing::ChatType::GROUP &&
+                            message.chat_type != routing::ChatType::CHANNEL);
         if (is_dm) {
             command_authorized = true;
         } else if (!config.channel.allow_from.empty()) {
@@ -2417,7 +2417,7 @@ MessageDispatcher::PermissionCheckResult MessageDispatcher::check_permissions(
     }
 
     // Group policy check
-    if (message.chat_type == routing::ChatType::Group) {
+    if (message.chat_type == routing::ChatType::GROUP) {
         switch (config.channel.group_policy) {
             case ChannelConfig::GroupPolicy::Block:
                 result.allowed = false;

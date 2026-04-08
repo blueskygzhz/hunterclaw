@@ -30,7 +30,7 @@ struct InboundMessage {
     
     // 聊天信息
     std::string chat_id;              // 聊天会话ID
-    routing::ChatType chat_type = routing::ChatType::Direct;  // 聊天类型
+    routing::ChatType chat_type = routing::ChatType::DIRECT;  // 聊天类型
     std::optional<std::string> guild_id;  // 服务器ID (Discord等)
     std::optional<std::string> thread_id; // 线程ID
     
