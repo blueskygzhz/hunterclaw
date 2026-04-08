@@ -148,6 +148,14 @@ public:
     /// 设置配置
     virtual void set_config(const LLMConfig& config) = 0;
     
+    /// 🎯 对齐 OpenClaw: failover 时动态覆盖模型名
+    /// 默认实现修改内部配置的 model 字段
+    virtual void set_model_override(const std::string& model) {
+        auto config = get_config();
+        config.model = model;
+        set_config(config);
+    }
+    
     /// 估算token数量
     virtual int estimate_tokens(const std::string& text) const = 0;
 };

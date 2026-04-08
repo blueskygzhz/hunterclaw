@@ -3,6 +3,7 @@
 #include <spdlog/spdlog.h>
 #include <mutex>
 #include <shared_mutex>
+#include <set>
 
 namespace hunterclaw {
 namespace gateway {
@@ -83,14 +84,33 @@ PermissionCheckResult MethodGuard::check_permission(
         };
     }
     
-    // 3. 查找方法所需权限
-    auto scope_opt = get_method_scope(method);
-    if (!scope_opt.has_value()) {
-        // 未定义权限要求 → 默认通过
+    // 🎯 对齐 OpenClaw: NODE_ROLE_METHODS 不受 OperatorScope 限制
+    if (node_role_methods().count(method) > 0) {
         return { true, "", "" };
     }
     
-    std::string required_scope = scope_opt.value();
+    // 3. 查找方法所需权限 (显式映射)
+    auto scope_opt = get_method_scope(method);
+    
+    std::string required_scope;
+    if (scope_opt.has_value()) {
+        required_scope = scope_opt.value();
+    } else {
+        // 🎯 对齐 OpenClaw: ADMIN_METHOD_PREFIXES 前缀匹配
+        bool matched_prefix = false;
+        for (const auto& prefix : admin_method_prefixes()) {
+            if (method.compare(0, prefix.size(), prefix) == 0) {
+                required_scope = operator_scope::ADMIN;
+                matched_prefix = true;
+                break;
+            }
+        }
+        
+        if (!matched_prefix) {
+            // 🎯 对齐 OpenClaw: 未分类方法默认需要 admin scope
+            required_scope = operator_scope::ADMIN;
+        }
+    }
     
     // 4. 检查权限
     return check_scope(client_ctx, required_scope);
@@ -100,7 +120,25 @@ PermissionCheckResult MethodGuard::check_scope(
     const ClientContext& client_ctx,
     const std::string& required_scope
 ) const {
-    if (AuthManager::has_scope(client_ctx.scopes(), required_scope)) {
+    const auto& client_scopes = client_ctx.scopes();
+    
+    // 🎯 对齐 OpenClaw authorizeOperatorScopesForMethod:
+    // 1. operator.admin 拥有所有权限
+    if (AuthManager::has_scope(client_scopes, operator_scope::ADMIN)) {
+        return { true, "", "" };
+    }
+    
+    // 2. operator.read 方法可以被 operator.write 满足
+    if (required_scope == operator_scope::READ) {
+        if (AuthManager::has_scope(client_scopes, operator_scope::READ) ||
+            AuthManager::has_scope(client_scopes, operator_scope::WRITE)) {
+            return { true, "", "" };
+        }
+        return { false, auth_errors::PERMISSION_DENIED, required_scope };
+    }
+    
+    // 3. 精确匹配
+    if (AuthManager::has_scope(client_scopes, required_scope)) {
         return { true, "", "" };
     }
     
@@ -312,118 +350,135 @@ std::vector<json> MethodGuard::get_audit_logs(int limit) const {
 
 // ========== 静态方法 ==========
 
+// 🎯 严格对齐 OpenClaw method-scopes.ts: NODE_ROLE_METHODS
+static const std::set<std::string>& node_role_methods() {
+    static const std::set<std::string> methods = {
+        "node.invoke.result",
+        "node.event",
+        "node.pending.drain",
+        "node.canvas.capability.refresh",
+        "node.pending.pull",
+        "node.pending.ack",
+        "skills.bins"
+    };
+    return methods;
+}
+
+// 🎯 严格对齐 OpenClaw method-scopes.ts: ADMIN_METHOD_PREFIXES
+static const std::vector<std::string>& admin_method_prefixes() {
+    static const std::vector<std::string> prefixes = {
+        "exec.approvals.",
+        "config.",
+        "wizard.",
+        "update."
+    };
+    return prefixes;
+}
+
 std::map<std::string, std::string> MethodGuard::get_default_method_scopes() {
-    // 🎯 100% OpenClaw 对齐的方法权限映射
+    // 🎯 严格对齐 OpenClaw method-scopes.ts: METHOD_SCOPE_GROUPS
+    // 5 个 OperatorScope 分组，每个方法映射到恰好一个 scope
     return {
-        // ========== Agent Methods ==========
-        {"agent.run", scopes::AGENT_RUN},
-        {"agent.cancel", scopes::AGENT_CANCEL},
-        {"agent.abort", scopes::AGENT_CANCEL},
-        {"agent.pause", scopes::AGENT_CANCEL},
-        {"agent.resume", scopes::AGENT_CANCEL},
-        {"agent.status", scopes::AGENT_RUN},       // 读取也需要权限
-        {"agent.wait", scopes::AGENT_RUN},
-        {"agent.result", scopes::AGENT_RUN},
-        {"agent.logs", scopes::AGENT_DEBUG},
-        {"agent.snapshot", scopes::AGENT_DEBUG},
-        {"agent.list", scopes::AGENT_RUN},
-        {"agent.identity", scopes::AGENT_RUN},
-        
-        {"agents.spawn", scopes::AGENT_RUN},
-        {"agents.list", scopes::AGENT_RUN},
-        {"agents.terminate", scopes::AGENT_CANCEL},
-        
-        // ========== Session Methods ==========
-        {"session.create", scopes::SESSION_WRITE},
-        {"session.update", scopes::SESSION_WRITE},
-        {"session.delete", scopes::SESSION_DELETE},
-        {"session.reset", scopes::SESSION_WRITE},
-        {"session.get", scopes::SESSION_READ},
-        {"session.list", scopes::SESSION_READ},
-        
-        // ========== Chat Methods ==========
-        {"chat.send", scopes::AGENT_RUN},          // 发送消息 = 运行 Agent
-        {"chat.abort", scopes::AGENT_CANCEL},
-        {"chat.history", scopes::SESSION_READ},
-        {"chat.updateParams", scopes::SESSION_WRITE},
-        {"chat.regenerate", scopes::AGENT_RUN},
-        {"chat.fork", scopes::SESSION_WRITE},
-        {"chat.summarize", scopes::AGENT_RUN},
-        {"chat.inject", scopes::SESSION_WRITE},
-        {"chat.edit", scopes::SESSION_WRITE},
-        {"chat.delete", scopes::SESSION_WRITE},
-        {"chat.transcript", scopes::SESSION_READ},
-        {"chat.export", scopes::SESSION_READ},
-        
-        // ========== Skill Methods ==========
-        {"skill.list", scopes::SKILL_LIST},
-        {"skill.get", scopes::SKILL_LIST},
-        {"skill.install", scopes::SKILL_INSTALL},
-        {"skill.update", scopes::SKILL_INSTALL},
-        {"skill.uninstall", scopes::SKILL_UNINSTALL},
-        {"skill.reload", scopes::SKILL_INSTALL},
-        
-        // ========== Plugin Methods ==========
-        {"plugin.list", scopes::PLUGIN_LIST},
-        {"plugin.install", scopes::PLUGIN_INSTALL},
-        {"plugin.uninstall", scopes::PLUGIN_UNINSTALL},
-        
-        // ========== Channel Methods ==========
-        {"channel.list", scopes::CHANNEL_MANAGE},
-        {"channel.get", scopes::CHANNEL_MANAGE},
-        {"channel.start", scopes::CHANNEL_MANAGE},
-        {"channel.stop", scopes::CHANNEL_MANAGE},
-        {"channel.restart", scopes::CHANNEL_MANAGE},
-        {"channel.send", scopes::CHANNEL_MANAGE},
-        {"channel.health", scopes::CHANNEL_MANAGE},
-        {"channel.config", scopes::CHANNEL_MANAGE},
-        
-        // ========== Config Methods ==========
-        {"config.get", scopes::SESSION_READ},      // 读取配置需要基本权限
-        {"config.set", scopes::ADMIN_FULL},        // 修改配置需要管理员权限
-        {"config.reload", scopes::ADMIN_FULL},
-        {"config.patch", scopes::ADMIN_FULL},
-        {"config.apply", scopes::ADMIN_FULL},
-        {"config.validate", scopes::SESSION_READ},
-        {"config.export", scopes::SESSION_READ},
-        {"config.schema", scopes::SESSION_READ},
-        
-        // ========== Discovery & Nodes (管理员功能) ==========
-        {"discovery.announce", scopes::ADMIN_FULL},
-        {"discovery.query", scopes::ADMIN_FULL},
-        {"discovery.health", scopes::ADMIN_FULL},
-        
-        {"nodes.list", scopes::ADMIN_FULL},
-        {"nodes.connect", scopes::ADMIN_FULL},
-        {"nodes.disconnect", scopes::ADMIN_FULL},
-        {"nodes.invoke", scopes::ADMIN_FULL},
-        {"nodes.status", scopes::ADMIN_FULL},
-        {"nodes.broadcast", scopes::ADMIN_FULL},
-        {"nodes.subscribe", scopes::ADMIN_FULL},
-        {"nodes.unsubscribe", scopes::ADMIN_FULL},
-        {"nodes.discover", scopes::ADMIN_FULL},
-        {"nodes.register", scopes::ADMIN_FULL},
-        {"nodes.health", scopes::ADMIN_FULL},
-        {"nodes.sync", scopes::ADMIN_FULL},
-        
-        // ========== Hooks (管理员功能) ==========
-        {"hooks.register", scopes::ADMIN_FULL},
-        {"hooks.unregister", scopes::ADMIN_FULL},
-        {"hooks.list", scopes::ADMIN_FULL},
-        {"hooks.trigger", scopes::ADMIN_FULL},
-        
-        // ========== Cron (管理员功能) ==========
-        {"wake", scopes::SESSION_READ},            // Heartbeat 不需要特殊权限
-        {"cron.status", scopes::ADMIN_FULL},
-        {"cron.list", scopes::ADMIN_FULL},
-        {"cron.add", scopes::ADMIN_FULL},
-        {"cron.update", scopes::ADMIN_FULL},
-        {"cron.remove", scopes::ADMIN_FULL},
-        {"cron.run", scopes::ADMIN_FULL},
-        {"cron.runs", scopes::ADMIN_FULL}
-        
-        // ========== 注意 ==========
-        // ping, echo, status 不在此列表中,因为它们不需要鉴权
+        // ========== operator.approvals ==========
+        {"exec.approval.request",       operator_scope::APPROVALS},
+        {"exec.approval.waitDecision",  operator_scope::APPROVALS},
+        {"exec.approval.resolve",       operator_scope::APPROVALS},
+
+        // ========== operator.pairing ==========
+        {"node.pair.request",    operator_scope::PAIRING},
+        {"node.pair.list",       operator_scope::PAIRING},
+        {"node.pair.approve",    operator_scope::PAIRING},
+        {"node.pair.reject",     operator_scope::PAIRING},
+        {"node.pair.verify",     operator_scope::PAIRING},
+        {"device.pair.list",     operator_scope::PAIRING},
+        {"device.pair.approve",  operator_scope::PAIRING},
+        {"device.pair.reject",   operator_scope::PAIRING},
+        {"device.pair.remove",   operator_scope::PAIRING},
+        {"device.token.rotate",  operator_scope::PAIRING},
+        {"device.token.revoke",  operator_scope::PAIRING},
+        {"node.rename",          operator_scope::PAIRING},
+
+        // ========== operator.read ==========
+        {"health",                    operator_scope::READ},
+        {"doctor.memory.status",      operator_scope::READ},
+        {"logs.tail",                 operator_scope::READ},
+        {"channels.status",           operator_scope::READ},
+        {"status",                    operator_scope::READ},
+        {"usage.status",              operator_scope::READ},
+        {"usage.cost",                operator_scope::READ},
+        {"tts.status",                operator_scope::READ},
+        {"tts.providers",             operator_scope::READ},
+        {"models.list",               operator_scope::READ},
+        {"tools.catalog",             operator_scope::READ},
+        {"agents.list",               operator_scope::READ},
+        {"agent.identity.get",        operator_scope::READ},
+        {"skills.status",             operator_scope::READ},
+        {"voicewake.get",             operator_scope::READ},
+        {"sessions.list",             operator_scope::READ},
+        {"sessions.get",              operator_scope::READ},
+        {"sessions.preview",          operator_scope::READ},
+        {"sessions.resolve",          operator_scope::READ},
+        {"sessions.usage",            operator_scope::READ},
+        {"sessions.usage.timeseries", operator_scope::READ},
+        {"sessions.usage.logs",       operator_scope::READ},
+        {"cron.list",                 operator_scope::READ},
+        {"cron.status",               operator_scope::READ},
+        {"cron.runs",                 operator_scope::READ},
+        {"gateway.identity.get",      operator_scope::READ},
+        {"system-presence",           operator_scope::READ},
+        {"last-heartbeat",            operator_scope::READ},
+        {"node.list",                 operator_scope::READ},
+        {"node.describe",             operator_scope::READ},
+        {"chat.history",              operator_scope::READ},
+        {"config.get",                operator_scope::READ},
+        {"config.schema.lookup",      operator_scope::READ},
+        {"talk.config",               operator_scope::READ},
+        {"agents.files.list",         operator_scope::READ},
+        {"agents.files.get",          operator_scope::READ},
+
+        // ========== operator.write ==========
+        {"send",                  operator_scope::WRITE},
+        {"poll",                  operator_scope::WRITE},
+        {"agent",                 operator_scope::WRITE},
+        {"agent.wait",            operator_scope::WRITE},
+        {"wake",                  operator_scope::WRITE},
+        {"talk.mode",             operator_scope::WRITE},
+        {"tts.enable",            operator_scope::WRITE},
+        {"tts.disable",           operator_scope::WRITE},
+        {"tts.convert",           operator_scope::WRITE},
+        {"tts.setProvider",       operator_scope::WRITE},
+        {"voicewake.set",         operator_scope::WRITE},
+        {"node.invoke",           operator_scope::WRITE},
+        {"chat.send",             operator_scope::WRITE},
+        {"chat.abort",            operator_scope::WRITE},
+        {"browser.request",       operator_scope::WRITE},
+        {"push.test",             operator_scope::WRITE},
+        {"node.pending.enqueue",  operator_scope::WRITE},
+
+        // ========== operator.admin ==========
+        {"channels.logout",   operator_scope::ADMIN},
+        {"agents.create",     operator_scope::ADMIN},
+        {"agents.update",     operator_scope::ADMIN},
+        {"agents.delete",     operator_scope::ADMIN},
+        {"skills.install",    operator_scope::ADMIN},
+        {"skills.update",     operator_scope::ADMIN},
+        {"secrets.reload",    operator_scope::ADMIN},
+        {"secrets.resolve",   operator_scope::ADMIN},
+        {"cron.add",          operator_scope::ADMIN},
+        {"cron.update",       operator_scope::ADMIN},
+        {"cron.remove",       operator_scope::ADMIN},
+        {"cron.run",          operator_scope::ADMIN},
+        {"sessions.patch",    operator_scope::ADMIN},
+        {"sessions.reset",    operator_scope::ADMIN},
+        {"sessions.delete",   operator_scope::ADMIN},
+        {"sessions.compact",  operator_scope::ADMIN},
+        {"connect",           operator_scope::ADMIN},
+        {"chat.inject",       operator_scope::ADMIN},
+        {"web.login.start",   operator_scope::ADMIN},
+        {"web.login.wait",    operator_scope::ADMIN},
+        {"set-heartbeats",    operator_scope::ADMIN},
+        {"system-event",      operator_scope::ADMIN},
+        {"agents.files.set",  operator_scope::ADMIN}
     };
 }
 

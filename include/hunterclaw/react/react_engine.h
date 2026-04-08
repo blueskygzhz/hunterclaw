@@ -122,6 +122,15 @@ struct StreamCallbacks {
     std::function<void()> on_end;
     std::function<void(const std::string& error)> on_error;
 
+    // 🎯 对齐 OpenClaw: onAgentEvent — structured stream events for WebSocket broadcast
+    // stream: "tool" | "assistant" | "lifecycle" | "thinking" | "compaction"
+    // data: JSON payload describing the event phase and details
+    struct AgentEvent {
+        std::string stream;    // "tool", "assistant", "lifecycle", "thinking", "compaction"
+        core::JsonValue data;  // { phase: "start"|"update"|"result", name, toolCallId, ... }
+    };
+    std::function<void(const AgentEvent& event)> on_agent_event;
+
     // 🎯 OpenClaw 对齐: 用于直连推送的 session_id
     std::string session_id;
 
@@ -204,6 +213,33 @@ struct ReactConfig {
     // 默认 disabled=false 以对齐 OpenClaw 的 DEFAULT_LOOP_DETECTION_CONFIG.enabled=false
     // 需要在 agent 配置中显式开启: loop_detection.enabled = true
     LoopDetectionConfig loop_detection;
+
+    // ============================================================================
+    // 🎯 对齐 OpenClaw run.ts:412-660: Auth profile rotation + model failover
+    // ============================================================================
+
+    // Auth profile — represents a single LLM provider credential
+    struct AuthProfile {
+        std::string id;           // e.g. "openai-main", "anthropic-fallback"
+        std::string provider;     // e.g. "openai", "anthropic"
+        std::string api_key;
+        std::string base_url;
+        std::string model;        // model override for this profile
+        int64_t cooldown_until_ms = 0;  // timestamp when cooldown expires (0 = not cooling)
+    };
+
+    // Failover configuration
+    struct FailoverConfig {
+        bool enabled = false;
+        // Auth profiles in priority order (first = primary, rest = fallbacks)
+        std::vector<AuthProfile> profiles;
+        // Cooldown duration in ms after a profile fails (default 60s)
+        int64_t cooldown_ms = 60000;
+        // Maximum retry attempts across all profiles before giving up
+        int max_retries = 3;
+        // Fallback model to use if primary model fails (thinking level degradation)
+        std::string fallback_model;
+    } failover;
 };
 
 // ReAct 引擎 - 对齐 OpenClaw
@@ -344,6 +380,10 @@ private:
         std::string last_block_reply_text;
         // 🎯 对齐 OpenClaw: suppressBlockChunks — set by finalizeAssistantTexts
         bool suppress_block_chunks = false;
+        // 🎯 对齐 OpenClaw EmbeddedBlockChunker: code-fence aware chunking
+        // Tracks whether we're inside a fenced code block (``` or ~~~)
+        bool in_code_fence = false;
+        std::string code_fence_marker;  // stores the opening fence marker for matching close
         // 🎯 对齐 OpenClaw: reasoningStreamOpen
         bool reasoning_stream_open = false;
         // 🎯 对齐 OpenClaw: emittedAssistantUpdate
@@ -362,6 +402,8 @@ private:
         std::string last_assistant_text_trimmed;
         // 🎯 对齐 OpenClaw: assistantTextBaseline
         int assistant_text_baseline = 0;
+        // 🎯 对齐 OpenClaw: noteLastAssistant — tracks last assistant message for agent_end error detection
+        std::string last_assistant_full_text;
         // 🎯 对齐 OpenClaw: partialBlockState (thinking/final stateful tracking)
         struct BlockState {
             bool thinking = false;

@@ -36,8 +36,8 @@ struct AuthResult {
     bool ok = false;
     std::string device_id;
     std::vector<std::string> scopes;
-    std::string reason;  // "NOT_AUTHENTICATED", "DEVICE_TOKEN_MISMATCH", "RATE_LIMITED", etc.
-    std::string method;  // "none", "bearer", "device", "challenge", "trusted-proxy"
+    std::string reason;  // "token_missing", "token_mismatch", "password_mismatch", "rate_limited", etc.
+    std::string method;  // "none", "token", "password", "device-token", "tailscale", "trusted-proxy"
     std::string user;    // 用户标识 (Trusted Proxy 模式)
     bool rate_limited = false;
     int64_t retry_after_ms = 0;
@@ -530,32 +530,46 @@ private:
 // 权限常量 (对齐 OpenClaw)
 // ============================================================================
 
+// ============================================================================
+// 🎯 严格对齐 OpenClaw method-scopes.ts: 5 个 OperatorScope
+// ============================================================================
+
+namespace operator_scope {
+    constexpr const char* ADMIN      = "operator.admin";
+    constexpr const char* READ       = "operator.read";
+    constexpr const char* WRITE      = "operator.write";
+    constexpr const char* APPROVALS  = "operator.approvals";
+    constexpr const char* PAIRING    = "operator.pairing";
+}
+
+// CLI 默认拥有所有 5 个 scope (对齐 OpenClaw CLI_DEFAULT_OPERATOR_SCOPES)
+inline std::vector<std::string> cli_default_operator_scopes() {
+    return {
+        operator_scope::ADMIN,
+        operator_scope::READ,
+        operator_scope::WRITE,
+        operator_scope::APPROVALS,
+        operator_scope::PAIRING
+    };
+}
+
+// 向后兼容别名 — 旧代码中引用 scopes::ADMIN_FULL 等的地方可平滑迁移
 namespace scopes {
-    // Agent 权限
-    constexpr const char* AGENT_RUN = "agent.run";
-    constexpr const char* AGENT_CANCEL = "agent.cancel";
-    constexpr const char* AGENT_DEBUG = "agent.debug";
-    
-    // Session 权限
-    constexpr const char* SESSION_READ = "session.read";
-    constexpr const char* SESSION_WRITE = "session.write";
-    constexpr const char* SESSION_DELETE = "session.delete";
-    
-    // Skill 权限
-    constexpr const char* SKILL_INSTALL = "skill.install";
-    constexpr const char* SKILL_UNINSTALL = "skill.uninstall";
-    constexpr const char* SKILL_LIST = "skill.list";
-    
-    // Plugin 权限
-    constexpr const char* PLUGIN_INSTALL = "plugin.install";
-    constexpr const char* PLUGIN_UNINSTALL = "plugin.uninstall";
-    constexpr const char* PLUGIN_LIST = "plugin.list";
-    
-    // Channel 权限
-    constexpr const char* CHANNEL_MANAGE = "channel.manage";
-    
-    // 管理员权限 (拥有所有权限)
-    constexpr const char* ADMIN_FULL = "admin.full";
+    // 映射到 OperatorScope
+    constexpr const char* ADMIN_FULL     = "operator.admin";
+    constexpr const char* AGENT_RUN      = "operator.write";    // agent → write scope
+    constexpr const char* AGENT_CANCEL   = "operator.write";
+    constexpr const char* AGENT_DEBUG    = "operator.read";
+    constexpr const char* SESSION_READ   = "operator.read";
+    constexpr const char* SESSION_WRITE  = "operator.admin";
+    constexpr const char* SESSION_DELETE = "operator.admin";
+    constexpr const char* SKILL_INSTALL  = "operator.admin";
+    constexpr const char* SKILL_UNINSTALL = "operator.admin";
+    constexpr const char* SKILL_LIST     = "operator.read";
+    constexpr const char* PLUGIN_INSTALL  = "operator.admin";
+    constexpr const char* PLUGIN_UNINSTALL = "operator.admin";
+    constexpr const char* PLUGIN_LIST    = "operator.read";
+    constexpr const char* CHANNEL_MANAGE = "operator.admin";
 }
 
 // ============================================================================

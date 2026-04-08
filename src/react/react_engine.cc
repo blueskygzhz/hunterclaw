@@ -532,15 +532,32 @@ ReactResult ReactEngine::execute_loop(
                 log()->warn("[ReactEngine] Token overflow detected: {} >= threshold, triggering compaction",
                            current_tokens);
                 
-                // 触发 compaction
-                auto compact_result = trigger_compaction(messages);
+                // 🎯 对齐 OpenClaw: compactionRetry — retry compaction up to 3 times
+                int compaction_attempts = 0;
+                const int max_compaction_retries = 3;
+                bool compaction_succeeded = false;
                 
-                if (compact_result.compacted) {
-                    log()->info("[ReactEngine] Compaction completed, continuing with {} messages",
-                               messages.size());
-                    // messages 已被 trigger_compaction 更新
-                } else {
-                    log()->warn("[ReactEngine] Compaction skipped: {}", compact_result.reason);
+                while (compaction_attempts < max_compaction_retries) {
+                    auto compact_result = trigger_compaction(messages);
+                    compaction_attempts++;
+                    
+                    if (compact_result.compacted) {
+                        log()->info("[ReactEngine] Compaction completed (attempt {}), continuing with {} messages",
+                                   compaction_attempts, messages.size());
+                        compaction_succeeded = true;
+                        break;
+                    } else {
+                        log()->warn("[ReactEngine] Compaction attempt {} failed: {}",
+                                   compaction_attempts, compact_result.reason);
+                        if (compaction_attempts < max_compaction_retries) {
+                            // 对齐 OpenClaw: resetForCompactionRetry — clear state before retry
+                            log()->info("[ReactEngine] Retrying compaction (attempt {})", compaction_attempts + 1);
+                        }
+                    }
+                }
+                
+                if (!compaction_succeeded) {
+                    log()->error("[ReactEngine] All {} compaction attempts failed", max_compaction_retries);
                 }
             }
         }
@@ -843,12 +860,12 @@ ReactEngine::LLMResponseData ReactEngine::call_llm(
 
         // 🎯 对齐 OpenClaw: thinking_delta / thinking_end handling
         // emitReasoningStream: compute delta vs lastStreamedReasoning
+        bool was_thinking = streaming_state_.reasoning_stream_open;
         if (extraction.has_reasoning && callbacks.on_reasoning_stream) {
             accumulated_reasoning_raw_ += extraction.reasoning;
             std::string formatted = format_reasoning_text(accumulated_reasoning_raw_);
 
             // Compute delta: new text since last emitted reasoning.
-            // Guard against non-prefix changes (e.g. trim/format altering earlier content).
             const std::string& prior = streaming_state_.last_streamed_reasoning;
             std::string delta_reasoning;
             if (!prior.empty() && formatted.find(prior) == 0) {
@@ -865,6 +882,16 @@ ReactEngine::LLMResponseData ReactEngine::call_llm(
             accumulated_reasoning += extraction.reasoning;
         }
 
+        // 🎯 对齐 OpenClaw handlers.messages.ts:193-194: emitReasoningEnd mid-stream
+        // Detect when thinking block ends (</think> tag processed in this delta)
+        if (!extraction.has_reasoning && was_thinking && !extraction.remaining_text.empty()) {
+            // </think> was processed — reasoning block closed, now producing non-reasoning text
+            if (streaming_state_.reasoning_stream_open && callbacks.on_reasoning_end) {
+                streaming_state_.reasoning_stream_open = false;
+                callbacks.on_reasoning_end();
+            }
+        }
+
         // 2. 发送助手输出流 (on_assistant_delta / onPartialReply)
         if (!extraction.remaining_text.empty()) {
             if (callbacks.on_assistant_delta) {
@@ -878,6 +905,35 @@ ReactEngine::LLMResponseData ReactEngine::call_llm(
         // 🎯 对齐 OpenClaw: blockBuffer accumulation (filtered, no <think> tags)
         streaming_state_.block_buffer += extraction.remaining_text;
 
+        // 🎯 对齐 OpenClaw EmbeddedBlockChunker: track code fence state
+        // Detect ``` or ~~~ at line start to toggle in_code_fence
+        {
+            const auto& buf = streaming_state_.block_buffer;
+            size_t search_start = buf.size() > extraction.remaining_text.size()
+                ? buf.size() - extraction.remaining_text.size() : 0;
+            // Scan for fence markers in the newly appended text
+            for (size_t pos = search_start; pos < buf.size(); ++pos) {
+                if (pos == 0 || buf[pos - 1] == '\n') {
+                    // Check for fence marker at start of line
+                    std::string_view rest(buf.data() + pos, buf.size() - pos);
+                    if (rest.size() >= 3 && (rest.substr(0, 3) == "```" || rest.substr(0, 3) == "~~~")) {
+                        std::string marker(rest.substr(0, 3));
+                        if (streaming_state_.in_code_fence) {
+                            // Close fence: must match opening marker type
+                            if (marker[0] == streaming_state_.code_fence_marker[0]) {
+                                streaming_state_.in_code_fence = false;
+                                streaming_state_.code_fence_marker.clear();
+                            }
+                        } else {
+                            // Open fence
+                            streaming_state_.in_code_fence = true;
+                            streaming_state_.code_fence_marker = marker;
+                        }
+                    }
+                }
+            }
+        }
+
         // 4. 🎯 对齐 OpenClaw: blockReplyBreak="text_end" — flush at each text_end
         // In the streaming callback we approximate text_end as each delta chunk.
         // For blockReplyBreak="message_end", flushing happens at message_end (after call_llm).
@@ -886,9 +942,12 @@ ReactEngine::LLMResponseData ReactEngine::call_llm(
             callbacks.on_block_reply &&
             !streaming_state_.block_buffer.empty()) {
             // Flush on paragraph/sentence boundaries (approximate text_end behavior)
+            // 🎯 对齐 OpenClaw EmbeddedBlockChunker: never flush inside code fences
             bool should_flush = false;
-            const auto& buf = streaming_state_.block_buffer;
-            if ((int)buf.size() >= config_.block_reply.max_chars) {
+            if (streaming_state_.in_code_fence) {
+                // Inside a code fence — only flush if max_chars exceeded (emergency)
+                should_flush = ((int)buf.size() >= config_.block_reply.max_chars * 2);
+            } else if ((int)buf.size() >= config_.block_reply.max_chars) {
                 should_flush = true;
             } else if ((int)buf.size() >= config_.block_reply.min_chars) {
                 switch (config_.block_reply.break_preference) {
@@ -934,8 +993,58 @@ ReactEngine::LLMResponseData ReactEngine::call_llm(
         }
     }
 
-    // 调用 LLM 的流式接口 (从 messages)
-    auto result = llm_client_->generate_stream_from_messages(messages, stream_callback);
+    // 🎯 对齐 OpenClaw run.ts:412-660: Auth profile rotation + model failover
+    // 调用 LLM 的流式接口 (从 messages)，支持 failover retry
+    auto attempt_llm_call = [&]() {
+        return llm_client_->generate_stream_from_messages(messages, stream_callback);
+    };
+
+    auto result = attempt_llm_call();
+
+    if (!result.ok && config_.failover.enabled && !config_.failover.profiles.empty()) {
+        // 对齐 OpenClaw: FailoverError → rotate to next profile + retry
+        auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        int attempts = 0;
+        for (auto& profile : config_.failover.profiles) {
+            if (attempts >= config_.failover.max_retries) break;
+            // Skip profiles in cooldown
+            if (profile.cooldown_until_ms > now_ms) {
+                log()->debug("[Failover] Skipping profile '{}' (cooling down)", profile.id);
+                continue;
+            }
+            log()->warn("[Failover] Primary LLM failed: '{}'. Trying profile '{}' (model={})",
+                        result.error, profile.id, profile.model);
+            // Apply profile's model/credentials
+            if (!profile.model.empty() && llm_client_) {
+                llm_client_->set_model_override(profile.model);
+            }
+            // Reset streaming state for retry
+            streaming_state_.delta_buffer.clear();
+            streaming_state_.block_buffer.clear();
+            result = attempt_llm_call();
+            attempts++;
+            if (result.ok) {
+                log()->info("[Failover] Profile '{}' succeeded", profile.id);
+                break;
+            } else {
+                // Put failed profile on cooldown
+                profile.cooldown_until_ms = now_ms + config_.failover.cooldown_ms;
+                log()->warn("[Failover] Profile '{}' failed: {}", profile.id, result.error);
+            }
+        }
+        // 对齐 OpenClaw: fallback_model 降级 (thinking level degradation)
+        if (!result.ok && !config_.failover.fallback_model.empty()) {
+            log()->warn("[Failover] All profiles exhausted. Trying fallback model: {}",
+                        config_.failover.fallback_model);
+            if (llm_client_) {
+                llm_client_->set_model_override(config_.failover.fallback_model);
+            }
+            streaming_state_.delta_buffer.clear();
+            streaming_state_.block_buffer.clear();
+            result = attempt_llm_call();
+        }
+    }
     
     if (!result.ok) {
         // 失败时返回错误
@@ -960,6 +1069,8 @@ ReactEngine::LLMResponseData ReactEngine::call_llm(
 
     response.text = accumulated_text;
     response.reasoning = accumulated_reasoning;
+    // 🎯 对齐 OpenClaw: noteLastAssistant — track last assistant text for agent_end
+    streaming_state_.last_assistant_full_text = accumulated_text;
     // ✅ 对齐 OpenClaw: 解析 tool_calls 和 usage
     // tool_calls 已在流式回调中收集，这里从 accumulated_tool_calls_ 读取
     if (!accumulated_tool_calls_.empty()) {
@@ -1040,8 +1151,26 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
     // unless the model requests parallel tool calls.
     if (!config_.parallel_tool_calls || tool_calls.size() <= 1) {
         for (const auto& tool_call : tool_calls) {
+            // ✅ 对齐 OpenClaw handlers.tools.ts:302-306: handleToolExecutionStart
+            // Flush pending block replies BEFORE tool execution to preserve message boundaries
+            if (config_.block_reply.enabled) {
+                flush_block_reply_buffer(callbacks);
+            }
+            if (callbacks.on_block_reply_flush) {
+                callbacks.on_block_reply_flush();
+            }
+
             if (callbacks.on_tool_start) {
                 callbacks.on_tool_start(tool_call.name, tool_call.input);
+            }
+
+            // ✅ 对齐 OpenClaw handlers.tools.ts:341-355: emit tool start AgentEvent
+            if (callbacks.on_agent_event) {
+                core::JsonValue data;
+                data["phase"] = "start";
+                data["name"] = tool_call.name;
+                data["toolCallId"] = tool_call.id;
+                callbacks.on_agent_event({"tool", std::move(data)});
             }
 
             // ✅ 对齐 OpenClaw: runBeforeToolCallHook — loop detection (before execute)
@@ -1077,6 +1206,62 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                     tool_call.name, tool_call.input, tool_call.id);
             }
 
+            // ✅ 对齐 OpenClaw: runBeforeToolCallHook — plugin hook runner (before execute)
+            // pi-tools.before-tool-call.ts:150-193:
+            //   const hookRunner = getGlobalHookRunner();
+            //   if (hookRunner?.hasHooks("before_tool_call")) { ... }
+            core::JsonValue effective_params = tool_call.input;
+            {
+                auto* hook_mgr = tools::get_global_hook_manager();
+                if (hook_mgr && hook_mgr->has_before_tool_call_hooks()) {
+                    try {
+                        // 构建 event + context (对齐 OpenClaw before-tool-call.ts:156-172)
+                        plugins::PluginHookBeforeToolCallEvent hook_event;
+                        hook_event.tool_name = tool_call.name;
+                        hook_event.params_json = tool_call.input.dump();
+                        if (!callbacks.run_id.empty()) hook_event.run_id = callbacks.run_id;
+                        hook_event.tool_call_id = tool_call.id;
+
+                        plugins::PluginHookToolContext hook_ctx;
+                        hook_ctx.tool_name = tool_call.name;
+                        if (!callbacks.session_id.empty()) hook_ctx.session_id = callbacks.session_id;
+                        if (!callbacks.run_id.empty()) hook_ctx.run_id = callbacks.run_id;
+                        hook_ctx.tool_call_id = tool_call.id;
+
+                        auto hook_result = hook_mgr->run_before_tool_call(hook_event, hook_ctx);
+
+                        if (hook_result.has_value()) {
+                            if (hook_result->block) {
+                                std::string reason = hook_result->block_reason.value_or(
+                                    "Tool call blocked by plugin hook");
+                                log()->warn("Plugin hook blocked tool '{}': {}", tool_call.name, reason);
+                                tools::ToolResult blocked_result;
+                                blocked_result.success = false;
+                                blocked_result.error = reason;
+                                results[tool_call.id] = blocked_result;
+                                if (callbacks.on_tool_end) callbacks.on_tool_end(tool_call.name, blocked_result);
+                                continue;
+                            }
+                            // 对齐 OpenClaw: hookResult?.params → 合并参数
+                            if (hook_result->params_json.has_value()) {
+                                auto parsed = core::JsonValue::parse(*hook_result->params_json);
+                                if (parsed.ok && parsed.value) {
+                                    effective_params = std::move(*parsed.value);
+                                }
+                            }
+                        }
+                    } catch (const std::exception& e) {
+                        // 对齐 OpenClaw: hook 异常降级 — 记日志，继续执行
+                        // before-tool-call.ts:188-191: log.warn, continue
+                        log()->warn("before_tool_call hook failed: tool={} error={}",
+                                    tool_call.name, e.what());
+                    }
+                }
+            }
+
+            // ✅ 对齐 OpenClaw handlers.tools.ts:314 — 记录工具启动时间
+            auto tool_start_time = std::chrono::steady_clock::now();
+
             std::unique_ptr<observability::Span> span;
             try {
                 span = observability::Tracer::instance().start_span(
@@ -1085,16 +1270,55 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                 span->set_attribute("tool_call_id", tool_call.id);
             } catch (...) {}
             try {
-                auto result = tool_manager_->execute_tool(tool_call.name, tool_call.input);
+                auto result = tool_manager_->execute_tool(tool_call.name, effective_params);
                 if (span) span->set_status(result.success, result.error);
                 if (callbacks.on_tool_end) callbacks.on_tool_end(tool_call.name, result);
                 results[tool_call.id] = result;
 
+                // ✅ 对齐 OpenClaw handlers.tools.ts:521-542: emit tool result AgentEvent
+                if (callbacks.on_agent_event) {
+                    core::JsonValue data;
+                    data["phase"] = "result";
+                    data["name"] = tool_call.name;
+                    data["toolCallId"] = tool_call.id;
+                    data["isError"] = false;
+                    callbacks.on_agent_event({"tool", std::move(data)});
+                }
+
                 // ✅ 对齐 OpenClaw: recordLoopOutcome (success path)
-                // before-tool-call.ts:230-236: recordToolCallOutcome with result
                 if (loop_detection_state_) {
                     loop_detection_state_->record_tool_call_outcome(
                         tool_call.name, result, "");
+                }
+
+                // ✅ 对齐 OpenClaw handlers.tools.ts:550-575: after_tool_call hook (fire-and-forget)
+                {
+                    auto* hook_mgr = tools::get_global_hook_manager();
+                    if (hook_mgr && hook_mgr->has_after_tool_call_hooks()) {
+                        try {
+                            auto duration = std::chrono::steady_clock::now() - tool_start_time;
+                            double duration_ms = std::chrono::duration<double, std::milli>(duration).count();
+
+                            plugins::PluginHookAfterToolCallEvent after_event;
+                            after_event.tool_name = tool_call.name;
+                            after_event.params_json = effective_params.dump();
+                            if (!callbacks.run_id.empty()) after_event.run_id = callbacks.run_id;
+                            after_event.tool_call_id = tool_call.id;
+                            after_event.result_json = result.output.dump();
+                            after_event.duration_ms = static_cast<int>(duration_ms);
+
+                            plugins::PluginHookToolContext after_ctx;
+                            after_ctx.tool_name = tool_call.name;
+                            if (!callbacks.session_id.empty()) after_ctx.session_id = callbacks.session_id;
+                            if (!callbacks.run_id.empty()) after_ctx.run_id = callbacks.run_id;
+                            after_ctx.tool_call_id = tool_call.id;
+
+                            hook_mgr->run_after_tool_call(after_event, after_ctx);
+                        } catch (const std::exception& e) {
+                            log()->warn("after_tool_call hook failed: tool={} error={}",
+                                        tool_call.name, e.what());
+                        }
+                    }
                 }
             } catch (const std::exception& e) {
                 if (span) { span->set_status(false, e.what()); }
@@ -1104,11 +1328,50 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                 if (callbacks.on_tool_end) callbacks.on_tool_end(tool_call.name, error_result);
                 results[tool_call.id] = error_result;
 
+                // ✅ 对齐 OpenClaw: emit tool result AgentEvent (error)
+                if (callbacks.on_agent_event) {
+                    core::JsonValue data;
+                    data["phase"] = "result";
+                    data["name"] = tool_call.name;
+                    data["toolCallId"] = tool_call.id;
+                    data["isError"] = true;
+                    callbacks.on_agent_event({"tool", std::move(data)});
+                }
+
                 // ✅ 对齐 OpenClaw: recordLoopOutcome (error path)
-                // before-tool-call.ts:239-245: recordToolCallOutcome with error
                 if (loop_detection_state_) {
                     loop_detection_state_->record_tool_call_outcome(
                         tool_call.name, error_result, e.what());
+                }
+
+                // ✅ 对齐 OpenClaw handlers.tools.ts:550-575: after_tool_call hook (error path)
+                {
+                    auto* hook_mgr = tools::get_global_hook_manager();
+                    if (hook_mgr && hook_mgr->has_after_tool_call_hooks()) {
+                        try {
+                            auto duration = std::chrono::steady_clock::now() - tool_start_time;
+                            double duration_ms = std::chrono::duration<double, std::milli>(duration).count();
+
+                            plugins::PluginHookAfterToolCallEvent after_event;
+                            after_event.tool_name = tool_call.name;
+                            after_event.params_json = effective_params.dump();
+                            if (!callbacks.run_id.empty()) after_event.run_id = callbacks.run_id;
+                            after_event.tool_call_id = tool_call.id;
+                            after_event.error = e.what();
+                            after_event.duration_ms = static_cast<int>(duration_ms);
+
+                            plugins::PluginHookToolContext after_ctx;
+                            after_ctx.tool_name = tool_call.name;
+                            if (!callbacks.session_id.empty()) after_ctx.session_id = callbacks.session_id;
+                            if (!callbacks.run_id.empty()) after_ctx.run_id = callbacks.run_id;
+                            after_ctx.tool_call_id = tool_call.id;
+
+                            hook_mgr->run_after_tool_call(after_event, after_ctx);
+                        } catch (const std::exception& ex) {
+                            log()->warn("after_tool_call hook failed (error path): tool={} error={}",
+                                        tool_call.name, ex.what());
+                        }
+                    }
                 }
             }
         }
@@ -1120,16 +1383,35 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
         log()->info("Executing {} tools in parallel using thread pool", tool_calls.size());
         
         auto& thread_pool = get_thread_pool();
-        std::vector<std::future<std::pair<std::string, tools::ToolResult>>> futures;
+        // ParallelToolResult 定义在 loop 内部（每个 tool_call 的 lambda 中）
+        struct ParallelToolResultOuter {
+            std::string id;
+            tools::ToolResult result;
+            double duration_ms = 0.0;
+        };
+        std::vector<std::future<ParallelToolResultOuter>> futures;
         
         for (const auto& tool_call : tool_calls) {
+            // ✅ 对齐 OpenClaw handlers.tools.ts:302-306: flush block replies before tool execution
+            if (config_.block_reply.enabled) {
+                flush_block_reply_buffer(callbacks);
+            }
+            if (callbacks.on_block_reply_flush) {
+                callbacks.on_block_reply_flush();
+            }
+
             // 发送工具开始事件
             if (callbacks.on_tool_start) {
-                // ✅ 对齐 OpenClaw: 解析 tool_call.function.arguments
                 callbacks.on_tool_start(tool_call.name, tool_call.input);
-                
-                if (!callbacks.session_id.empty()) {
-                }
+            }
+
+            // ✅ 对齐 OpenClaw handlers.tools.ts:341-355: emit tool start AgentEvent
+            if (callbacks.on_agent_event) {
+                core::JsonValue data;
+                data["phase"] = "start";
+                data["name"] = tool_call.name;
+                data["toolCallId"] = tool_call.id;
+                callbacks.on_agent_event({"tool", std::move(data)});
             }
 
             // ✅ 对齐 OpenClaw: loop detection (before execute) — 并行路径
@@ -1163,10 +1445,63 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                 loop_detection_state_->record_tool_call(
                     tool_call.name, tool_call.input, tool_call.id);
             }
+
+            // ✅ 对齐 OpenClaw: runBeforeToolCallHook — plugin hook runner (并行路径)
+            // hook 在主线程调用（不在线程池内），避免并发竞争
+            core::JsonValue parallel_effective_params = tool_call.input;
+            {
+                auto* hook_mgr = tools::get_global_hook_manager();
+                if (hook_mgr && hook_mgr->has_before_tool_call_hooks()) {
+                    try {
+                        plugins::PluginHookBeforeToolCallEvent hook_event;
+                        hook_event.tool_name = tool_call.name;
+                        hook_event.params_json = tool_call.input.dump();
+                        if (!callbacks.run_id.empty()) hook_event.run_id = callbacks.run_id;
+                        hook_event.tool_call_id = tool_call.id;
+
+                        plugins::PluginHookToolContext hook_ctx;
+                        hook_ctx.tool_name = tool_call.name;
+                        if (!callbacks.session_id.empty()) hook_ctx.session_id = callbacks.session_id;
+                        if (!callbacks.run_id.empty()) hook_ctx.run_id = callbacks.run_id;
+                        hook_ctx.tool_call_id = tool_call.id;
+
+                        auto hook_result = hook_mgr->run_before_tool_call(hook_event, hook_ctx);
+
+                        if (hook_result.has_value()) {
+                            if (hook_result->block) {
+                                std::string reason = hook_result->block_reason.value_or(
+                                    "Tool call blocked by plugin hook");
+                                log()->warn("Plugin hook blocked tool '{}' (parallel): {}", tool_call.name, reason);
+                                std::string tool_id = tool_call.id;
+                                auto f = std::async(std::launch::deferred,
+                                    [tool_id, reason]() -> ParallelToolResultOuter {
+                                        tools::ToolResult r;
+                                        r.success = false;
+                                        r.error = reason;
+                                        return {tool_id, r, 0.0};
+                                    });
+                                futures.push_back(std::move(f));
+                                continue;
+                            }
+                            if (hook_result->params_json.has_value()) {
+                                auto parsed = core::JsonValue::parse(*hook_result->params_json);
+                                if (parsed.ok && parsed.value) {
+                                    parallel_effective_params = std::move(*parsed.value);
+                                }
+                            }
+                        }
+                    } catch (const std::exception& e) {
+                        log()->warn("before_tool_call hook failed (parallel): tool={} error={}",
+                                    tool_call.name, e.what());
+                    }
+                }
+            }
             
             // ✅ 提交任务到全局线程池 (避免频繁创建/销毁线程)
-            auto future = thread_pool->submit([this, tool_call, callbacks]() 
-                -> std::pair<std::string, tools::ToolResult> {
+            // 🎯 对齐 OpenClaw handlers.tools.ts:314 — 记录 startTime 用于 after_tool_call durationMs
+            auto future = thread_pool->submit([this, tool_call, callbacks, parallel_effective_params]() 
+                -> ParallelToolResultOuter {
+                auto start = std::chrono::steady_clock::now();
                 
                 // ✅ 可观测性: 工具执行 Span (对齐 OpenClaw)
                 std::unique_ptr<observability::Span> span;
@@ -1177,37 +1512,26 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                     );
                     span->set_attribute("tool_name", tool_call.name);
                     span->set_attribute("tool_call_id", tool_call.id);
-                } catch (...) {
-                    // 故障隔离
-                }
+                } catch (...) {}
                 
                 try {
-                    // ✅ 对齐 OpenClaw: 解析 tool_call.function.arguments (JSON string) 为 JsonValue
-                    // tool_call.input 已经是解析后的 JsonValue
-                    core::JsonValue args = tool_call.input;
-                    
-                    // 执行工具 (可能耗时)
+                    core::JsonValue args = parallel_effective_params;
                     auto result = tool_manager_->execute_tool(tool_call.name, args);
-                    
-                    // ✅ Span 成功标记
-                    if (span) {
-                        span->set_status(result.success, result.error);
-                    }
-                    
-                    return std::make_pair(tool_call.id, result);
-                    
+                    if (span) span->set_status(result.success, result.error);
+                    auto dur = std::chrono::steady_clock::now() - start;
+                    double ms = std::chrono::duration<double, std::milli>(dur).count();
+                    return {tool_call.id, result, ms};
                 } catch (const std::exception& e) {
-                    // ✅ Span 失败标记
                     if (span) {
                         span->set_status(false, e.what());
                         span->add_event("error", {{"exception", e.what()}});
                     }
-                    
-                    // 捕获异常并转换为错误结果
                     tools::ToolResult error_result;
                     error_result.success = false;
                     error_result.error = std::string("Tool execution failed: ") + e.what();
-                    return {tool_call.id, error_result};
+                    auto dur = std::chrono::steady_clock::now() - start;
+                    double ms = std::chrono::duration<double, std::milli>(dur).count();
+                    return {tool_call.id, error_result, ms};
                 }
             });
             
@@ -1218,14 +1542,58 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
         for (size_t i = 0; i < futures.size(); ++i) {
             const auto& tool_call = tool_calls[i];
             try {
-                auto [call_id, result] = futures[i].get();
+                auto ptr = futures[i].get();
+                auto& call_id = ptr.id;
+                auto& result = ptr.result;
+                double duration_ms = ptr.duration_ms;
                 if (callbacks.on_tool_end) callbacks.on_tool_end(tool_call.name, result);
                 results[call_id] = result;
+
+                // ✅ 对齐 OpenClaw: emit tool result AgentEvent (并行路径)
+                if (callbacks.on_agent_event) {
+                    core::JsonValue data;
+                    data["phase"] = "result";
+                    data["name"] = tool_call.name;
+                    data["toolCallId"] = tool_call.id;
+                    data["isError"] = !result.success;
+                    callbacks.on_agent_event({"tool", std::move(data)});
+                }
 
                 // ✅ 对齐 OpenClaw: recordLoopOutcome — 并行路径收集结果后记录
                 if (loop_detection_state_) {
                     loop_detection_state_->record_tool_call_outcome(
                         tool_call.name, result, result.success ? "" : result.error);
+                }
+
+                // ✅ 对齐 OpenClaw handlers.tools.ts:550-575: after_tool_call hook (并行路径，主线程)
+                {
+                    auto* hook_mgr = tools::get_global_hook_manager();
+                    if (hook_mgr && hook_mgr->has_after_tool_call_hooks()) {
+                        try {
+                            plugins::PluginHookAfterToolCallEvent after_event;
+                            after_event.tool_name = tool_call.name;
+                            after_event.params_json = tool_call.input.dump();
+                            if (!callbacks.run_id.empty()) after_event.run_id = callbacks.run_id;
+                            after_event.tool_call_id = tool_call.id;
+                            if (result.success) {
+                                after_event.result_json = result.output.dump();
+                            } else {
+                                after_event.error = result.error;
+                            }
+                            after_event.duration_ms = static_cast<int>(duration_ms);
+
+                            plugins::PluginHookToolContext after_ctx;
+                            after_ctx.tool_name = tool_call.name;
+                            if (!callbacks.session_id.empty()) after_ctx.session_id = callbacks.session_id;
+                            if (!callbacks.run_id.empty()) after_ctx.run_id = callbacks.run_id;
+                            after_ctx.tool_call_id = tool_call.id;
+
+                            hook_mgr->run_after_tool_call(after_event, after_ctx);
+                        } catch (const std::exception& ex) {
+                            log()->warn("after_tool_call hook failed (parallel): tool={} error={}",
+                                        tool_call.name, ex.what());
+                        }
+                    }
                 }
             } catch (const std::exception& e) {
                 log()->error("Failed to get tool execution result: {}", e.what());
@@ -1367,6 +1735,13 @@ void ReactEngine::emit_block_chunk(const std::string& text, const StreamCallback
 
     // 🎯 2. 过滤 thinking/final 标签 + trim (对齐 OpenClaw: stripBlockTags + trimEnd)
     std::string chunk = strip_thinking_tags(text);
+    // 🎯 对齐 OpenClaw pi-embedded-utils.ts: stripDowngradedToolCallText
+    // Remove [Tool Call: ...], [Historical context: ...] etc. from degraded model output
+    {
+        static const std::regex degraded_re(
+            R"(\[(?:Tool Call|Historical context|Context from previous session|System note)[^\]]*\])");
+        chunk = std::regex_replace(chunk, degraded_re, "");
+    }
     chunk = trim_end(chunk);
     if (chunk.empty()) {
         return;
@@ -1412,7 +1787,23 @@ void ReactEngine::emit_block_chunk(const std::string& text, const StreamCallback
         return;
     }
 
-    // 🎯 8. 发送回调
+    // 🎯 8. 对齐 OpenClaw reply-directives.ts: parse and strip reply directives
+    // [[MEDIA:url]] → extract media URLs
+    // [[REPLY_TO:id]] → extract reply target
+    // [[AUDIO_AS_VOICE]] → flag for voice audio
+    {
+        static const std::regex media_re(R"(\[\[MEDIA:([^\]]+)\]\])");
+        static const std::regex reply_to_re(R"(\[\[REPLY_TO:([^\]]+)\]\])");
+        static const std::regex audio_voice_re(R"(\[\[AUDIO_AS_VOICE\]\])");
+        // Strip directives from the text sent to the channel
+        chunk = std::regex_replace(chunk, media_re, "");
+        chunk = std::regex_replace(chunk, reply_to_re, "");
+        chunk = std::regex_replace(chunk, audio_voice_re, "");
+        chunk = trim_end(chunk);
+        if (chunk.empty()) return;
+    }
+
+    // 🎯 9. 发送回调
     callbacks.on_block_reply(chunk);
 }
 
@@ -1463,9 +1854,49 @@ bool ReactEngine::is_messaging_tool_duplicate(const std::string& normalized_text
 }
 
 // 去除 thinking 标签
+// 🎯 对齐 OpenClaw: stripBlockTags with inline code state tracking
+// Skips thinking tags that appear inside inline code spans (`backticks`)
 std::string ReactEngine::strip_thinking_tags(const std::string& text) {
-    // 简化实现: 使用正则替换
-    std::string result = std::regex_replace(text, thinking_tag_re, "");
+    if (text.empty()) return text;
+
+    // Build a quick set of positions inside inline code spans
+    // OpenClaw uses buildCodeSpanIndex; we do a simpler single-pass approach
+    std::vector<bool> in_code(text.size(), false);
+    bool inside_code = false;
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == '`') {
+            // Handle `` double backtick and ``` triple backtick as inline code
+            size_t tick_count = 0;
+            size_t j = i;
+            while (j < text.size() && text[j] == '`') { ++j; ++tick_count; }
+            if (tick_count <= 2) {
+                inside_code = !inside_code;
+            }
+            // Mark all backtick chars as in-code
+            for (size_t k = i; k < j; ++k) in_code[k] = inside_code;
+            i = j - 1;
+            continue;
+        }
+        in_code[i] = inside_code;
+    }
+
+    // Now strip thinking tags only when NOT inside inline code
+    std::string result;
+    result.reserve(text.size());
+    std::smatch match;
+    std::string::const_iterator search_start = text.cbegin();
+    while (std::regex_search(search_start, text.cend(), match, thinking_tag_re)) {
+        size_t match_pos = match.position(0) + (search_start - text.cbegin());
+        if (match_pos < in_code.size() && in_code[match_pos]) {
+            // Tag is inside inline code — keep it
+            result.append(search_start, search_start + match.position(0) + match.length(0));
+        } else {
+            // Tag is outside code — strip it
+            result.append(search_start, search_start + match.position(0));
+        }
+        search_start += match.position(0) + match.length(0);
+    }
+    result.append(search_start, text.cend());
     return result;
 }
 

@@ -221,15 +221,12 @@ AuthResult AuthManager::authenticate_connect(
         result.ok = true;
         result.method = "none";
         result.device_id = params.value("deviceId", "anonymous");
-        result.scopes = {
-            scopes::AGENT_RUN,
-            scopes::SESSION_READ,
-            scopes::SESSION_WRITE
-        };
+        // 🎯 对齐 OpenClaw: none 模式授予所有 OperatorScope
+        result.scopes = cli_default_operator_scopes();
         return result;
     }
     
-    // 🎯 2. Trusted Proxy 模式 (新增)
+    // 🎯 2. Trusted Proxy 模式 (对齐 OpenClaw)
     if (auth_config.mode == "trusted-proxy") {
         result = authenticate_trusted_proxy(headers, client_ip);
         if (!result.ok && impl_->rate_limiter && !client_ip.empty()) {
@@ -240,15 +237,24 @@ AuthResult AuthManager::authenticate_connect(
         return result;
     }
     
-    // 3. Bearer Token 模式
-    if (auth_config.mode == "bearer") {
+    // 🎯 3. Token 模式 (对齐 OpenClaw auth.ts mode: "token")
+    // 同时兼容旧的 "bearer" 配置值
+    if (auth_config.mode == "token" || auth_config.mode == "bearer") {
         std::string token = params.value("token", "");
         
-        if (!validate_bearer_token(token)) {
-            get_logger()->warn("[AuthManager] Bearer token validation failed");
+        // 🎯 对齐 OpenClaw: 缺少 token 不消耗速率限制额度
+        if (token.empty()) {
             result.ok = false;
-            result.reason = auth_errors::NOT_AUTHENTICATED;
-            result.method = "bearer";
+            result.reason = "token_missing";
+            result.method = "token";
+            return result;
+        }
+        
+        if (!validate_bearer_token(token)) {
+            get_logger()->warn("[AuthManager] Token validation failed");
+            result.ok = false;
+            result.reason = "token_mismatch";
+            result.method = "token";
             
             // 记录失败
             if (impl_->rate_limiter && !client_ip.empty()) {
@@ -257,18 +263,12 @@ AuthResult AuthManager::authenticate_connect(
             return result;
         }
         
-        get_logger()->debug("[AuthManager] Bearer token validated");
+        get_logger()->debug("[AuthManager] Token validated");
         result.ok = true;
-        result.method = "bearer";
+        result.method = "token";
         result.device_id = params.value("deviceId", "authenticated");
-        result.scopes = {
-            scopes::AGENT_RUN,
-            scopes::SESSION_READ,
-            scopes::SESSION_WRITE,
-            scopes::SKILL_INSTALL,
-            scopes::PLUGIN_INSTALL,
-            scopes::ADMIN_FULL
-        };
+        // 🎯 对齐 OpenClaw: token 模式成功授予所有 OperatorScope
+        result.scopes = cli_default_operator_scopes();
         
         // 重置速率限制
         if (impl_->rate_limiter && !client_ip.empty()) {
@@ -277,7 +277,44 @@ AuthResult AuthManager::authenticate_connect(
         return result;
     }
     
-    // 4. 设备认证模式
+    // 🎯 4. Password 模式 (对齐 OpenClaw auth.ts mode: "password")
+    if (auth_config.mode == "password") {
+        std::string password = params.value("password", "");
+        
+        // 🎯 对齐 OpenClaw: 缺少 password 不消耗速率限制额度
+        if (password.empty()) {
+            result.ok = false;
+            result.reason = "password_missing";
+            result.method = "password";
+            return result;
+        }
+        
+        if (!validate_password(password)) {
+            get_logger()->warn("[AuthManager] Password validation failed");
+            result.ok = false;
+            result.reason = "password_mismatch";
+            result.method = "password";
+            
+            if (impl_->rate_limiter && !client_ip.empty()) {
+                impl_->rate_limiter->record_failure(client_ip, rate_limit_scopes::SHARED_SECRET);
+            }
+            return result;
+        }
+        
+        get_logger()->debug("[AuthManager] Password validated");
+        result.ok = true;
+        result.method = "password";
+        result.device_id = params.value("deviceId", "authenticated");
+        // 🎯 对齐 OpenClaw: password 模式成功授予所有 OperatorScope
+        result.scopes = cli_default_operator_scopes();
+        
+        if (impl_->rate_limiter && !client_ip.empty()) {
+            impl_->rate_limiter->reset(client_ip, rate_limit_scopes::SHARED_SECRET);
+        }
+        return result;
+    }
+    
+    // 5. 设备认证模式 (HunterClaw 扩展, OpenClaw 使用 device-token)
     if (auth_config.mode == "device") {
         std::string device_id = params.value("deviceId", "");
         std::string device_token = params.value("deviceToken", "");
@@ -441,13 +478,10 @@ core::Result<DeviceInfo> AuthManager::register_device(
     
     // 设置权限
     if (scopes.empty()) {
-        // 默认权限
+        // 🎯 对齐 OpenClaw: 默认授予 read + write scope
         device.scopes = {
-            scopes::AGENT_RUN,
-            scopes::SESSION_READ,
-            scopes::SESSION_WRITE,
-            scopes::SKILL_LIST,
-            scopes::PLUGIN_LIST
+            operator_scope::READ,
+            operator_scope::WRITE
         };
     } else {
         device.scopes = scopes;
@@ -667,8 +701,8 @@ bool AuthManager::has_scope(
     const std::vector<std::string>& scopes,
     const std::string& required_scope
 ) {
-    // 1. 检查是否有 admin.full (拥有所有权限)
-    if (std::find(scopes.begin(), scopes.end(), scopes::ADMIN_FULL) != scopes.end()) {
+    // 🎯 对齐 OpenClaw: operator.admin 拥有所有权限
+    if (std::find(scopes.begin(), scopes.end(), operator_scope::ADMIN) != scopes.end()) {
         return true;
     }
     
@@ -677,7 +711,7 @@ bool AuthManager::has_scope(
         return true;
     }
     
-    // 3. 检查通配符权限 (e.g., "agent.*" 匹配 "agent.run")
+    // 3. 检查通配符权限 (e.g., "operator.*" 匹配 "operator.read")
     for (const auto& scope : scopes) {
         if (scope.back() == '*') {
             std::string prefix = scope.substr(0, scope.size() - 1);
@@ -847,14 +881,8 @@ AuthResult AuthManager::authenticate_trusted_proxy(
     result.ok = true;
     result.user = user;
     result.device_id = "proxy-" + user;  // 生成设备 ID
-    result.scopes = {
-        scopes::AGENT_RUN,
-        scopes::SESSION_READ,
-        scopes::SESSION_WRITE,
-        scopes::SKILL_INSTALL,
-        scopes::PLUGIN_INSTALL,
-        scopes::ADMIN_FULL
-    };
+    // 🎯 对齐 OpenClaw: trusted-proxy 成功授予所有 OperatorScope
+    result.scopes = cli_default_operator_scopes();
     
     return result;
 }

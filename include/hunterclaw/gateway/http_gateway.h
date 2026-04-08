@@ -62,6 +62,13 @@ struct HttpGatewayOptions {
     
     // 请求大小限制
     size_t max_request_body_size = 10 * 1024 * 1024;  // 10MB
+    
+    // 🎯 对齐 OpenClaw: WebSocket upstream URL (用于 CWE-319 安全检查)
+    std::string ws_upstream_url;
+    
+    // 🎯 对齐 OpenClaw: 允许 private network 的明文 ws:// (break-glass 开关)
+    // 等价于 OPENCLAW_ALLOW_INSECURE_PRIVATE_WS=1
+    bool allow_insecure_private_ws = false;
 };
 
 // ============================================================================

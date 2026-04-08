@@ -9,6 +9,7 @@
 #include <chrono>                                   // 🎯 时间戳
 #include <iomanip>                                  // 🎯 格式化输出
 #include <sstream>                                  // 🎯 字符串流
+#include <algorithm>                                // 🎯 std::transform
 
 using json = nlohmann::json;
 
@@ -49,6 +50,119 @@ namespace {
 
 namespace hunterclaw {
 namespace gateway {
+
+// ============================================================================
+// 🎯 对齐 OpenClaw net.ts: isSecureWebSocketUrl (CWE-319)
+// ============================================================================
+
+/**
+ * 检查主机名是否为 loopback 地址
+ * 对齐 OpenClaw: isLoopbackHost
+ */
+static bool is_loopback_host(const std::string& host) {
+    if (host.empty()) return false;
+    std::string h = host;
+    // 小写化
+    std::transform(h.begin(), h.end(), h.begin(), ::tolower);
+    if (h == "localhost") return true;
+    if (h == "127.0.0.1") return true;
+    if (h == "::1") return true;
+    if (h == "[::1]") return true;
+    // IPv4-mapped IPv6 loopback
+    if (h == "::ffff:127.0.0.1") return true;
+    // 127.x.x.x
+    if (h.size() >= 4 && h.substr(0, 4) == "127.") return true;
+    return false;
+}
+
+/**
+ * 检查主机名是否为 RFC1918 / link-local / loopback 私有地址
+ * 对齐 OpenClaw: isPrivateOrLoopbackHost
+ */
+static bool is_private_or_loopback_host(const std::string& host) {
+    if (is_loopback_host(host)) return true;
+    // 简化: IPv4 private ranges
+    if (host.size() >= 3 && host.substr(0, 3) == "10.") return true;
+    if (host.size() >= 8 && host.substr(0, 8) == "192.168.") return true;
+    if (host.size() >= 4 && host.substr(0, 4) == "172.") {
+        // 172.16.0.0 - 172.31.255.255
+        try {
+            auto dot = host.find('.', 4);
+            if (dot != std::string::npos) {
+                int second_octet = std::stoi(host.substr(4, dot - 4));
+                if (second_octet >= 16 && second_octet <= 31) return true;
+            }
+        } catch (...) {}
+    }
+    // CGNAT 100.64/10
+    if (host.size() >= 4 && host.substr(0, 4) == "100.") {
+        try {
+            auto dot = host.find('.', 4);
+            if (dot != std::string::npos) {
+                int second_octet = std::stoi(host.substr(4, dot - 4));
+                if (second_octet >= 64 && second_octet <= 127) return true;
+            }
+        } catch (...) {}
+    }
+    return false;
+}
+
+/**
+ * 🎯 严格对齐 OpenClaw net.ts: isSecureWebSocketUrl
+ * 
+ * CWE-319: Cleartext Transmission of Sensitive Information
+ * 
+ * - wss:// (TLS) 总是安全
+ * - ws:// 仅 loopback 地址安全
+ * - 可选: 允许 private network 的 ws://
+ * 
+ * @param url WebSocket URL
+ * @param allow_private_ws 是否允许 private network 的 ws://
+ * @return true 如果 URL 安全
+ */
+static bool is_secure_websocket_url(
+    const std::string& url,
+    bool allow_private_ws = false
+) {
+    // 解析 scheme
+    std::string scheme;
+    auto scheme_end = url.find("://");
+    if (scheme_end == std::string::npos) return false;
+    scheme = url.substr(0, scheme_end);
+    std::transform(scheme.begin(), scheme.end(), scheme.begin(), ::tolower);
+    
+    // 🎯 对齐 OpenClaw: http(s) → ws(s) 归一化
+    if (scheme == "https") scheme = "wss";
+    else if (scheme == "http") scheme = "ws";
+    
+    if (scheme == "wss") return true;
+    if (scheme != "ws") return false;
+    
+    // 提取 hostname
+    std::string host_part = url.substr(scheme_end + 3);
+    // 移除 path/query
+    auto slash_pos = host_part.find('/');
+    if (slash_pos != std::string::npos) host_part = host_part.substr(0, slash_pos);
+    // 移除 port
+    auto colon_pos = host_part.rfind(':');
+    if (colon_pos != std::string::npos && host_part.find('[') == std::string::npos) {
+        host_part = host_part.substr(0, colon_pos);
+    }
+    // 处理 bracketed IPv6
+    if (host_part.front() == '[' && host_part.back() == ']') {
+        host_part = host_part.substr(1, host_part.size() - 2);
+    }
+    
+    // 默认策略: 仅 loopback 的 ws:// 安全
+    if (is_loopback_host(host_part)) return true;
+    
+    // 可选 break-glass: private network
+    if (allow_private_ws) {
+        if (is_private_or_loopback_host(host_part)) return true;
+    }
+    
+    return false;
+}
 
 // ============================================================================
 // Middleware Implementations
@@ -229,6 +343,21 @@ HttpGateway::~HttpGateway() {
 core::Result<bool> HttpGateway::start() {
     if (running_.load()) {
         return core::Result<bool>::Err("HTTP Gateway already running");
+    }
+    
+    // 🎯 对齐 OpenClaw call.ts: isSecureWebSocketUrl 安全检查 (CWE-319)
+    // 如果配置了 WebSocket upstream URL，验证其安全性
+    if (!options_.ws_upstream_url.empty()) {
+        bool allow_private = options_.allow_insecure_private_ws;
+        if (!is_secure_websocket_url(options_.ws_upstream_url, allow_private)) {
+            std::string error_msg = 
+                "SECURITY ERROR: Gateway WebSocket URL \"" + options_.ws_upstream_url + 
+                "\" uses plaintext ws:// to a non-loopback address. "
+                "Both credentials and chat data would be exposed to network interception. "
+                "Fix: Use wss:// for remote gateway URLs, or keep loopback binding.";
+            log_error(error_msg);
+            return core::Result<bool>::Err(error_msg);
+        }
     }
     
     log_info("[HTTP Gateway] Starting on {}:{}", options_.host, options_.port);
