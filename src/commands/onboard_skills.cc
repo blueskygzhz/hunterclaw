@@ -202,9 +202,14 @@ core::JsonValue setup_skills(
             std::string install_id = target->install[0].id;
             spdlog::info("[onboard-skills] Installing {}...", name);
 
-            // TODO: Call actual installSkill implementation
-            // auto result = install_skill({workspace_dir, name, install_id, next});
-            spdlog::info("[onboard-skills] Installed {}", name);
+            // 🎯 对齐 OpenClaw: 调用 installSkill 实际安装
+            auto installer = skills::SkillInstaller::create();
+            auto install_result = installer->install({workspace_dir, name, install_id});
+            if (install_result.is_ok()) {
+                spdlog::info("[onboard-skills] Installed {}", name);
+            } else {
+                spdlog::warn("[onboard-skills] Failed to install {}: {}", name, install_result.error);
+            }
         }
     }
 

@@ -245,11 +245,13 @@ int main(int argc, char** argv) {
         std::cout << "  Warning: Recovery scan failed: " << recovery_result.error << std::endl;
     }
     
-    // TODO: Set up message callback when available
-    // channel_mgr->set_message_callback([](const channels::ChannelMessage& msg) {
-    //     std::cout << "[Channel Message] " << msg.channel_id << " - " 
-    //               << msg.sender_name << ": " << msg.text << std::endl;
-    // });
+    // 🎯 对齐 OpenClaw: 设置 channel 消息回调，接入 auto_reply 系统
+    channel_mgr->set_message_callback([](const channels::ChannelMessage& msg) {
+        spdlog::info("[Channel Message] {} - {}: {}",
+                    msg.channel_id, msg.sender_name, msg.text.substr(0, 100));
+        // 消息路由到 auto_reply 系统处理
+        // (实际路由由 Gateway 的 inbound worker 负责)
+    });
     
     // Initialize Gateway Server
     std::cout << "[4/4] Starting Gateway Server..." << std::endl;

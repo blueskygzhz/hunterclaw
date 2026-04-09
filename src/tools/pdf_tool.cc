@@ -577,14 +577,52 @@ PdfAnalysisResult PDFTool::analyze_with_openai(
     const std::string& prompt,
     int max_tokens
 ) {
-    // TODO: call OpenAI API
+    // 🎯 对齐 OpenClaw: OpenAI PDF analysis (text extraction + chat)
+    (void)max_tokens;
+
+    // OpenAI doesn't support native PDF — use text extraction fallback
+    auto extracted = extract_text_from_pdf(path);
+    std::string text_content = extracted.is_ok() ? extracted.get() : "[extraction failed]";
+
+    const char* api_key = std::getenv("OPENAI_API_KEY");
+    infra::HttpClient client;
+    infra::HttpRequestOptions opts;
+    json request_body = {
+        {"model", "gpt-4o"},
+        {"messages", json::array({
+            {{"role", "user"}, {"content", prompt + "\n\n---\n\nDocument content:\n" + text_content.substr(0, 100000)}}
+        })},
+        {"max_tokens", 4096}
+    };
+    opts.body = request_body.dump();
+    opts.headers = {
+        {"Content-Type", "application/json"},
+        {"Authorization", std::string("Bearer ") + (api_key ? api_key : "")}
+    };
+    opts.timeout_ms = 60000;
+
+    auto http_result = client.post("https://api.openai.com/v1/chat/completions", opts);
     PdfAnalysisResult result;
-    result.analysis = "[OpenAI PDF analysis - stub]";
     result.model = "openai/gpt-4o";
-    result.input_tokens = 0;
-    result.output_tokens = 0;
     result.used_native_pdf = false;
     result.used_extraction_fallback = true;
+
+    if (http_result.is_ok()) {
+        try {
+            auto resp = json::parse(http_result.get().body);
+            if (resp.contains("choices") && !resp["choices"].empty()) {
+                result.analysis = resp["choices"][0]["message"].value("content", "");
+            }
+            if (resp.contains("usage")) {
+                result.input_tokens = resp["usage"].value("prompt_tokens", 0);
+                result.output_tokens = resp["usage"].value("completion_tokens", 0);
+            }
+        } catch (...) {
+            result.analysis = "[OpenAI PDF analysis failed: parse error]";
+        }
+    } else {
+        result.analysis = "[OpenAI PDF analysis failed: " + http_result.error + "]";
+    }
     return result;
 }
 

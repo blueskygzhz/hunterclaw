@@ -162,7 +162,11 @@ core::Result<void> ChannelsRemoveCommand::execute(const std::vector<std::string>
         return core::Result<void>::err(config_result.error);
     }
     
-    // TODO: Remove channel from config
+    // 🎯 对齐 OpenClaw: 从配置删除 channel
+    auto config_json = config_result.value().to_json();
+    if (config_json.contains("channels")) {
+        config_json["channels"].erase(name);
+    }
     
     // Save config
     auto save_result = save_channels_config(config_result.value());

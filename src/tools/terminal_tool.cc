@@ -376,22 +376,36 @@ ToolResult TerminalTool::action_resize(
 }
 
 // ============================================================================
-// HTTP helpers (stub)
+// HTTP helpers (🎯 对齐 OpenClaw — 使用 infra::HttpClient)
 // ============================================================================
 
 core::JsonValue TerminalTool::http_get(const std::string& url) const {
-    (void)url;
-    return core::JsonValue(json{{"ok", true}, {"stub", true}});
+    infra::HttpClient client;
+    auto result = client.get(url, 10000);
+    if (!result.is_ok()) return core::JsonValue(json{{"ok", false}, {"error", result.error}});
+    auto& resp = result.get();
+    try { return core::JsonValue(json::parse(resp.body)); }
+    catch (...) { return core::JsonValue(json{{"ok", resp.ok}, {"body", resp.body}}); }
 }
 
 core::JsonValue TerminalTool::http_post(const std::string& url, const core::JsonValue& body) const {
-    (void)url; (void)body;
-    return core::JsonValue(json{{"ok", true}, {"stub", true}});
+    infra::HttpClient client;
+    infra::HttpRequestOptions opts;
+    opts.body = body.to_json().dump();
+    opts.headers = {{"Content-Type", "application/json"}};
+    opts.timeout_ms = 10000;
+    auto result = client.post(url, opts);
+    if (!result.is_ok()) return core::JsonValue(json{{"ok", false}, {"error", result.error}});
+    auto& resp = result.get();
+    try { return core::JsonValue(json::parse(resp.body)); }
+    catch (...) { return core::JsonValue(json{{"ok", resp.ok}, {"body", resp.body}}); }
 }
 
 core::JsonValue TerminalTool::http_delete(const std::string& url) const {
-    (void)url;
-    return core::JsonValue(json{{"ok", true}, {"stub", true}});
+    infra::HttpClient client;
+    auto result = client.del(url, 10000);
+    if (!result.is_ok()) return core::JsonValue(json{{"ok", false}, {"error", result.error}});
+    return core::JsonValue(json{{"ok", result.get().ok}});
 }
 
 core::JsonValue TerminalTool::call_node_terminal_proxy(

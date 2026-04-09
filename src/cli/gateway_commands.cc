@@ -407,11 +407,29 @@ core::Result<void> GatewayConfigCommand::execute(const std::vector<std::string>&
     
     auto cmd_args = parse_result.value();
     
-    // TODO: Implement config management
-    JsonOutput output{false, "error", "Config management not implemented yet"};
-    output.print();
-    
-    return core::Result<void>::err("Not implemented");
+    // 🎯 对齐 OpenClaw: config 管理 — 读取并显示当前配置
+    std::string config_path = core::utils::expand_path("~/.hunterclaw/config.json");
+    if (!std::filesystem::exists(config_path)) {
+        JsonOutput output{false, "error", "Config file not found: " + config_path};
+        output.print();
+        return core::Result<void>::err("Config file not found");
+    }
+
+    try {
+        std::ifstream file(config_path);
+        nlohmann::json config;
+        file >> config;
+
+        JsonOutput output{true, "success", "Config loaded"};
+        output.data["path"] = config_path;
+        output.data["config"] = config.dump(2);
+        output.print();
+        return core::Result<void>::ok();
+    } catch (const std::exception& e) {
+        JsonOutput output{false, "error", std::string("Failed to read config: ") + e.what()};
+        output.print();
+        return core::Result<void>::err(e.what());
+    }
 }
 
 // GatewayHealthCommand implementation

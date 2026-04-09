@@ -703,23 +703,38 @@ ToolResult BrowserTool::action_dialog(
 }
 
 // ============================================================================
-// HTTP helpers (stub - real implementation via HttpClient)
+// HTTP helpers (🎯 对齐 OpenClaw — 使用 infra::HttpClient)
 // ============================================================================
 
 core::JsonValue BrowserTool::http_get(const std::string& url) const {
-    // TODO: use real HTTP client
-    (void)url;
-    return core::JsonValue(json{{"ok", true}, {"stub", true}, {"url", url}});
+    infra::HttpClient client;
+    auto result = client.get(url, 10000);
+    if (!result.is_ok()) return core::JsonValue(json{{"ok", false}, {"error", result.error}});
+    auto& resp = result.get();
+    if (!resp.ok) return core::JsonValue(json{{"ok", false}, {"status", resp.status_code}, {"body", resp.body}});
+    try { return core::JsonValue(json::parse(resp.body)); }
+    catch (...) { return core::JsonValue(json{{"ok", true}, {"body", resp.body}}); }
 }
 
 core::JsonValue BrowserTool::http_post(const std::string& url, const core::JsonValue& body) const {
-    (void)url; (void)body;
-    return core::JsonValue(json{{"ok", true}, {"stub", true}});
+    infra::HttpClient client;
+    infra::HttpRequestOptions opts;
+    opts.body = body.to_json().dump();
+    opts.headers = {{"Content-Type", "application/json"}};
+    opts.timeout_ms = 10000;
+    auto result = client.post(url, opts);
+    if (!result.is_ok()) return core::JsonValue(json{{"ok", false}, {"error", result.error}});
+    auto& resp = result.get();
+    try { return core::JsonValue(json::parse(resp.body)); }
+    catch (...) { return core::JsonValue(json{{"ok", resp.ok}, {"body", resp.body}}); }
 }
 
 core::JsonValue BrowserTool::http_delete(const std::string& url) const {
-    (void)url;
-    return core::JsonValue(json{{"ok", true}, {"stub", true}});
+    infra::HttpClient client;
+    auto result = client.del(url, 10000);
+    if (!result.is_ok()) return core::JsonValue(json{{"ok", false}, {"error", result.error}});
+    auto& resp = result.get();
+    return core::JsonValue(json{{"ok", resp.ok}, {"status", resp.status_code}});
 }
 
 core::JsonValue BrowserTool::call_node_browser_proxy(

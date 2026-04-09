@@ -679,15 +679,28 @@ core::Result<json> method_channel_send(
         }
     }
 
-    // ✅ 对齐 OpenClaw: 通过 channel_manager 发送消息
+    // 🎯 对齐 OpenClaw: 通过 delivery queue 发送消息
     auto channel_mgr = server->channel_manager();
     bool send_ok = false;
     std::string send_error;
-    // Note: ChannelManager::deliver_message() not yet implemented
     if (!channel_mgr) {
         send_error = "channel manager not available";
     } else {
-        send_error = "deliver_message not implemented; use delivery queue";
+        // Route through outbound delivery system
+        try {
+            outbound::DeliverOutboundPayloadsParams deliver_params;
+            deliver_params.channel = channel_id;
+            deliver_params.to = to;
+            deliver_params.account_id = account_id;
+            queue::MessagePayload payload;
+            payload.text = text;
+            deliver_params.payloads = {payload};
+            auto result = outbound::deliver_outbound_payloads(deliver_params);
+            send_ok = result.is_ok();
+            if (!send_ok) send_error = result.error;
+        } catch (const std::exception& e) {
+            send_error = e.what();
+        }
     }
 
     // =========================================================================
