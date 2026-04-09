@@ -1105,28 +1105,40 @@ SkillSnapshot SkillManager::build_workspace_skill_snapshot(
     }
     auto compacted = compact_skill_paths(resolved_skills);
 
-    // 4. Apply prompt limits (maxSkillsInPrompt / maxSkillsPromptChars)
+    // 4. Apply prompt limits — 🎯 严格对齐 OpenClaw applySkillsPromptLimits
+    // Step 4a: maxSkillsInPrompt (count cap, default 150)
     int max_skills = 150;
+    int max_chars = 30000;  // 🎯 对齐 OpenClaw DEFAULT_MAX_SKILLS_PROMPT_CHARS = 30_000
     if (impl_->config_) {
         max_skills = impl_->config_->skills.limits.max_skills_in_prompt;
+        if (impl_->config_->skills.limits.max_skills_prompt_chars > 0) {
+            max_chars = impl_->config_->skills.limits.max_skills_prompt_chars;
+        }
     }
+
+    bool truncated = false;
+    std::string truncated_reason;
+
     if (static_cast<int>(compacted.size()) > max_skills) {
         log()->warn("Truncating skills from {} to max {}", compacted.size(), max_skills);
         compacted.resize(max_skills);
         resolved_skills.resize(max_skills);
+        truncated = true;
+        truncated_reason = "count";
     }
 
-    // 5. Build XML prompt block (same format as build_skills_prompt)
-    std::ostringstream ss;
-    if (!compacted.empty()) {
+    // Step 4b: maxSkillsPromptChars (char cap, binary search)
+    // 🎯 严格对齐 OpenClaw workspace.ts:547-562: 二分搜索找到最大可容纳的前缀
+    auto format_skills_block = [](const std::vector<Skill>& skills) -> std::string {
+        if (skills.empty()) return "";
+        std::ostringstream ss;
         ss << "\n<available_skills>\n";
         ss << "Before replying: scan <available_skills> <description> entries.\n";
         ss << "- If exactly one skill clearly applies: read its SKILL.md at <location> with `read`, then follow it.\n";
         ss << "- If multiple could apply: choose the most specific one, then read/follow it.\n";
         ss << "- If none clearly apply: do not read any SKILL.md.\n";
         ss << "Constraints: never read more than one skill up front; only read after selecting.\n\n";
-
-        for (const auto& skill : compacted) {
+        for (const auto& skill : skills) {
             ss << "  <skill>\n";
             ss << "    <name>" << xml_escape(skill.name) << "</name>\n";
             ss << "    <description>" << xml_escape(skill.description) << "</description>\n";
@@ -1137,7 +1149,45 @@ SkillSnapshot SkillManager::build_workspace_skill_snapshot(
             ss << "  </skill>\n";
         }
         ss << "</available_skills>\n";
+        return ss.str();
+    };
+
+    auto fits = [&](const std::vector<Skill>& skills) -> bool {
+        return static_cast<int>(format_skills_block(skills).size()) <= max_chars;
+    };
+
+    if (!fits(compacted)) {
+        // 🎯 对齐 OpenClaw: Binary search the largest prefix that fits in the char budget.
+        int lo = 0;
+        int hi = static_cast<int>(compacted.size());
+        while (lo < hi) {
+            int mid = (lo + hi + 1) / 2;  // ceil division
+            std::vector<Skill> prefix(compacted.begin(), compacted.begin() + mid);
+            if (fits(prefix)) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        log()->warn("Truncating skills from {} to {} by char budget ({} chars)",
+                    compacted.size(), lo, max_chars);
+        compacted.resize(lo);
+        resolved_skills.resize(lo);
+        truncated = true;
+        truncated_reason = "chars";
     }
+
+    // 5. Build XML prompt block
+    std::string prompt_block = format_skills_block(compacted);
+
+    // 🎯 对齐 OpenClaw: truncation note
+    std::ostringstream ss;
+    if (truncated) {
+        ss << "\xE2\x9A\xA0\xEF\xB8\x8F Skills truncated: included "
+           << compacted.size() << " of " << resolved_skills.size()
+           << ". Run `hunterclaw skills check` to audit.\n";
+    }
+    ss << prompt_block;
 
     // 6. Build snapshot
     SkillSnapshot snapshot;

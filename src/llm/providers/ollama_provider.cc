@@ -43,7 +43,78 @@ public:
         const GenerateOptions& options,
         StreamCallback callback
     ) override {
-        return core::Result<GenerateResponse>::Err("Streaming not yet implemented for Ollama");
+        // 🎯 严格对齐 OpenClaw: Ollama streaming — POST /api/chat with stream:true
+        auto request_json = build_request_json(options);
+
+        // Force streaming mode
+        try {
+            auto parsed = nlohmann::json::parse(request_json);
+            parsed["stream"] = true;
+            request_json = parsed.dump();
+        } catch (...) {}
+
+        std::string url = config_.base_url + "/api/chat";
+
+        infra::HttpRequestOptions http_opts;
+        http_opts.body = request_json;
+        http_opts.timeout_ms = 120000;  // Streaming can take longer
+        http_opts.headers = {
+            {"Content-Type", "application/json"}
+        };
+
+        // 🎯 对齐 OpenClaw: stream response line-by-line (NDJSON format)
+        // Ollama returns newline-delimited JSON objects
+        GenerateResponse final_response;
+        final_response.content = "";
+
+        auto stream_result = http_client_->post_stream(url, http_opts,
+            [&](const std::string& chunk) {
+                // Each chunk is a JSON line
+                std::istringstream lines(chunk);
+                std::string line;
+                while (std::getline(lines, line)) {
+                    if (line.empty()) continue;
+                    try {
+                        auto j = nlohmann::json::parse(line);
+
+                        // Extract content delta
+                        std::string delta;
+                        if (j.contains("message") && j["message"].contains("content")) {
+                            delta = j["message"]["content"].get<std::string>();
+                        }
+
+                        if (!delta.empty()) {
+                            final_response.content += delta;
+                            // Invoke stream callback
+                            if (callback) {
+                                StreamChunk sc;
+                                sc.delta = delta;
+                                sc.done = j.value("done", false);
+                                callback(sc);
+                            }
+                        }
+
+                        // Check if done
+                        if (j.value("done", false)) {
+                            // Extract usage stats if available
+                            if (j.contains("eval_count")) {
+                                final_response.usage.output_tokens = j["eval_count"].get<int>();
+                            }
+                            if (j.contains("prompt_eval_count")) {
+                                final_response.usage.input_tokens = j["prompt_eval_count"].get<int>();
+                            }
+                        }
+                    } catch (...) {
+                        // Skip malformed lines
+                    }
+                }
+            });
+
+        if (!stream_result.is_ok()) {
+            return core::Result<GenerateResponse>::Err(stream_result.error);
+        }
+
+        return core::Result<GenerateResponse>::Ok(final_response);
     }
     
     int estimate_tokens(const std::string& text) const override {

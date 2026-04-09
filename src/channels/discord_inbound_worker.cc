@@ -95,6 +95,7 @@ void DiscordInboundWorker::process_job(DiscordInboundJob job) {
         InboundMessage msg;
         msg.channel    = job.payload.channel;
         msg.account_id = job.payload.account_id;  // optional<string>
+        // 🎯 对齐 OpenClaw: 使用路由系统构建的 session_key
         msg.session_key = job.payload.session_key.value_or(
             job.payload.message_channel_id);
         // Store raw event data in metadata

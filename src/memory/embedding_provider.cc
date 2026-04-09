@@ -677,7 +677,63 @@ core::Result<std::vector<float>> VoyageEmbeddingProvider::embed_query(const std:
 core::Result<std::vector<std::vector<float>>> VoyageEmbeddingProvider::embed_batch(
     const std::vector<std::string>& texts) {
     
-    return core::Result<std::vector<std::vector<float>>>::Err("Voyage batch not yet implemented");
+    // 🎯 严格对齐 OpenClaw: embeddings-voyage.ts batch embedding
+    // Voyage AI supports batch embedding via POST /v1/embeddings with input as array
+    if (texts.empty()) {
+        return core::Result<std::vector<std::vector<float>>>::Ok({});
+    }
+
+    // Voyage has a max batch size of 128 texts
+    const size_t MAX_BATCH = 128;
+    std::vector<std::vector<float>> all_embeddings;
+
+    for (size_t offset = 0; offset < texts.size(); offset += MAX_BATCH) {
+        size_t end = std::min(offset + MAX_BATCH, texts.size());
+        std::vector<std::string> batch(texts.begin() + offset, texts.begin() + end);
+
+        json request_body = {
+            {"model", config_.model},
+            {"input", json::array()}
+        };
+        for (const auto& text : batch) {
+            request_body["input"].push_back(text);
+        }
+        if (config_.input_type.has_value()) {
+            request_body["input_type"] = *config_.input_type;
+        }
+
+        std::map<std::string, std::string> headers = config_.headers;
+        headers["Content-Type"] = "application/json";
+
+        auto http_result = http_client_->post(config_.endpoint, request_body.dump(), headers, 30000);
+        if (!http_result.is_ok()) {
+            return core::Result<std::vector<std::vector<float>>>::Err(
+                "Voyage batch embedding failed: " + http_result.error);
+        }
+
+        try {
+            auto response = json::parse(http_result.get().body);
+            if (!response.contains("data") || !response["data"].is_array()) {
+                return core::Result<std::vector<std::vector<float>>>::Err(
+                    "Invalid Voyage batch response: missing data array");
+            }
+
+            for (const auto& item : response["data"]) {
+                std::vector<float> embedding;
+                if (item.contains("embedding") && item["embedding"].is_array()) {
+                    for (const auto& val : item["embedding"]) {
+                        embedding.push_back(val.get<float>());
+                    }
+                }
+                all_embeddings.push_back(std::move(embedding));
+            }
+        } catch (const std::exception& e) {
+            return core::Result<std::vector<std::vector<float>>>::Err(
+                std::string("Failed to parse Voyage batch response: ") + e.what());
+        }
+    }
+
+    return core::Result<std::vector<std::vector<float>>>::Ok(all_embeddings);
 }
 
 // ============================================================================

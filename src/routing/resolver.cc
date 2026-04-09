@@ -825,5 +825,160 @@ bool AccountLookup::has_account(const std::string& channel, const std::string& a
 
 void AccountLookup::clear() { impl_->accounts_by_channel.clear(); }
 
+// ============================================================================
+// Session Key Utilities (补齐)
+// ✅ 对齐 OpenClaw: session-key-utils.ts getSubagentDepth
+// ============================================================================
+
+int get_subagent_depth(const std::string& session_key) {
+  auto parsed = parse_agent_session_key(session_key);
+  if (!parsed) return 0;
+  // 🎯 对齐 OpenClaw: count "sub:" segments in rest
+  int depth = 0;
+  std::string rest = parsed->rest;
+  while (rest.compare(0, 4, "sub:") == 0) {
+    depth++;
+    // Find next segment after "sub:<agentId>:"
+    size_t colon_pos = rest.find(':', 4);
+    if (colon_pos == std::string::npos) break;
+    rest = rest.substr(colon_pos + 1);
+  }
+  return depth;
+}
+
+bool should_scope_heartbeat_wake(const std::string& session_key) {
+  return parse_agent_session_key(session_key).has_value();
+}
+
+// ============================================================================
+// Resolve Preferred Account ID
+// ✅ 对齐 OpenClaw: bindings.ts:105-114 resolvePreferredAccountId
+// ============================================================================
+
+std::string resolve_preferred_account_id(const ResolvePreferredAccountIdParams& params) {
+  if (!params.bound_accounts.empty()) {
+    return params.bound_accounts[0];
+  }
+  return params.default_account_id;
+}
+
+// ============================================================================
+// Default Account Warnings
+// ✅ 对齐 OpenClaw: routing/default-account-warnings.ts
+// ============================================================================
+
+std::string format_channel_default_account_path(const std::string& channel_key) {
+  return "channels." + channel_key + ".defaultAccount";
+}
+
+std::string format_channel_accounts_default_path(const std::string& channel_key) {
+  return "channels." + channel_key + ".accounts.default";
+}
+
+std::string format_set_explicit_default_instruction(const std::string& channel_key) {
+  return "Set " + format_channel_default_account_path(channel_key) +
+         " or add " + format_channel_accounts_default_path(channel_key);
+}
+
+std::string format_set_explicit_default_to_configured_instruction(const std::string& channel_key) {
+  return "Set " + format_channel_default_account_path(channel_key) +
+         " to one of these accounts, or add " + format_channel_accounts_default_path(channel_key);
+}
+
+// ============================================================================
+// Channel Route Resolution Helpers
+// ✅ 对齐 OpenClaw 各渠道 route-resolution 封装
+// ============================================================================
+
+// 🎯 对齐 OpenClaw: discord/monitor/route-resolution.ts:10-22
+RoutePeer build_discord_route_peer(bool is_direct_message, bool is_group_dm,
+                                   const std::string& direct_user_id,
+                                   const std::string& conversation_id) {
+  ChatType kind;
+  if (is_direct_message) {
+    kind = ChatType::DIRECT;
+  } else if (is_group_dm) {
+    kind = ChatType::GROUP;
+  } else {
+    kind = ChatType::CHANNEL;
+  }
+
+  std::string id;
+  if (is_direct_message) {
+    std::string trimmed_user = trim(direct_user_id);
+    id = trimmed_user.empty() ? conversation_id : trimmed_user;
+  } else {
+    id = conversation_id;
+  }
+
+  return RoutePeer{kind, id};
+}
+
+// 🎯 对齐 OpenClaw: resolveDiscordConversationRoute (route-resolution.ts:24-43)
+ResolvedAgentRoute resolve_discord_conversation_route(
+    RouteResolver& resolver,
+    const std::optional<std::string>& account_id,
+    const std::optional<std::string>& guild_id,
+    const std::vector<std::string>& member_role_ids,
+    const RoutePeer& peer,
+    const std::optional<std::string>& parent_conversation_id) {
+  ResolveAgentRouteInput input;
+  input.channel = "discord";
+  input.account_id = account_id;
+  input.guild_id = guild_id;
+  input.member_role_ids = member_role_ids;
+  input.peer = peer;
+  if (parent_conversation_id && !trim(*parent_conversation_id).empty()) {
+    input.parent_peer = RoutePeer{ChatType::CHANNEL, *parent_conversation_id};
+  }
+  return resolver.resolve_route(input);
+}
+
+// 🎯 对齐 OpenClaw: resolveDiscordBoundConversationRoute (route-resolution.ts:45-78)
+// + resolveDiscordEffectiveRoute (route-resolution.ts:80-100)
+ResolvedAgentRoute resolve_discord_bound_conversation_route(
+    RouteResolver& resolver,
+    const std::optional<std::string>& account_id,
+    const std::optional<std::string>& guild_id,
+    const std::vector<std::string>& member_role_ids,
+    bool is_direct_message,
+    bool is_group_dm,
+    const std::string& direct_user_id,
+    const std::string& conversation_id,
+    const std::optional<std::string>& parent_conversation_id,
+    const std::optional<std::string>& bound_session_key) {
+
+  auto peer = build_discord_route_peer(is_direct_message, is_group_dm,
+                                       direct_user_id, conversation_id);
+  auto route = resolve_discord_conversation_route(
+      resolver, account_id, guild_id, member_role_ids, peer, parent_conversation_id);
+
+  // 🎯 对齐 OpenClaw: resolveDiscordEffectiveRoute
+  if (bound_session_key && !trim(*bound_session_key).empty()) {
+    std::string bsk = trim(*bound_session_key);
+    route.session_key = bsk;
+    route.agent_id = resolve_agent_id_from_session_key(bsk);
+    route.last_route_policy = derive_last_route_policy(bsk, route.main_session_key);
+  }
+
+  return route;
+}
+
+// 🎯 对齐 OpenClaw: 通用渠道路由解析
+// 各渠道 monitor (Telegram/Slack/Signal/LINE) 的 resolveAgentRoute 调用模式
+ResolvedAgentRoute resolve_channel_route(
+    RouteResolver& resolver,
+    const std::string& channel_name,
+    const std::optional<std::string>& account_id,
+    const RoutePeer& peer,
+    const std::optional<std::string>& team_id) {
+  ResolveAgentRouteInput input;
+  input.channel = channel_name;
+  input.account_id = account_id;
+  input.peer = peer;
+  input.team_id = team_id;
+  return resolver.resolve_route(input);
+}
+
 }  // namespace routing
 }  // namespace hunterclaw

@@ -350,13 +350,71 @@ std::string TableConverter::convert_tables(const std::string& markdown,
 
 std::optional<MarkdownTable> TableConverter::parse_table(const std::string& markdown,
                                                           int start_pos) {
-    // Simple table parsing (full implementation would be more robust)
+    // 🎯 对齐 OpenClaw: parseMarkdownTable — 解析 | 分隔的表格
     // Look for | column | column | pattern
-    std::regex table_row_regex(R"(\|(.+)\|)");
-    std::smatch match;
-    
-    // TODO: Full implementation
-    return std::nullopt;
+    std::istringstream stream(markdown.substr(start_pos));
+    std::string line;
+    std::vector<std::string> lines;
+
+    while (std::getline(stream, line)) {
+        if (line.find('|') == std::string::npos) break;
+        lines.push_back(line);
+    }
+
+    if (lines.size() < 2) return std::nullopt;  // Need at least header + separator
+
+    // Parse cells from a row
+    auto parse_row = [](const std::string& row) -> std::vector<std::string> {
+        std::vector<std::string> cells;
+        std::istringstream ss(row);
+        std::string cell;
+        // Split by |
+        while (std::getline(ss, cell, '|')) {
+            // Trim whitespace
+            auto start = cell.find_first_not_of(" \t");
+            auto end = cell.find_last_not_of(" \t");
+            if (start != std::string::npos && end != std::string::npos) {
+                cells.push_back(cell.substr(start, end - start + 1));
+            } else if (!cell.empty()) {
+                cells.push_back("");
+            }
+        }
+        return cells;
+    };
+
+    // Check if second line is separator (---|---|---)
+    bool has_separator = false;
+    std::regex sep_re(R"(^[\s|:-]+$)");
+    if (lines.size() >= 2 && std::regex_match(lines[1], sep_re) &&
+        lines[1].find('-') != std::string::npos) {
+        has_separator = true;
+    }
+
+    if (!has_separator) return std::nullopt;
+
+    MarkdownTable table;
+
+    // Parse headers
+    auto header_cells = parse_row(lines[0]);
+    for (const auto& cell : header_cells) {
+        MarkdownTable::Cell hc;
+        hc.text = cell;
+        table.headers.push_back(hc);
+    }
+
+    // Parse data rows (skip separator at index 1)
+    for (size_t i = 2; i < lines.size(); ++i) {
+        auto row_cells = parse_row(lines[i]);
+        std::vector<MarkdownTable::Cell> row;
+        for (const auto& cell : row_cells) {
+            MarkdownTable::Cell rc;
+            rc.text = cell;
+            row.push_back(rc);
+        }
+        table.rows.push_back(row);
+    }
+
+    return table;
 }
 
 std::string TableConverter::table_to_bullets(const MarkdownTable& table) {
@@ -378,18 +436,43 @@ std::string TableConverter::table_to_bullets(const MarkdownTable& table) {
 }
 
 std::string TableConverter::table_to_code_block(const MarkdownTable& table) {
+    // 🎯 对齐 OpenClaw: Format as ASCII table
     std::ostringstream oss;
     oss << "```\n";
     
-    // TODO: Format as ASCII table
+    // Calculate column widths
+    std::vector<size_t> widths;
     for (const auto& header : table.headers) {
-        oss << header.text << " | ";
+        widths.push_back(header.text.size());
+    }
+    for (const auto& row : table.rows) {
+        for (size_t i = 0; i < row.size() && i < widths.size(); ++i) {
+            widths[i] = std::max(widths[i], row[i].text.size());
+        }
+    }
+
+    // Helper to pad string
+    auto pad = [](const std::string& s, size_t w) -> std::string {
+        if (s.size() >= w) return s;
+        return s + std::string(w - s.size(), ' ');
+    };
+
+    // Header row
+    for (size_t i = 0; i < table.headers.size(); ++i) {
+        oss << " " << pad(table.headers[i].text, widths[i]) << " |";
     }
     oss << "\n";
-    
+
+    // Separator row
+    for (size_t i = 0; i < widths.size(); ++i) {
+        oss << "-" << std::string(widths[i], '-') << "-+";
+    }
+    oss << "\n";
+
+    // Data rows
     for (const auto& row : table.rows) {
-        for (const auto& cell : row) {
-            oss << cell.text << " | ";
+        for (size_t i = 0; i < row.size() && i < widths.size(); ++i) {
+            oss << " " << pad(row[i].text, widths[i]) << " |";
         }
         oss << "\n";
     }
@@ -684,19 +767,64 @@ std::string MarkdownConverter::markdown_to_plain_text(const std::string& markdow
 }
 
 std::string MarkdownConverter::markdown_to_slack(const std::string& markdown) {
-    // Slack uses similar formatting to Markdown
-    return markdown;
+    // 🎯 对齐 OpenClaw: markdown → Slack mrkdwn 格式
+    std::string result = markdown;
+
+    // Convert **bold** → *bold*
+    result = std::regex_replace(result, std::regex(R"(\*\*(.+?)\*\*)"), "*$1*");
+    // Convert *italic* → _italic_
+    result = std::regex_replace(result, std::regex(R"((?<!\*)\*([^*]+?)\*(?!\*))"), "_$1_");
+    // Convert ~~strikethrough~~ → ~strikethrough~
+    result = std::regex_replace(result, std::regex(R"(~~(.+?)~~)"), "~$1~");
+    // Convert [text](url) → <url|text>
+    result = std::regex_replace(result, std::regex(R"(\[([^\]]+)\]\(([^)]+)\))"), "<$2|$1>");
+
+    return result;
 }
 
 std::string MarkdownConverter::markdown_to_discord(const std::string& markdown) {
-    // Discord uses Markdown-like syntax
-    return markdown;
+    // 🎯 对齐 OpenClaw: Discord 原生支持大部分 Markdown
+    // 主要差异: 标题用 **加粗** 替代（Discord 不支持 # 标题）
+    std::string result = markdown;
+
+    // Convert # headings to **bold** (Discord doesn't render # as headings in messages)
+    result = std::regex_replace(result, std::regex(R"(^#{1,6}\s+(.+)$)", std::regex::multiline), "**$1**");
+
+    return result;
 }
 
 std::string MarkdownConverter::markdown_to_telegram(const std::string& markdown) {
-    // Telegram has its own formatting
-    // TODO: Implement conversion
-    return markdown;
+    // 🎯 对齐 OpenClaw: markdown → Telegram MarkdownV2 格式
+    // Telegram MarkdownV2 需要转义特殊字符: _*[]()~`>#+-=|{}.!
+    std::string result = markdown;
+
+    // Escape special chars that aren't part of formatting
+    // (保留 **bold**, *italic*, `code`, ```block```, [link](url))
+    // 简化版: 转义 . ! - ( ) 等
+    auto escape_telegram = [](const std::string& text) -> std::string {
+        std::string out;
+        out.reserve(text.size() * 1.2);
+        for (char c : text) {
+            switch (c) {
+                case '.': case '!': case '-': case '(': case ')':
+                case '{': case '}': case '=': case '+': case '>':
+                case '#': case '|':
+                    out += '\\';
+                    out += c;
+                    break;
+                default:
+                    out += c;
+                    break;
+            }
+        }
+        return out;
+    };
+
+    // Protect code blocks and inline code first
+    // (simplified — full implementation would use state machine)
+    result = escape_telegram(result);
+
+    return result;
 }
 
 // ============================================================================
@@ -729,12 +857,75 @@ bool MarkdownValidator::has_unclosed_formatting(const std::string& markdown) {
 }
 
 std::vector<std::string> MarkdownValidator::find_broken_links(const std::string& markdown) {
-    // TODO: Implement broken link detection
-    return {};
+    // 🎯 对齐 OpenClaw: findBrokenLinks — 查找格式错误的 markdown 链接
+    std::vector<std::string> broken;
+
+    // Find all [text](url) patterns
+    std::regex link_re(R"(\[([^\]]*)\]\(([^)]*)\))");
+    auto begin = std::sregex_iterator(markdown.begin(), markdown.end(), link_re);
+    auto end = std::sregex_iterator();
+
+    for (auto it = begin; it != end; ++it) {
+        std::string url = (*it)[2].str();
+        // Check for obviously broken URLs
+        if (url.empty()) {
+            broken.push_back("[" + (*it)[1].str() + "]() — empty URL");
+        } else if (url.find(' ') != std::string::npos && url.find("http") == 0) {
+            broken.push_back(url + " — contains spaces");
+        } else if (url.find("http") == 0 && url.find("://") == std::string::npos) {
+            broken.push_back(url + " — missing ://");
+        }
+    }
+
+    // Find unclosed links: [text]( without closing )
+    std::regex unclosed_re(R"(\[[^\]]*\]\([^)]*$)", std::regex::multiline);
+    auto ub = std::sregex_iterator(markdown.begin(), markdown.end(), unclosed_re);
+    for (auto it = ub; it != end; ++it) {
+        broken.push_back((*it)[0].str() + " — unclosed link");
+    }
+
+    return broken;
 }
 
 bool MarkdownValidator::has_invalid_tables(const std::string& markdown) {
-    // TODO: Implement table validation
+    // 🎯 对齐 OpenClaw: hasInvalidTables — 检测格式错误的表格
+    // Valid markdown table needs:
+    // 1. Header row with |
+    // 2. Separator row with |---|
+    // 3. At least one data row
+
+    std::regex table_start_re(R"(^\|.+\|$)", std::regex::multiline);
+    std::regex separator_re(R"(^\|[\s\-:|]+\|$)", std::regex::multiline);
+
+    auto has_table_rows = std::regex_search(markdown, table_start_re);
+    if (!has_table_rows) return false;  // No tables at all
+
+    // Check if tables have proper separator
+    auto has_separator = std::regex_search(markdown, separator_re);
+    if (!has_separator) return true;  // Has table-like rows but no separator
+
+    // Check column count consistency
+    std::istringstream stream(markdown);
+    std::string line;
+    int prev_col_count = -1;
+    bool in_table = false;
+
+    while (std::getline(stream, line)) {
+        if (line.empty() || line.find('|') == std::string::npos) {
+            in_table = false;
+            prev_col_count = -1;
+            continue;
+        }
+        if (line.front() == '|') {
+            int col_count = static_cast<int>(std::count(line.begin(), line.end(), '|')) - 1;
+            if (in_table && prev_col_count != -1 && col_count != prev_col_count) {
+                return true;  // Inconsistent column count
+            }
+            in_table = true;
+            prev_col_count = col_count;
+        }
+    }
+
     return false;
 }
 
@@ -743,8 +934,61 @@ bool MarkdownValidator::has_invalid_tables(const std::string& markdown) {
 // ============================================================================
 
 std::vector<BlockquoteParser::BlockquoteSpan> BlockquoteParser::parse_blockquotes(const std::string& markdown) {
-    // TODO: Implement blockquote parsing
-    return {};
+    // 🎯 对齐 OpenClaw: parseBlockquotes — 解析 > 引用块
+    std::vector<BlockquoteSpan> spans;
+
+    std::istringstream stream(markdown);
+    std::string line;
+    int pos = 0;
+    int span_start = -1;
+    int depth = 0;
+
+    while (std::getline(stream, line)) {
+        int line_start = pos;
+        pos += static_cast<int>(line.size()) + 1;  // +1 for newline
+
+        // Count leading > characters
+        int line_depth = 0;
+        size_t i = 0;
+        while (i < line.size()) {
+            if (line[i] == '>') {
+                line_depth++;
+                i++;
+                if (i < line.size() && line[i] == ' ') i++;  // Skip optional space
+            } else if (line[i] == ' ' || line[i] == '\t') {
+                i++;
+            } else {
+                break;
+            }
+        }
+
+        if (line_depth > 0) {
+            if (span_start == -1) {
+                span_start = line_start;
+                depth = line_depth;
+            }
+        } else {
+            if (span_start != -1) {
+                BlockquoteSpan span;
+                span.start = span_start;
+                span.end = line_start;
+                span.depth = depth;
+                spans.push_back(span);
+                span_start = -1;
+            }
+        }
+    }
+
+    // Close last span if open
+    if (span_start != -1) {
+        BlockquoteSpan span;
+        span.start = span_start;
+        span.end = static_cast<int>(markdown.size());
+        span.depth = depth;
+        spans.push_back(span);
+    }
+
+    return spans;
 }
 
 std::string BlockquoteParser::extract_blockquote_content(const std::string& markdown,
@@ -753,8 +997,43 @@ std::string BlockquoteParser::extract_blockquote_content(const std::string& mark
 }
 
 std::vector<ListParser::ListItem> ListParser::parse_list_items(const std::string& markdown) {
-    // TODO: Implement list parsing
-    return {};
+    // 🎯 对齐 OpenClaw: parseListItems — 解析有序/无序列表
+    std::vector<ListItem> items;
+
+    std::istringstream stream(markdown);
+    std::string line;
+    int pos = 0;
+
+    // Patterns: "- item", "* item", "+ item", "1. item", "1) item"
+    std::regex unordered_re(R"(^(\s*)([-*+])\s+(.+)$)");
+    std::regex ordered_re(R"(^(\s*)(\d+)[.)]\s+(.+)$)");
+
+    while (std::getline(stream, line)) {
+        int line_start = pos;
+        pos += static_cast<int>(line.size()) + 1;
+
+        std::smatch match;
+        if (std::regex_match(line, match, unordered_re)) {
+            ListItem item;
+            item.start = line_start;
+            item.end = pos - 1;
+            item.indent = static_cast<int>(match[1].str().size());
+            item.ordered = false;
+            item.content = match[3].str();
+            items.push_back(item);
+        } else if (std::regex_match(line, match, ordered_re)) {
+            ListItem item;
+            item.start = line_start;
+            item.end = pos - 1;
+            item.indent = static_cast<int>(match[1].str().size());
+            item.ordered = true;
+            item.index = std::stoi(match[2].str());
+            item.content = match[3].str();
+            items.push_back(item);
+        }
+    }
+
+    return items;
 }
 
 std::string ListParser::extract_list_item_content(const std::string& markdown,

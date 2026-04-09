@@ -202,14 +202,30 @@ ReactResult ReactEngine::run(
     try {
         auto result = execute_loop(user_input, history, callbacks);
         
-        // ✅ ContextEngine: afterTurn (对齐 OpenClaw attempt.ts:2608-2660)
+        // ✅ ContextEngine: afterTurn (严格对齐 OpenClaw attempt.ts:2610-2660)
+        // 🎯 三级降级: afterTurn → ingestBatch → ingest (逐条)
         if (context_engine_) {
+            // 构建消息快照 JSON 列表
+            std::vector<std::string> messages_json;
+            for (const auto& msg : result.messages_snapshot) {
+                nlohmann::json j;
+                j["role"] = [&]() {
+                    switch (msg.role) {
+                        case llm::LLMMessageRole::User: return "user";
+                        case llm::LLMMessageRole::Assistant: return "assistant";
+                        case llm::LLMMessageRole::System: return "system";
+                        case llm::LLMMessageRole::Tool: return "toolResult";
+                        default: return "unknown";
+                    }
+                }();
+                j["content"] = msg.content;
+                messages_json.push_back(j.dump());
+            }
+            int pre_prompt_count = static_cast<int>(history.size());
+
+            // 🎯 对齐 OpenClaw: 优先 afterTurn，不存在则降级到 ingest
+            bool after_turn_called = false;
             try {
-                // 构建消息 JSON 列表
-                std::vector<std::string> messages_json;
-                // afterTurn 需要的 pre_prompt_message_count
-                int pre_prompt_count = static_cast<int>(history.size());
-                
                 context_engine_->after_turn(
                     callbacks.session_id,
                     callbacks.transcript_path,
@@ -220,10 +236,46 @@ ReactResult ReactEngine::run(
                     context_window_config_.context_window_tokens,  // token_budget
                     nlohmann::json::object()  // runtime_context
                 );
+                after_turn_called = true;
             } catch (const std::exception& e) {
-                log()->warn("[ContextEngine] afterTurn failed: {}", e.what());
-                // 对齐 OpenClaw: afterTurn 失败时降级到 ingestBatch/ingest
-                // (simplified — 完整实现需要逐条 ingest 新消息)
+                log()->warn("[ContextEngine] afterTurn failed: {}, falling back to ingest", e.what());
+            }
+
+            // 🎯 严格对齐 OpenClaw: Fallback — ingest new messages individually
+            // attempt.ts:2632-2659: if afterTurn is not a function → ingestBatch/ingest
+            if (!after_turn_called) {
+                // Slice new messages: messagesSnapshot.slice(prePromptMessageCount)
+                int new_start = pre_prompt_count;
+                int total = static_cast<int>(messages_json.size());
+                if (new_start < total) {
+                    // 🎯 对齐 OpenClaw: 优先 ingestBatch，否则逐条 ingest
+                    try {
+                        // Try ingestBatch first
+                        std::vector<std::string> new_messages(
+                            messages_json.begin() + new_start,
+                            messages_json.end());
+                        context_engine_->ingest_batch(
+                            callbacks.session_id,
+                            std::nullopt,  // session_key
+                            new_messages);
+                    } catch (const std::exception& batch_err) {
+                        log()->warn("[ContextEngine] ingestBatch failed: {}, falling back to individual ingest",
+                                   batch_err.what());
+                        // 🎯 对齐 OpenClaw: 逐条 ingest fallback
+                        for (int i = new_start; i < total; ++i) {
+                            try {
+                                context_engine_->ingest(
+                                    callbacks.session_id,
+                                    std::nullopt,  // session_key
+                                    messages_json[i],
+                                    false);  // is_heartbeat
+                            } catch (const std::exception& ingest_err) {
+                                log()->warn("[ContextEngine] ingest failed for message {}: {}",
+                                           i, ingest_err.what());
+                            }
+                        }
+                    }
+                }
             }
         }
         
@@ -576,8 +628,8 @@ ReactResult ReactEngine::execute_loop(
             cancelled_ = true;
             break;
         }
-        // ✅ 新增: Token Overflow 检查 (对齐 OpenClaw)
-        if (compaction_mgr_) {
+        // ✅ 严格对齐 OpenClaw run.ts:1007-1192: Token Overflow 检查 + compact + tool result truncation
+        if (compaction_mgr_ || context_engine_) {
             int current_tokens = estimate_conversation_tokens(messages);
             int context_window = context_window_config_.context_window_tokens;
             
@@ -599,57 +651,110 @@ ReactResult ReactEngine::execute_loop(
             }
             
             // 检查是否需要 compaction
-            if (compaction_mgr_->should_compact(agent_messages, current_tokens, context_window)) {
+            bool should_compact = compaction_mgr_ &&
+                compaction_mgr_->should_compact(agent_messages, current_tokens, context_window);
+
+            if (should_compact) {
                 log()->warn("[ReactEngine] Token overflow detected: {} >= threshold, triggering compaction",
                            current_tokens);
                 
-                // 🎯 对齐 OpenClaw: compactionRetry — retry compaction up to 3 times
-                int compaction_attempts = 0;
-                const int max_compaction_retries = 3;
+                // 🎯 严格对齐 OpenClaw run.ts:741: MAX_OVERFLOW_COMPACTION_ATTEMPTS = 3
+                const int MAX_OVERFLOW_COMPACTION_ATTEMPTS = 3;
+                int overflow_compaction_attempts = 0;
                 bool compaction_succeeded = false;
-                
-                while (compaction_attempts < max_compaction_retries) {
-                    // 🎯 对齐 OpenClaw handlers.compaction.ts:7-38: emit compaction start AgentEvent
+
+                // 🎯 严格对齐 OpenClaw run.ts:1020-1129: 先尝试 contextEngine.compact()
+                while (overflow_compaction_attempts < MAX_OVERFLOW_COMPACTION_ATTEMPTS) {
+                    overflow_compaction_attempts++;
+                    log()->warn("[ReactEngine] Context overflow (attempt {}/{}); attempting auto-compaction",
+                               overflow_compaction_attempts, MAX_OVERFLOW_COMPACTION_ATTEMPTS);
+
+                    // 🎯 对齐 OpenClaw: emit compaction start event
                     if (callbacks.on_agent_event) {
                         core::JsonValue data;
                         data["phase"] = "start";
                         callbacks.on_agent_event({"compaction", std::move(data)});
                     }
 
-                    auto compact_result = trigger_compaction(messages);
-                    compaction_attempts++;
-                    
-                    if (compact_result.compacted) {
-                        log()->info("[ReactEngine] Compaction completed (attempt {}), continuing with {} messages",
-                                   compaction_attempts, messages.size());
+                    // 🎯 严格对齐 OpenClaw: 优先调用 contextEngine.compact()
+                    bool compact_ok = false;
+                    if (context_engine_) {
+                        try {
+                            auto ce_result = context_engine_->compact(
+                                callbacks.session_id,
+                                callbacks.transcript_path,
+                                context_window,
+                                true,   // force = true (overflow 时强制)
+                                current_tokens,  // current_token_count
+                                "budget",  // compaction_target = "budget"
+                                std::nullopt,  // custom_instructions
+                                nlohmann::json({
+                                    {"trigger", "overflow"},
+                                    {"attempt", overflow_compaction_attempts},
+                                    {"maxAttempts", MAX_OVERFLOW_COMPACTION_ATTEMPTS}
+                                })  // runtime_context
+                            );
+                            compact_ok = ce_result.ok && ce_result.compacted;
+                            if (!compact_ok) {
+                                log()->warn("[ReactEngine] contextEngine.compact() did not compact: {}",
+                                           ce_result.reason.value_or("nothing to compact"));
+                            }
+                        } catch (const std::exception& e) {
+                            log()->warn("[ReactEngine] contextEngine.compact() threw: {}", e.what());
+                        }
+                    }
+
+                    // Fallback 到 compaction_mgr_ (如果 CE compact 失败)
+                    if (!compact_ok && compaction_mgr_) {
+                        auto compact_result = trigger_compaction(messages);
+                        compact_ok = compact_result.compacted;
+                        if (!compact_ok) {
+                            log()->warn("[ReactEngine] CompactionManager also failed: {}",
+                                       compact_result.reason);
+                        }
+                    }
+
+                    // 🎯 对齐 OpenClaw: emit compaction end event
+                    if (callbacks.on_agent_event) {
+                        core::JsonValue data;
+                        data["phase"] = "end";
+                        data["willRetry"] = !compact_ok && (overflow_compaction_attempts < MAX_OVERFLOW_COMPACTION_ATTEMPTS);
+                        callbacks.on_agent_event({"compaction", std::move(data)});
+                    }
+
+                    if (compact_ok) {
+                        log()->info("[ReactEngine] Auto-compaction succeeded (attempt {}); retrying prompt",
+                                   overflow_compaction_attempts);
                         compaction_succeeded = true;
-                        // 🎯 对齐 OpenClaw handlers.compaction.ts:64-72: emit compaction end AgentEvent
-                        if (callbacks.on_agent_event) {
-                            core::JsonValue data;
-                            data["phase"] = "end";
-                            data["willRetry"] = false;
-                            callbacks.on_agent_event({"compaction", std::move(data)});
-                        }
                         break;
-                    } else {
-                        log()->warn("[ReactEngine] Compaction attempt {} failed: {}",
-                                   compaction_attempts, compact_result.reason);
-                        bool will_retry = (compaction_attempts < max_compaction_retries);
-                        // 🎯 对齐 OpenClaw: compaction end event with willRetry
-                        if (callbacks.on_agent_event) {
-                            core::JsonValue data;
-                            data["phase"] = "end";
-                            data["willRetry"] = will_retry;
-                            callbacks.on_agent_event({"compaction", std::move(data)});
-                        }
-                        if (will_retry) {
-                            log()->info("[ReactEngine] Retrying compaction (attempt {})", compaction_attempts + 1);
-                        }
                     }
                 }
                 
+                // 🎯 严格对齐 OpenClaw run.ts:1130-1179: Fallback — truncate oversized tool results
                 if (!compaction_succeeded) {
-                    log()->error("[ReactEngine] All {} compaction attempts failed", max_compaction_retries);
+                    log()->warn("[ReactEngine] All {} compaction attempts failed; checking for oversized tool results",
+                               MAX_OVERFLOW_COMPACTION_ATTEMPTS);
+                    // Truncate oversized tool results (对齐 OpenClaw: truncateOversizedToolResultsInSession)
+                    bool truncated_any = false;
+                    for (auto& msg : messages) {
+                        if (msg.role == llm::LLMMessageRole::Tool) {
+                            int estimated_tokens = static_cast<int>(msg.content.size()) / 4;
+                            // If a single tool result > 25% of context window, truncate it
+                            if (estimated_tokens > context_window / 4) {
+                                size_t max_chars = static_cast<size_t>(context_window / 4) * 4;
+                                msg.content = msg.content.substr(0, max_chars) +
+                                    "\n\n[Output truncated — exceeded context window budget]";
+                                truncated_any = true;
+                                log()->warn("[ReactEngine] Truncated oversized tool result ({} → {} chars)",
+                                           estimated_tokens * 4, max_chars);
+                            }
+                        }
+                    }
+                    if (truncated_any) {
+                        log()->info("[ReactEngine] Tool result truncation complete; continuing");
+                    } else {
+                        log()->error("[ReactEngine] No oversized tool results to truncate; giving up");
+                    }
                 }
             }
         }

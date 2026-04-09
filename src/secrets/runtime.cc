@@ -508,12 +508,58 @@ std::map<std::string, SecretResolutionResult> SecretsRuntimeManager::resolve_exe
 ) {
     std::map<std::string, SecretResolutionResult> results;
     
-    // TODO: Implement command execution with timeout
-    // For now, return error
+    // 🎯 严格对齐 OpenClaw: secrets exec provider
+    // 通过外部命令解析 secret values (e.g. `op read op://vault/item/password`)
     for (const auto& ref : refs) {
-        results[ref.key()] = SecretResolutionResult::fail(
-            "Exec provider not yet implemented: " + provider_config.command
-        );
+        // Check cache first
+        if (cache) {
+            auto cached = cache->get(ref.key());
+            if (cached.has_value()) {
+                results[ref.key()] = SecretResolutionResult::ok(*cached);
+                continue;
+            }
+        }
+
+        // Build command: replace {ref} placeholder with ref_id
+        std::string cmd = provider_config.command;
+        size_t pos = cmd.find("{ref}");
+        if (pos != std::string::npos) {
+            cmd.replace(pos, 5, ref.ref_id);
+        } else {
+            cmd += " " + ref.ref_id;
+        }
+
+        // Execute command with popen (对齐 OpenClaw: child_process.execSync)
+        std::string output;
+        FILE* pipe = popen(cmd.c_str(), "r");
+        if (!pipe) {
+            results[ref.key()] = SecretResolutionResult::fail(
+                "Failed to execute command: " + cmd);
+            continue;
+        }
+
+        char buffer[256];
+        while (fgets(buffer, sizeof(buffer), pipe)) {
+            output += buffer;
+        }
+        int exit_code = pclose(pipe);
+
+        // Trim trailing newline
+        while (!output.empty() && (output.back() == '\n' || output.back() == '\r')) {
+            output.pop_back();
+        }
+
+        if (exit_code != 0 || output.empty()) {
+            results[ref.key()] = SecretResolutionResult::fail(
+                "Exec provider returned exit code " + std::to_string(exit_code) +
+                " for ref: " + ref.ref_id);
+        } else {
+            results[ref.key()] = SecretResolutionResult::ok(output);
+            // Update cache
+            if (cache) {
+                cache->put(ref.key(), output);
+            }
+        }
     }
     
     return results;

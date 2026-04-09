@@ -1,5 +1,6 @@
 // Aligned with openclaw: src/discord/monitor/message-handler.ts
 #include "hunterclaw/channels/discord_message_handler.h"
+#include "hunterclaw/routing/resolver.h"
 #include <chrono>
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_sinks.h>
@@ -120,10 +121,56 @@ DiscordMessageHandlerWithLifecycle create_discord_message_handler(
                 payload.message = data;
             }
 
-            // Aligned with openclaw: sessionKey = route.sessionKey
-            // Use channel_id as session key (full routing will be implemented with preflight)
-            payload.session_key = channel_id.empty() ? std::nullopt
-                                                      : std::optional<std::string>(channel_id);
+            // 🎯 严格对齐 OpenClaw: discord/monitor/route-resolution.ts
+            // 用 resolve_discord_bound_conversation_route 构建正确的 session_key
+            {
+                // 提取 author.id (DM 时作为 direct_user_id)
+                std::string direct_user_id;
+                if (payload.is_direct_message && data.contains("author") && data["author"].is_object()) {
+                    if (data["author"].contains("id") && data["author"]["id"].is_string()) {
+                        direct_user_id = data["author"]["id"].get<std::string>();
+                    }
+                }
+
+                // 提取 parent_id（线程继承父会话）
+                std::optional<std::string> parent_id;
+                if (data.contains("message_reference") && data["message_reference"].is_object()) {
+                    const auto& ref = data["message_reference"];
+                    if (ref.contains("channel_id") && ref["channel_id"].is_string()) {
+                        parent_id = ref["channel_id"].get<std::string>();
+                    }
+                }
+
+                // 提取 member.roles[]
+                std::vector<std::string> member_role_ids;
+                if (data.contains("member") && data["member"].is_object()) {
+                    const auto& member = data["member"];
+                    if (member.contains("roles") && member["roles"].is_array()) {
+                        for (const auto& role : member["roles"]) {
+                            if (role.is_string()) {
+                                member_role_ids.push_back(role.get<std::string>());
+                            }
+                        }
+                    }
+                }
+
+                // 构建路由 — 使用 routing 系统的渠道封装函数
+                routing::RouteResolver resolver;
+                resolver.set_default_agent_id("main");
+
+                auto route = routing::resolve_discord_bound_conversation_route(
+                    resolver,
+                    std::optional<std::string>(account_id),
+                    payload.guild_id,
+                    member_role_ids,
+                    payload.is_direct_message,
+                    false,  // is_group_dm — 需要从 channel.type 判断
+                    direct_user_id,
+                    channel_id,
+                    parent_id);
+
+                payload.session_key = route.session_key;
+            }
 
             job.queue_key = resolve_discord_inbound_job_queue_key(payload);
 

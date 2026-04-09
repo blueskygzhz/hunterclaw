@@ -166,17 +166,131 @@ TtsProvider::Ptr create_openai_tts_provider(
     return std::make_shared<OpenAiTtsProvider>(api_key, url);
 }
 
+// ============================================================================
+// 🎯 ElevenLabs TTS Provider
+// 严格对齐 OpenClaw: src/tts/providers/elevenlabs.ts
+// ============================================================================
+
+class ElevenLabsTtsProvider : public TtsProvider {
+public:
+    explicit ElevenLabsTtsProvider(const std::string& api_key,
+                                    const std::string& voice_id = "21m00Tcm4TlvDq8ikWAM",
+                                    const std::string& model_id = "eleven_monolingual_v1")
+        : api_key_(api_key), voice_id_(voice_id), model_id_(model_id) {}
+
+    core::Result<TtsResult> text_to_speech(const TtsRequest& request) override {
+        // 🎯 对齐 OpenClaw elevenlabs.ts: POST /v1/text-to-speech/{voiceId}
+        std::string url = "https://api.elevenlabs.io/v1/text-to-speech/" + voice_id_;
+
+        infra::HttpClient client;
+        infra::HttpRequest http_req;
+        http_req.url = url;
+        http_req.method = "POST";
+        http_req.headers = {
+            {"Accept", "audio/mpeg"},
+            {"xi-api-key", api_key_},
+            {"Content-Type", "application/json"}
+        };
+
+        nlohmann::json body;
+        body["text"] = request.text;
+        body["model_id"] = model_id_;
+        body["voice_settings"] = {
+            {"stability", 0.5},
+            {"similarity_boost", 0.75}
+        };
+        http_req.body = body.dump();
+
+        auto response = client.request(http_req);
+        if (!response.ok()) {
+            return core::Result<TtsResult>::Err(
+                "ElevenLabs TTS failed: " + std::to_string(response.status_code));
+        }
+
+        // Save audio to file
+        std::string output_path = request.output_dir + "/tts_" +
+            std::to_string(std::time(nullptr)) + ".mp3";
+        std::ofstream out(output_path, std::ios::binary);
+        if (!out.is_open()) {
+            return core::Result<TtsResult>::Err("Failed to write audio file");
+        }
+        out.write(response.body.data(), response.body.size());
+        out.close();
+
+        TtsResult result;
+        result.audio_path = output_path;
+        result.mime_type = "audio/mpeg";
+        result.duration_ms = 0;  // ElevenLabs doesn't return duration in response
+        return core::Result<TtsResult>::Ok(result);
+    }
+
+    std::string name() const override { return "elevenlabs"; }
+
+private:
+    std::string api_key_;
+    std::string voice_id_;
+    std::string model_id_;
+};
+
 TtsProvider::Ptr create_elevenlabs_tts_provider(const std::string& api_key) {
-    // TODO: Implement ElevenLabs provider
-    // Aligned with openclaw: src/tts/providers/elevenlabs.ts
-    return nullptr;
+    // 🎯 对齐 OpenClaw: src/tts/providers/elevenlabs.ts
+    return std::make_shared<ElevenLabsTtsProvider>(api_key);
 }
 
+// ============================================================================
+// 🎯 Edge TTS Provider
+// 严格对齐 OpenClaw: src/tts/providers/edge.ts
+// Uses edge-tts CLI (Python package) for free Microsoft Edge TTS
+// ============================================================================
+
+class EdgeTtsProvider : public TtsProvider {
+public:
+    EdgeTtsProvider() = default;
+
+    core::Result<TtsResult> text_to_speech(const TtsRequest& request) override {
+        // 🎯 对齐 OpenClaw edge.ts: spawn edge-tts CLI process
+        std::string output_path = request.output_dir + "/tts_" +
+            std::to_string(std::time(nullptr)) + ".mp3";
+
+        // Build edge-tts command
+        // edge-tts --text "..." --write-media output.mp3 [--voice voice_name]
+        std::string voice = request.voice.value_or("en-US-AriaNeural");
+        std::string escaped_text = request.text;
+        // Escape double quotes for shell
+        size_t pos = 0;
+        while ((pos = escaped_text.find('"', pos)) != std::string::npos) {
+            escaped_text.replace(pos, 1, "\\\"");
+            pos += 2;
+        }
+
+        std::string cmd = "edge-tts --text \"" + escaped_text +
+            "\" --write-media \"" + output_path +
+            "\" --voice \"" + voice + "\" 2>/dev/null";
+
+        int exit_code = std::system(cmd.c_str());
+        if (exit_code != 0) {
+            return core::Result<TtsResult>::Err(
+                "edge-tts failed with exit code " + std::to_string(exit_code) +
+                ". Ensure edge-tts is installed: pip install edge-tts");
+        }
+
+        if (!std::filesystem::exists(output_path)) {
+            return core::Result<TtsResult>::Err("edge-tts did not produce output file");
+        }
+
+        TtsResult result;
+        result.audio_path = output_path;
+        result.mime_type = "audio/mpeg";
+        result.duration_ms = 0;
+        return core::Result<TtsResult>::Ok(result);
+    }
+
+    std::string name() const override { return "edge"; }
+};
+
 TtsProvider::Ptr create_edge_tts_provider() {
-    // TODO: Implement Edge TTS provider
-    // Aligned with openclaw: src/tts/providers/edge.ts
-    // Uses edge-tts Python package or direct HTTP API
-    return nullptr;
+    // 🎯 对齐 OpenClaw: src/tts/providers/edge.ts
+    return std::make_shared<EdgeTtsProvider>();
 }
 
 }  // namespace tts

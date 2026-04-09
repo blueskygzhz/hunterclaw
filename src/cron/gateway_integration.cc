@@ -319,13 +319,13 @@ void GatewayCronIntegration::set_context(
     const std::string& agent_id,
     const std::optional<std::string>& session_key
 ) {
-    // TODO: ExecutionContext not yet implemented in CronService
-    // CronService::ExecutionContext ctx;
-    // ctx.agent_id = agent_id;
-    // ctx.session_key = session_key;
-    // service_->set_context(ctx);
+    // 🎯 对齐 OpenClaw: CronService ExecutionContext — 多租户上下文
+    if (service_) {
+        service_->set_execution_context(agent_id, session_key);
+    }
     
-    log()->debug("[Cron] Context set to agent_id={} (not yet implemented)", agent_id);
+    log()->debug("[Cron] Context set to agent_id={}, session_key={}",
+                agent_id, session_key.value_or("(none)"));
 }
 
 // ============================================================================

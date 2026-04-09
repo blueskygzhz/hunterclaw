@@ -1,6 +1,7 @@
 #include "hunterclaw/channels/plugin.h"
 #include "hunterclaw/plugins/plugin_system.h"   // PluginDefinition for channel-as-plugin registration
 #include "hunterclaw/security/timing_safe.h"   // constant-time compare for webhook secret
+#include "hunterclaw/routing/resolver.h"       // 🎯 路由系统
 #include <httplib.h>                            // dedicated HTTP server for webhook listener
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -827,6 +828,21 @@ ChannelPlugin make_telegram_plugin() {
             }
 
             inbound_msg.timestamp = std::chrono::system_clock::now();
+
+            // 🎯 严格对齐 OpenClaw: telegram/conversation-route.ts
+            // 用 resolve_channel_route 构建正确的 session_key
+            {
+                routing::RoutePeer peer{inbound_msg.chat_type, chat_id};
+                routing::RouteResolver resolver;
+                resolver.set_default_agent_id("main");
+
+                auto route = routing::resolve_channel_route(
+                    resolver, "telegram",
+                    std::optional<std::string>(ctx.account_id),
+                    peer);
+
+                inbound_msg.session_key = route.session_key;
+            }
 
             if (ctx.dispatch_inbound) {
                 ctx.dispatch_inbound(inbound_msg);

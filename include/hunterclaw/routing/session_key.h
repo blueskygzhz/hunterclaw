@@ -80,5 +80,20 @@ inline std::optional<T> resolve_account_entry(
   return std::nullopt;
 }
 
+// ============================================================================
+// getSubagentDepth — 对齐 OpenClaw session-key-utils.ts
+// ============================================================================
+inline int sk_get_subagent_depth(const std::string& key) {
+  return get_subagent_depth(key);
+}
+
+// ============================================================================
+// scopedHeartbeatWakeOptions — 对齐 OpenClaw session-key.ts:33-38
+// 如果 sessionKey 是 agent: 格式，返回 true（调用方应在 wakeOptions 中注入 sessionKey）
+// ============================================================================
+inline bool sk_should_scope_heartbeat_wake(const std::string& key) {
+  return should_scope_heartbeat_wake(key);
+}
+
 } // namespace routing
 } // namespace hunterclaw

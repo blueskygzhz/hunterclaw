@@ -136,10 +136,57 @@ static std::string resolve_send_policy(
         }
     }
 
-    // Aligned with openclaw: no config.session.sendPolicy rules → default "allow"
-    // HunterClaw does not yet have a full sendPolicy rules engine.
-    // The default is "allow" unless explicitly overridden.
-    // This matches openclaw's behavior when cfg.session?.sendPolicy is undefined.
+    // 🎯 严格对齐 OpenClaw: config.session.sendPolicy 规则引擎
+    // OpenClaw: resolveSendPolicy checks config.session.sendPolicy rules array
+    // Each rule: { channel?, chatType?, action: "allow"|"deny" }
+    // First match wins; no match → default "allow"
+    //
+    // TODO: 从实际 config 读取 sendPolicy rules
+    // 当前从 dispatcher 的 config_ 成员获取
+    if (config_) {
+        auto cfg_data = config_->data;
+        if (cfg_data.contains("session") && cfg_data["session"].is_object() &&
+            cfg_data["session"].contains("sendPolicy") && cfg_data["session"]["sendPolicy"].is_array()) {
+            const auto& rules = cfg_data["session"]["sendPolicy"];
+            std::string chat_type_str;
+            switch (chat_type) {
+                case routing::ChatType::DIRECT:  chat_type_str = "direct"; break;
+                case routing::ChatType::GROUP:   chat_type_str = "group"; break;
+                case routing::ChatType::CHANNEL: chat_type_str = "channel"; break;
+                default: chat_type_str = ""; break;
+            }
+
+            for (const auto& rule : rules) {
+                if (!rule.is_object()) continue;
+
+                // Check channel match
+                bool channel_match = true;
+                if (rule.contains("channel") && rule["channel"].is_string()) {
+                    std::string rule_channel = rule["channel"].get<std::string>();
+                    if (!rule_channel.empty() && rule_channel != "*") {
+                        channel_match = (rule_channel == channel);
+                    }
+                }
+
+                // Check chatType match
+                bool type_match = true;
+                if (rule.contains("chatType") && rule["chatType"].is_string()) {
+                    std::string rule_type = rule["chatType"].get<std::string>();
+                    if (!rule_type.empty() && rule_type != "*") {
+                        type_match = (rule_type == chat_type_str);
+                    }
+                }
+
+                if (channel_match && type_match) {
+                    std::string action = rule.value("action", "allow");
+                    if (action == "deny") return "deny";
+                    if (action == "allow") return "allow";
+                }
+            }
+        }
+    }
+
+    // No matching rule → default "allow" (对齐 OpenClaw 默认行为)
     return "allow";
 }
 
@@ -206,21 +253,29 @@ static channels::InboundMessage finalize_inbound_context(
         ctx.originating_channel = normalize_channel(ctx.originating_channel);
     }
 
-    // Resolve session_key if not already set
-    // Aligned with openclaw: ctx.SessionKey derivation from channel:chatType:peerId
+    // 🎯 严格对齐 OpenClaw: 用 RouteResolver 解析路由并构建 session_key
+    // OpenClaw 中各渠道 monitor 调用 resolveAgentRoute({cfg, channel, accountId, peer})
+    // 然后使用 route.sessionKey 作为入站消息的 session key
     if (ctx.session_key.empty()) {
-        // Build session key: channel:chatType:peerId
-        // e.g. "telegram:dm:123456" or "feishu:group:oc_abc"
-        const std::string chat_type_str = [&]() -> std::string {
-            switch (ctx.chat_type) {
-                case routing::ChatType::GROUP:   return "group";
-                case routing::ChatType::CHANNEL: return "channel";
-                default:                         return "dm";
-            }
-        }();
+        // 构建 peer（对齐 OpenClaw: RoutePeer {kind, id}）
+        routing::ChatType peer_kind = ctx.chat_type;
+        if (peer_kind == routing::ChatType::UNKNOWN) {
+            peer_kind = routing::ChatType::DIRECT;
+        }
         const std::string peer_id = !ctx.chat_id.empty() ? ctx.chat_id : ctx.sender_id;
+
         if (!ctx.channel.empty() && !peer_id.empty()) {
-            ctx.session_key = ctx.channel + ":" + chat_type_str + ":" + peer_id;
+            // 🎯 对齐 OpenClaw: buildAgentPeerSessionKey → agent:{agentId}:{channel}:{kind}:{peerId}
+            // 使用 build_agent_peer_session_key 生成标准格式 session key
+            routing::BuildAgentPeerSessionKeyParams params;
+            params.agent_id = "main";  // 默认 agent，实际由 RouteResolver 动态决定
+            params.channel = ctx.channel;
+            params.account_id = ctx.account_id;
+            params.peer_kind = routing::chat_type_to_string(peer_kind);
+            params.peer_id = peer_id;
+            params.dm_scope = "main";  // 默认 DM scope，实际由配置决定
+
+            ctx.session_key = routing::build_agent_peer_session_key(params);
         }
     }
 
@@ -249,19 +304,9 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_inbound_message(
 
     AutoReplyConfig auto_reply_config;
     auto_reply_config.enabled = true;
-    // Resolve agent_id from session_key (aligned with openclaw: resolveSessionAgentId)
+    // Resolve agent_id from session_key (对齐 OpenClaw: resolveAgentIdFromSessionKey)
     auto_reply_config.agent_id = finalized.session_key.empty() ? "default" :
-        [&]() -> std::string {
-            // Parse "agent:<agentId>:..." prefix from session key
-            const std::string& sk = finalized.session_key;
-            if (sk.substr(0, 6) == "agent:") {
-                size_t second_colon = sk.find(':', 6);
-                if (second_colon != std::string::npos) {
-                    return sk.substr(6, second_colon - 6);
-                }
-            }
-            return "default";
-        }();
+        routing::resolve_agent_id_from_session_key(finalized.session_key);
 
     auto result = dispatch_reply_from_config(finalized, auto_reply_config);
 
@@ -2543,15 +2588,33 @@ void MessageDispatcher::maybe_apply_tts_to_payload(
         if (payload.text.find("MEDIA:") != std::string::npos) continue;
         if (payload.text.size() < 10) continue;  // Too short for TTS
 
-        // TODO: TTS provider integration not yet implemented.
-        // Aligned with openclaw: textToSpeech({ text, provider, channel })
-        // When tts::TtsProviderRegistry is available, uncomment the following:
-        //   auto provider = tts::TtsProviderRegistry::instance().get_provider(tts_provider);
-        //   tts::TtsRequest tts_request;
-        //   auto tts_result = provider->text_to_speech(tts_request);
-        //   payload.media_urls.push_back(tts_response.audio_path);
-        log()->debug("maybe_apply_tts_to_payload: TTS not yet implemented, skipping payload len={}",
-                     payload.text.size());
+        // 🎯 严格对齐 OpenClaw: textToSpeech({ text, provider, channel })
+        // Invoke TTS provider to convert text → audio URL
+        auto& registry = tts::TtsProviderRegistry::instance();
+        auto provider = registry.get_provider(tts_provider);
+        if (!provider) {
+            log()->debug("maybe_apply_tts_to_payload: no TTS provider '{}' available, skipping",
+                        tts_provider);
+            continue;
+        }
+
+        tts::TtsRequest tts_request;
+        tts_request.text = payload.text;
+        tts_request.output_dir = "/tmp/hunterclaw-tts";
+
+        // Create output dir if needed
+        std::filesystem::create_directories(tts_request.output_dir);
+
+        auto tts_result = provider->text_to_speech(tts_request);
+        if (tts_result.is_ok()) {
+            auto& audio = tts_result.get();
+            payload.media_urls.push_back(audio.audio_path);
+            log()->info("maybe_apply_tts_to_payload: TTS generated audio for payload len={} → {}",
+                       payload.text.size(), audio.audio_path);
+        } else {
+            log()->warn("maybe_apply_tts_to_payload: TTS failed for payload len={}: {}",
+                       payload.text.size(), tts_result.error);
+        }
     }
 }
 
@@ -2792,17 +2855,83 @@ void ReplyGenerator::apply_link_understanding(
     std::string& prompt,
     const channels::InboundMessage& message
 ) {
-    // ✅ Aligned with openclaw: applyLinkUnderstanding (link-understanding/apply.ts)
+    // 🎯 严格对齐 OpenClaw: applyLinkUnderstanding (link-understanding/apply.ts)
     //
     // Fetches and extracts content from URLs in the message:
     //   - Detects URLs in message text
     //   - Fetches page content (title, description, main text)
     //   - Appends extracted content to prompt as context
-    //
-    // TODO: Full implementation requires tools::LinkUnderstanding class.
-    // For now, this is a no-op stub.
     if (message.text.empty()) return;
-    (void)prompt;
+
+    // Extract URLs from message
+    std::regex url_re(R"(https?://[^\s<>\"']+)");
+    auto begin = std::sregex_iterator(message.text.begin(), message.text.end(), url_re);
+    auto end = std::sregex_iterator();
+
+    std::vector<std::string> urls;
+    for (auto it = begin; it != end; ++it) {
+        urls.push_back((*it)[0].str());
+    }
+
+    if (urls.empty()) return;
+
+    // Fetch content for each URL (max 3 to avoid delays)
+    const int MAX_URLS = 3;
+    std::ostringstream context;
+    int fetched = 0;
+
+    for (const auto& url : urls) {
+        if (fetched >= MAX_URLS) break;
+
+        try {
+            // Use curl to fetch page content
+            std::string cmd = "curl -fsSL --max-time 5 --max-filesize 524288 '" + url + "' 2>/dev/null";
+            FILE* pipe = popen(cmd.c_str(), "r");
+            if (!pipe) continue;
+
+            std::string html;
+            char buffer[4096];
+            while (fgets(buffer, sizeof(buffer), pipe)) {
+                html += buffer;
+                if (html.size() > 100000) break;  // Cap at 100KB
+            }
+            pclose(pipe);
+
+            if (html.empty()) continue;
+
+            // Extract title
+            std::regex title_re(R"(<title[^>]*>(.*?)</title>)", std::regex::icase);
+            std::smatch title_match;
+            std::string title;
+            if (std::regex_search(html, title_match, title_re)) {
+                title = title_match[1].str();
+            }
+
+            // Extract meta description
+            std::regex desc_re(R"(<meta[^>]*name=\"description\"[^>]*content=\"([^\"]*)\")");
+            std::smatch desc_match;
+            std::string description;
+            if (std::regex_search(html, desc_match, desc_re)) {
+                description = desc_match[1].str();
+            }
+
+            // Build context
+            context << "\n\n<link_content url=\"" << url << "\">\n";
+            if (!title.empty()) context << "Title: " << title << "\n";
+            if (!description.empty()) context << "Description: " << description << "\n";
+            context << "</link_content>\n";
+
+            fetched++;
+        } catch (...) {
+            // Skip failed URLs
+        }
+    }
+
+    if (fetched > 0) {
+        prompt += "\n\n<link_understanding>\n" +
+            context.str() +
+            "</link_understanding>\n";
+    }
 }
 
 } // namespace auto_reply

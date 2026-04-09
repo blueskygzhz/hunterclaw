@@ -330,8 +330,35 @@ ConfigValidationResult ConfigValidator::validate(const json& config_json) const 
 ConfigValidationResult ConfigValidator::validate_with_plugins(
     const json& config_json,
     const std::vector<std::string>& plugin_dirs) const {
-    // TODO: Load plugin schemas and validate
-    return validate(config_json);
+    // 🎯 对齐 OpenClaw: validateWithPlugins — 先做基础验证，再加载插件 schema
+    auto result = validate(config_json);
+
+    // Load plugin schemas from plugin directories
+    for (const auto& dir : plugin_dirs) {
+        namespace fs = std::filesystem;
+        fs::path schema_path = fs::path(dir) / "config-schema.json";
+        if (fs::exists(schema_path)) {
+            try {
+                std::ifstream schema_file(schema_path);
+                json plugin_schema;
+                schema_file >> plugin_schema;
+                // Validate plugin-specific sections
+                if (plugin_schema.contains("properties")) {
+                    ConfigSchemaBuilder builder;
+                    std::vector<std::string> plugin_errors;
+                    builder.validate_against_schema(config_json, plugin_schema, &plugin_errors);
+                    for (const auto& err : plugin_errors) {
+                        result.errors.push_back("[plugin:" + fs::path(dir).filename().string() + "] " + err);
+                    }
+                    if (!plugin_errors.empty()) result.valid = false;
+                }
+            } catch (...) {
+                // Skip invalid plugin schemas
+            }
+        }
+    }
+
+    return result;
 }
 
 ConfigValidationResult ConfigValidator::validate_section(

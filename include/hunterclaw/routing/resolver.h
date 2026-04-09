@@ -297,5 +297,92 @@ class AccountLookup {
   std::unique_ptr<Impl> impl_;
 };
 
+// ============================================================================
+// Session Key Utilities (补齐)
+// ✅ 对齐 OpenClaw: session-key-utils.ts getSubagentDepth
+// ============================================================================
+
+// 🎯 对齐 OpenClaw: getSubagentDepth(sessionKey)
+// 返回 session key 中 sub: 嵌套深度 (0 = 非子代理)
+int get_subagent_depth(const std::string& session_key);
+
+// 🎯 对齐 OpenClaw: scopedHeartbeatWakeOptions(sessionKey, wakeOptions)
+// 如果 sessionKey 是 agent: 格式，返回包含 sessionKey 的 options
+bool should_scope_heartbeat_wake(const std::string& session_key);
+
+// ============================================================================
+// Resolve Preferred Account ID
+// ✅ 对齐 OpenClaw: bindings.ts resolvePreferredAccountId
+// ============================================================================
+
+struct ResolvePreferredAccountIdParams {
+  std::vector<std::string> account_ids;
+  std::string default_account_id;
+  std::vector<std::string> bound_accounts;
+};
+
+// 🎯 对齐 OpenClaw: resolvePreferredAccountId
+// 优先绑定账户，回退到默认
+std::string resolve_preferred_account_id(const ResolvePreferredAccountIdParams& params);
+
+// ============================================================================
+// Default Account Warnings
+// ✅ 对齐 OpenClaw: routing/default-account-warnings.ts
+// ============================================================================
+
+// 🎯 对齐 OpenClaw: formatChannelDefaultAccountPath
+std::string format_channel_default_account_path(const std::string& channel_key);
+
+// 🎯 对齐 OpenClaw: formatChannelAccountsDefaultPath
+std::string format_channel_accounts_default_path(const std::string& channel_key);
+
+// 🎯 对齐 OpenClaw: formatSetExplicitDefaultInstruction
+std::string format_set_explicit_default_instruction(const std::string& channel_key);
+
+// 🎯 对齐 OpenClaw: formatSetExplicitDefaultToConfiguredInstruction
+std::string format_set_explicit_default_to_configured_instruction(const std::string& channel_key);
+
+// ============================================================================
+// Channel Route Resolution Helpers
+// ✅ 对齐 OpenClaw 各渠道 route-resolution 封装
+// ============================================================================
+
+// 🎯 对齐 OpenClaw: discord/monitor/route-resolution.ts buildDiscordRoutePeer
+RoutePeer build_discord_route_peer(bool is_direct_message, bool is_group_dm,
+                                   const std::string& direct_user_id,
+                                   const std::string& conversation_id);
+
+// 🎯 对齐 OpenClaw: resolveDiscordConversationRoute
+ResolvedAgentRoute resolve_discord_conversation_route(
+    RouteResolver& resolver,
+    const std::optional<std::string>& account_id,
+    const std::optional<std::string>& guild_id,
+    const std::vector<std::string>& member_role_ids,
+    const RoutePeer& peer,
+    const std::optional<std::string>& parent_conversation_id = std::nullopt);
+
+// 🎯 对齐 OpenClaw: resolveDiscordBoundConversationRoute
+// bound_session_key 覆盖路由的 sessionKey
+ResolvedAgentRoute resolve_discord_bound_conversation_route(
+    RouteResolver& resolver,
+    const std::optional<std::string>& account_id,
+    const std::optional<std::string>& guild_id,
+    const std::vector<std::string>& member_role_ids,
+    bool is_direct_message,
+    bool is_group_dm,
+    const std::string& direct_user_id,
+    const std::string& conversation_id,
+    const std::optional<std::string>& parent_conversation_id = std::nullopt,
+    const std::optional<std::string>& bound_session_key = std::nullopt);
+
+// 🎯 对齐 OpenClaw: 通用渠道路由解析（Telegram/Slack/Signal/LINE 等）
+// 简化封装，指定 channel 名称后调用 resolveAgentRoute
+ResolvedAgentRoute resolve_channel_route(
+    RouteResolver& resolver,
+    const std::string& channel_name,  // "telegram", "slack", "signal", "line", etc.
+    const std::optional<std::string>& account_id,
+    const RoutePeer& peer,
+    const std::optional<std::string>& team_id = std::nullopt);
+
 }  // namespace routing
 }  // namespace hunterclaw

@@ -213,10 +213,33 @@ core::Result<json> method_skills_status(
     const ClientContext& client_ctx,
     const json& params
 ) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
+    (void)method_guard; (void)client_ctx; (void)params;
+
+    // 🎯 严格对齐 OpenClaw: skills.status (server-methods/skills.ts)
     json result;
     result["ok"] = true;
-    result["skills"] = json::array();
+
+    auto skill_mgr = server->skill_manager();
+    if (!skill_mgr) {
+        result["skills"] = json::array();
+        return core::Result<json>::Ok(result);
+    }
+
+    // Get all skills from manager
+    auto snapshot = skill_mgr->get_snapshot();
+    json skills_arr = json::array();
+    for (const auto& skill : snapshot.skills) {
+        json s;
+        s["name"] = skill.name;
+        s["description"] = skill.description;
+        s["location"] = skill.file_path.string();
+        s["installed"] = skill.installed;
+        s["enabled"] = skill.enabled;
+        if (skill.version.has_value()) s["version"] = *skill.version;
+        skills_arr.push_back(s);
+    }
+    result["skills"] = skills_arr;
+    result["version"] = snapshot.version;
     return core::Result<json>::Ok(result);
 }
 
@@ -226,9 +249,32 @@ core::Result<json> method_skills_bins(
     const ClientContext& client_ctx,
     const json& params
 ) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
+    (void)method_guard; (void)client_ctx; (void)params;
+
+    // 🎯 严格对齐 OpenClaw: skills.bins (server-methods/skills.ts)
     json result;
-    result["bins"] = json::array();
+
+    auto skill_mgr = server->skill_manager();
+    if (!skill_mgr) {
+        result["bins"] = json::array();
+        return core::Result<json>::Ok(result);
+    }
+
+    // Get bin requirements from all skills
+    auto snapshot = skill_mgr->get_snapshot();
+    json bins_arr = json::array();
+    for (const auto& skill : snapshot.skills) {
+        for (const auto& bin : skill.required_bins) {
+            json b;
+            b["name"] = bin.name;
+            b["skill"] = skill.name;
+            b["found"] = bin.found;
+            if (bin.path.has_value()) b["path"] = *bin.path;
+            if (bin.version.has_value()) b["version"] = *bin.version;
+            bins_arr.push_back(b);
+        }
+    }
+    result["bins"] = bins_arr;
     return core::Result<json>::Ok(result);
 }
 
@@ -238,8 +284,36 @@ core::Result<json> method_skills_install(
     const ClientContext& client_ctx,
     const json& params
 ) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    return core::Result<json>::Err("skills.install not yet implemented");
+    (void)method_guard; (void)client_ctx;
+
+    // 🎯 严格对齐 OpenClaw: skills.install (server-methods/skills.ts)
+    std::string skill_name = params.value("skillName", "");
+    if (skill_name.empty()) {
+        return core::Result<json>::Err("skillName is required");
+    }
+
+    std::optional<std::string> install_id;
+    if (params.contains("installId") && params["installId"].is_string()) {
+        install_id = params["installId"].get<std::string>();
+    }
+
+    auto skill_mgr = server->skill_manager();
+    if (!skill_mgr) {
+        return core::Result<json>::Err("skill manager not available");
+    }
+
+    auto install_result = skill_mgr->install_skill(skill_name, install_id);
+    if (install_result.is_err()) {
+        json result;
+        result["ok"] = false;
+        result["message"] = install_result.error;
+        return core::Result<json>::Ok(result);
+    }
+
+    json result;
+    result["ok"] = true;
+    result["skillName"] = skill_name;
+    return core::Result<json>::Ok(result);
 }
 
 core::Result<json> method_skills_update(
@@ -248,8 +322,43 @@ core::Result<json> method_skills_update(
     const ClientContext& client_ctx,
     const json& params
 ) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    return core::Result<json>::Err("skills.update not yet implemented");
+    (void)method_guard; (void)client_ctx;
+
+    // 🎯 严格对齐 OpenClaw: skills.update (server-methods/skills.ts)
+    // Update skill config entry (apiKey, enabled, etc.)
+    std::string skill_name = params.value("skillName", "");
+    if (skill_name.empty()) {
+        return core::Result<json>::Err("skillName is required");
+    }
+
+    // Apply updates to skill entry in config
+    auto cfg = server->config();
+    if (cfg) {
+        // Update config JSON with skill entry changes
+        auto& data = cfg->data;
+        if (!data.contains("skills")) data["skills"] = json::object();
+        if (!data["skills"].contains("entries")) data["skills"]["entries"] = json::object();
+
+        json entry = data["skills"]["entries"].value(skill_name, json::object());
+        if (params.contains("apiKey")) {
+            entry["apiKey"] = params["apiKey"];
+        }
+        if (params.contains("enabled")) {
+            entry["enabled"] = params["enabled"];
+        }
+        data["skills"]["entries"][skill_name] = entry;
+    }
+
+    // Bump skill snapshot version to trigger refresh
+    auto skill_mgr = server->skill_manager();
+    if (skill_mgr) {
+        skill_mgr->bump_snapshot_version();
+    }
+
+    json result;
+    result["ok"] = true;
+    result["skillName"] = skill_name;
+    return core::Result<json>::Ok(result);
 }
 
 // ============================================================================
