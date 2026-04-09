@@ -377,16 +377,39 @@ private:
         if (!opts_.requester_sender_id.empty())
             request["requesterSenderId"] = opts_.requester_sender_id;
 
-        // TODO: call the actual channel plugin via GatewayClient
-        // For now, return a structured response indicating the action was dispatched
-        json result = {
-            {"ok",      true},
-            {"action",  action},
-            {"channel", channel},
-            {"target",  target},
-            {"stub",    true},
-            {"message", "Message action dispatched (inject GatewayClient for real delivery)"},
-        };
+        // 🎯 对齐 OpenClaw: 通过 Gateway RPC 投递消息到 channel
+        json rpc = {{"method", "send"}, {"params", request}};
+        std::string rpc_body = rpc.dump();
+
+        // Use curl for HTTP POST (message_tool doesn't link infra)
+        std::string cmd = "curl -fsSX POST 'http://127.0.0.1:3000/v1/rpc' "
+            "-H 'Content-Type: application/json' "
+            "-d '" + rpc_body + "' --max-time 10 2>/dev/null";
+        FILE* pipe = popen(cmd.c_str(), "r");
+        std::string response_body;
+        if (pipe) {
+            char buf[4096];
+            while (fgets(buf, sizeof(buf), pipe)) response_body += buf;
+            pclose(pipe);
+        }
+
+        json result;
+        if (!response_body.empty()) {
+            try {
+                auto resp = json::parse(response_body);
+                result = resp.contains("result") ? resp["result"] : resp;
+                result["ok"] = true;
+            } catch (...) {
+                result["ok"] = true;
+                result["body"] = response_body;
+            }
+        } else {
+            result["ok"] = false;
+            result["action"] = action;
+            result["channel"] = channel;
+            result["target"] = target;
+            result["error"] = "Gateway RPC failed";
+        }
 
         // For send actions, include the message text in the result
         std::string msg_text;

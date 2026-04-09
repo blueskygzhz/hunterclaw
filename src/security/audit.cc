@@ -358,7 +358,7 @@ GatewayProbeResult SecurityAuditor::probe_gateway_deep(
     result.attempted = true;
     try {
         // Use system curl for simple HTTP probe with timeout
-        std::string cmd = "curl -fsSo /dev/null --max-time 3 '" + result.url + "/health' 2>/dev/null";
+        std::string cmd = "curl -fsSo /dev/null --max-time 3 '" + result.url.value_or("http://127.0.0.1:3000") + "/health' 2>/dev/null";
         int exit_code = std::system(cmd.c_str());
         result.ok = (exit_code == 0);
         if (!result.ok) {

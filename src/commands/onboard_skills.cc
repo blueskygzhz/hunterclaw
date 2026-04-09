@@ -200,15 +200,15 @@ core::JsonValue setup_skills(
             if (!target || target->install.empty()) continue;
 
             std::string install_id = target->install[0].id;
-            spdlog::info("[onboard-skills] Installing {}...", name);
+            if (auto log = spdlog::get("default")) log->info("[onboard-skills] Installing {}...", name);
 
             // 🎯 对齐 OpenClaw: 调用 installSkill 实际安装
             auto installer = skills::SkillInstaller::create();
             auto install_result = installer->install({workspace_dir, name, install_id});
             if (install_result.is_ok()) {
-                spdlog::info("[onboard-skills] Installed {}", name);
+                if (auto log = spdlog::get("default")) log->info("[onboard-skills] Installed {}", name);
             } else {
-                spdlog::warn("[onboard-skills] Failed to install {}: {}", name, install_result.error);
+                if (auto log = spdlog::get("default")) log->warn("[onboard-skills] Failed to install {}: {}", name, install_result.error);
             }
         }
     }
@@ -220,8 +220,10 @@ core::JsonValue setup_skills(
         if (prompter.confirm("Set " + s->primary_env + " for " + s->name + "?", false)) {
             auto api_key = prompter.text("Enter " + s->primary_env);
             api_key = normalize_secret_input(api_key);
-            // upsertSkillEntry(next, s->skill_key, {apiKey: api_key})
-            // (simplified — actual implementation updates config JSON)
+            // 🎯 对齐 OpenClaw: upsertSkillEntry — 写入 apiKey 到配置
+            if (!next.contains("skills")) next["skills"] = nlohmann::json::object();
+            if (!next["skills"].contains("entries")) next["skills"]["entries"] = nlohmann::json::object();
+            next["skills"]["entries"][s->skill_key] = {{"apiKey", api_key}};
         }
     }
 

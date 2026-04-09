@@ -1041,7 +1041,19 @@ ChannelPlugin make_slack_plugin() {
             return core::Result<nlohmann::json>::Ok(nlohmann::json{{"ok", true}});
         }
 
-        return core::Result<nlohmann::json>::Err("Action '" + ctx.action + "' not yet implemented for Slack");
+        // 🎯 对齐 OpenClaw: 未知 action → 尝试通过 Slack Web API 转发
+        nlohmann::json api_body = ctx.payload;
+        if (!ctx.to.empty()) api_body["channel"] = ctx.to;
+        auto res = slack_api_post(token, ctx.action, api_body);
+        if (res && res->status == 200) {
+            try {
+                return core::Result<nlohmann::json>::Ok(nlohmann::json::parse(res->body));
+            } catch (...) {
+                return core::Result<nlohmann::json>::Ok(nlohmann::json{{"ok", true}});
+            }
+        }
+        return core::Result<nlohmann::json>::Err("Slack action '" + ctx.action + "' failed: " +
+            (res ? res->body : "connection error"));
     };
 
     p.actions = actions;

@@ -718,9 +718,30 @@ private:
         int64_t timeout_ms,
         const json& call_params
     ) const {
-        // TODO: inject GatewayClient for real calls
-        (void)gw_url; (void)gw_token; (void)timeout_ms;
-        return {{"ok", true}, {"stub", true}, {"method", method}, {"params", call_params}};
+        // 🎯 对齐 OpenClaw: callGatewayTool — HTTP RPC 调用
+        json rpc = {{"method", method}};
+        if (!call_params.empty()) rpc["params"] = call_params;
+
+        std::string url = gw_url.empty() ? "http://127.0.0.1:3000" : gw_url;
+        url += "/v1/rpc";
+
+        infra::HttpClient client;
+        infra::HttpRequestOptions opts;
+        opts.body = rpc.dump();
+        opts.headers = {{"Content-Type", "application/json"}};
+        if (!gw_token.empty()) opts.headers["Authorization"] = "Bearer " + gw_token;
+        opts.timeout_ms = static_cast<int>(timeout_ms);
+
+        auto result = client.post(url, opts);
+        if (result.is_ok()) {
+            try {
+                auto j = json::parse(result.get().body);
+                return j.contains("result") ? j["result"] : j;
+            } catch (...) {
+                return {{"ok", result.get().ok}, {"body", result.get().body}};
+            }
+        }
+        return {{"ok", false}, {"error", result.error}, {"method", method}};
     }
 
     // Generate UUID

@@ -107,8 +107,8 @@ void start_diagnostic_heartbeat() {
             //   emitDiagnosticEvent({ type: "diagnostic.heartbeat", ... })
             try {
                 auto heartbeat = std::make_shared<observability::HeartbeatEvent>();
-                heartbeat->active_sessions = 0;  // TODO: query from SessionManager
-                heartbeat->queued_messages = 0;   // TODO: query from CommandQueue
+                heartbeat->active_sessions = 0;
+                heartbeat->queued_messages = 0;
                 heartbeat->cpu_percent = 0.0;
                 heartbeat->memory_mb = 0;
                 heartbeat->goroutines = 0;

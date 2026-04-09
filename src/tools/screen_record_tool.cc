@@ -158,7 +158,7 @@ core::JsonValue ScreenRecordTool::route_to_node(
             }
         }
     }
-    return core::JsonValue(json{{"ok", true}, {"stub", true}, {"action", action}});
+    return core::JsonValue(json{{"ok", false}, {"error", "No connected node supports screen recording. Pair a Mac/iOS node first."}, {"action", action}});
 }
 
 bool ScreenRecordTool::validate_duration(int duration) {

@@ -150,7 +150,7 @@ core::JsonValue LocationTool::route_to_node(
             }
         }
     }
-    return core::JsonValue(json{{"ok", true}, {"stub", true}, {"action", action}});
+    return core::JsonValue(json{{"ok", false}, {"error", "No connected node supports location services. Pair a Mac/iOS node first."}, {"action", action}});
 }
 
 std::string LocationTool::format_coordinates(double latitude, double longitude) {

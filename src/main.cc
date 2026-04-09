@@ -178,8 +178,20 @@ int main(int argc, char** argv) {
     // Load plugins from ~/.hunterclaw/plugins
     std::string plugins_dir = core::utils::expand_path("~/.hunterclaw/plugins");
     if (core::utils::file_exists(plugins_dir)) {
-        // TODO: Scan and load plugins
+        // 🎯 对齐 OpenClaw: 扫描插件目录并加载
         std::cout << "  Loading plugins from: " << plugins_dir << std::endl;
+        try {
+            for (const auto& entry : std::filesystem::directory_iterator(plugins_dir)) {
+                if (entry.is_directory()) {
+                    auto result = plugin_mgr->load_plugin(entry.path().string());
+                    if (result.is_ok()) {
+                        std::cout << "    Loaded plugin: " << entry.path().filename().string() << std::endl;
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            std::cout << "  Warning: Plugin scan failed: " << e.what() << std::endl;
+        }
     }
     
     // Initialize Skill Manager
@@ -245,13 +257,9 @@ int main(int argc, char** argv) {
         std::cout << "  Warning: Recovery scan failed: " << recovery_result.error << std::endl;
     }
     
-    // 🎯 对齐 OpenClaw: 设置 channel 消息回调，接入 auto_reply 系统
-    channel_mgr->set_message_callback([](const channels::ChannelMessage& msg) {
-        spdlog::info("[Channel Message] {} - {}: {}",
-                    msg.channel_id, msg.sender_name, msg.text.substr(0, 100));
-        // 消息路由到 auto_reply 系统处理
-        // (实际路由由 Gateway 的 inbound worker 负责)
-    });
+    // 🎯 对齐 OpenClaw: channel 消息回调
+    // 消息路由由 Gateway 的 inbound worker 在 gateway.cc 中负责
+    // channel_mgr 在 Gateway 启动时自动注册消息处理回调
     
     // Initialize Gateway Server
     std::cout << "[4/4] Starting Gateway Server..." << std::endl;

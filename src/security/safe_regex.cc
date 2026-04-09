@@ -7,6 +7,7 @@
 #include <optional>
 #include <algorithm>
 #include <cmath>
+#include <climits>
 
 namespace hunterclaw {
 namespace security {

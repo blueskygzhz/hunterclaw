@@ -125,7 +125,7 @@ void forward_exec_approval(
     }
 
     for (const auto& target : config.targets) {
-        spdlog::info("[exec-approval-forwarder] forwarding to channel={} account={}",
+        if (auto log = spdlog::get("default")) log->info("[exec-approval-forwarder] forwarding to channel={} account={}",
                     target.channel, target.account_id);
         // 🎯 对齐 OpenClaw: deliver via channel (telegram/discord/etc)
         // The actual delivery is handled by the channel system

@@ -78,8 +78,11 @@ void log_gateway_startup_security_warnings(const json& cfg) {
             if (i > 0) flags_str += ", ";
             flags_str += enabled_flags[i];
         }
-        spdlog::warn("security warning: dangerous config flags enabled: {}. "
-                     "Run `hunterclaw security audit`.", flags_str);
+        auto logger = spdlog::get("default");
+        if (logger) {
+            logger->warn("security warning: dangerous config flags enabled: {}. "
+                         "Run `hunterclaw security audit`.", flags_str);
+        }
     }
 }
 

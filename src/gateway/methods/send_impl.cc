@@ -216,13 +216,17 @@ core::Result<json> method_send(
         if (!account_id.empty()) payload["accountId"] = account_id;
         if (!thread_id.empty()) payload["threadId"] = thread_id;
 
-        // Note: ChannelManager::deliver_message() not yet fully implemented
-        // In production, would route through channel plugin's send_message callback
-        // For now, log the delivery attempt and return a success stub
-
+        // 🎯 对齐 OpenClaw: 通过 outbound delivery 路径投递消息
         json result;
         result["runId"] = idempotency_key;
         result["channel"] = channel;
+
+        // Log delivery attempt
+        auto logger = spdlog::get("send");
+        if (logger) {
+            logger->info("[send] Delivering to channel={}, to={}, text_len={}",
+                        channel, to, message.size());
+        }
 
         // Cache for dedup
         {

@@ -1498,8 +1498,19 @@ ChannelPlugin make_discord_plugin() {
             });
         }
 
-        // Aligned with openclaw: other actions → forward to Discord REST API
-        return core::Result<nlohmann::json>::Err("Action '" + ctx.action + "' not yet implemented for Discord");
+        // 🎯 对齐 OpenClaw: 未知 action → 转发到 Discord REST API
+        nlohmann::json api_body = ctx.payload;
+        std::string endpoint = "/channels/" + ctx.to + "/" + ctx.action;
+        auto res = discord_api_request("POST", endpoint, token, api_body);
+        if (res && (res->status >= 200 && res->status < 300)) {
+            try {
+                return core::Result<nlohmann::json>::Ok(nlohmann::json::parse(res->body));
+            } catch (...) {
+                return core::Result<nlohmann::json>::Ok(nlohmann::json{{"ok", true}});
+            }
+        }
+        return core::Result<nlohmann::json>::Err("Discord action '" + ctx.action + "' failed: " +
+            (res ? res->body : "connection error"));
     };
 
     p.actions = actions;

@@ -650,20 +650,27 @@ core::Result<bool> MemoryManagerWithAutoReindex::seed_embedding_cache(
     // 对齐 OpenClaw manager-sync-ops.ts:278-327
     // 从原始数据库复制 embedding cache 到临时数据库
     
+    // 🎯 对齐 OpenClaw: 从源存储复制 embedding cache 到目标存储
+    // 使用批量查询 + 批量插入
     if (!source_storage || !target_storage) {
         return core::Result<bool>::Err("Invalid storage pointers");
     }
     
-    // 简化实现：暂时跳过 embedding cache 复制
-    // TODO: 实现完整的 cache 复制逻辑
-    // 1. 需要在 SQLiteVectorStorage 中添加 get_all_cached_embeddings() 方法
-    // 2. 需要添加批量 cache_embedding() 方法
-    // 
-    // 不复制 cache 的影响：
-    // - 重建索引时需要重新生成所有 embeddings
-    // - 性能下降，但功能完整
-    
-    // 软失败：返回成功，继续 reindex
+    try {
+        // Get all cached embeddings from source
+        auto cached = source_storage->get_all_cached_embeddings();
+        if (!cached.empty()) {
+            // Batch insert into target
+            for (const auto& [key, embedding] : cached) {
+                target_storage->cache_embedding(key, embedding);
+            }
+            { auto _l = spdlog::get("default"); if (_l) _l->info("[AutoReindex] Copied {} cached embeddings to new index", cached.size()); }
+        }
+    } catch (const std::exception& e) {
+        // 软失败：日志记录但继续 reindex
+        { auto _l = spdlog::get("default"); if (_l) _l->warn("[AutoReindex] Cache copy failed (non-fatal): {}", e.what()); }
+    }
+
     return core::Result<bool>::Ok(true);
 }
 
@@ -730,12 +737,38 @@ core::Result<bool> MemoryManagerWithAutoReindex::write_meta(
 }
 
 core::Result<bool> MemoryManagerWithAutoReindex::do_incremental_sync() {
-    // TODO: 实现增量同步
+    // 🎯 对齐 OpenClaw: incrementalSync
     // 1. 检测变更的文件 (mtime 检查)
     // 2. 仅重新分块变更的文件
-    // 3. 更新 embeddings
-    // 4. 更新数据库
-    
+    // 3. 更新 embeddings + 数据库
+
+    if (!storage_) {
+        return core::Result<bool>::Err("Storage not initialized");
+    }
+
+    int updated = 0;
+    for (const auto& [path, last_mtime] : file_mtimes_) {
+        try {
+            auto current_mtime = std::filesystem::last_write_time(path);
+            auto current_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                current_mtime.time_since_epoch()).count();
+            if (current_ms > last_mtime) {
+                // File changed — re-chunk and re-embed
+                auto chunks = chunker_->chunk_file(path);
+                if (chunks.is_ok()) {
+                    for (const auto& chunk : chunks.get()) {
+                        storage_->upsert_chunk(chunk);
+                    }
+                    file_mtimes_[path] = current_ms;
+                    updated++;
+                }
+            }
+        } catch (...) {}
+    }
+
+    if (updated > 0) {
+        if (auto log = spdlog::get("default")) log->info("[AutoReindex] Incremental sync: updated {} files", updated);
+    }
     return core::Result<bool>::Ok(true);
 }
 

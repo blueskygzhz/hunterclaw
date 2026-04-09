@@ -382,22 +382,42 @@ private:
         int64_t timeout_ms,
         const json& call_params
     ) const {
-        // In HunterClaw, gateway calls go through the GatewayClient
-        // For now, return a stub response indicating the call was made
-        // The actual implementation depends on the GatewayClient being available
-        // TODO: inject GatewayClient into GatewayTool for real calls
+        // 🎯 对齐 OpenClaw: callGatewayTool — 通过 HTTP/WebSocket 调用 Gateway 方法
         if (auto log = spdlog::get("default")) log->info("[GatewayTool] call_gateway: method={}, url={}, timeout={}ms",
                      method, gw_url.empty() ? "(default)" : gw_url, timeout_ms);
 
-        // Return a stub response
-        json result = {
-            {"method",  method},
-            {"ok",      true},
-            {"stub",    true},
-            {"message", "Gateway call stub - inject GatewayClient for real calls"},
-        };
-        if (!call_params.empty()) result["params"] = call_params;
-        return result;
+        // Build JSON-RPC request
+        json rpc_request;
+        rpc_request["method"] = method;
+        if (!call_params.empty()) rpc_request["params"] = call_params;
+
+        // Try HTTP POST to gateway
+        std::string url = gw_url.empty() ? "http://127.0.0.1:3000" : gw_url;
+        url += "/v1/rpc";
+
+        infra::HttpClient client;
+        infra::HttpRequestOptions opts;
+        opts.body = rpc_request.dump();
+        opts.headers = {{"Content-Type", "application/json"}};
+        if (!gw_token.empty()) {
+            opts.headers["Authorization"] = "Bearer " + gw_token;
+        }
+        opts.timeout_ms = static_cast<int>(timeout_ms);
+
+        auto http_result = client.post(url, opts);
+        if (http_result.is_ok()) {
+            auto& resp = http_result.get();
+            try {
+                auto j = json::parse(resp.body);
+                if (j.contains("result")) return j["result"];
+                return j;
+            } catch (...) {
+                return {{"ok", resp.ok}, {"body", resp.body}};
+            }
+        }
+
+        // Fallback: return error with details
+        return {{"ok", false}, {"error", http_result.error}, {"method", method}};
     }
 };
 

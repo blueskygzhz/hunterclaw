@@ -152,7 +152,7 @@ void maybe_prune_sandboxes(int idle_hours, int max_age_days) {
         std::string cmd = "docker rm -f " + name + " 2>/dev/null";
         system(cmd.c_str());
         remove_registry_entry(name);
-        spdlog::info("[sandbox/prune] Removed expired container: {}", name);
+        if (auto log = spdlog::get("default")) log->info("[sandbox/prune] Removed expired container: {}", name);
     }
 }
 

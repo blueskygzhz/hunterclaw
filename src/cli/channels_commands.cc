@@ -57,7 +57,8 @@ namespace {
             return core::Result<void>::err("Failed to write config file");
         }
         
-        // TODO: Serialize JSON
+        // 🎯 对齐 OpenClaw: 序列化 JSON 配置到文件
+        file << config.to_json().dump(2);
         return core::Result<void>::ok();
     }
 }
@@ -85,8 +86,17 @@ core::Result<void> ChannelsListCommand::execute(const std::vector<std::string>& 
     
     JsonOutput output{true, "success", "Channels listed"};
     
-    // TODO: Add channels data to output
-    output.data["count"] = "0";
+    // 🎯 对齐 OpenClaw: 从配置读取 channels 数据
+    auto& config = config_result.value();
+    auto channels_json = config.to_json();
+    int count = 0;
+    if (channels_json.contains("channels") && channels_json["channels"].is_object()) {
+        count = static_cast<int>(channels_json["channels"].size());
+        for (auto it = channels_json["channels"].begin(); it != channels_json["channels"].end(); ++it) {
+            output.data[it.key()] = it.value().dump();
+        }
+    }
+    output.data["count"] = std::to_string(count);
     
     output.print();
     return core::Result<void>::ok();
@@ -120,8 +130,11 @@ core::Result<void> ChannelsAddCommand::execute(const std::vector<std::string>& a
         return core::Result<void>::err(config_result.error);
     }
     
-    // TODO: Add channel to config
-    
+    // 🎯 对齐 OpenClaw: 添加 channel 到配置
+    auto config_json = config_result.value().to_json();
+    if (!config_json.contains("channels")) config_json["channels"] = nlohmann::json::object();
+    config_json["channels"][name] = {{"type", type}, {"token", token}, {"enabled", true}};
+
     // Save config
     auto save_result = save_channels_config(config_result.value());
     if (!save_result.is_ok()) {

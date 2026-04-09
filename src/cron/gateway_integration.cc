@@ -254,11 +254,27 @@ nlohmann::json GatewayCronIntegration::handle_runs(const nlohmann::json& params)
     }
     
     std::string id = params["id"].get<std::string>();
-    // Note: Run logs not implemented yet in CronService
     
-    log()->warn("Run logs not yet implemented in CronService");
-    
+    // 🎯 对齐 OpenClaw: cron run logs — 从 CronService 获取运行日志
     nlohmann::json logs_json = nlohmann::json::array();
+    
+    if (service_) {
+        auto runs = service_->get_run_history(id, 50);
+        for (const auto& run : runs) {
+            nlohmann::json entry;
+            entry["id"] = run.run_id;
+            entry["jobId"] = id;
+            entry["startedAt"] = run.started_at_ms;
+            if (run.finished_at_ms.has_value()) {
+                entry["finishedAt"] = *run.finished_at_ms;
+                entry["durationMs"] = *run.finished_at_ms - run.started_at_ms;
+            }
+            entry["status"] = run.succeeded ? "success" : "failure";
+            if (!run.error.empty()) entry["error"] = run.error;
+            if (!run.output.empty()) entry["output"] = run.output;
+            logs_json.push_back(entry);
+        }
+    }
     
     return {
         {"runs", logs_json}

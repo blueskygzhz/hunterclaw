@@ -132,7 +132,18 @@ core::Result<void> GatewayStartCommand::execute(const std::vector<std::string>& 
     // Load config file if exists
     if (std::filesystem::exists(config_file)) {
         std::ifstream file(config_file);
-        // TODO: Parse JSON config
+        // 🎯 对齐 OpenClaw: 解析 JSON 配置文件
+        try {
+            nlohmann::json cfg_json;
+            file >> cfg_json;
+            if (cfg_json.contains("gateway")) {
+                auto& gw = cfg_json["gateway"];
+                if (gw.contains("host") && gw["host"].is_string()) config.host = gw["host"];
+                if (gw.contains("port") && gw["port"].is_number()) config.port = gw["port"];
+            }
+        } catch (...) {
+            std::cerr << "Warning: failed to parse config file: " << config_file << std::endl;
+        }
     }
     
     if (daemon) {

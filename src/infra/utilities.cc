@@ -130,11 +130,27 @@ std::optional<std::string> safe_json_stringify(const JsonValue& value) {
 }
 
 std::optional<JsonValue> safe_json_parse(const std::string& json) {
-    // Simplified JSON parser (for production, use a real library like nlohmann/json)
+    // 🎯 对齐 OpenClaw: 使用 nlohmann/json 完整解析
     try {
+        auto parsed = nlohmann::json::parse(json);
+        // Convert nlohmann::json → JsonValue (simplified: wrap as string)
         JsonValue result;
-        result.type = JsonValue::Type::Null;
-        // TODO: Implement full JSON parsing
+        if (parsed.is_string()) {
+            result.type = JsonValue::Type::String;
+            result.string_val = parsed.get<std::string>();
+        } else if (parsed.is_number()) {
+            result.type = JsonValue::Type::Number;
+            result.number_val = parsed.get<double>();
+        } else if (parsed.is_boolean()) {
+            result.type = JsonValue::Type::Boolean;
+            result.bool_val = parsed.get<bool>();
+        } else if (parsed.is_null()) {
+            result.type = JsonValue::Type::Null;
+        } else {
+            // Object or array — store as string representation
+            result.type = JsonValue::Type::String;
+            result.string_val = parsed.dump();
+        }
         return result;
     } catch (...) {
         return std::nullopt;

@@ -561,14 +561,46 @@ PdfAnalysisResult PDFTool::analyze_with_gemini(
     const std::string& prompt,
     int max_tokens
 ) {
-    // TODO: call Gemini API with native PDF support
+    // 🎯 对齐 OpenClaw: Gemini native PDF — inline_data
+    (void)max_tokens;
+    std::ifstream f(path, std::ios::binary);
+    std::string pdf_data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    std::string pdf_base64 = infra::base64_encode(
+        reinterpret_cast<const unsigned char*>(pdf_data.data()), pdf_data.size());
+    const char* api_key = std::getenv("GEMINI_API_KEY");
+    std::string url = std::string("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=") +
+        (api_key ? api_key : "");
+    infra::HttpClient client;
+    infra::HttpRequestOptions opts;
+    nlohmann::json request_body = {{"contents", nlohmann::json::array({
+        {{"parts", nlohmann::json::array({
+            {{"inline_data", {{"mime_type", "application/pdf"}, {"data", pdf_base64}}}},
+            {{"text", prompt}}
+        })}}
+    })}};
+    opts.body = request_body.dump();
+    opts.headers = {{"Content-Type", "application/json"}};
+    opts.timeout_ms = 60000;
+    auto http_result = client.post(url, opts);
     PdfAnalysisResult result;
-    result.analysis = "[Gemini native PDF analysis - stub]";
     result.model = "google/gemini-2.5-pro";
-    result.input_tokens = 0;
-    result.output_tokens = 0;
     result.used_native_pdf = true;
     result.used_extraction_fallback = false;
+    if (http_result.is_ok()) {
+        try {
+            auto resp = nlohmann::json::parse(http_result.get().body);
+            if (resp.contains("candidates") && !resp["candidates"].empty()) {
+                auto& parts = resp["candidates"][0]["content"]["parts"];
+                if (!parts.empty()) result.analysis = parts[0].value("text", "");
+            }
+            if (resp.contains("usageMetadata")) {
+                result.input_tokens = resp["usageMetadata"].value("promptTokenCount", 0);
+                result.output_tokens = resp["usageMetadata"].value("candidatesTokenCount", 0);
+            }
+        } catch (...) { result.analysis = "[Gemini parse error]"; }
+    } else {
+        result.analysis = "[Gemini failed: " + http_result.error + "]";
+    }
     return result;
 }
 

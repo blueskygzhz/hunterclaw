@@ -416,8 +416,25 @@ core::JsonValue TerminalTool::call_node_terminal_proxy(
     const core::JsonValue& body,
     int timeout_ms
 ) const {
-    (void)node_id; (void)method; (void)path; (void)query; (void)body; (void)timeout_ms;
-    return core::JsonValue(json{{"ok", true}, {"stub", true}});
+    // 🎯 对齐 OpenClaw: node.invoke via HTTP RPC
+    json rpc = {{"method", "node.invoke"}, {"params", {
+        {"nodeId", node_id}, {"command", method},
+        {"params", {{"path", path}, {"query", query}, {"body", body.to_json()}}}
+    }}};
+    std::string url = "http://127.0.0.1:3000/v1/rpc";
+    infra::HttpClient client;
+    infra::HttpRequestOptions opts;
+    opts.body = rpc.dump();
+    opts.headers = {{"Content-Type", "application/json"}};
+    opts.timeout_ms = static_cast<int>(timeout_ms);
+    auto result = client.post(url, opts);
+    if (result.is_ok()) {
+        try {
+            auto j = json::parse(result.get().body);
+            return core::JsonValue(j.contains("result") ? j["result"] : j);
+        } catch (...) {}
+    }
+    return core::JsonValue(json{{"ok", false}, {"error", result.is_ok() ? "parse error" : result.error}});
 }
 
 // ============================================================================

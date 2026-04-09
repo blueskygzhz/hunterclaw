@@ -747,8 +747,8 @@ std::shared_ptr<Tool> BuiltinTools::create_web_search_tool(const ToolContext& co
     if (!brave_key && !tavily_key) {
         return nullptr;  // 未配置 API key，不注册工具
     }
-    // 已配置 API key，返回占位工具 (实际实现需要 HTTP 客户端)
-    return nullptr;  // TODO: 实现完整的 Web 搜索 HTTP 调用
+    // 🎯 对齐 OpenClaw: 返回 WebSearchTool 实例（已在 web_search_tool.cc 中完整实现）
+    return std::make_unique<WebSearchTool>(context);
 }
 
 void BuiltinTools::register_all(ToolManager& manager, const ToolContext& context) {

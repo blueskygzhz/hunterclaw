@@ -349,15 +349,32 @@ private:
         const std::string& gw_token,
         int64_t timeout_ms
     ) const {
-        // TODO: call gateway "nodes.list" to get first available node
-        // For now, return empty string (gateway will use default node)
+        // 🎯 对齐 OpenClaw: resolveNodeId — 从 gateway 获取第一个可用节点
         if (auto log = spdlog::get("default")) log->debug("[CanvasTool] resolve_node_id: auto-resolving from gateway");
-        (void)gw_url; (void)gw_token; (void)timeout_ms;
+
+        json rpc = {{"method", "node.list"}};
+        std::string url = (gw_url.empty() ? "http://127.0.0.1:3000" : gw_url) + "/v1/rpc";
+        infra::HttpClient client;
+        infra::HttpRequestOptions opts;
+        opts.body = rpc.dump();
+        opts.headers = {{"Content-Type", "application/json"}};
+        if (!gw_token.empty()) opts.headers["Authorization"] = "Bearer " + gw_token;
+        opts.timeout_ms = static_cast<int>(timeout_ms);
+
+        auto result = client.post(url, opts);
+        if (result.is_ok()) {
+            try {
+                auto j = json::parse(result.get().body);
+                auto& nodes = j.contains("result") ? j["result"]["nodes"] : j["nodes"];
+                if (nodes.is_array() && !nodes.empty()) {
+                    return nodes[0].value("id", std::string{});
+                }
+            } catch (...) {}
+        }
         return "";
     }
 
     // 🎯 对齐 OpenClaw: invoke(command, invokeParams)
-    // Calls node.invoke via gateway
     json invoke_node(
         const std::string& node_id,
         const std::string& command,
@@ -366,18 +383,43 @@ private:
         const std::string& gw_token,
         int64_t timeout_ms
     ) const {
-        // TODO: call gateway "node.invoke" with nodeId, command, params, idempotencyKey
+        // 🎯 对齐 OpenClaw: node.invoke via HTTP RPC
         if (auto log = spdlog::get("default")) log->info("[CanvasTool] invoke_node: nodeId={}, command={}", node_id, command);
-        (void)gw_url; (void)gw_token; (void)timeout_ms;
 
-        // Return stub response
-        return {{"ok", true}, {"stub", true}, {"command", command}};
+        json rpc = {{"method", "node.invoke"}, {"params", {
+            {"nodeId", node_id}, {"command", command}, {"params", invoke_params}
+        }}};
+        std::string url = (gw_url.empty() ? "http://127.0.0.1:3000" : gw_url) + "/v1/rpc";
+        infra::HttpClient client;
+        infra::HttpRequestOptions opts;
+        opts.body = rpc.dump();
+        opts.headers = {{"Content-Type", "application/json"}};
+        if (!gw_token.empty()) opts.headers["Authorization"] = "Bearer " + gw_token;
+        opts.timeout_ms = static_cast<int>(timeout_ms);
+
+        auto result = client.post(url, opts);
+        if (result.is_ok()) {
+            try {
+                auto j = json::parse(result.get().body);
+                return j.contains("result") ? j["result"] : j;
+            } catch (...) {}
+        }
+        return {{"ok", false}, {"error", result.is_ok() ? "parse error" : result.error}};
     }
 
     // 🎯 对齐 OpenClaw: readJsonlFromPath
     std::string read_jsonl_from_path(const std::string& path) const {
-        // Read JSONL file from allowed paths
-        // TODO: implement path security check (isInboundPathAllowed)
+        // 🎯 对齐 OpenClaw: isInboundPathAllowed — 路径安全检查
+        // 禁止路径穿越和访问敏感目录
+        if (path.find("..") != std::string::npos) {
+            throw std::runtime_error("Path traversal not allowed: " + path);
+        }
+        // 禁止访问 /etc, /proc, /sys 等系统目录
+        for (const auto& banned : {"/etc/", "/proc/", "/sys/", "/dev/"}) {
+            if (path.find(banned) == 0) {
+                throw std::runtime_error("Access to system path not allowed: " + path);
+            }
+        }
         try {
             std::ifstream f(path);
             if (!f.is_open()) throw std::runtime_error("Cannot open file: " + path);

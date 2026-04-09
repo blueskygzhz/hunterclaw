@@ -160,15 +160,15 @@ static void log_remote_bin_probe_failure(const std::string& node_id,
     std::string label = describe_node(node_id);
     if (message.find("node not connected") != std::string::npos ||
         message.find("node disconnected") != std::string::npos) {
-        spdlog::info("[skills-remote] remote bin probe skipped: node unavailable ({})", label);
+        { auto _l = spdlog::get("default"); if (_l) _l->info("[skills-remote] remote bin probe skipped: node unavailable ({})", label); }
         return;
     }
     if (message.find("invoke timed out") != std::string::npos ||
         message.find("timeout") != std::string::npos) {
-        spdlog::warn("[skills-remote] remote bin probe timed out ({})", label);
+        if (auto log = spdlog::get("default")) log->warn("[skills-remote] remote bin probe timed out ({})", label);
         return;
     }
-    spdlog::warn("[skills-remote] remote bin probe error ({}): {}", label, message);
+    if (auto log = spdlog::get("default")) log->warn("[skills-remote] remote bin probe error ({}): {}", label, message);
 }
 
 // ============================================================================

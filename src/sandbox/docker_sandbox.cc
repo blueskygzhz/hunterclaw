@@ -713,10 +713,23 @@ bool DockerSandbox::interrupt_command(const std::string& command_id) {
 
 // 获取后台命令状态
 SandboxResult DockerSandbox::get_background_command_status(const std::string& command_id) {
-    (void)command_id;  // ✅ 避免 unused parameter 警告
+    // 🎯 对齐 OpenClaw: 检查后台命令的 docker exec 进程状态
     SandboxResult result;
-    result.success = true;
-    result.stdout_output = "Status check not implemented";
+    std::string check_cmd = "docker exec " + container_id_ + " sh -c 'kill -0 " + command_id + " 2>/dev/null && echo running || echo done'";
+    FILE* pipe = popen(check_cmd.c_str(), "r");
+    if (pipe) {
+        char buf[256];
+        std::string output;
+        while (fgets(buf, sizeof(buf), pipe)) output += buf;
+        pclose(pipe);
+        // Trim
+        while (!output.empty() && (output.back() == '\n' || output.back() == '\r')) output.pop_back();
+        result.success = true;
+        result.stdout_output = output;
+    } else {
+        result.success = false;
+        result.stdout_output = "Failed to check command status";
+    }
     return result;
 }
 

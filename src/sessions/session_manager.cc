@@ -819,21 +819,37 @@ std::optional<std::string> SessionMapper::extract_label(const std::string& sessi
 core::Result<hunterclaw::agents::AgentConfig> FileSessionManager::get_agent_config(
     const std::string& agent_id
 ) {
-    // TODO: 这是临时实现，实际应该从 AgentRegistry 或配置系统获取
-    // 目前返回一个默认配置以允许编译通过
-    
+    // 🎯 对齐 OpenClaw: 从配置文件读取 agent 配置
+    // 先尝试从 config.json 读取，失败则返回默认值
     hunterclaw::agents::AgentConfig config;
     config.id = agent_id;
     config.name = agent_id;
     config.is_default = (agent_id == "main" || agent_id == "default");
     
-    // 设置默认工作空间
     std::string home = std::getenv("HOME") ? std::getenv("HOME") : "/tmp";
     config.workspace = home + "/.hunterclaw/agents/" + agent_id;
     config.agent_dir = config.workspace;
-    
-    // 默认 creator 为空 (后续从配置文件读取)
     config.creator = "";
+
+    // Try to load from config file
+    std::string config_path = home + "/.hunterclaw/config.json";
+    try {
+        if (std::filesystem::exists(config_path)) {
+            std::ifstream f(config_path);
+            nlohmann::json cfg;
+            f >> cfg;
+            if (cfg.contains("agents") && cfg["agents"].is_array()) {
+                for (const auto& a : cfg["agents"]) {
+                    if (a.value("id", "") == agent_id) {
+                        config.name = a.value("name", agent_id);
+                        if (a.contains("systemPrompt")) config.system_prompt = a["systemPrompt"];
+                        if (a.contains("workspace")) config.workspace = a["workspace"];
+                        break;
+                    }
+                }
+            }
+        }
+    } catch (...) {}
     
     // 默认模型配置
     config.model.provider = "anthropic";

@@ -397,7 +397,7 @@ std::optional<MarkdownTable> TableConverter::parse_table(const std::string& mark
     // Parse headers
     auto header_cells = parse_row(lines[0]);
     for (const auto& cell : header_cells) {
-        MarkdownTable::Cell hc;
+        TableCell hc;
         hc.text = cell;
         table.headers.push_back(hc);
     }
@@ -405,9 +405,9 @@ std::optional<MarkdownTable> TableConverter::parse_table(const std::string& mark
     // Parse data rows (skip separator at index 1)
     for (size_t i = 2; i < lines.size(); ++i) {
         auto row_cells = parse_row(lines[i]);
-        std::vector<MarkdownTable::Cell> row;
+        std::vector<TableCell> row;
         for (const auto& cell : row_cells) {
-            MarkdownTable::Cell rc;
+            TableCell rc;
             rc.text = cell;
             row.push_back(rc);
         }
@@ -758,8 +758,47 @@ std::string MarkdownConverter::markdown_to_html(const std::string& markdown,
 }
 
 std::string MarkdownConverter::html_to_markdown(const std::string& html) {
-    // TODO: Implement HTML to Markdown conversion
-    return html;
+    // 🎯 对齐 OpenClaw: html-to-markdown conversion
+    std::string result = html;
+    // Strip HTML tags and convert common elements
+    // <br> / <br/> → \n
+    result = std::regex_replace(result, std::regex(R"(<br\s*/?>)"), "\n");
+    // <p>...</p> → \n\n...\n\n
+    result = std::regex_replace(result, std::regex(R"(<p[^>]*>)"), "\n\n");
+    result = std::regex_replace(result, std::regex(R"(</p>)"), "\n\n");
+    // <strong>/<b> → **
+    result = std::regex_replace(result, std::regex(R"(</?(?:strong|b)>)"), "**");
+    // <em>/<i> → *
+    result = std::regex_replace(result, std::regex(R"(</?(?:em|i)>)"), "*");
+    // <code> → `
+    result = std::regex_replace(result, std::regex(R"(</?code>)"), "`");
+    // <a href="url">text</a> → [text](url)
+    {
+        std::regex a_re(R"xx(<a\s+href="([^"]*)"[^>]*>([^<]*)</a>)xx");
+        result = std::regex_replace(result, a_re, "[$2]($1)");
+    }
+    // <h1>...<h6> → # ... ######
+    for (int i = 6; i >= 1; --i) {
+        std::string hashes(i, '#');
+        result = std::regex_replace(result, std::regex("<h" + std::to_string(i) + "[^>]*>"), "\n" + hashes + " ");
+        result = std::regex_replace(result, std::regex("</h" + std::to_string(i) + ">"), "\n");
+    }
+    // <li> → - 
+    result = std::regex_replace(result, std::regex(R"(<li[^>]*>)"), "- ");
+    result = std::regex_replace(result, std::regex(R"(</li>)"), "\n");
+    // Strip remaining tags
+    result = std::regex_replace(result, std::regex(R"(<[^>]+>)"), "");
+    // Decode common entities
+    size_t pos;
+    while ((pos = result.find("&amp;")) != std::string::npos) result.replace(pos, 5, "&");
+    while ((pos = result.find("&lt;")) != std::string::npos) result.replace(pos, 4, "<");
+    while ((pos = result.find("&gt;")) != std::string::npos) result.replace(pos, 4, ">");
+    while ((pos = result.find("&quot;")) != std::string::npos) result.replace(pos, 6, "\"");
+    while ((pos = result.find("&#39;")) != std::string::npos) result.replace(pos, 5, "'");
+    while ((pos = result.find("&nbsp;")) != std::string::npos) result.replace(pos, 6, " ");
+    // Collapse excessive newlines
+    result = std::regex_replace(result, std::regex(R"(\n{4,})"), "\n\n\n");
+    return result;
 }
 
 std::string MarkdownConverter::markdown_to_plain_text(const std::string& markdown) {
@@ -788,7 +827,17 @@ std::string MarkdownConverter::markdown_to_discord(const std::string& markdown) 
     std::string result = markdown;
 
     // Convert # headings to **bold** (Discord doesn't render # as headings in messages)
-    result = std::regex_replace(result, std::regex(R"(^#{1,6}\s+(.+)$)", std::regex::multiline), "**$1**");
+    // C++17 doesn't have std::regex::multiline, process line by line
+    {
+        std::istringstream ss(result);
+        std::string line, out;
+        std::regex heading_re(R"(^#{1,6}\s+(.+)$)");
+        while (std::getline(ss, line)) {
+            out += std::regex_replace(line, heading_re, "**$1**") + "\n";
+        }
+        if (!out.empty() && out.back() == '\n') out.pop_back();
+        result = out;
+    }
 
     return result;
 }
@@ -878,7 +927,7 @@ std::vector<std::string> MarkdownValidator::find_broken_links(const std::string&
     }
 
     // Find unclosed links: [text]( without closing )
-    std::regex unclosed_re(R"(\[[^\]]*\]\([^)]*$)", std::regex::multiline);
+    std::regex unclosed_re(R"(\[[^\]]*\]\([^)]*$)");
     auto ub = std::sregex_iterator(markdown.begin(), markdown.end(), unclosed_re);
     for (auto it = ub; it != end; ++it) {
         broken.push_back((*it)[0].str() + " — unclosed link");
@@ -894,14 +943,22 @@ bool MarkdownValidator::has_invalid_tables(const std::string& markdown) {
     // 2. Separator row with |---|
     // 3. At least one data row
 
-    std::regex table_start_re(R"(^\|.+\|$)", std::regex::multiline);
-    std::regex separator_re(R"(^\|[\s\-:|]+\|$)", std::regex::multiline);
+    std::regex table_start_re(R"(^\|.+\|$)");
+    std::regex separator_re(R"(^\|[\s\-:|]+\|$)");
 
-    auto has_table_rows = std::regex_search(markdown, table_start_re);
+    // Check line-by-line since C++ regex doesn't support multiline
+    bool has_table_rows = false;
+    bool has_separator = false;
+    {
+        std::istringstream ss(markdown);
+        std::string line;
+        while (std::getline(ss, line)) {
+            if (std::regex_match(line, table_start_re)) has_table_rows = true;
+            if (std::regex_match(line, separator_re) && line.find('-') != std::string::npos) has_separator = true;
+        }
+    }
     if (!has_table_rows) return false;  // No tables at all
 
-    // Check if tables have proper separator
-    auto has_separator = std::regex_search(markdown, separator_re);
     if (!has_separator) return true;  // Has table-like rows but no separator
 
     // Check column count consistency
@@ -972,7 +1029,7 @@ std::vector<BlockquoteParser::BlockquoteSpan> BlockquoteParser::parse_blockquote
                 BlockquoteSpan span;
                 span.start = span_start;
                 span.end = line_start;
-                span.depth = depth;
+                span.level = depth;
                 spans.push_back(span);
                 span_start = -1;
             }
@@ -984,7 +1041,7 @@ std::vector<BlockquoteParser::BlockquoteSpan> BlockquoteParser::parse_blockquote
         BlockquoteSpan span;
         span.start = span_start;
         span.end = static_cast<int>(markdown.size());
-        span.depth = depth;
+        span.level = depth;
         spans.push_back(span);
     }
 
@@ -1017,17 +1074,20 @@ std::vector<ListParser::ListItem> ListParser::parse_list_items(const std::string
             ListItem item;
             item.start = line_start;
             item.end = pos - 1;
-            item.indent = static_cast<int>(match[1].str().size());
-            item.ordered = false;
+            item.level = static_cast<int>(match[1].str().size()) / 2;
+            item.type = ListType::Bullet;
+            item.marker = match[2].str();
+            item.index = 0;
             item.content = match[3].str();
             items.push_back(item);
         } else if (std::regex_match(line, match, ordered_re)) {
             ListItem item;
             item.start = line_start;
             item.end = pos - 1;
-            item.indent = static_cast<int>(match[1].str().size());
-            item.ordered = true;
+            item.level = static_cast<int>(match[1].str().size()) / 2;
+            item.type = ListType::Ordered;
             item.index = std::stoi(match[2].str());
+            item.marker = match[2].str() + ".";
             item.content = match[3].str();
             items.push_back(item);
         }

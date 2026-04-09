@@ -1412,7 +1412,18 @@ ReactEngine::LLMResponseData ReactEngine::call_llm(
         li_event.provider   = llm_client_ ? llm_client_->get_config().provider : "unknown";
         li_event.model      = llm_client_ ? llm_client_->get_config().model    : "unknown";
         li_event.prompt     = messages.empty() ? "" : messages.back().content;
-        li_event.history_messages_json = "[]";  // simplified
+        li_event.history_messages_json = [&]() -> std::string {
+            nlohmann::json arr = nlohmann::json::array();
+            for (const auto& msg : messages) {
+                nlohmann::json m;
+                m["role"] = (msg.role == llm::LLMMessageRole::User) ? "user" :
+                            (msg.role == llm::LLMMessageRole::Assistant) ? "assistant" :
+                            (msg.role == llm::LLMMessageRole::System) ? "system" : "tool";
+                m["content"] = msg.content;
+                arr.push_back(m);
+            }
+            return arr.dump();
+        }();
         li_event.images_count = 0;
 
         tools::PluginHookAgentContext li_ctx;

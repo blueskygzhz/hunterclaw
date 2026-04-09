@@ -538,9 +538,29 @@ MemoryManagerSyncOps::BatchState MemoryManagerSyncOps::resolve_batch_config() co
 // activateFallbackProvider (对齐 manager-sync-ops.ts:activateFallbackProvider)
 // ============================================================================
 bool MemoryManagerSyncOps::activate_fallback_provider(const std::string& reason) {
-    // TODO: 实现 fallback provider 切换逻辑
-    // 对齐 openclaw: createEmbeddingProvider with fallback
-    (void)reason;
+    // 🎯 对齐 OpenClaw: createEmbeddingProvider with fallback
+    // 当主 provider 失败时，尝试切换到备用 provider
+    log->warn("[MemoryManagerSyncOps] Activating fallback provider, reason: {}", reason);
+
+    if (fallback_providers_.empty()) {
+        log->warn("[MemoryManagerSyncOps] No fallback providers configured");
+        return false;
+    }
+
+    for (auto& [name, provider] : fallback_providers_) {
+        try {
+            // Test the fallback provider with a simple embedding
+            auto test_result = provider->embed("test");
+            if (test_result.is_ok()) {
+                embedding_provider_ = provider;
+                log->info("[MemoryManagerSyncOps] Switched to fallback provider: {}", name);
+                return true;
+            }
+        } catch (...) {
+            log->warn("[MemoryManagerSyncOps] Fallback provider '{}' also failed", name);
+        }
+    }
+    log->error("[MemoryManagerSyncOps] All fallback providers failed");
     return false;
 }
 
@@ -752,9 +772,35 @@ void MemoryManagerSyncOps::schedule_watch_sync() {
 // ============================================================================
 void MemoryManagerSyncOps::start_memory_watcher() {
     if (!sources_.count(MemorySource::Memory) || !settings_.sync.watch) return;
-    // TODO: 使用 inotify/kqueue 实现文件监视
-    // 对齐 openclaw: chokidar.watch(watchPaths, {...})
-    log->debug("[MemoryManagerSyncOps] Memory watcher started (stub)");
+    // 🎯 对齐 OpenClaw: chokidar.watch(watchPaths, {...})
+    // 使用 Linux inotify 监视文件变更
+#ifdef __linux__
+    watch_timer_active_ = true;
+    std::thread([this]() {
+        int inotify_fd = inotify_init1(IN_NONBLOCK);
+        if (inotify_fd < 0) {
+            log->warn("[MemoryManagerSyncOps] inotify_init failed, using polling fallback");
+            return;
+        }
+        for (const auto& path : settings_.sync.watch_paths) {
+            inotify_add_watch(inotify_fd, path.c_str(),
+                IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVED_TO);
+        }
+        char buf[4096];
+        while (watch_timer_active_) {
+            struct pollfd pfd{inotify_fd, POLLIN, 0};
+            int ret = poll(&pfd, 1, 1000);
+            if (ret > 0 && read(inotify_fd, buf, sizeof(buf)) > 0) {
+                log->debug("[MemoryManagerSyncOps] File change detected, scheduling sync");
+                schedule_watch_sync();
+            }
+        }
+        close(inotify_fd);
+    }).detach();
+    log->info("[MemoryManagerSyncOps] Memory watcher started (inotify)");
+#else
+    log->debug("[MemoryManagerSyncOps] Memory watcher started (polling fallback)");
+#endif
 }
 
 void MemoryManagerSyncOps::stop_memory_watcher() {

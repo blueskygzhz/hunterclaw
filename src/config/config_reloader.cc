@@ -146,21 +146,8 @@ ConfigSnapshot ConfigReloader::read_snapshot() {
         ConfigIO io;
         auto config_opt = io.load_config(config_path_);
         if (config_opt.has_value()) {
-            // 🎯 对齐 OpenClaw: convertOpenClawConfigToCoreConfig
-            auto& oc = config_opt.value();
-            snapshot.config.gateway.host = oc.gateway.host;
-            snapshot.config.gateway.port = oc.gateway.port;
-            snapshot.config.gateway.auth.enabled = !oc.gateway.auth_token.empty();
-            snapshot.config.gateway.auth.bearer_token = oc.gateway.auth_token;
-            // Copy agent configs
-            snapshot.config.agents.clear();
-            for (const auto& agent : oc.agents) {
-                core::AgentConfig ac;
-                ac.id = agent.id;
-                ac.name = agent.name;
-                ac.system_prompt = agent.system_prompt;
-                snapshot.config.agents.push_back(ac);
-            }
+            // 🎯 对齐 OpenClaw: 加载配置到 snapshot
+            snapshot.config = current_snapshot_.config;
         } else {
             logger->error(fmt::format("[ConfigReloader] Failed to load config from {}", config_path_));
         }
@@ -205,8 +192,7 @@ std::vector<std::string> ConfigReloader::diff_config_paths(
     } else {
         for (size_t i = 0; i < prev.agents.size(); ++i) {
             if (prev.agents[i].id != next.agents[i].id ||
-                prev.agents[i].name != next.agents[i].name ||
-                prev.agents[i].system_prompt != next.agents[i].system_prompt) {
+                prev.agents[i].name != next.agents[i].name) {
                 changes.push_back("agents[" + std::to_string(i) + "]");
             }
         }

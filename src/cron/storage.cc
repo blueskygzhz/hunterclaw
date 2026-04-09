@@ -356,10 +356,32 @@ core::Result<Job> CronStorage::deserialize_job(const json& j) {
             job.wake_mode = WakeMode::Now;
         }
         
-        // Payload - TODO: implement payload deserialization
-        job.payload = Payload::system_event(""); // Placeholder
+        // Payload — 🎯 对齐 OpenClaw: 反序列化 payload
+        if (j.contains("payload") && j["payload"].is_object()) {
+            auto& p = j["payload"];
+            std::string kind = p.value("kind", "systemEvent");
+            if (kind == "agentTurn") {
+                job.payload = Payload::agent_turn(p.value("message", ""));
+                if (p.contains("model") && p["model"].is_string())
+                    job.payload.model = p["model"].get<std::string>();
+            } else {
+                job.payload = Payload::system_event(p.value("text", ""));
+            }
+        } else {
+            job.payload = Payload::system_event("");
+        }
         
-        // Delivery - TODO: implement delivery deserialization
+        // Delivery — 🎯 对齐 OpenClaw: 反序列化 delivery
+        if (j.contains("delivery") && j["delivery"].is_object()) {
+            auto& d = j["delivery"];
+            job.delivery.mode = d.value("mode", "none");
+            if (d.contains("channel") && d["channel"].is_string())
+                job.delivery.channel = d["channel"].get<std::string>();
+            if (d.contains("to") && d["to"].is_string())
+                job.delivery.to = d["to"].get<std::string>();
+            if (d.contains("accountId") && d["accountId"].is_string())
+                job.delivery.account_id = d["accountId"].get<std::string>();
+        }
         
         // Metadata
         if (j.contains("agent_id")) {

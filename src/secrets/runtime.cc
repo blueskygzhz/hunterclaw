@@ -250,13 +250,31 @@ PreparedSecretsRuntimeSnapshot SecretsRuntimeManager::prepare_snapshot(
     // Step 3: Replace secret references in config with resolved values
     replace_secret_refs_in_config(snapshot.config, resolved, warnings);
     
-    // Step 4: Load auth profile stores (if agent_dirs provided)
+    // Step 4: Load auth profile stores (对齐 OpenClaw: loadAuthProfileStores)
     for (const auto& agent_dir : agent_dirs) {
-        // TODO: Implement auth profile store loading
-        // For now, just create empty store
         PreparedSecretsRuntimeSnapshot::AuthStoreEntry entry;
         entry.agent_dir = agent_dir;
         entry.store.agent_dir = agent_dir;
+        // Load auth profiles from {agent_dir}/auth-profiles.json
+        std::string auth_path = agent_dir + "/auth-profiles.json";
+        try {
+            if (std::filesystem::exists(auth_path)) {
+                std::ifstream f(auth_path);
+                nlohmann::json auth_json;
+                f >> auth_json;
+                if (auth_json.is_object()) {
+                    for (auto it = auth_json.begin(); it != auth_json.end(); ++it) {
+                        entry.store.profiles[it.key()] = it.value();
+                    }
+                }
+            }
+        } catch (...) {
+            SecretResolverWarning w;
+            w.code = "AUTH_PROFILE_LOAD_FAILED";
+            w.path = auth_path;
+            w.message = "Failed to load auth profiles from: " + auth_path;
+            warnings.push_back(w);
+        }
         snapshot.auth_stores.push_back(entry);
     }
     
@@ -513,9 +531,9 @@ std::map<std::string, SecretResolutionResult> SecretsRuntimeManager::resolve_exe
     for (const auto& ref : refs) {
         // Check cache first
         if (cache) {
-            auto cached = cache->get(ref.key());
+            auto cached = cache->get_resolved(ref.key());
             if (cached.has_value()) {
-                results[ref.key()] = SecretResolutionResult::ok(*cached);
+                results[ref.key()] = *cached;
                 continue;
             }
         }
@@ -557,7 +575,7 @@ std::map<std::string, SecretResolutionResult> SecretsRuntimeManager::resolve_exe
             results[ref.key()] = SecretResolutionResult::ok(output);
             // Update cache
             if (cache) {
-                cache->put(ref.key(), output);
+                cache->set_resolved(ref.key(), SecretResolutionResult::ok(output));
             }
         }
     }

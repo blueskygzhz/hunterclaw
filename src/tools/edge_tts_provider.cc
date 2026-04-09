@@ -112,8 +112,9 @@ core::JsonValue EdgeTTSProvider::synthesize(
     file.read(buffer.data(), file_size);
     file.close();
     
-    // Convert to base64 (simplified, use proper base64 encoding in production)
-    std::string audio_base64;  // TODO: Implement base64 encoding
+    // 🎯 对齐 OpenClaw: base64 编码音频数据
+    std::string audio_base64 = infra::base64_encode(
+        reinterpret_cast<const unsigned char*>(buffer.data()), buffer.size());
     
     // Build result
     core::JsonValue result = core::JsonValue::object();

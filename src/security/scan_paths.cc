@@ -24,7 +24,7 @@ bool is_path_inside(const std::string& base_path, const std::string& candidate_p
     if (rel.empty()) return true; // same path
     std::string rel_str = rel.string();
     if (rel_str == ".") return true;
-    if (rel_str.starts_with("..")) return false;
+    if (rel_str.rfind("..", 0) == 0) return false;
     if (fs::path(rel_str).is_absolute()) return false;
     return true;
 }

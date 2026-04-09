@@ -8,15 +8,18 @@
 #include <spdlog/spdlog.h>
 
 namespace hunterclaw {
-namespace logging {
 
-// Forward declarations
+// Forward declarations from security module
 namespace security {
     std::optional<std::regex> compile_safe_regex(
         const std::string& source,
         std::regex_constants::syntax_option_type flags = std::regex_constants::ECMAScript
     );
 }
+
+namespace logging {
+
+using hunterclaw::security::compile_safe_regex;
 
 // ============================================================================
 // Constants — 严格对齐 OpenClaw: DEFAULT_REDACT_PATTERNS (17 个模式)
@@ -32,7 +35,7 @@ static const std::vector<std::string> DEFAULT_REDACT_PATTERNS = {
     // 1. ENV-style assignments (KEY|TOKEN|SECRET|PASSWORD|PASSWD)
     R"(\b[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)\b\s*[=:]\s*(["']?)([^\s"'\\]+)\1)",
     // 2. JSON fields (apiKey|token|secret|password|passwd|accessToken|refreshToken)
-    R"("(?:apiKey|token|secret|password|passwd|accessToken|refreshToken)"\s*:\s*"([^"]+)")",
+    R"xx("(?:apiKey|token|secret|password|passwd|accessToken|refreshToken)"\s*:\s*"([^"]+)")xx",
     // 3. CLI flags (--api-key|--token|--secret|--password|--passwd)
     R"(--(?:api[-_]?key|token|secret|password|passwd)\s+(["']?)([^\s"']+)\1)",
     // 4. Authorization headers (with colon/equals)

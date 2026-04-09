@@ -65,7 +65,8 @@ struct LineRule {
     SkillScanSeverity severity;
     std::string message;
     std::regex pattern;
-    std::optional<std::regex> requires_context;
+    bool has_context = false;
+    std::regex context_pattern;
 };
 
 struct SourceRule {
@@ -73,66 +74,80 @@ struct SourceRule {
     SkillScanSeverity severity;
     std::string message;
     std::regex pattern;
-    std::optional<std::regex> requires_context;
+    bool has_context = false;
+    std::regex context_pattern;
 };
 
 std::vector<LineRule> get_line_rules() {
-    return {
-        {
-            "dangerous-exec",
-            SkillScanSeverity::Critical,
-            "Shell command execution detected (child_process/system)",
-            std::regex(R"(\b(exec|execSync|spawn|spawnSync|execFile|execFileSync|system|popen)\s*\()"),
-            std::regex(R"(child_process|cstdlib|popen)")
-        },
-        {
-            "dynamic-code-execution",
-            SkillScanSeverity::Critical,
-            "Dynamic code execution detected",
-            std::regex(R"(\beval\s*\(|new\s+Function\s*\(|dlopen\s*\()"),
-            std::nullopt
-        },
-        {
-            "crypto-mining",
-            SkillScanSeverity::Critical,
-            "Possible crypto-mining reference detected",
-            std::regex(R"(stratum\+tcp|stratum\+ssl|coinhive|cryptonight|xmrig)", std::regex::icase),
-            std::nullopt
-        },
-        {
-            "suspicious-network",
-            SkillScanSeverity::Warn,
-            "WebSocket connection to non-standard port",
-            std::regex(R"(new\s+WebSocket\s*\(\s*["']wss?:\/\/[^"']*:(\d+))"),
-            std::nullopt
-        },
-    };
+    std::vector<LineRule> rules;
+    {
+        LineRule r;
+        r.rule_id = "dangerous-exec";
+        r.severity = SkillScanSeverity::Critical;
+        r.message = "Shell command execution detected (child_process/system)";
+        r.pattern = std::regex(R"(\b(exec|execSync|spawn|spawnSync|execFile|execFileSync|system|popen)\s*\()");
+        r.has_context = true;
+        r.context_pattern = std::regex(R"(child_process|cstdlib|popen)");
+        rules.push_back(std::move(r));
+    }
+    {
+        LineRule r;
+        r.rule_id = "dynamic-code-execution";
+        r.severity = SkillScanSeverity::Critical;
+        r.message = "Dynamic code execution detected";
+        r.pattern = std::regex(R"(\beval\s*\(|new\s+Function\s*\(|dlopen\s*\()");
+        rules.push_back(std::move(r));
+    }
+    {
+        LineRule r;
+        r.rule_id = "crypto-mining";
+        r.severity = SkillScanSeverity::Critical;
+        r.message = "Possible crypto-mining reference detected";
+        r.pattern = std::regex(R"(stratum\+tcp|stratum\+ssl|coinhive|cryptonight|xmrig)", std::regex::icase);
+        rules.push_back(std::move(r));
+    }
+    {
+        LineRule r;
+        r.rule_id = "suspicious-network";
+        r.severity = SkillScanSeverity::Warn;
+        r.message = "WebSocket connection to non-standard port";
+        r.pattern = std::regex(R"(new\s+WebSocket\s*\(\s*["']wss?:\/\/[^"']*:(\d+))");
+        rules.push_back(std::move(r));
+    }
+    return rules;
 }
 
 std::vector<SourceRule> get_source_rules() {
-    return {
-        {
-            "potential-exfiltration",
-            SkillScanSeverity::Warn,
-            "File read combined with network send - possible data exfiltration",
-            std::regex(R"(readFileSync|readFile|ifstream)"),
-            std::regex(R"(\bfetch\b|\bpost\b|http\.request|curl_easy)", std::regex::icase)
-        },
-        {
-            "obfuscated-code",
-            SkillScanSeverity::Warn,
-            "Hex-encoded string sequence detected (possible obfuscation)",
-            std::regex(R"((\\x[0-9a-fA-F]{2}){6,})"),
-            std::nullopt
-        },
-        {
-            "env-harvesting",
-            SkillScanSeverity::Critical,
-            "Environment variable access combined with network send - possible credential harvesting",
-            std::regex(R"(process\.env|getenv\s*\()"),
-            std::regex(R"(\bfetch\b|\bpost\b|http\.request|curl)", std::regex::icase)
-        },
-    };
+    std::vector<SourceRule> rules;
+    {
+        SourceRule r;
+        r.rule_id = "potential-exfiltration";
+        r.severity = SkillScanSeverity::Warn;
+        r.message = "File read combined with network send - possible data exfiltration";
+        r.pattern = std::regex(R"(readFileSync|readFile|ifstream)");
+        r.has_context = true;
+        r.context_pattern = std::regex(R"(\bfetch\b|\bpost\b|http\.request|curl_easy)", std::regex::icase);
+        rules.push_back(std::move(r));
+    }
+    {
+        SourceRule r;
+        r.rule_id = "obfuscated-code";
+        r.severity = SkillScanSeverity::Warn;
+        r.message = "Hex-encoded string sequence detected (possible obfuscation)";
+        r.pattern = std::regex(R"((\\x[0-9a-fA-F]{2}){6,})");
+        rules.push_back(std::move(r));
+    }
+    {
+        SourceRule r;
+        r.rule_id = "env-harvesting";
+        r.severity = SkillScanSeverity::Critical;
+        r.message = "Environment variable access combined with network send - possible credential harvesting";
+        r.pattern = std::regex(R"(process\.env|getenv\s*\()");
+        r.has_context = true;
+        r.context_pattern = std::regex(R"(\bfetch\b|\bpost\b|http\.request|curl)", std::regex::icase);
+        rules.push_back(std::move(r));
+    }
+    return rules;
 }
 
 std::string truncate_evidence(const std::string& evidence, int max_len = 120) {
@@ -180,7 +195,7 @@ std::vector<SkillScanFinding> scan_source(const std::string& source, const std::
     
     for (auto& rule : line_rules) {
         if (matched_line_rules.count(rule.rule_id)) continue;
-        if (rule.requires_context && !std::regex_search(source, *rule.requires_context)) continue;
+        if (rule.has_context && !std::regex_search(source, rule.context_pattern)) continue;
         
         for (int i = 0; i < (int)lines.size(); i++) {
             std::smatch match;
@@ -211,7 +226,7 @@ std::vector<SkillScanFinding> scan_source(const std::string& source, const std::
         std::string key = rule.rule_id + "::" + rule.message;
         if (matched_source_rules.count(key)) continue;
         if (!std::regex_search(source, rule.pattern)) continue;
-        if (rule.requires_context && !std::regex_search(source, *rule.requires_context)) continue;
+        if (rule.has_context && !std::regex_search(source, rule.context_pattern)) continue;
         
         int match_line = 1;
         std::string match_evidence;
@@ -264,7 +279,7 @@ SkillScanSummary scan_directory_with_summary(
         auto filename = entry.path().filename().string();
         
         // Skip hidden dirs and node_modules
-        if (filename.starts_with(".") || filename == "node_modules") {
+        if (filename.rfind(".", 0) == 0 || filename == "node_modules") {
             it.disable_recursion_pending();
             continue;
         }
