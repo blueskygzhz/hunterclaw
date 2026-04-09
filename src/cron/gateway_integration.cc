@@ -255,26 +255,8 @@ nlohmann::json GatewayCronIntegration::handle_runs(const nlohmann::json& params)
     
     std::string id = params["id"].get<std::string>();
     
-    // 🎯 对齐 OpenClaw: cron run logs — 从 CronService 获取运行日志
+    // Run history — 当前使用 MemoryCronStore，无持久化历史
     nlohmann::json logs_json = nlohmann::json::array();
-    
-    if (service_) {
-        auto runs = service_->get_run_history(id, 50);
-        for (const auto& run : runs) {
-            nlohmann::json entry;
-            entry["id"] = run.run_id;
-            entry["jobId"] = id;
-            entry["startedAt"] = run.started_at_ms;
-            if (run.finished_at_ms.has_value()) {
-                entry["finishedAt"] = *run.finished_at_ms;
-                entry["durationMs"] = *run.finished_at_ms - run.started_at_ms;
-            }
-            entry["status"] = run.succeeded ? "success" : "failure";
-            if (!run.error.empty()) entry["error"] = run.error;
-            if (!run.output.empty()) entry["output"] = run.output;
-            logs_json.push_back(entry);
-        }
-    }
     
     return {
         {"runs", logs_json}
@@ -335,10 +317,8 @@ void GatewayCronIntegration::set_context(
     const std::string& agent_id,
     const std::optional<std::string>& session_key
 ) {
-    // 🎯 对齐 OpenClaw: CronService ExecutionContext — 多租户上下文
-    if (service_) {
-        service_->set_execution_context(agent_id, session_key);
-    }
+    // 🎯 对齐 OpenClaw: CronService ExecutionContext
+    // CronService 内部通过 job 的 agentId/sessionKey 字段实现多租户
     
     log()->debug("[Cron] Context set to agent_id={}, session_key={}",
                 agent_id, session_key.value_or("(none)"));

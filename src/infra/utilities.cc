@@ -130,26 +130,23 @@ std::optional<std::string> safe_json_stringify(const JsonValue& value) {
 }
 
 std::optional<JsonValue> safe_json_parse(const std::string& json) {
-    // 🎯 对齐 OpenClaw: 使用 nlohmann/json 完整解析
     try {
-        auto parsed = nlohmann::json::parse(json);
-        // Convert nlohmann::json → JsonValue (simplified: wrap as string)
+        // Parse JSON string and store as string representation
         JsonValue result;
-        if (parsed.is_string()) {
-            result.type = JsonValue::Type::String;
-            result.string_val = parsed.get<std::string>();
-        } else if (parsed.is_number()) {
-            result.type = JsonValue::Type::Number;
-            result.number_val = parsed.get<double>();
-        } else if (parsed.is_boolean()) {
-            result.type = JsonValue::Type::Boolean;
-            result.bool_val = parsed.get<bool>();
-        } else if (parsed.is_null()) {
+        if (json.empty() || json == "null") {
             result.type = JsonValue::Type::Null;
-        } else {
-            // Object or array — store as string representation
+        } else if (json == "true" || json == "false") {
+            result.type = JsonValue::Type::Boolean;
+            result.bool_value = (json == "true");
+        } else if (!json.empty() && (json[0] == '"')) {
             result.type = JsonValue::Type::String;
-            result.string_val = parsed.dump();
+            result.string_value = json.substr(1, json.size() - 2);
+        } else if (!json.empty() && (std::isdigit(json[0]) || json[0] == '-')) {
+            result.type = JsonValue::Type::Number;
+            result.number_value = std::stod(json);
+        } else {
+            result.type = JsonValue::Type::String;
+            result.string_value = json;
         }
         return result;
     } catch (...) {

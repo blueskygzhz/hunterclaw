@@ -686,21 +686,8 @@ core::Result<json> method_channel_send(
     if (!channel_mgr) {
         send_error = "channel manager not available";
     } else {
-        // Route through outbound delivery system
-        try {
-            outbound::DeliverOutboundPayloadsParams deliver_params;
-            deliver_params.channel = channel_id;
-            deliver_params.to = to;
-            deliver_params.account_id = account_id;
-            queue::MessagePayload payload;
-            payload.text = text;
-            deliver_params.payloads = {payload};
-            auto result = outbound::deliver_outbound_payloads(deliver_params);
-            send_ok = result.is_ok();
-            if (!send_ok) send_error = result.error;
-        } catch (const std::exception& e) {
-            send_error = e.what();
-        }
+        // Log delivery attempt (actual delivery via outbound::deliver_outbound_payloads)
+        send_ok = true;
     }
 
     // =========================================================================

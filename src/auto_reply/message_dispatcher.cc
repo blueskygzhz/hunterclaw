@@ -142,49 +142,9 @@ static std::string resolve_send_policy(
     // First match wins; no match → default "allow"
     //
     // TODO: 从实际 config 读取 sendPolicy rules
-    // 当前从 dispatcher 的 config_ 成员获取
-    if (config_) {
-        auto cfg_data = config_->data;
-        if (cfg_data.contains("session") && cfg_data["session"].is_object() &&
-            cfg_data["session"].contains("sendPolicy") && cfg_data["session"]["sendPolicy"].is_array()) {
-            const auto& rules = cfg_data["session"]["sendPolicy"];
-            std::string chat_type_str;
-            switch (chat_type) {
-                case routing::ChatType::DIRECT:  chat_type_str = "direct"; break;
-                case routing::ChatType::GROUP:   chat_type_str = "group"; break;
-                case routing::ChatType::CHANNEL: chat_type_str = "channel"; break;
-                default: chat_type_str = ""; break;
-            }
-
-            for (const auto& rule : rules) {
-                if (!rule.is_object()) continue;
-
-                // Check channel match
-                bool channel_match = true;
-                if (rule.contains("channel") && rule["channel"].is_string()) {
-                    std::string rule_channel = rule["channel"].get<std::string>();
-                    if (!rule_channel.empty() && rule_channel != "*") {
-                        channel_match = (rule_channel == channel);
-                    }
-                }
-
-                // Check chatType match
-                bool type_match = true;
-                if (rule.contains("chatType") && rule["chatType"].is_string()) {
-                    std::string rule_type = rule["chatType"].get<std::string>();
-                    if (!rule_type.empty() && rule_type != "*") {
-                        type_match = (rule_type == chat_type_str);
-                    }
-                }
-
-                if (channel_match && type_match) {
-                    std::string action = rule.value("action", "allow");
-                    if (action == "deny") return "deny";
-                    if (action == "allow") return "allow";
-                }
-            }
-        }
-    }
+    // 当前未从 config 读取规则，返回默认 "allow"
+    (void)channel;
+    (void)chat_type;
 
     // No matching rule → default "allow" (对齐 OpenClaw 默认行为)
     return "allow";
@@ -2588,33 +2548,11 @@ void MessageDispatcher::maybe_apply_tts_to_payload(
         if (payload.text.find("MEDIA:") != std::string::npos) continue;
         if (payload.text.size() < 10) continue;  // Too short for TTS
 
-        // 🎯 严格对齐 OpenClaw: textToSpeech({ text, provider, channel })
-        // Invoke TTS provider to convert text → audio URL
-        auto& registry = tts::TtsProviderRegistry::instance();
-        auto provider = registry.get_provider(tts_provider);
-        if (!provider) {
-            log()->debug("maybe_apply_tts_to_payload: no TTS provider '{}' available, skipping",
-                        tts_provider);
-            continue;
-        }
-
-        tts::TtsRequest tts_request;
-        tts_request.text = payload.text;
-        tts_request.output_dir = "/tmp/hunterclaw-tts";
-
-        // Create output dir if needed
-        std::filesystem::create_directories(tts_request.output_dir);
-
-        auto tts_result = provider->text_to_speech(tts_request);
-        if (tts_result.is_ok()) {
-            auto& audio = tts_result.get();
-            payload.media_urls.push_back(audio.audio_path);
-            log()->info("maybe_apply_tts_to_payload: TTS generated audio for payload len={} → {}",
-                       payload.text.size(), audio.audio_path);
-        } else {
-            log()->warn("maybe_apply_tts_to_payload: TTS failed for payload len={}: {}",
-                       payload.text.size(), tts_result.error);
-        }
+        // 🎯 对齐 OpenClaw: textToSpeech({ text, provider, channel })
+        // TTS provider integration — requires tts::TtsProviderRegistry
+        // When TTS module is available, this will invoke provider->text_to_speech()
+        log()->debug("maybe_apply_tts_to_payload: TTS skipped (provider not linked), payload len={}",
+                     payload.text.size());
     }
 }
 

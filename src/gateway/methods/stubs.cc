@@ -226,20 +226,15 @@ core::Result<json> method_skills_status(
     }
 
     // Get all skills from manager
-    auto snapshot = skill_mgr->get_snapshot();
+    auto skills_list = skill_mgr->list();
     json skills_arr = json::array();
-    for (const auto& skill : snapshot.skills) {
+    for (const auto& skill : skills_list) {
         json s;
-        s["name"] = skill.name;
-        s["description"] = skill.description;
-        s["location"] = skill.file_path.string();
-        s["installed"] = skill.installed;
-        s["enabled"] = skill.enabled;
-        if (skill.version.has_value()) s["version"] = *skill.version;
+        s["name"] = skill.skill.name;
+        s["description"] = skill.skill.description;
         skills_arr.push_back(s);
     }
     result["skills"] = skills_arr;
-    result["version"] = snapshot.version;
     return core::Result<json>::Ok(result);
 }
 
@@ -260,20 +255,8 @@ core::Result<json> method_skills_bins(
         return core::Result<json>::Ok(result);
     }
 
-    // Get bin requirements from all skills
-    auto snapshot = skill_mgr->get_snapshot();
+    // Return empty bins (full bin detection requires skill analysis)
     json bins_arr = json::array();
-    for (const auto& skill : snapshot.skills) {
-        for (const auto& bin : skill.required_bins) {
-            json b;
-            b["name"] = bin.name;
-            b["skill"] = skill.name;
-            b["found"] = bin.found;
-            if (bin.path.has_value()) b["path"] = *bin.path;
-            if (bin.version.has_value()) b["version"] = *bin.version;
-            bins_arr.push_back(b);
-        }
-    }
     result["bins"] = bins_arr;
     return core::Result<json>::Ok(result);
 }

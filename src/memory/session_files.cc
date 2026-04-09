@@ -1,4 +1,5 @@
 #include "hunterclaw/memory/session_files.h"
+#include "hunterclaw/logging/redact.h"
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -64,7 +65,7 @@ std::string normalize_session_text(const std::string& value) {
 // 🎯 统一调用 logging::redact_sensitive_text，mode="tools"
 // ============================================================================
 std::string redact_sensitive_text(const std::string& text) {
-    return logging::redact_sensitive_text(text, {std::string("tools"), std::nullopt});
+    return hunterclaw::logging::redact_sensitive_text(text, {std::string("tools"), std::nullopt});
 }
 
 // ============================================================================

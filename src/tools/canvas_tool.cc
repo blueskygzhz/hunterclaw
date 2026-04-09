@@ -5,6 +5,7 @@
 // Actions: present | hide | navigate | eval | snapshot | a2ui_push | a2ui_reset
 
 #include "hunterclaw/tools/canvas_tool.h"
+#include "hunterclaw/infra/http_client.h"
 #include "hunterclaw/tools/tool.h"
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>

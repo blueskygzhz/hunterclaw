@@ -334,8 +334,13 @@ public:
     Stats get_stats() const;
     
 private:
-    WebSocketServerOptions options_;  // 配置参数
-    // \u2705 \u5bf9\u9f50 OpenClaw: WebSocket \u8fde\u63a5\u7ba1\u7406\n    mutable std::mutex clients_mutex_;\n    std::unordered_map<std::string, std::shared_ptr<WebSocketClient>> clients_;  // conn_id -> client\n    std::atomic<bool> running_{false};\n    std::thread accept_thread_;\n    Stats stats_;\n    std::atomic<uint64_t> next_conn_id_{1};
+    WebSocketServerOptions options_;
+    mutable std::mutex clients_mutex_;
+    std::unordered_map<std::string, std::shared_ptr<WebSocketClient>> clients_;
+    std::atomic<bool> running_{false};
+    std::thread accept_thread_;
+    Stats stats_;
+    std::atomic<uint64_t> next_conn_id_{1};
 };
 
 } // namespace gateway

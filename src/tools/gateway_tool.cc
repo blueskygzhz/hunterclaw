@@ -7,6 +7,7 @@
 
 #include "hunterclaw/tools/gateway_tool.h"
 #include "hunterclaw/tools/tool.h"
+#include "hunterclaw/infra/http_client.h"
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 #include <string>
@@ -391,7 +392,6 @@ private:
         rpc_request["method"] = method;
         if (!call_params.empty()) rpc_request["params"] = call_params;
 
-        // Try HTTP POST to gateway
         std::string url = gw_url.empty() ? "http://127.0.0.1:3000" : gw_url;
         url += "/v1/rpc";
 
@@ -405,19 +405,24 @@ private:
         opts.timeout_ms = static_cast<int>(timeout_ms);
 
         auto http_result = client.post(url, opts);
-        if (http_result.is_ok()) {
-            auto& resp = http_result.get();
-            try {
-                auto j = json::parse(resp.body);
-                if (j.contains("result")) return j["result"];
-                return j;
-            } catch (...) {
-                return {{"ok", resp.ok}, {"body", resp.body}};
-            }
+        if (!http_result.is_ok()) {
+            json err;
+            err["ok"] = false;
+            err["error"] = http_result.error;
+            err["method"] = method;
+            return err;
         }
-
-        // Fallback: return error with details
-        return {{"ok", false}, {"error", http_result.error}, {"method", method}};
+        auto& resp = http_result.get();
+        try {
+            auto j = json::parse(resp.body);
+            if (j.contains("result")) return j["result"];
+            return j;
+        } catch (...) {
+            json r;
+            r["ok"] = resp.ok;
+            r["body"] = resp.body;
+            return r;
+        }
     }
 };
 

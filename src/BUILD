@@ -403,6 +403,7 @@ cc_library(
     srcs = glob(["tools/*.cc"]),
     deps = [
         "//:hunterclaw_headers",
+        ":hunterclaw_infra",              # ✅ 添加 infra 依赖 (HttpClient)
         ":hunterclaw_llm",
         ":hunterclaw_memory",
         ":hunterclaw_sessions",

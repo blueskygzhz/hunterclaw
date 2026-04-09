@@ -113,8 +113,8 @@ core::JsonValue EdgeTTSProvider::synthesize(
     file.close();
     
     // 🎯 对齐 OpenClaw: base64 编码音频数据
-    std::string audio_base64 = infra::base64_encode(
-        reinterpret_cast<const unsigned char*>(buffer.data()), buffer.size());
+    std::vector<uint8_t> audio_bytes(buffer.begin(), buffer.end());
+    std::string audio_base64 = infra::base64_encode(audio_bytes);
     
     // Build result
     core::JsonValue result = core::JsonValue::object();

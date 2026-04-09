@@ -374,13 +374,18 @@ core::Result<Job> CronStorage::deserialize_job(const json& j) {
         // Delivery — 🎯 对齐 OpenClaw: 反序列化 delivery
         if (j.contains("delivery") && j["delivery"].is_object()) {
             auto& d = j["delivery"];
-            job.delivery.mode = d.value("mode", "none");
+            Delivery delivery;
+            std::string mode_str = d.value("mode", "none");
+            if (mode_str == "announce") delivery.mode = DeliveryMode::Announce;
+            else if (mode_str == "webhook") delivery.mode = DeliveryMode::Webhook;
+            else delivery.mode = DeliveryMode::None;
             if (d.contains("channel") && d["channel"].is_string())
-                job.delivery.channel = d["channel"].get<std::string>();
+                delivery.channel = d["channel"].get<std::string>();
             if (d.contains("to") && d["to"].is_string())
-                job.delivery.to = d["to"].get<std::string>();
+                delivery.to = d["to"].get<std::string>();
             if (d.contains("accountId") && d["accountId"].is_string())
-                job.delivery.account_id = d["accountId"].get<std::string>();
+                delivery.account_id = d["accountId"].get<std::string>();
+            job.delivery = delivery;
         }
         
         // Metadata

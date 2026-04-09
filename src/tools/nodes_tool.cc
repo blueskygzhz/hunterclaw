@@ -10,6 +10,7 @@
 // ownerOnly: true
 
 #include "hunterclaw/tools/nodes_tool.h"
+#include "hunterclaw/infra/http_client.h"
 #include "hunterclaw/tools/tool.h"
 #include <nlohmann/json.hpp>
 #include <string>

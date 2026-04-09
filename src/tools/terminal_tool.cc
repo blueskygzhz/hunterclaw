@@ -6,6 +6,7 @@
 // Targets: sandbox | host | node
 
 #include "hunterclaw/tools/terminal_tool.h"
+#include "hunterclaw/infra/http_client.h"
 #include "hunterclaw/core/json.h"
 #include "hunterclaw/core/types.h"
 #include <nlohmann/json.hpp>
@@ -376,36 +377,33 @@ ToolResult TerminalTool::action_resize(
 }
 
 // ============================================================================
-// HTTP helpers (🎯 对齐 OpenClaw — 使用 infra::HttpClient)
+// HTTP helpers (使用 curl 命令)
 // ============================================================================
 
 core::JsonValue TerminalTool::http_get(const std::string& url) const {
-    infra::HttpClient client;
-    auto result = client.get(url, 10000);
-    if (!result.is_ok()) return core::JsonValue(json{{"ok", false}, {"error", result.error}});
-    auto& resp = result.get();
-    try { return core::JsonValue(json::parse(resp.body)); }
-    catch (...) { return core::JsonValue(json{{"ok", resp.ok}, {"body", resp.body}}); }
+    std::string cmd = "curl -fsSL '" + url + "' --max-time 10 2>/dev/null";
+    FILE* pipe = popen(cmd.c_str(), "r"); std::string body; char buf[4096];
+    if (pipe) { while(fgets(buf, sizeof(buf), pipe)) body += buf; pclose(pipe); }
+    if (body.empty()) { json r; r["ok"] = false; return core::JsonValue(r); }
+    try { return core::JsonValue(json::parse(body)); }
+    catch (...) { json r; r["ok"] = true; r["body"] = body; return core::JsonValue(r); }
 }
 
 core::JsonValue TerminalTool::http_post(const std::string& url, const core::JsonValue& body) const {
-    infra::HttpClient client;
-    infra::HttpRequestOptions opts;
-    opts.body = body.to_json().dump();
-    opts.headers = {{"Content-Type", "application/json"}};
-    opts.timeout_ms = 10000;
-    auto result = client.post(url, opts);
-    if (!result.is_ok()) return core::JsonValue(json{{"ok", false}, {"error", result.error}});
-    auto& resp = result.get();
-    try { return core::JsonValue(json::parse(resp.body)); }
-    catch (...) { return core::JsonValue(json{{"ok", resp.ok}, {"body", resp.body}}); }
+    std::string data = body.to_json().dump();
+    std::string cmd = "curl -fsSX POST '" + url + "' -H 'Content-Type: application/json' -d '" + data + "' --max-time 10 2>/dev/null";
+    FILE* pipe = popen(cmd.c_str(), "r"); std::string resp; char buf[4096];
+    if (pipe) { while(fgets(buf, sizeof(buf), pipe)) resp += buf; pclose(pipe); }
+    if (resp.empty()) { json r; r["ok"] = false; return core::JsonValue(r); }
+    try { return core::JsonValue(json::parse(resp)); }
+    catch (...) { json r; r["ok"] = true; r["body"] = resp; return core::JsonValue(r); }
 }
 
 core::JsonValue TerminalTool::http_delete(const std::string& url) const {
-    infra::HttpClient client;
-    auto result = client.del(url, 10000);
-    if (!result.is_ok()) return core::JsonValue(json{{"ok", false}, {"error", result.error}});
-    return core::JsonValue(json{{"ok", result.get().ok}});
+    std::string cmd = "curl -fsSX DELETE '" + url + "' --max-time 10 2>/dev/null";
+    FILE* pipe = popen(cmd.c_str(), "r"); std::string resp; char buf[4096];
+    if (pipe) { while(fgets(buf, sizeof(buf), pipe)) resp += buf; pclose(pipe); }
+    json r; r["ok"] = !resp.empty(); return core::JsonValue(r);
 }
 
 core::JsonValue TerminalTool::call_node_terminal_proxy(
@@ -416,25 +414,17 @@ core::JsonValue TerminalTool::call_node_terminal_proxy(
     const core::JsonValue& body,
     int timeout_ms
 ) const {
-    // 🎯 对齐 OpenClaw: node.invoke via HTTP RPC
-    json rpc = {{"method", "node.invoke"}, {"params", {
-        {"nodeId", node_id}, {"command", method},
-        {"params", {{"path", path}, {"query", query}, {"body", body.to_json()}}}
-    }}};
-    std::string url = "http://127.0.0.1:3000/v1/rpc";
-    infra::HttpClient client;
-    infra::HttpRequestOptions opts;
-    opts.body = rpc.dump();
-    opts.headers = {{"Content-Type", "application/json"}};
-    opts.timeout_ms = static_cast<int>(timeout_ms);
-    auto result = client.post(url, opts);
-    if (result.is_ok()) {
-        try {
-            auto j = json::parse(result.get().body);
-            return core::JsonValue(j.contains("result") ? j["result"] : j);
-        } catch (...) {}
-    }
-    return core::JsonValue(json{{"ok", false}, {"error", result.is_ok() ? "parse error" : result.error}});
+    json rpc;
+    rpc["method"] = "node.invoke";
+    json p; p["nodeId"] = node_id; p["command"] = method;
+    json pp; pp["path"] = path; pp["query"] = query.to_json(); pp["body"] = body.to_json();
+    p["params"] = pp; rpc["params"] = p;
+    std::string data = rpc.dump();
+    std::string cmd = "curl -fsSX POST 'http://127.0.0.1:3000/v1/rpc' -H 'Content-Type: application/json' -d '" + data + "' --max-time " + std::to_string(timeout_ms / 1000) + " 2>/dev/null";
+    FILE* pipe = popen(cmd.c_str(), "r"); std::string resp; char buf[4096];
+    if (pipe) { while(fgets(buf, sizeof(buf), pipe)) resp += buf; pclose(pipe); }
+    if (!resp.empty()) { try { auto j = json::parse(resp); return core::JsonValue(j.contains("result") ? j["result"] : j); } catch (...) {} }
+    json err; err["ok"] = false; err["error"] = "node.invoke failed"; return core::JsonValue(err);
 }
 
 // ============================================================================

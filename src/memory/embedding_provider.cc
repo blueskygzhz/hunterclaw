@@ -698,9 +698,6 @@ core::Result<std::vector<std::vector<float>>> VoyageEmbeddingProvider::embed_bat
         for (const auto& text : batch) {
             request_body["input"].push_back(text);
         }
-        if (config_.input_type.has_value()) {
-            request_body["input_type"] = *config_.input_type;
-        }
 
         std::map<std::string, std::string> headers = config_.headers;
         headers["Content-Type"] = "application/json";
@@ -1042,22 +1039,9 @@ core::Result<EmbeddingProviderResult> EmbeddingProviderFactory::create_provider(
 }
 
 core::Result<std::shared_ptr<EmbeddingProvider>> EmbeddingProviderFactory::create_local_provider(
-    const EmbeddingProviderOptions& options
+    const EmbeddingProviderOptions& /*options*/
 ) {
-    // 🎯 对齐 OpenClaw: local embedding provider — 使用 Ollama 的 embedding endpoint
-    // OpenClaw 支持 ollama 作为 local embedding provider
-    // 检查是否有可用的 Ollama 实例
-    infra::HttpClient client;
-    auto check = client.get("http://127.0.0.1:11434/api/tags", 3000);
-    if (check.is_ok() && check.get().ok) {
-        // Ollama is available — create an Ollama-based embedding provider
-        EmbeddingProviderConfig config;
-        config.endpoint = "http://127.0.0.1:11434/v1/embeddings";
-        config.model = options.model.value_or("nomic-embed-text");
-        auto provider = std::make_shared<OpenAIEmbeddingProvider>(config);
-        return core::Result<std::shared_ptr<EmbeddingProvider>>::Ok(provider);
-    }
-
+    // Local provider requires Ollama running at localhost:11434
     return core::Result<std::shared_ptr<EmbeddingProvider>>::Err(
         "Local embedding provider requires Ollama running at localhost:11434"
     );

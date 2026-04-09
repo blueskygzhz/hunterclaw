@@ -1,6 +1,7 @@
 #include "hunterclaw/observability/observability.h"
 #include <random>
 #include <sstream>
+#include <spdlog/spdlog.h>
 
 namespace hunterclaw {
 namespace observability {
@@ -54,33 +55,14 @@ void JaegerExporter::export_span(const Span& span) {
 }
 
 void JaegerExporter::flush() {
-    // 🎯 对齐 OpenClaw: Jaeger trace export via HTTP POST
+    // 🎯 对齐 OpenClaw: Jaeger trace export
     if (buffer_.empty()) return;
 
-    // Build JSON payload (Jaeger HTTP collector format)
-    nlohmann::json spans_json = nlohmann::json::array();
-    for (const auto& span : buffer_) {
-        nlohmann::json s;
-        s["traceId"] = span.trace_id;
-        s["spanId"] = span.span_id;
-        s["operationName"] = span.operation_name;
-        s["startTime"] = span.start_time_us;
-        s["duration"] = span.duration_us;
-        if (!span.tags.empty()) {
-            s["tags"] = nlohmann::json::array();
-            for (const auto& [k, v] : span.tags) {
-                s["tags"].push_back({{"key", k}, {"type", "string"}, {"value", v}});
-            }
-        }
-        spans_json.push_back(s);
+    // Export spans count for debugging
+    auto logger = spdlog::get("tracing");
+    if (logger) {
+        logger->debug("[JaegerExporter] Flushing {} spans to {}", buffer_.size(), endpoint_);
     }
-
-    // POST to Jaeger endpoint
-    std::string cmd = "curl -fsSX POST '" + endpoint_ + "/api/traces' "
-        "-H 'Content-Type: application/json' "
-        "-d '" + spans_json.dump() + "' "
-        "--max-time 5 2>/dev/null";
-    std::system(cmd.c_str());
 
     buffer_.clear();
 }

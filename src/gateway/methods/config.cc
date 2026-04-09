@@ -137,7 +137,7 @@ core::Result<json> method_config_get(
     // 🎯 严格对齐 OpenClaw: redactConfigSnapshot(snapshot, schema.uiHints)
     // 调用 redact_config_secrets 对配置进行脱敏
     if (snapshot.contains("config") && snapshot["config"].is_object()) {
-        snapshot["config"] = config::redact_config_secrets(snapshot["config"]);
+        snapshot["config"] = ::hunterclaw::config::redact_config_secrets(snapshot["config"]);
     }
 
     return core::Result<json>::Ok(snapshot);
@@ -925,7 +925,7 @@ core::Result<json> method_config_apply(
     json result;
     result["ok"] = write_ok;
     result["path"] = config_path;
-    result["config"] = config::redact_config_secrets(parsed_config);
+    result["config"] = ::hunterclaw::config::redact_config_secrets(parsed_config);
     result["restart"] = restart_result;
     result["sentinel"] = json{
         {"path", sentinel_path.empty() ? json(nullptr) : json(sentinel_path)},

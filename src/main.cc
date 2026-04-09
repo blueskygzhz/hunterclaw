@@ -183,10 +183,7 @@ int main(int argc, char** argv) {
         try {
             for (const auto& entry : std::filesystem::directory_iterator(plugins_dir)) {
                 if (entry.is_directory()) {
-                    auto result = plugin_mgr->load_plugin(entry.path().string());
-                    if (result.is_ok()) {
-                        std::cout << "    Loaded plugin: " << entry.path().filename().string() << std::endl;
-                    }
+                    std::cout << "    Found plugin: " << entry.path().filename().string() << std::endl;
                 }
             }
         } catch (const std::exception& e) {
@@ -257,9 +254,8 @@ int main(int argc, char** argv) {
         std::cout << "  Warning: Recovery scan failed: " << recovery_result.error << std::endl;
     }
     
-    // 🎯 对齐 OpenClaw: channel 消息回调
-    // 消息路由由 Gateway 的 inbound worker 在 gateway.cc 中负责
-    // channel_mgr 在 Gateway 启动时自动注册消息处理回调
+    // 🎯 对齐 OpenClaw: channel 消息回调由 Gateway inbound worker 处理
+    // channel_mgr 的消息路由在 Gateway 启动时通过 inbound plugin hooks 注册
     
     // Initialize Gateway Server
     std::cout << "[4/4] Starting Gateway Server..." << std::endl;

@@ -1,5 +1,6 @@
 #include "hunterclaw/observability/observability.h"
 #include "hunterclaw/observability/diagnostic_events.h"
+#include "hunterclaw/logging/redact.h"
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/file_sinks.h>  // ✅ file_sinks 在此文件中定义
 #include <spdlog/sinks/stdout_sinks.h>  // ✅ stdout_sinks
@@ -137,12 +138,12 @@ void StructuredLogger::log(LogLevel level, const std::string& event,
     // 🎯 严格对齐 OpenClaw: 统一调用 logging::redact_sensitive_text
     std::string json_str = entry.to_json();
     if (config_.redact_sensitive) {
-        logging::RedactOptions opts;
+        hunterclaw::logging::RedactOptions opts;
         opts.mode = "tools";
         if (!config_.redact_patterns.empty()) {
             opts.patterns = config_.redact_patterns;
         }
-        json_str = logging::redact_sensitive_text(json_str, opts);
+        json_str = hunterclaw::logging::redact_sensitive_text(json_str, opts);
     }
     
     // 写入日志 (JSON Lines 格式)
