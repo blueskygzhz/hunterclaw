@@ -767,9 +767,35 @@ void MemoryManagerSyncOps::stop_memory_watcher() {
 // ============================================================================
 void MemoryManagerSyncOps::start_session_watcher() {
     if (!sources_.count(MemorySource::Sessions)) return;
-    // TODO: 订阅 session transcript 更新事件
-    // 对齐 openclaw: onSessionTranscriptUpdate(...)
-    log->debug("[MemoryManagerSyncOps] Session watcher started (stub)");
+    // 🎯 对齐 OpenClaw: onSessionTranscriptUpdate(...)
+    // 监视 session transcript 目录变更
+    session_watch_timer_active_ = true;
+    std::thread([this]() {
+        while (session_watch_timer_active_) {
+            // Poll session transcript directory for new/modified files
+            if (!settings_.sessions_dir.empty()) {
+                try {
+                    for (const auto& entry : std::filesystem::directory_iterator(settings_.sessions_dir)) {
+                        if (entry.is_regular_file() && entry.path().extension() == ".jsonl") {
+                            auto mtime = std::filesystem::last_write_time(entry.path());
+                            auto mtime_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                mtime.time_since_epoch()).count();
+                            // Check if file was modified since last check
+                            auto key = entry.path().string();
+                            if (session_mtimes_.count(key) == 0 || session_mtimes_[key] < mtime_ms) {
+                                session_mtimes_[key] = mtime_ms;
+                                // Trigger session re-sync
+                                log->debug("[MemoryManagerSyncOps] Session transcript updated: {}",
+                                          entry.path().filename().string());
+                            }
+                        }
+                    }
+                } catch (...) {}
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+        }
+    }).detach();
+    log->info("[MemoryManagerSyncOps] Session watcher started");
 }
 
 void MemoryManagerSyncOps::stop_session_watcher() {

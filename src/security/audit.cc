@@ -354,11 +354,20 @@ GatewayProbeResult SecurityAuditor::probe_gateway_deep(
     int port = http.value("port", 3000);
     result.url = "http://" + host + ":" + std::to_string(port);
     
-    // TODO: Implement actual HTTP probe with timeout
-    // For now, mark as not attempted (requires HTTP client library)
-    result.attempted = false;
-    result.ok = false;
-    result.error = "Gateway probe not implemented (requires HTTP client)";
+    // 🎯 对齐 OpenClaw: Gateway HTTP probe — 检测 HTTP 端点是否可达
+    result.attempted = true;
+    try {
+        // Use system curl for simple HTTP probe with timeout
+        std::string cmd = "curl -fsSo /dev/null --max-time 3 '" + result.url + "/health' 2>/dev/null";
+        int exit_code = std::system(cmd.c_str());
+        result.ok = (exit_code == 0);
+        if (!result.ok) {
+            result.error = "Gateway HTTP probe failed (exit code " + std::to_string(exit_code) + ")";
+        }
+    } catch (const std::exception& e) {
+        result.ok = false;
+        result.error = std::string("Gateway probe exception: ") + e.what();
+    }
     
     return result;
 }

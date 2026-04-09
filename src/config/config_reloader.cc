@@ -146,9 +146,21 @@ ConfigSnapshot ConfigReloader::read_snapshot() {
         ConfigIO io;
         auto config_opt = io.load_config(config_path_);
         if (config_opt.has_value()) {
-            // TODO: Convert OpenClawConfig to core::Config
-            // For now, use existing config
-            snapshot.config = current_snapshot_.config;
+            // 🎯 对齐 OpenClaw: convertOpenClawConfigToCoreConfig
+            auto& oc = config_opt.value();
+            snapshot.config.gateway.host = oc.gateway.host;
+            snapshot.config.gateway.port = oc.gateway.port;
+            snapshot.config.gateway.auth.enabled = !oc.gateway.auth_token.empty();
+            snapshot.config.gateway.auth.bearer_token = oc.gateway.auth_token;
+            // Copy agent configs
+            snapshot.config.agents.clear();
+            for (const auto& agent : oc.agents) {
+                core::AgentConfig ac;
+                ac.id = agent.id;
+                ac.name = agent.name;
+                ac.system_prompt = agent.system_prompt;
+                snapshot.config.agents.push_back(ac);
+            }
         } else {
             logger->error(fmt::format("[ConfigReloader] Failed to load config from {}", config_path_));
         }
@@ -187,11 +199,18 @@ std::vector<std::string> ConfigReloader::diff_config_paths(
         changes.push_back("gateway.heartbeat_interval");
     }
     
-    // Agent 配置 - agents 是 vector,没有 defaults 字段
-    // TODO: 如果需要比较 agent 配置,需要遍历 vector
-    // if (prev.agents.size() != next.agents.size()) {
-    //     changes.push_back("agents");
-    // }
+    // 🎯 对齐 OpenClaw: Agent 配置比较（遍历 agents vector）
+    if (prev.agents.size() != next.agents.size()) {
+        changes.push_back("agents");
+    } else {
+        for (size_t i = 0; i < prev.agents.size(); ++i) {
+            if (prev.agents[i].id != next.agents[i].id ||
+                prev.agents[i].name != next.agents[i].name ||
+                prev.agents[i].system_prompt != next.agents[i].system_prompt) {
+                changes.push_back("agents[" + std::to_string(i) + "]");
+            }
+        }
+    }
     
     return changes;
 }

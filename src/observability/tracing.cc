@@ -54,7 +54,34 @@ void JaegerExporter::export_span(const Span& span) {
 }
 
 void JaegerExporter::flush() {
-    // TODO: HTTP POST to Jaeger (使用 libcurl)
+    // 🎯 对齐 OpenClaw: Jaeger trace export via HTTP POST
+    if (buffer_.empty()) return;
+
+    // Build JSON payload (Jaeger HTTP collector format)
+    nlohmann::json spans_json = nlohmann::json::array();
+    for (const auto& span : buffer_) {
+        nlohmann::json s;
+        s["traceId"] = span.trace_id;
+        s["spanId"] = span.span_id;
+        s["operationName"] = span.operation_name;
+        s["startTime"] = span.start_time_us;
+        s["duration"] = span.duration_us;
+        if (!span.tags.empty()) {
+            s["tags"] = nlohmann::json::array();
+            for (const auto& [k, v] : span.tags) {
+                s["tags"].push_back({{"key", k}, {"type", "string"}, {"value", v}});
+            }
+        }
+        spans_json.push_back(s);
+    }
+
+    // POST to Jaeger endpoint
+    std::string cmd = "curl -fsSX POST '" + endpoint_ + "/api/traces' "
+        "-H 'Content-Type: application/json' "
+        "-d '" + spans_json.dump() + "' "
+        "--max-time 5 2>/dev/null";
+    std::system(cmd.c_str());
+
     buffer_.clear();
 }
 
