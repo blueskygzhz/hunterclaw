@@ -3,6 +3,7 @@
 #include "hunterclaw/gateway/server_lanes.h"  // 对齐 OpenClaw: applyGatewayLaneConcurrency
 #include "hunterclaw/agents/agent_pool.h"
 #include "hunterclaw/agents/agent_instance.h"
+#include "hunterclaw/memory/memory_index_manager.h"  // ✅ Memory startup (对齐 server-startup-memory.ts)
 #include "hunterclaw/cron/service.h"
 #include "hunterclaw/core/utils.h"
 #include "hunterclaw/observability/diagnostic_events.h"  // ✅ 可观测性集成
@@ -1987,6 +1988,27 @@ core::Result<bool> GatewayServer::start() {
     auto result = impl_->server_impl->start();
     if (result.is_ok()) {
         impl_->running.store(true);
+
+        // ✅ Aligned with openclaw: server-startup-memory.ts
+        // 对齐 OpenClaw: startGatewayMemoryBackend({ cfg, log })
+        // 在 gateway 启动时预热 memory backend，确保首次搜索不需要冷启动
+        {
+            auto log = spdlog::get("default");
+            try {
+                memory::MemoryIndexManager::Params mem_params;
+                mem_params.agent_id = "main";
+                mem_params.workspace_dir = impl_->config->data.value("workspace", ".");
+                auto mem_result = memory::MemoryIndexManager::get(mem_params);
+                if (mem_result.is_ok() && mem_result.get()) {
+                    if (log) log->info("[gateway] memory startup initialization armed for agent \"main\"");
+                } else if (log) {
+                    log->debug("[gateway] memory not configured or unavailable: {}", 
+                              mem_result.is_err() ? mem_result.error : "null");
+                }
+            } catch (const std::exception& e) {
+                if (log) log->warn("[gateway] memory startup initialization failed: {}", e.what());
+            }
+        }
 
         // ✅ Aligned with openclaw: server.impl.ts
         //   onHeartbeatEvent((evt) => {

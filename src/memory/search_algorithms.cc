@@ -83,20 +83,87 @@ double bm25_rank_to_score(double rank) {
 }
 
 // ============================================================================
-// tokenize (对齐 mmr.ts:tokenize)
+// tokenize (对齐 mmr.ts:48-71)
+// Extracts alphanumeric tokens, CJK unigrams, and adjacent CJK bigrams
 // ============================================================================
+
+// CJK character detection (对齐 mmr.ts:37 CJK_RE)
+static bool is_cjk_char(uint32_t cp) {
+    return (cp >= 0x3040 && cp <= 0x309F) ||  // Hiragana
+           (cp >= 0x30A0 && cp <= 0x30FF) ||  // Katakana
+           (cp >= 0x3400 && cp <= 0x4DBF) ||  // CJK Extension A
+           (cp >= 0x4E00 && cp <= 0x9FFF) ||  // CJK Unified Ideographs
+           (cp >= 0xAC00 && cp <= 0xD7AF) ||  // Hangul Syllables
+           (cp >= 0x1100 && cp <= 0x11FF);    // Hangul Jamo
+}
+
+// Decode one UTF-8 codepoint, return bytes consumed
+static int decode_utf8(const char* s, size_t len, uint32_t& cp) {
+    if (len == 0) return 0;
+    unsigned char c = static_cast<unsigned char>(s[0]);
+    if (c < 0x80) { cp = c; return 1; }
+    if ((c & 0xE0) == 0xC0 && len >= 2) { cp = (c & 0x1F) << 6 | (s[1] & 0x3F); return 2; }
+    if ((c & 0xF0) == 0xE0 && len >= 3) { cp = (c & 0x0F) << 12 | (s[1] & 0x3F) << 6 | (s[2] & 0x3F); return 3; }
+    if ((c & 0xF8) == 0xF0 && len >= 4) { cp = (c & 0x07) << 18 | (s[1] & 0x3F) << 12 | (s[2] & 0x3F) << 6 | (s[3] & 0x3F); return 4; }
+    cp = c; return 1;
+}
+
+// Encode one codepoint to UTF-8 string
+static std::string encode_utf8(uint32_t cp) {
+    std::string out;
+    if (cp < 0x80) { out += static_cast<char>(cp); }
+    else if (cp < 0x800) { out += static_cast<char>(0xC0 | (cp >> 6)); out += static_cast<char>(0x80 | (cp & 0x3F)); }
+    else if (cp < 0x10000) { out += static_cast<char>(0xE0 | (cp >> 12)); out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F)); out += static_cast<char>(0x80 | (cp & 0x3F)); }
+    else { out += static_cast<char>(0xF0 | (cp >> 18)); out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F)); out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F)); out += static_cast<char>(0x80 | (cp & 0x3F)); }
+    return out;
+}
+
 std::set<std::string> tokenize(const std::string& text) {
-    std::set<std::string> result;
-    std::regex token_re(R"([a-z0-9_]+)");
-    // 转小写
+    // 对齐 mmr.ts:49: const lower = normalizeLowercaseStringOrEmpty(text)
     std::string lower = text;
     std::transform(lower.begin(), lower.end(), lower.begin(),
                    [](unsigned char c){ return std::tolower(c); });
+
+    std::set<std::string> result;
+
+    // 对齐 mmr.ts:50: ASCII tokens
+    std::regex token_re(R"([a-z0-9_]+)");
     auto begin = std::sregex_iterator(lower.begin(), lower.end(), token_re);
     auto end = std::sregex_iterator();
     for (auto it = begin; it != end; ++it) {
         result.insert(it->str());
     }
+
+    // 对齐 mmr.ts:53-70: CJK unigrams + adjacent bigrams
+    struct CjkData { std::string ch; size_t index; };
+    std::vector<CjkData> cjk_chars;
+    const char* p = lower.c_str();
+    size_t remaining = lower.size();
+    size_t char_index = 0;
+    while (remaining > 0) {
+        uint32_t cp;
+        int bytes = decode_utf8(p, remaining, cp);
+        if (bytes <= 0) break;
+        if (is_cjk_char(cp)) {
+            cjk_chars.push_back({encode_utf8(cp), char_index});
+        }
+        p += bytes;
+        remaining -= bytes;
+        char_index++;
+    }
+
+    // Unigrams
+    for (const auto& d : cjk_chars) {
+        result.insert(d.ch);
+    }
+
+    // Bigrams only from originally adjacent characters (对齐 mmr.ts:63-66)
+    for (size_t i = 0; i + 1 < cjk_chars.size(); ++i) {
+        if (cjk_chars[i + 1].index == cjk_chars[i].index + 1) {
+            result.insert(cjk_chars[i].ch + cjk_chars[i + 1].ch);
+        }
+    }
+
     return result;
 }
 

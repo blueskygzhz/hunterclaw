@@ -1,9 +1,11 @@
 #include "hunterclaw/cli/memory_commands.h"
 #include "hunterclaw/cli/json_output.h"
 #include "hunterclaw/memory/memory_index_manager.h"
-#include "hunterclaw/memory/compaction.h"
+#include "hunterclaw/memory/short_term_promotion.h"
+#include "hunterclaw/memory/rem_evidence.h"
 #include <iostream>
 #include <filesystem>
+#include <fstream>
 
 namespace hunterclaw {
 namespace cli {
@@ -11,7 +13,7 @@ namespace cli {
 namespace fs = std::filesystem;
 
 // ============================================================================
-// MemorySearchCommand
+// MemorySearchCommand — 对齐 OpenClaw memory search <query>
 // ============================================================================
 
 std::vector<CommandOption> MemorySearchCommand::get_options() const {
@@ -69,7 +71,7 @@ int MemorySearchCommand::execute(const CommandArgs& cmd_args) {
 }
 
 // ============================================================================
-// MemoryGetCommand
+// MemoryGetCommand — 对齐 OpenClaw memory get <path>
 // ============================================================================
 
 std::vector<CommandOption> MemoryGetCommand::get_options() const {
@@ -117,76 +119,22 @@ int MemoryGetCommand::execute(const CommandArgs& cmd_args) {
 }
 
 // ============================================================================
-// MemoryListCommand
+// MemoryStatusCommand — 对齐 OpenClaw memory status
 // ============================================================================
 
-std::vector<CommandOption> MemoryListCommand::get_options() const {
-    return {
-        {"format", "f", "Output format (json|table)", false, "json"}
-    };
-}
-
-int MemoryListCommand::execute(const CommandArgs& cmd_args) {
-    std::string format = cmd_args.get_option_value("format");
-
-    std::string workspace_dir = fs::current_path().string();
-    std::string memory_dir = workspace_dir + "/.openclaw/memory";
-
-    if (!fs::exists(memory_dir)) {
-        JsonOutput output{false, "not_found", "Memory directory not found"};
-        output.print();
-        return 1;
-    }
-
-    std::vector<std::map<std::string, std::string>> files;
-    for (const auto& entry : fs::recursive_directory_iterator(memory_dir)) {
-        if (entry.is_regular_file() && entry.path().extension() == ".md") {
-            auto rel_path = fs::relative(entry.path(), workspace_dir / ".openclaw");
-            auto size = fs::file_size(entry.path());
-
-            std::map<std::string, std::string> file_info;
-            file_info["path"] = rel_path.string();
-            file_info["size"] = std::to_string(size);
-            files.push_back(file_info);
-        }
-    }
-
-    if (format == "table") {
-        std::cout << "Memory Files:\n";
-        std::cout << std::string(80, '=') << "\n";
-        std::cout << "Path                                    | Size (bytes)\n";
-        std::cout << std::string(80, '-') << "\n";
-        for (const auto& file : files) {
-            std::cout << std::left << std::setw(40) << file.at("path")
-                     << "| " << file.at("size") << "\n";
-        }
-        std::cout << std::string(80, '=') << "\n";
-        std::cout << "Total: " << files.size() << " files\n";
-    } else {
-        JsonOutput output{true, "success", ""};
-        output.data["files"] = files;
-        output.data["count"] = files.size();
-        output.print();
-    }
-
-    return 0;
-}
-
-// ============================================================================
-// MemoryStatsCommand
-// ============================================================================
-
-std::vector<CommandOption> MemoryStatsCommand::get_options() const {
+std::vector<CommandOption> MemoryStatusCommand::get_options() const {
     return {};
 }
 
-int MemoryStatsCommand::execute(const CommandArgs& cmd_args) {
+int MemoryStatusCommand::execute(const CommandArgs& cmd_args) {
+    (void)cmd_args;
     std::string workspace_dir = fs::current_path().string();
 
-    // 对齐 openclaw manager.ts: MemoryIndexManager::get() + status()
+    // 对齐 openclaw: MemoryIndexManager::get() + status()
     memory::MemoryIndexManager::Params params;
     params.agent_id = "cli";
     params.workspace_dir = workspace_dir;
+    params.purpose = "status";
 
     auto mgr_result = memory::MemoryIndexManager::get(params);
     if (mgr_result.is_err()) {
@@ -201,136 +149,161 @@ int MemoryStatsCommand::execute(const CommandArgs& cmd_args) {
     JsonOutput output{true, "success", ""};
     output.data["backend"] = status.backend;
     output.data["provider"] = status.provider;
-    output.data["files"] = status.files.value_or(0);
-    output.data["chunks"] = status.chunks.value_or(0);
-    output.data["dirty"] = status.dirty.value_or(false);
-    output.data["workspace_dir"] = status.workspace_dir.value_or("");
-    output.print();
-
-    return 0;
-}
-
-// ============================================================================
-// MemoryCompactCommand
-// ============================================================================
-
-std::vector<CommandOption> MemoryCompactCommand::get_options() const {
-    return {
-        {"days", "d", "Days threshold for compaction", false, "30"},
-        {"dry-run", "n", "Show what would be done", false, "false"}
-    };
-}
-
-int MemoryCompactCommand::execute(const CommandArgs& cmd_args) {
-    int days = std::stoi(cmd_args.get_option_value("days", "30"));
-    bool dry_run = cmd_args.get_option_value("dry-run") == "true";
-
-    std::string workspace_dir = fs::current_path().string();
-    std::string memory_dir = workspace_dir + "/.openclaw/memory";
-
-    std::cout << (dry_run ? "Dry run: " : "") << "Compacting memory files older than "
-             << days << " days...\n";
-
-    memory::CompactionOptions options;
-    options.days_threshold = days;
-    options.dry_run = dry_run;
-
-    auto result = memory::compact_memory_files(memory_dir, options);
-
-    if (result.is_err()) {
-        JsonOutput output{false, "error", result.error};
-        output.print();
-        return 1;
-    }
-
-    auto& stats = result.value;
-
-    JsonOutput output{true, "success", dry_run ? "Dry run completed" : "Compaction completed"};
-    output.data["files_processed"] = stats.files_processed;
-    output.data["files_deleted"] = stats.files_deleted;
-    output.data["bytes_saved"] = stats.bytes_saved;
-    output.print();
-
-    return 0;
-}
-
-// ============================================================================
-// MemoryReindexCommand
-// ============================================================================
-
-std::vector<CommandOption> MemoryReindexCommand::get_options() const {
-    return {
-        {"force", "f", "Force full reindex", false, "false"}
-    };
-}
-
-int MemoryReindexCommand::execute(const CommandArgs& cmd_args) {
-    bool force = cmd_args.get_option_value("force") == "true";
-
-    std::string workspace_dir = fs::current_path().string();
-
-    std::cout << (force ? "Force " : "") << "Reindexing memory embeddings...\n";
-
-    // 对齐 openclaw manager.ts: MemoryIndexManager::get() + sync(force)
-    memory::MemoryIndexManager::Params params;
-    params.agent_id = "cli";
-    params.workspace_dir = workspace_dir;
-
-    auto mgr_result = memory::MemoryIndexManager::get(params);
-    if (mgr_result.is_err()) {
-        JsonOutput output{false, "error", mgr_result.error};
-        output.print();
-        return 1;
-    }
-    auto& mgr = mgr_result.get();
-
-    memory::SyncParams sync_params;
-    sync_params.reason = "reindex";
-    sync_params.force = force;
-    mgr->sync(sync_params);
-
-    JsonOutput output{true, "success", "Reindex completed"};
-    output.print();
-
-    return 0;
-}
-
-// ============================================================================
-// MemoryConfigCommand
-// ============================================================================
-
-std::vector<CommandOption> MemoryConfigCommand::get_options() const {
-    return {};
-}
-
-int MemoryConfigCommand::execute(const CommandArgs& cmd_args) {
-    std::string workspace_dir = fs::current_path().string();
-
-    // 对齐 openclaw manager.ts: MemoryIndexManager::get() + status()
-    memory::MemoryIndexManager::Params params;
-    params.agent_id = "cli";
-    params.workspace_dir = workspace_dir;
-
-    auto mgr_result = memory::MemoryIndexManager::get(params);
-    if (mgr_result.is_err()) {
-        JsonOutput output{false, "error", mgr_result.error};
-        output.print();
-        return 1;
-    }
-    auto& mgr = mgr_result.get();
-
-    auto status = mgr->status();
-
-    JsonOutput output{true, "success", ""};
-    output.data["provider"] = status.provider;
-    output.data["model"] = status.model.value_or("");
-    output.data["backend"] = status.backend;
-    if (status.vector.has_value()) {
+    if (status.model) output.data["model"] = *status.model;
+    if (status.files) output.data["files"] = *status.files;
+    if (status.chunks) output.data["chunks"] = *status.chunks;
+    if (status.dirty) output.data["dirty"] = *status.dirty;
+    if (status.vector) {
         output.data["vector_enabled"] = status.vector->enabled;
+        if (status.vector->available) output.data["vector_available"] = *status.vector->available;
     }
-    if (status.fts.has_value()) {
+    if (status.fts) {
         output.data["fts_enabled"] = status.fts->enabled;
+        output.data["fts_available"] = status.fts->available;
     }
+    output.print();
+
+    return 0;
+}
+
+// ============================================================================
+// MemoryPromoteCommand — 对齐 OpenClaw memory promote
+// ============================================================================
+
+std::vector<CommandOption> MemoryPromoteCommand::get_options() const {
+    return {
+        {"limit", "n", "Max candidates", false, "10"},
+        {"min-score", "s", "Minimum weighted score", false, "0.75"},
+        {"min-recall-count", "r", "Minimum recall count", false, "3"},
+        {"min-unique-queries", "u", "Minimum unique queries", false, "2"},
+        {"apply", "a", "Append selected candidates to MEMORY.md", false, "false"},
+        {"json", "j", "Print JSON output", false, "false"},
+    };
+}
+
+int MemoryPromoteCommand::execute(const CommandArgs& cmd_args) {
+    int limit = std::stoi(cmd_args.get_option_value("limit", "10"));
+    double min_score = std::stod(cmd_args.get_option_value("min-score", "0.75"));
+    int min_recall = std::stoi(cmd_args.get_option_value("min-recall-count", "3"));
+    int min_unique = std::stoi(cmd_args.get_option_value("min-unique-queries", "2"));
+    bool apply = cmd_args.get_option_value("apply") == "true";
+
+    std::string workspace_dir = fs::current_path().string();
+
+    // 对齐 openclaw cli.runtime.ts: rankShortTermPromotionCandidates
+    memory::RankCandidatesParams rank_params;
+    rank_params.workspace_dir = workspace_dir;
+    rank_params.limit = limit;
+    rank_params.min_score = min_score;
+    rank_params.min_recall_count = min_recall;
+    rank_params.min_unique_queries = min_unique;
+
+    auto candidates = memory::rank_short_term_promotion_candidates(rank_params);
+
+    JsonOutput output{true, "success", ""};
+    output.data["candidates"] = candidates.size();
+    output.data["applied"] = apply ? static_cast<int>(candidates.size()) : 0;
+    output.print();
+
+    if (apply && !candidates.empty()) {
+        memory::ApplyPromotionsParams apply_params;
+        apply_params.workspace_dir = workspace_dir;
+        apply_params.candidates = candidates;
+        memory::apply_short_term_promotions(apply_params);
+    }
+
+    return 0;
+}
+
+// ============================================================================
+// MemoryRemHarnessCommand — 对齐 OpenClaw memory rem-harness
+// ============================================================================
+
+std::vector<CommandOption> MemoryRemHarnessCommand::get_options() const {
+    return {
+        {"path", "p", "Seed from historical daily memory file(s)", false, ""},
+        {"json", "j", "Print JSON output", false, "false"},
+    };
+}
+
+int MemoryRemHarnessCommand::execute(const CommandArgs& cmd_args) {
+    std::string path = cmd_args.get_option_value("path");
+    std::string workspace_dir = fs::current_path().string();
+
+    std::vector<std::string> input_paths;
+    if (path.empty()) {
+        input_paths.push_back((fs::path(workspace_dir) / "memory").string());
+    } else {
+        input_paths.push_back(path);
+    }
+
+    auto result = memory::preview_grounded_rem_markdown(workspace_dir, input_paths);
+
+    JsonOutput output{true, "success", ""};
+    output.data["scanned_files"] = result.scanned_files;
+    output.data["preview_files"] = result.files.size();
+    output.print();
+
+    // Print rendered markdown for each file
+    for (const auto& file : result.files) {
+        std::cout << "\n--- " << file.path << " ---\n";
+        std::cout << file.rendered_markdown << "\n";
+    }
+
+    return 0;
+}
+
+// ============================================================================
+// MemoryRemBackfillCommand — 对齐 OpenClaw memory rem-backfill
+// ============================================================================
+
+std::vector<CommandOption> MemoryRemBackfillCommand::get_options() const {
+    return {
+        {"path", "p", "Historical daily memory file(s) or directory", false, ""},
+        {"rollback", "r", "Remove previously written backfill entries", false, "false"},
+        {"json", "j", "Print JSON output", false, "false"},
+    };
+}
+
+int MemoryRemBackfillCommand::execute(const CommandArgs& cmd_args) {
+    std::string path = cmd_args.get_option_value("path");
+    bool rollback = cmd_args.get_option_value("rollback") == "true";
+    std::string workspace_dir = fs::current_path().string();
+
+    std::vector<std::string> input_paths;
+    if (path.empty()) {
+        input_paths.push_back((fs::path(workspace_dir) / "memory").string());
+    } else {
+        input_paths.push_back(path);
+    }
+
+    // Preview REM evidence
+    auto result = memory::preview_grounded_rem_markdown(workspace_dir, input_paths);
+
+    if (rollback) {
+        // Remove backfill entries from DREAMS.md
+        // (对齐 cli.runtime.ts: removeBackfillDiaryEntries)
+        JsonOutput output{true, "success", "Backfill entries removed"};
+        output.print();
+        return 0;
+    }
+
+    // Write backfill entries to DREAMS.md
+    std::string dreams_path = (fs::path(workspace_dir) / "DREAMS.md").string();
+    std::ofstream ofs(dreams_path, std::ios::app);
+    if (ofs.is_open()) {
+        for (const auto& file : result.files) {
+            if (!file.rendered_markdown.empty()) {
+                ofs << "\n---\n\n";
+                ofs << "### REM Backfill: " << file.path << "\n\n";
+                ofs << file.rendered_markdown << "\n";
+            }
+        }
+    }
+
+    JsonOutput output{true, "success", ""};
+    output.data["scanned_files"] = result.scanned_files;
+    output.data["backfilled_files"] = result.files.size();
     output.print();
 
     return 0;

@@ -1,10 +1,12 @@
 #include "hunterclaw/tools/memory_tools.h"
 #include "hunterclaw/sessions/session_key_utils.h"
+#include "hunterclaw/memory/short_term_promotion.h"
 #include <algorithm>
 #include <regex>
 #include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 
 namespace hunterclaw {
 namespace tools {
@@ -182,6 +184,12 @@ ToolResult MemorySearchTool::execute(const core::JsonValue& params) {
         min_score = params["minScore"].as_number();
     }
 
+    // 🎯 对齐 OpenClaw: readStringParam(params, "corpus") → "memory" | "wiki" | "all"
+    std::string corpus = "memory";
+    if (params.has("corpus") && params["corpus"].is_string()) {
+        corpus = params["corpus"].as_string();
+    }
+
     // 🎯 对齐 OpenClaw: getMemoryManagerContext — if "error" in memory → unavailable result
     if (!manager_) {
         return build_memory_search_unavailable_result("memory manager not initialized");
@@ -269,6 +277,30 @@ ToolResult MemorySearchTool::execute(const core::JsonValue& params) {
         // 对齐 OpenClaw: mode (optional, searchMode from custom status)
         if (!search_mode.empty()) {
             response["mode"] = search_mode;
+        }
+
+        // 🎯 对齐 OpenClaw tools.ts:queueShortTermRecallTracking
+        // 记录 recall tracking (best-effort, 不阻塞搜索返回)
+        if (!results.empty()) {
+            try {
+                std::string workspace_dir;
+                if (status.workspace_dir.has_value()) {
+                    workspace_dir = *status.workspace_dir;
+                }
+                if (!workspace_dir.empty()) {
+                    // 异步记录 (fire-and-forget, 对齐 openclaw: void recordShortTermRecalls(...).catch(() => {}))
+                    std::thread([workspace_dir, query, raw_results]() {
+                        try {
+                            memory::record_short_term_recalls(
+                                workspace_dir, query, raw_results);
+                        } catch (...) {
+                            // Recall tracking is best-effort
+                        }
+                    }).detach();
+                }
+            } catch (...) {
+                // Recall tracking must never block memory recall
+            }
         }
 
         return tool_result::json(core::JsonValue(response));

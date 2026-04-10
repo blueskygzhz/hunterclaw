@@ -40,6 +40,10 @@ public:
                     {"type",        core::JsonValue("number")},
                     {"description", core::JsonValue("Minimum similarity score (0-1, default: 0.35)")}
                 })},
+                {"corpus",     core::JsonValue::object({
+                    {"type",        core::JsonValue("string")},
+                    {"description", core::JsonValue("Corpus to search: \"memory\" (default), \"wiki\", or \"all\"")}
+                })},
             },
             {"query"}
         };
@@ -81,6 +85,10 @@ public:
                 {"lines", core::JsonValue::object({
                     {"type",        core::JsonValue("number")},
                     {"description", core::JsonValue("Number of lines to read (optional, default: all)")}
+                })},
+                {"corpus", core::JsonValue::object({
+                    {"type",        core::JsonValue("string")},
+                    {"description", core::JsonValue("Corpus to read from: \"memory\" (default), \"wiki\", or \"all\"")}
                 })},
             },
             {"path"}

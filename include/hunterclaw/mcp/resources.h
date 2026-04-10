@@ -126,7 +126,6 @@ private:
     PromptGenerator prompt_generator_;
     
     // Tool implementations
-    core::Result<JsonValue> tool_memory_search(const JsonValue& args);
     core::Result<JsonValue> tool_run_agent(const JsonValue& args);
     core::Result<JsonValue> tool_list_skills(const JsonValue& args);
     core::Result<JsonValue> tool_execute_skill(const JsonValue& args);

@@ -161,7 +161,6 @@ const std::vector<CoreToolDefinition> CORE_TOOL_DEFINITIONS = {
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     {"memory_search", "memory_search", "Semantic memory search", "memory", {ToolProfileId::CODING}, true},
     {"memory_get", "memory_get", "Read memory files", "memory", {ToolProfileId::CODING}, true},
-    {"memory_add", "memory_add", "Add memory entry", "memory", {ToolProfileId::CODING}, true},
     
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     // Sessions Section
