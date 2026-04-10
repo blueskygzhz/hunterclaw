@@ -41,6 +41,12 @@ public:
     // 对齐: reset()
     void reset();
 
+    // 对齐: parseChunk (public for use by reply_delivery)
+    static DirectiveParseResult parse_chunk(
+        const std::string& raw,
+        const std::string& silent_token
+    );
+
 private:
     std::string pending_tail_;
 
@@ -59,11 +65,6 @@ private:
     };
     static SplitResult split_trailing_directive(const std::string& text);
 
-    // 对齐: parseChunk
-    static DirectiveParseResult parse_chunk(
-        const std::string& raw,
-        const std::string& silent_token
-    );
 };
 
 } // namespace react

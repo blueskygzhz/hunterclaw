@@ -279,13 +279,89 @@ class LegacyContextEngine : public ContextEngine {
 using ContextEngineFactory = std::function<std::shared_ptr<ContextEngine>()>;
 
 // ============================================================================
-// Context Engine Registry
+// Transcript Rewrite Types (对齐 OpenClaw context-engine/types.ts:62-85)
+// ============================================================================
+
+struct TranscriptRewriteReplacement {
+  std::string entry_id;    // Existing transcript entry id to replace
+  std::string message_json; // Replacement message content as JSON
+};
+
+struct TranscriptRewriteRequest {
+  std::vector<TranscriptRewriteReplacement> replacements;
+};
+
+struct TranscriptRewriteResult {
+  bool changed;
+  int bytes_freed;
+  int rewritten_entries;
+  std::optional<std::string> reason;
+};
+
+using ContextEngineMaintenanceResult = TranscriptRewriteResult;
+
+// ============================================================================
+// Prompt Cache Types (对齐 OpenClaw context-engine/types.ts:87-128)
+// ============================================================================
+
+enum class PromptCacheRetention {
+  NONE,
+  SHORT,
+  LONG,
+  IN_MEMORY,
+  H24
+};
+
+struct PromptCacheUsage {
+  std::optional<int> input;
+  std::optional<int> output;
+  std::optional<int> cache_read;
+  std::optional<int> cache_write;
+  std::optional<int> total;
+};
+
+struct PromptCacheObservation {
+  bool broke;
+  std::optional<int> previous_cache_read;
+  std::optional<int> cache_read;
+};
+
+struct PromptCacheInfo {
+  std::optional<PromptCacheRetention> retention;
+  std::optional<PromptCacheUsage> last_call_usage;
+  std::optional<PromptCacheObservation> observation;
+  std::optional<int64_t> last_cache_touch_at;
+  std::optional<int64_t> expires_at;
+};
+
+// ============================================================================
+// Context Engine Registry (对齐 OpenClaw context-engine/registry.ts)
 // ============================================================================
 
 /**
+ * Registration result (对齐 ContextEngineRegistrationResult).
+ */
+struct ContextEngineRegistrationResult {
+  bool ok;
+  std::optional<std::string> existing_owner; // Set when ok=false
+};
+
+/**
  * Register a context engine implementation under the given id.
+ * Simple registration without owner tracking.
  */
 void register_context_engine(const std::string& id, ContextEngineFactory factory);
+
+/**
+ * Owner-aware registration (对齐 OpenClaw registerContextEngineForOwner).
+ * Prevents cross-owner overwrite + protects core-owned default slot.
+ */
+ContextEngineRegistrationResult register_context_engine_for_owner(
+    const std::string& id,
+    ContextEngineFactory factory,
+    const std::string& owner,
+    bool allow_same_owner_refresh = false
+);
 
 /**
  * Return the factory for a registered engine, or nullptr.
@@ -321,6 +397,32 @@ void register_legacy_context_engine();
 void ensure_context_engines_initialized();
 
 // ============================================================================
+// Delegate Compaction Helper (对齐 OpenClaw context-engine/delegate.ts)
+// ============================================================================
+
+/**
+ * Delegate compaction to the built-in runtime compaction path.
+ * Third-party engines can call this from their compact() implementations.
+ */
+CompactResult delegate_compaction_to_runtime(
+    const std::string& session_id,
+    const std::string& session_file,
+    const std::optional<int>& token_budget = std::nullopt,
+    bool force = false,
+    const std::optional<int>& current_token_count = std::nullopt,
+    const std::optional<std::string>& custom_instructions = std::nullopt,
+    const std::string& workspace_dir = ""
+);
+
+/**
+ * Build a context-engine-ready system prompt addition from the active
+ * memory plugin prompt path (对齐 buildMemorySystemPromptAddition).
+ */
+std::optional<std::string> build_memory_system_prompt_addition(
+    const std::vector<std::string>& available_tools
+);
+
+// ============================================================================
 // Utility Functions
 // ============================================================================
 
@@ -333,6 +435,11 @@ std::string subagent_end_reason_to_string(SubagentEndReason reason);
  * Convert string to SubagentEndReason.
  */
 std::optional<SubagentEndReason> string_to_subagent_end_reason(const std::string& str);
+
+/**
+ * Convert PromptCacheRetention to string.
+ */
+std::string prompt_cache_retention_to_string(PromptCacheRetention retention);
 
 }  // namespace context
 }  // namespace hunterclaw
