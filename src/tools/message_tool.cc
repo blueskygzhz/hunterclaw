@@ -7,6 +7,7 @@
 #include "hunterclaw/tools/message_tool.h"
 #include "hunterclaw/tools/tool.h"
 #include "hunterclaw/core/types.h"
+#include "hunterclaw/infra/http_client.h"
 #include <nlohmann/json.hpp>
 #include <string>
 #include <set>
@@ -381,16 +382,16 @@ private:
         json rpc = {{"method", "send"}, {"params", request}};
         std::string rpc_body = rpc.dump();
 
-        // Use curl for HTTP POST (message_tool doesn't link infra)
-        std::string cmd = "curl -fsSX POST 'http://127.0.0.1:3000/v1/rpc' "
-            "-H 'Content-Type: application/json' "
-            "-d '" + rpc_body + "' --max-time 10 2>/dev/null";
-        FILE* pipe = popen(cmd.c_str(), "r");
+        // 使用 infra::HttpClient 发送 RPC
+        infra::HttpClient client;
+        infra::HttpRequestOptions http_opts;
+        http_opts.body = rpc_body;
+        http_opts.headers = {{"Content-Type", "application/json"}};
+        http_opts.timeout_ms = 10000;
+        auto http_result = client.post("http://127.0.0.1:3000/v1/rpc", http_opts);
         std::string response_body;
-        if (pipe) {
-            char buf[4096];
-            while (fgets(buf, sizeof(buf), pipe)) response_body += buf;
-            pclose(pipe);
+        if (http_result.is_ok()) {
+            response_body = http_result.get().body;
         }
 
         json result;

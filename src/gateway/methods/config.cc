@@ -5,6 +5,7 @@
 
 #include "hunterclaw/gateway/gateway.h"
 #include "hunterclaw/gateway/method_guard.h"
+#include "hunterclaw/config/config_system.h"
 #include "hunterclaw/core/utils.h"
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>

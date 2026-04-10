@@ -703,36 +703,37 @@ ToolResult BrowserTool::action_dialog(
 }
 
 // ============================================================================
-// HTTP helpers (使用 curl 命令)
+// HTTP helpers (使用 infra::HttpClient)
 // ============================================================================
 
 core::JsonValue BrowserTool::http_get(const std::string& url) const {
-    std::string cmd = "curl -fsSL '" + url + "' --max-time 10 2>/dev/null";
-    FILE* pipe = popen(cmd.c_str(), "r");
-    std::string body; char buf[4096];
-    if (pipe) { while(fgets(buf, sizeof(buf), pipe)) body += buf; pclose(pipe); }
-    if (body.empty()) { json r; r["ok"] = false; r["error"] = "fetch failed"; return core::JsonValue(r); }
-    try { return core::JsonValue(json::parse(body)); }
-    catch (...) { json r; r["ok"] = true; r["body"] = body; return core::JsonValue(r); }
+    infra::HttpClient client;
+    auto result = client.get(url, 10000);
+    if (!result.is_ok()) { json r; r["ok"] = false; r["error"] = "fetch failed"; return core::JsonValue(r); }
+    auto& resp = result.get();
+    if (resp.body.empty()) { json r; r["ok"] = false; r["error"] = "empty response"; return core::JsonValue(r); }
+    try { return core::JsonValue(json::parse(resp.body)); }
+    catch (...) { json r; r["ok"] = true; r["body"] = resp.body; return core::JsonValue(r); }
 }
 
 core::JsonValue BrowserTool::http_post(const std::string& url, const core::JsonValue& body) const {
-    std::string data = body.to_json().dump();
-    std::string cmd = "curl -fsSX POST '" + url + "' -H 'Content-Type: application/json' -d '" + data + "' --max-time 10 2>/dev/null";
-    FILE* pipe = popen(cmd.c_str(), "r");
-    std::string resp; char buf[4096];
-    if (pipe) { while(fgets(buf, sizeof(buf), pipe)) resp += buf; pclose(pipe); }
-    if (resp.empty()) { json r; r["ok"] = false; return core::JsonValue(r); }
-    try { return core::JsonValue(json::parse(resp)); }
-    catch (...) { json r; r["ok"] = true; r["body"] = resp; return core::JsonValue(r); }
+    infra::HttpClient client;
+    infra::HttpRequestOptions opts;
+    opts.body = body.to_json().dump();
+    opts.headers = {{"Content-Type", "application/json"}};
+    opts.timeout_ms = 10000;
+    auto result = client.post(url, opts);
+    if (!result.is_ok()) { json r; r["ok"] = false; return core::JsonValue(r); }
+    auto& resp = result.get();
+    if (resp.body.empty()) { json r; r["ok"] = false; return core::JsonValue(r); }
+    try { return core::JsonValue(json::parse(resp.body)); }
+    catch (...) { json r; r["ok"] = true; r["body"] = resp.body; return core::JsonValue(r); }
 }
 
 core::JsonValue BrowserTool::http_delete(const std::string& url) const {
-    std::string cmd = "curl -fsSX DELETE '" + url + "' --max-time 10 2>/dev/null";
-    FILE* pipe = popen(cmd.c_str(), "r");
-    std::string resp; char buf[4096];
-    if (pipe) { while(fgets(buf, sizeof(buf), pipe)) resp += buf; pclose(pipe); }
-    json r; r["ok"] = !resp.empty(); return core::JsonValue(r);
+    infra::HttpClient client;
+    auto result = client.del(url, 10000);
+    json r; r["ok"] = result.is_ok(); return core::JsonValue(r);
 }
 
 core::JsonValue BrowserTool::call_node_browser_proxy(
@@ -757,15 +758,15 @@ core::JsonValue BrowserTool::call_node_browser_proxy(
     params["params"] = proxy_params;
     rpc["params"] = params;
 
-    std::string url = "http://127.0.0.1:3000/v1/rpc";
-    std::string data = rpc.dump();
-    std::string cmd = "curl -fsSX POST '" + url + "' -H 'Content-Type: application/json' -d '" + data + "' --max-time " + std::to_string(timeout_ms / 1000) + " 2>/dev/null";
-    FILE* pipe = popen(cmd.c_str(), "r");
-    std::string resp; char buf[4096];
-    if (pipe) { while(fgets(buf, sizeof(buf), pipe)) resp += buf; pclose(pipe); }
-    if (!resp.empty()) {
+    infra::HttpClient client;
+    infra::HttpRequestOptions opts;
+    opts.body = rpc.dump();
+    opts.headers = {{"Content-Type", "application/json"}};
+    opts.timeout_ms = timeout_ms;
+    auto result = client.post("http://127.0.0.1:3000/v1/rpc", opts);
+    if (result.is_ok()) {
         try {
-            auto j = json::parse(resp);
+            auto j = json::parse(result.get().body);
             return core::JsonValue(j.contains("result") ? j["result"] : j);
         } catch (...) {}
     }

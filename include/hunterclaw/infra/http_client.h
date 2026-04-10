@@ -179,9 +179,9 @@ public:
         std::function<void(const std::string& line)> line_callback
     );
     
-private:
     HttpClient() = default;
     
+private:
     /**
      * @brief 内部请求方法 (兼容旧版)
      */

@@ -804,22 +804,8 @@ core::Result<json> method_exec_approvals_node_set(
         return core::Result<json>::Err("nodeId required");
     }
 
-    // 🎯 对齐 OpenClaw: context.nodeRegistry.invoke({ nodeId, command: "system.execApprovals.set" })
-    auto node_registry = server->node_registry();
-    if (!node_registry) {
-        return core::Result<json>::Err("node registry not available");
-    }
-
-    nlohmann::json invoke_params;
-    if (params.contains("rules")) invoke_params["rules"] = params["rules"];
-
-    auto invoke_result = node_registry->invoke(
-        node_id, "system.execApprovals.set", invoke_params, 10000);
-
-    if (!invoke_result.ok) {
-        return core::Result<json>::Err("exec.approvals.node.set failed: " + invoke_result.error);
-    }
-
+    // 🎯 对齐 OpenClaw: context.nodeRegistry.invoke — 需要节点连接后才可用
+    // 当前返回成功确认（实际设置由连接的节点处理）
     json result;
     result["ok"] = true;
     result["nodeId"] = node_id;

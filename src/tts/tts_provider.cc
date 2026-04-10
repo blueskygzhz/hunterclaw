@@ -182,16 +182,6 @@ public:
         // 🎯 对齐 OpenClaw elevenlabs.ts: POST /v1/text-to-speech/{voiceId}
         std::string url = "https://api.elevenlabs.io/v1/text-to-speech/" + voice_id_;
 
-        infra::HttpClient client;
-        infra::HttpRequest http_req;
-        http_req.url = url;
-        http_req.method = "POST";
-        http_req.headers = {
-            {"Accept", "audio/mpeg"},
-            {"xi-api-key", api_key_},
-            {"Content-Type", "application/json"}
-        };
-
         nlohmann::json body;
         body["text"] = request.text;
         body["model_id"] = model_id_;
@@ -199,10 +189,24 @@ public:
             {"stability", 0.5},
             {"similarity_boost", 0.75}
         };
-        http_req.body = body.dump();
 
-        auto response = client.request(http_req);
-        if (!response.ok()) {
+        infra::HttpClient client;
+        infra::HttpRequestOptions opts;
+        opts.headers = {
+            {"Accept", "audio/mpeg"},
+            {"xi-api-key", api_key_},
+            {"Content-Type", "application/json"}
+        };
+        opts.body = body.dump();
+        opts.timeout_ms = 30000;
+
+        auto response_result = client.post(url, opts);
+        if (!response_result.is_ok()) {
+            return core::Result<TtsResult>::Err(
+                "ElevenLabs TTS failed: " + response_result.error);
+        }
+        auto& response = response_result.get();
+        if (!response.ok) {
             return core::Result<TtsResult>::Err(
                 "ElevenLabs TTS failed: " + std::to_string(response.status_code));
         }
