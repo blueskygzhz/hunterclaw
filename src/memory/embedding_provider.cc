@@ -702,7 +702,12 @@ core::Result<std::vector<std::vector<float>>> VoyageEmbeddingProvider::embed_bat
         std::map<std::string, std::string> headers = config_.headers;
         headers["Content-Type"] = "application/json";
 
-        auto http_result = http_client_->post(config_.endpoint, request_body.dump(), headers, 30000);
+        std::string url = config_.base_url + "/embeddings";
+        infra::HttpRequestOptions req_opts;
+        req_opts.headers = headers;
+        req_opts.body = request_body.dump();
+        req_opts.timeout_ms = 30000;
+        auto http_result = infra::HttpClient::create()->post(url, req_opts);
         if (!http_result.is_ok()) {
             return core::Result<std::vector<std::vector<float>>>::Err(
                 "Voyage batch embedding failed: " + http_result.error);

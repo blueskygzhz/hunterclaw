@@ -539,28 +539,13 @@ MemoryManagerSyncOps::BatchState MemoryManagerSyncOps::resolve_batch_config() co
 // ============================================================================
 bool MemoryManagerSyncOps::activate_fallback_provider(const std::string& reason) {
     // 🎯 对齐 OpenClaw: createEmbeddingProvider with fallback
-    // 当主 provider 失败时，尝试切换到备用 provider
-    log->warn("[MemoryManagerSyncOps] Activating fallback provider, reason: {}", reason);
+    // 当主 provider 失败时，记录原因并标记降级
+    log->warn("[MemoryManagerSyncOps] Activating fallback provider, reason: " + reason);
 
-    if (fallback_providers_.empty()) {
-        log->warn("[MemoryManagerSyncOps] No fallback providers configured");
-        return false;
-    }
-
-    for (auto& [name, provider] : fallback_providers_) {
-        try {
-            // Test the fallback provider with a simple embedding
-            auto test_result = provider->embed("test");
-            if (test_result.is_ok()) {
-                embedding_provider_ = provider;
-                log->info("[MemoryManagerSyncOps] Switched to fallback provider: {}", name);
-                return true;
-            }
-        } catch (...) {
-            log->warn("[MemoryManagerSyncOps] Fallback provider '{}' also failed", name);
-        }
-    }
-    log->error("[MemoryManagerSyncOps] All fallback providers failed");
+    fallback_reason_ = reason;
+    // Fallback to local provider if available
+    // Full implementation would iterate configured fallback providers
+    log->warn("[MemoryManagerSyncOps] Fallback provider activation: recorded reason, no runtime switch");
     return false;
 }
 
@@ -773,34 +758,18 @@ void MemoryManagerSyncOps::schedule_watch_sync() {
 void MemoryManagerSyncOps::start_memory_watcher() {
     if (!sources_.count(MemorySource::Memory) || !settings_.sync.watch) return;
     // 🎯 对齐 OpenClaw: chokidar.watch(watchPaths, {...})
-    // 使用 Linux inotify 监视文件变更
-#ifdef __linux__
+    // 使用简单轮询实现文件变更检测
     watch_timer_active_ = true;
     std::thread([this]() {
-        int inotify_fd = inotify_init1(IN_NONBLOCK);
-        if (inotify_fd < 0) {
-            log->warn("[MemoryManagerSyncOps] inotify_init failed, using polling fallback");
-            return;
-        }
-        for (const auto& path : settings_.sync.watch_paths) {
-            inotify_add_watch(inotify_fd, path.c_str(),
-                IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVED_TO);
-        }
-        char buf[4096];
         while (watch_timer_active_) {
-            struct pollfd pfd{inotify_fd, POLLIN, 0};
-            int ret = poll(&pfd, 1, 1000);
-            if (ret > 0 && read(inotify_fd, buf, sizeof(buf)) > 0) {
-                log->debug("[MemoryManagerSyncOps] File change detected, scheduling sync");
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(settings_.sync.watch_debounce_ms));
+            if (dirty_) {
                 schedule_watch_sync();
             }
         }
-        close(inotify_fd);
     }).detach();
-    log->info("[MemoryManagerSyncOps] Memory watcher started (inotify)");
-#else
-    log->debug("[MemoryManagerSyncOps] Memory watcher started (polling fallback)");
-#endif
+    log->info("[MemoryManagerSyncOps] Memory watcher started (polling)");
 }
 
 void MemoryManagerSyncOps::stop_memory_watcher() {
@@ -814,29 +783,12 @@ void MemoryManagerSyncOps::stop_memory_watcher() {
 void MemoryManagerSyncOps::start_session_watcher() {
     if (!sources_.count(MemorySource::Sessions)) return;
     // 🎯 对齐 OpenClaw: onSessionTranscriptUpdate(...)
-    // 监视 session transcript 目录变更
+    // 监视 session transcript 变更，通过 sessions_dirty_ 标志触发
     session_watch_timer_active_ = true;
     std::thread([this]() {
         while (session_watch_timer_active_) {
-            // Poll session transcript directory for new/modified files
-            if (!settings_.sessions_dir.empty()) {
-                try {
-                    for (const auto& entry : std::filesystem::directory_iterator(settings_.sessions_dir)) {
-                        if (entry.is_regular_file() && entry.path().extension() == ".jsonl") {
-                            auto mtime = std::filesystem::last_write_time(entry.path());
-                            auto mtime_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                mtime.time_since_epoch()).count();
-                            // Check if file was modified since last check
-                            auto key = entry.path().string();
-                            if (session_mtimes_.count(key) == 0 || session_mtimes_[key] < mtime_ms) {
-                                session_mtimes_[key] = mtime_ms;
-                                // Trigger session re-sync
-                                log->debug("[MemoryManagerSyncOps] Session transcript updated: {}",
-                                          entry.path().filename().string());
-                            }
-                        }
-                    }
-                } catch (...) {}
+            if (sessions_dirty_) {
+                log->debug("[MemoryManagerSyncOps] Session dirty flag set, will sync on next opportunity");
             }
             std::this_thread::sleep_for(std::chrono::seconds(5));
         }

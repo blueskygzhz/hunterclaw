@@ -89,7 +89,7 @@ public:
                             if (callback) {
                                 StreamChunk sc;
                                 sc.delta = delta;
-                                sc.done = j.value("done", false);
+                                sc.is_final = j.value("done", false);
                                 callback(sc);
                             }
                         }
@@ -98,10 +98,10 @@ public:
                         if (j.value("done", false)) {
                             // Extract usage stats if available
                             if (j.contains("eval_count")) {
-                                final_response.usage.output_tokens = j["eval_count"].get<int>();
+                                final_response.output_tokens = j["eval_count"].get<int>();
                             }
                             if (j.contains("prompt_eval_count")) {
-                                final_response.usage.input_tokens = j["prompt_eval_count"].get<int>();
+                                final_response.input_tokens = j["prompt_eval_count"].get<int>();
                             }
                         }
                     } catch (...) {

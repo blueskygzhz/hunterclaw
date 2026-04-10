@@ -1498,19 +1498,8 @@ ChannelPlugin make_discord_plugin() {
             });
         }
 
-        // 🎯 对齐 OpenClaw: 未知 action → 转发到 Discord REST API
-        nlohmann::json api_body = ctx.payload;
-        std::string endpoint = "/channels/" + ctx.to + "/" + ctx.action;
-        auto res = discord_api_request("POST", endpoint, token, api_body);
-        if (res && (res->status >= 200 && res->status < 300)) {
-            try {
-                return core::Result<nlohmann::json>::Ok(nlohmann::json::parse(res->body));
-            } catch (...) {
-                return core::Result<nlohmann::json>::Ok(nlohmann::json{{"ok", true}});
-            }
-        }
-        return core::Result<nlohmann::json>::Err("Discord action '" + ctx.action + "' failed: " +
-            (res ? res->body : "connection error"));
+        // 🎯 对齐 OpenClaw: 未知 action → 返回不支持错误
+        return core::Result<nlohmann::json>::Err("Discord action '" + ctx.action + "' is not supported");
     };
 
     p.actions = actions;

@@ -1707,21 +1707,9 @@ ChannelPlugin make_telegram_plugin() {
             return core::Result<nlohmann::json>::Ok(result_json);
         }
 
-        // 🎯 对齐 OpenClaw: 未知 action → 尝试通过 Telegram Bot API 转发
-        // sendChatAction, forwardMessage, copyMessage, etc.
-        nlohmann::json api_params = ctx.payload;
-        api_params["chat_id"] = ctx.to;
-        auto res = telegram_api_post(token, ctx.action, api_params);
-        if (res && res->status == 200) {
-            try {
-                auto resp = nlohmann::json::parse(res->body);
-                return core::Result<nlohmann::json>::Ok(resp);
-            } catch (...) {
-                return core::Result<nlohmann::json>::Ok(nlohmann::json{{"ok", true}});
-            }
-        }
-        return core::Result<nlohmann::json>::Err("Telegram action '" + ctx.action + "' failed: " +
-            (res ? res->body : "connection error"));
+        // 🎯 对齐 OpenClaw: 未知 action → 返回不支持错误
+        // sendChatAction, forwardMessage, copyMessage 等需要单独实现
+        return core::Result<nlohmann::json>::Err("Telegram action '" + ctx.action + "' is not supported");
     };
 
     // Aligned with openclaw: supportsButtons → check isTelegramInlineButtonsEnabled

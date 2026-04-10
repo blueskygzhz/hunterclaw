@@ -9,17 +9,22 @@
 
 namespace hunterclaw {
 
-// Forward declarations from security module
-namespace security {
-    std::optional<std::regex> compile_safe_regex(
-        const std::string& source,
-        std::regex_constants::syntax_option_type flags = std::regex_constants::ECMAScript
-    );
+// Local safe regex compile (avoids link dependency on security module)
+namespace {
+std::optional<std::regex> local_compile_safe_regex(
+    const std::string& source,
+    std::regex_constants::syntax_option_type flags = std::regex_constants::ECMAScript
+) {
+    if (source.empty() || source.size() > 2048) return std::nullopt;
+    try {
+        return std::regex(source, flags);
+    } catch (...) {
+        return std::nullopt;
+    }
 }
+}  // namespace
 
 namespace logging {
-
-using hunterclaw::security::compile_safe_regex;
 
 // ============================================================================
 // Constants — 严格对齐 OpenClaw: DEFAULT_REDACT_PATTERNS (17 个模式)
@@ -97,12 +102,12 @@ static std::optional<std::regex> parse_pattern(const std::string& raw) {
             std::string flags_str = trimmed.substr(last_slash + 1);
             auto flags = std::regex_constants::ECMAScript;
             if (flags_str.find('i') != std::string::npos) flags |= std::regex_constants::icase;
-            return security::compile_safe_regex(pattern, flags);
+            return local_compile_safe_regex(pattern, flags);
         }
     }
 
     // Default: case-insensitive global
-    return security::compile_safe_regex(trimmed,
+    return local_compile_safe_regex(trimmed,
         std::regex_constants::ECMAScript | std::regex_constants::icase);
 }
 

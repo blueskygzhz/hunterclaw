@@ -1518,7 +1518,7 @@ public:
         }
 
         // Depth limit check (aligned with OpenClaw)
-        int caller_depth = get_subagent_depth(effective_requester_key);
+        int caller_depth = routing::get_subagent_depth(effective_requester_key);
         int max_spawn_depth = ctx_.max_spawn_depth > 0 ? ctx_.max_spawn_depth : 5;
         if (caller_depth >= max_spawn_depth) {
             return make_json_result(json{

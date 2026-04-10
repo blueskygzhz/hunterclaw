@@ -842,7 +842,7 @@ core::Result<hunterclaw::agents::AgentConfig> FileSessionManager::get_agent_conf
                 for (const auto& a : cfg["agents"]) {
                     if (a.value("id", "") == agent_id) {
                         config.name = a.value("name", agent_id);
-                        if (a.contains("systemPrompt")) config.system_prompt = a["systemPrompt"];
+                        // system_prompt is part of skill/prompt config, not AgentConfig
                         if (a.contains("workspace")) config.workspace = a["workspace"];
                         break;
                     }

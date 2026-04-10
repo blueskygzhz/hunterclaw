@@ -1,4 +1,5 @@
 #include "hunterclaw/tools/edge_tts_provider.h"
+#include "hunterclaw/infra/utilities.h"
 #include <sstream>
 #include <cstdlib>
 #include <cstdio>

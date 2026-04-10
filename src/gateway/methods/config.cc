@@ -5,7 +5,6 @@
 
 #include "hunterclaw/gateway/gateway.h"
 #include "hunterclaw/gateway/method_guard.h"
-#include "hunterclaw/config/config_system.h"
 #include "hunterclaw/core/utils.h"
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -16,6 +15,31 @@
 #include <chrono>
 #include <signal.h>
 #include <unistd.h>
+
+namespace {
+// Local redact helper — masks sensitive keys in config JSON
+nlohmann::json local_redact_config_secrets(const nlohmann::json& config) {
+    static const std::vector<std::string> sensitive_keys = {
+        "apiKey", "api_key", "token", "secret", "password", "credentials"
+    };
+    nlohmann::json result = config;
+    for (const auto& key : sensitive_keys) {
+        if (result.contains(key) && result[key].is_string()) {
+            std::string val = result[key].get<std::string>();
+            if (val.size() > 8) {
+                result[key] = val.substr(0, 4) + "..." + val.substr(val.size() - 4);
+            } else if (!val.empty()) {
+                result[key] = "***";
+            }
+        }
+    }
+    // Recurse into objects
+    for (auto& [k, v] : result.items()) {
+        if (v.is_object()) v = local_redact_config_secrets(v);
+    }
+    return result;
+}
+}  // namespace
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -138,7 +162,7 @@ core::Result<json> method_config_get(
     // 🎯 严格对齐 OpenClaw: redactConfigSnapshot(snapshot, schema.uiHints)
     // 调用 redact_config_secrets 对配置进行脱敏
     if (snapshot.contains("config") && snapshot["config"].is_object()) {
-        snapshot["config"] = ::hunterclaw::config::redact_config_secrets(snapshot["config"]);
+        snapshot["config"] = local_redact_config_secrets(snapshot["config"]);
     }
 
     return core::Result<json>::Ok(snapshot);
@@ -926,7 +950,7 @@ core::Result<json> method_config_apply(
     json result;
     result["ok"] = write_ok;
     result["path"] = config_path;
-    result["config"] = ::hunterclaw::config::redact_config_secrets(parsed_config);
+    result["config"] = local_redact_config_secrets(parsed_config);
     result["restart"] = restart_result;
     result["sentinel"] = json{
         {"path", sentinel_path.empty() ? json(nullptr) : json(sentinel_path)},

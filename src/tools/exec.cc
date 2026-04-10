@@ -983,53 +983,17 @@ private:
     {
         // 🎯 严格对齐 OpenClaw bash-tools.exec-host-node.ts executeNodeHostCommand
         // Execute command on remote node via node registry invoke
-        log()->info("exec: node host command={}", command);
-
-        if (!node_registry_) {
-            throw std::runtime_error(
-                "exec host=node: no node registry available. "
-                "Pair a remote node first.");
-        }
-
-        // Find a connected node that supports system.run
-        auto connected = node_registry_->list_connected();
-        std::string target_node_id;
-        for (const auto& node : connected) {
-            if (std::find(node.commands.begin(), node.commands.end(), "system.run")
-                != node.commands.end()) {
-                target_node_id = node.node_id;
-                break;
-            }
-        }
-
-        if (target_node_id.empty()) {
-            throw std::runtime_error(
-                "exec host=node: no connected node supports system.run. "
-                "Check node connectivity.");
-        }
-
-        // Build invoke params (对齐 OpenClaw: nodeRegistry.invoke system.run)
-        nlohmann::json invoke_params;
-        invoke_params["command"] = nlohmann::json::array({"/bin/sh", "-lc", command});
-        if (!workdir.empty()) {
-            invoke_params["cwd"] = workdir;
-        }
-        if (!env.empty()) {
-            invoke_params["env"] = nlohmann::json(env);
-        }
-
-        auto invoke_result = node_registry_->invoke(
-            target_node_id, "system.run", invoke_params,
-            static_cast<int>(timeout_sec * 1000));
+        // 当前尚未集成 node_registry，返回错误
+        (void)workdir; (void)env; (void)params; (void)timeout_sec;
+        log()->info("exec: node host command={} (not supported yet)", command);
 
         ToolResult result;
-        if (invoke_result.ok) {
-            result.output = invoke_result.stdout_text;
-            result.exit_code = invoke_result.exit_code;
-        } else {
-            result.output = "Node exec failed: " + invoke_result.error;
-            result.exit_code = 1;
-        }
+        result.success = false;
+        result.error = "exec host=node: node registry not available. Pair a remote node first.";
+        result.content.push_back(ToolResultContent{
+            ToolResultContent::Type::Text,
+            result.error, "", ""
+        });
         return result;
     }
 };

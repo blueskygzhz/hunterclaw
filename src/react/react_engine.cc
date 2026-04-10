@@ -203,80 +203,10 @@ ReactResult ReactEngine::run(
         auto result = execute_loop(user_input, history, callbacks);
         
         // ✅ ContextEngine: afterTurn (严格对齐 OpenClaw attempt.ts:2610-2660)
-        // 🎯 三级降级: afterTurn → ingestBatch → ingest (逐条)
+        // 当前 ReactResult 没有 messages_snapshot，跳过 context ingest
+        // TODO: 添加 messages_snapshot 到 ReactResult 后启用
         if (context_engine_) {
-            // 构建消息快照 JSON 列表
-            std::vector<std::string> messages_json;
-            for (const auto& msg : result.messages_snapshot) {
-                nlohmann::json j;
-                j["role"] = [&]() {
-                    switch (msg.role) {
-                        case llm::LLMMessageRole::User: return "user";
-                        case llm::LLMMessageRole::Assistant: return "assistant";
-                        case llm::LLMMessageRole::System: return "system";
-                        case llm::LLMMessageRole::Tool: return "toolResult";
-                        default: return "unknown";
-                    }
-                }();
-                j["content"] = msg.content;
-                messages_json.push_back(j.dump());
-            }
-            int pre_prompt_count = static_cast<int>(history.size());
-
-            // 🎯 对齐 OpenClaw: 优先 afterTurn，不存在则降级到 ingest
-            bool after_turn_called = false;
-            try {
-                context_engine_->after_turn(
-                    callbacks.session_id,
-                    callbacks.transcript_path,
-                    messages_json,
-                    pre_prompt_count,
-                    std::nullopt,  // auto_compaction_summary
-                    false,         // is_heartbeat
-                    context_window_config_.context_window_tokens,  // token_budget
-                    nlohmann::json::object()  // runtime_context
-                );
-                after_turn_called = true;
-            } catch (const std::exception& e) {
-                log()->warn("[ContextEngine] afterTurn failed: {}, falling back to ingest", e.what());
-            }
-
-            // 🎯 严格对齐 OpenClaw: Fallback — ingest new messages individually
-            // attempt.ts:2632-2659: if afterTurn is not a function → ingestBatch/ingest
-            if (!after_turn_called) {
-                // Slice new messages: messagesSnapshot.slice(prePromptMessageCount)
-                int new_start = pre_prompt_count;
-                int total = static_cast<int>(messages_json.size());
-                if (new_start < total) {
-                    // 🎯 对齐 OpenClaw: 优先 ingestBatch，否则逐条 ingest
-                    try {
-                        // Try ingestBatch first
-                        std::vector<std::string> new_messages(
-                            messages_json.begin() + new_start,
-                            messages_json.end());
-                        context_engine_->ingest_batch(
-                            callbacks.session_id,
-                            std::nullopt,  // session_key
-                            new_messages);
-                    } catch (const std::exception& batch_err) {
-                        log()->warn("[ContextEngine] ingestBatch failed: {}, falling back to individual ingest",
-                                   batch_err.what());
-                        // 🎯 对齐 OpenClaw: 逐条 ingest fallback
-                        for (int i = new_start; i < total; ++i) {
-                            try {
-                                context_engine_->ingest(
-                                    callbacks.session_id,
-                                    std::nullopt,  // session_key
-                                    messages_json[i],
-                                    false);  // is_heartbeat
-                            } catch (const std::exception& ingest_err) {
-                                log()->warn("[ContextEngine] ingest failed for message {}: {}",
-                                           i, ingest_err.what());
-                            }
-                        }
-                    }
-                }
-            }
+            log()->debug("[ContextEngine] afterTurn skipped: messages_snapshot not yet available in ReactResult");
         }
         
         // ✅ Span 成功标记

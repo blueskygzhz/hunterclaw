@@ -748,7 +748,7 @@ std::shared_ptr<Tool> BuiltinTools::create_web_search_tool(const ToolContext& co
         return nullptr;  // 未配置 API key，不注册工具
     }
     // 🎯 对齐 OpenClaw: 返回 WebSearchTool 实例（已在 web_search_tool.cc 中完整实现）
-    return std::make_unique<WebSearchTool>(context);
+    return std::make_unique<WebSearchTool>(context.http_client);
 }
 
 void BuiltinTools::register_all(ToolManager& manager, const ToolContext& context) {

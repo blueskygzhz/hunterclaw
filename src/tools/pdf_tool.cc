@@ -8,6 +8,8 @@
 
 #include "hunterclaw/tools/pdf_tool.h"
 #include "hunterclaw/core/json.h"
+#include "hunterclaw/infra/http_client.h"
+#include "hunterclaw/infra/utilities.h"
 #include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
@@ -565,8 +567,8 @@ PdfAnalysisResult PDFTool::analyze_with_gemini(
     (void)max_tokens;
     std::ifstream f(path, std::ios::binary);
     std::string pdf_data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    std::string pdf_base64 = infra::base64_encode(
-        reinterpret_cast<const unsigned char*>(pdf_data.data()), pdf_data.size());
+    std::vector<uint8_t> pdf_bytes(pdf_data.begin(), pdf_data.end());
+    std::string pdf_base64 = infra::base64_encode(pdf_bytes);
     const char* api_key = std::getenv("GEMINI_API_KEY");
     std::string url = std::string("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=") +
         (api_key ? api_key : "");
@@ -613,8 +615,8 @@ PdfAnalysisResult PDFTool::analyze_with_openai(
     (void)max_tokens;
 
     // OpenAI doesn't support native PDF — use text extraction fallback
-    auto extracted = extract_text_from_pdf(path);
-    std::string text_content = extracted.is_ok() ? extracted.get() : "[extraction failed]";
+    std::string text_content = exec_command("pdftotext '" + path + "' - 2>/dev/null");
+    if (text_content.empty()) text_content = "[extraction failed]";
 
     const char* api_key = std::getenv("OPENAI_API_KEY");
     infra::HttpClient client;
