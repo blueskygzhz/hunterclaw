@@ -138,5 +138,37 @@ std::optional<VerboseLevel> parse_verbose_level(const std::string& str);
 std::optional<ReasoningLevel> parse_reasoning_level(const std::string& str);
 std::optional<BlockStreamingBreak> parse_block_streaming_break(const std::string& str);
 
+// ============================================================================
+// xhigh / binary thinking support (对齐 OpenClaw thinking.ts:41-81)
+// ============================================================================
+
+// 对齐 thinking.ts:41-59: isBinaryThinkingProvider
+// 检测 provider 是否只支持 on/off 两级 thinking (无 low/medium/high)
+bool is_binary_thinking_provider(
+    const std::string& provider,
+    const std::string& model = ""
+);
+
+// 对齐 thinking.ts:61-81: supportsXHighThinking
+// 检测 provider+model 是否支持 xhigh thinking level
+bool supports_xhigh_thinking(
+    const std::string& provider,
+    const std::string& model = ""
+);
+
+// 对齐 thinking.ts:83-89: listThinkingLevels
+// 返回可用的 thinking levels (考虑 xhigh 支持)
+std::vector<std::string> list_thinking_levels(
+    const std::string& provider = "",
+    const std::string& model = ""
+);
+
+// 对齐 thinking.ts:91-96: listThinkingLevelLabels
+// 返回 UI 展示的标签 (binary provider → ["off", "on"])
+std::vector<std::string> list_thinking_level_labels(
+    const std::string& provider = "",
+    const std::string& model = ""
+);
+
 } // namespace react
 } // namespace hunterclaw

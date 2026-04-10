@@ -17,8 +17,9 @@ public:
     std::string description() const override {
         return "Mandatory recall step: semantically search MEMORY.md + memory/*.md "
                "(and optional session transcripts) before answering questions about "
-               "prior work, decisions, dates, people, preferences, or todos; "
-               "returns top snippets with path + lines. "
+               "prior work, decisions, dates, people, preferences, or todos. "
+               "Optional `corpus=wiki` or `corpus=all` also searches registered "
+               "compiled-wiki supplements. "
                "If response has disabled=true, memory retrieval is unavailable "
                "and should be surfaced to the user.";
     }
@@ -65,7 +66,8 @@ public:
 
     std::string description() const override {
         return "Safe snippet read from MEMORY.md or memory/*.md with optional "
-               "from/lines; use after memory_search to pull only the needed lines "
+               "from/lines; `corpus=wiki` reads from registered compiled-wiki "
+               "supplements. Use after search to pull only the needed lines "
                "and keep context small.";
     }
 

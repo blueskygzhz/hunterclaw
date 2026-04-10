@@ -337,5 +337,66 @@ std::optional<BlockStreamingBreak> parse_block_streaming_break(const std::string
     return std::nullopt;
 }
 
+// ============================================================================
+// xhigh / binary thinking support (对齐 OpenClaw thinking.ts:41-96)
+// ============================================================================
+
+// 对齐 thinking.ts:41-59
+bool is_binary_thinking_provider(
+    const std::string& provider,
+    const std::string& model
+) {
+    // 目前没有内置 binary thinking provider
+    // 扩展点: 通过 plugin 注册的 provider 可以声明 binary thinking
+    // 对齐: resolveProviderBinaryThinking → plugin decision
+    (void)provider;
+    (void)model;
+    return false;
+}
+
+// 对齐 thinking.ts:61-81
+bool supports_xhigh_thinking(
+    const std::string& provider,
+    const std::string& model
+) {
+    if (model.empty()) return false;
+
+    // 目前没有内置 xhigh thinking 支持
+    // 扩展点: 通过 plugin 注册的 provider 可以声明 xhigh 支持
+    // 对齐: resolveProviderXHighThinking → plugin decision
+    (void)provider;
+    return false;
+}
+
+// 对齐 thinking.ts:83-89
+std::vector<std::string> list_thinking_levels(
+    const std::string& provider,
+    const std::string& model
+) {
+    // 对齐: const levels = listThinkingLevelsFallback(provider, model)
+    std::vector<std::string> levels = {"off", "low", "medium", "high"};
+
+    // 对齐: if (supportsXHighThinking) levels.splice(levels.length - 1, 0, "xhigh")
+    if (supports_xhigh_thinking(provider, model)) {
+        // Insert "xhigh" before "high" (last element)
+        levels.insert(levels.end() - 1, "xhigh");
+    }
+
+    return levels;
+}
+
+// 对齐 thinking.ts:91-96
+std::vector<std::string> list_thinking_level_labels(
+    const std::string& provider,
+    const std::string& model
+) {
+    // 对齐: if (isBinaryThinkingProvider) return ["off", "on"]
+    if (is_binary_thinking_provider(provider, model)) {
+        return {"off", "on"};
+    }
+    // 对齐: return listThinkingLevelLabelsFallback
+    return list_thinking_levels(provider, model);
+}
+
 } // namespace react
 } // namespace hunterclaw

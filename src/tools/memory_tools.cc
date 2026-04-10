@@ -1,6 +1,7 @@
 #include "hunterclaw/tools/memory_tools.h"
 #include "hunterclaw/sessions/session_key_utils.h"
 #include "hunterclaw/memory/short_term_promotion.h"
+#include "hunterclaw/memory/corpus_supplement.h"  // ✅ Corpus supplement 路由 (对齐 tools.shared.ts)
 #include <algorithm>
 #include <regex>
 #include <set>
@@ -190,63 +191,93 @@ ToolResult MemorySearchTool::execute(const core::JsonValue& params) {
         corpus = params["corpus"].as_string();
     }
 
+    // 🎯 对齐 OpenClaw tools.ts:167-168
+    // shouldQueryMemory = requestedCorpus !== "wiki"
+    // shouldQuerySupplements = requestedCorpus === "wiki" || requestedCorpus === "all"
+    bool should_query_memory = (corpus != "wiki");
+    bool should_query_supplements = (corpus == "wiki" || corpus == "all");
+
     // 🎯 对齐 OpenClaw: getMemoryManagerContext — if "error" in memory → unavailable result
-    if (!manager_) {
+    if (should_query_memory && !manager_ && !should_query_supplements) {
         return build_memory_search_unavailable_result("memory manager not initialized");
     }
 
     try {
         // 🎯 对齐 OpenClaw: resolveMemoryCitationsMode(cfg) → "auto" | "on" | "off"
-        // HunterClaw 默认 "auto"
         const std::string citations_mode = "auto";
 
         // 🎯 对齐 OpenClaw: shouldIncludeCitations({ mode, sessionKey })
-        // session_key 从 params 中读取（如果有）
         std::string session_key;
         if (params.has("_sessionKey") && params["_sessionKey"].is_string()) {
             session_key = params["_sessionKey"].as_string();
         }
         bool include_citations = should_include_citations(citations_mode, session_key);
 
-        // 🎯 对齐 OpenClaw: memory.manager.search(query, { maxResults, minScore, sessionKey })
-        SearchOptions opts;
-        opts.max_results = max_results;
-        opts.min_score   = min_score;
-        if (!session_key.empty()) opts.session_key = session_key;
-        auto raw_results = manager_->search(query, opts);
-
-        // 🎯 对齐 OpenClaw: memory.manager.status()
-        auto status = manager_->status();
-
-        // 🎯 对齐 OpenClaw: decorateCitations(rawResults, includeCitations)
-        auto decorated = decorate_citations(raw_results, include_citations);
-
-        // 🎯 对齐 OpenClaw: status.backend === "qmd" → clampResultsByInjectedChars
-        std::vector<MemorySearchResult> results;
-        if (status.backend == "qmd") {
-            // 对齐 OpenClaw: resolveMemoryBackendConfig({ cfg, agentId }).qmd?.limits.maxInjectedChars
-            // HunterClaw 暂不限制 qmd chars，传 nullopt
-            results = clamp_results_by_injected_chars(decorated, std::nullopt);
-        } else {
-            results = decorated;
-        }
-
-        // 🎯 对齐 OpenClaw: searchMode = (status.custom as { searchMode? })?.searchMode
+        // 🎯 对齐 OpenClaw tools.ts:179-217 — memory search (conditional on shouldQueryMemory)
+        std::vector<MemorySearchResult> raw_results;
+        std::vector<MemorySearchResult> surfaced_memory_results;
+        std::string provider_str;
         std::string search_mode;
-        if (status.custom.has_value() && !status.custom->search_mode.empty()) {
-            search_mode = status.custom->search_mode;
+        MemoryProviderStatus status;
+        bool has_status = false;
+
+        if (should_query_memory && manager_) {
+            SearchOptions opts;
+            opts.max_results = max_results;
+            opts.min_score   = min_score;
+            if (!session_key.empty()) opts.session_key = session_key;
+            raw_results = manager_->search(query, opts);
+
+            status = manager_->status();
+            has_status = true;
+
+            auto decorated = decorate_citations(raw_results, include_citations);
+
+            // 对齐: status.backend === "qmd" → clampResultsByInjectedChars
+            if (status.backend == "qmd") {
+                surfaced_memory_results = clamp_results_by_injected_chars(decorated, std::nullopt);
+            } else {
+                surfaced_memory_results = decorated;
+            }
+
+            provider_str = status.provider;
+            if (status.custom.has_value() && !status.custom->search_mode.empty()) {
+                search_mode = status.custom->search_mode;
+            }
+
+            // 🎯 对齐 OpenClaw tools.ts:206-212 queueShortTermRecallTracking
+            if (!surfaced_memory_results.empty()) {
+                try {
+                    std::string workspace_dir;
+                    if (status.workspace_dir.has_value()) {
+                        workspace_dir = *status.workspace_dir;
+                    }
+                    if (!workspace_dir.empty()) {
+                        std::thread([workspace_dir, query, raw_results]() {
+                            try {
+                                memory::record_short_term_recalls(
+                                    workspace_dir, query, raw_results);
+                            } catch (...) {}
+                        }).detach();
+                    }
+                } catch (...) {}
+            }
         }
 
-        // 🎯 对齐 OpenClaw: jsonResult({ results, provider, model, fallback, citations, mode })
-        nlohmann::json response = {
-            {"results",   nlohmann::json::array()},
-            {"provider",  status.provider},
-            {"citations", citations_mode},
-        };
+        // 🎯 对齐 OpenClaw tools.ts:218-225 — supplement search
+        std::vector<memory::MemoryCorpusSearchResult> supplement_results;
+        if (should_query_supplements) {
+            supplement_results = memory::search_memory_corpus_supplements(
+                query, max_results, session_key, corpus);
+        }
 
-        // results → JSON array
-        for (const auto& r : results) {
+        // 🎯 对齐 OpenClaw tools.ts:226-233 — merge + sort + slice
+        nlohmann::json merged_results = nlohmann::json::array();
+
+        // Memory results with corpus:"memory" tag
+        for (const auto& r : surfaced_memory_results) {
             nlohmann::json item = {
+                {"corpus",    "memory"},
                 {"path",      r.path},
                 {"startLine", r.start_line},
                 {"endLine",   r.end_line},
@@ -257,50 +288,67 @@ ToolResult MemorySearchTool::execute(const core::JsonValue& params) {
             if (r.citation.has_value()) {
                 item["citation"] = *r.citation;
             }
-            response["results"].push_back(item);
+            merged_results.push_back(item);
         }
 
-        // 对齐 OpenClaw: model (optional)
-        if (status.model.has_value()) {
+        // Supplement results (already have corpus field)
+        for (const auto& sr : supplement_results) {
+            nlohmann::json item = {
+                {"corpus",    sr.corpus},
+                {"path",      sr.path},
+                {"score",     sr.score},
+                {"snippet",   sr.snippet},
+            };
+            if (sr.title.has_value()) item["title"] = *sr.title;
+            if (sr.kind.has_value()) item["kind"] = *sr.kind;
+            if (sr.start_line.has_value()) item["startLine"] = *sr.start_line;
+            if (sr.end_line.has_value()) item["endLine"] = *sr.end_line;
+            if (sr.citation.has_value()) item["citation"] = *sr.citation;
+            if (sr.source.has_value()) item["source"] = *sr.source;
+            if (sr.provenance_label.has_value()) item["provenanceLabel"] = *sr.provenance_label;
+            merged_results.push_back(item);
+        }
+
+        // 对齐: .toSorted((l,r) => r.score !== l.score ? r.score - l.score : l.path.localeCompare(r.path))
+        // .slice(0, Math.max(1, maxResults ?? 10))
+        std::vector<nlohmann::json> sorted_vec(merged_results.begin(), merged_results.end());
+        std::sort(sorted_vec.begin(), sorted_vec.end(),
+            [](const nlohmann::json& a, const nlohmann::json& b) {
+                double sa = a.value("score", 0.0);
+                double sb = b.value("score", 0.0);
+                if (sa != sb) return sb < sa;
+                return a.value("path", "") < b.value("path", "");
+            });
+        int limit = std::max(1, max_results.value_or(10));
+        if (static_cast<int>(sorted_vec.size()) > limit) {
+            sorted_vec.resize(limit);
+        }
+
+        nlohmann::json final_results = nlohmann::json::array();
+        for (auto& item : sorted_vec) {
+            final_results.push_back(std::move(item));
+        }
+
+        // 🎯 对齐 OpenClaw tools.ts:234-241 — response
+        nlohmann::json response = {
+            {"results",   final_results},
+            {"citations", citations_mode},
+        };
+        if (!provider_str.empty()) {
+            response["provider"] = provider_str;
+        }
+        if (has_status && status.model.has_value()) {
             response["model"] = *status.model;
         }
-
-        // 对齐 OpenClaw: fallback (optional)
-        if (status.fallback.has_value()) {
+        if (has_status && status.fallback.has_value()) {
             nlohmann::json fallback_json = {{"from", status.fallback->from}};
             if (status.fallback->reason.has_value()) {
                 fallback_json["reason"] = *status.fallback->reason;
             }
             response["fallback"] = fallback_json;
         }
-
-        // 对齐 OpenClaw: mode (optional, searchMode from custom status)
         if (!search_mode.empty()) {
             response["mode"] = search_mode;
-        }
-
-        // 🎯 对齐 OpenClaw tools.ts:queueShortTermRecallTracking
-        // 记录 recall tracking (best-effort, 不阻塞搜索返回)
-        if (!results.empty()) {
-            try {
-                std::string workspace_dir;
-                if (status.workspace_dir.has_value()) {
-                    workspace_dir = *status.workspace_dir;
-                }
-                if (!workspace_dir.empty()) {
-                    // 异步记录 (fire-and-forget, 对齐 openclaw: void recordShortTermRecalls(...).catch(() => {}))
-                    std::thread([workspace_dir, query, raw_results]() {
-                        try {
-                            memory::record_short_term_recalls(
-                                workspace_dir, query, raw_results);
-                        } catch (...) {
-                            // Recall tracking is best-effort
-                        }
-                    }).detach();
-                }
-            } catch (...) {
-                // Recall tracking must never block memory recall
-            }
         }
 
         return tool_result::json(core::JsonValue(response));
@@ -333,6 +381,43 @@ ToolResult MemoryGetTool::execute(const core::JsonValue& params) {
     }
     if (params.has("lines") && params["lines"].is_number()) {
         lines = static_cast<int>(params["lines"].as_number());
+    }
+
+    // 🎯 对齐 OpenClaw tools.ts:267-271: readStringParam(params, "corpus")
+    std::string requested_corpus = "memory";
+    if (params.has("corpus") && params["corpus"].is_string()) {
+        requested_corpus = params["corpus"].as_string();
+    }
+
+    // 🎯 对齐 OpenClaw tools.ts:273-289: if (requestedCorpus === "wiki") → supplement only
+    if (requested_corpus == "wiki") {
+        auto supplement = memory::get_memory_corpus_supplement_result(
+            rel_path,
+            from,
+            lines,
+            "",  // agentSessionKey
+            requested_corpus
+        );
+        if (supplement.has_value()) {
+            nlohmann::json j = {
+                {"corpus",    supplement->corpus},
+                {"path",      supplement->path},
+                {"text",      supplement->content},
+                {"fromLine",  supplement->from_line},
+                {"lineCount", supplement->line_count},
+            };
+            if (supplement->title.has_value()) j["title"] = *supplement->title;
+            if (supplement->kind.has_value()) j["kind"] = *supplement->kind;
+            if (supplement->provenance_label.has_value()) j["provenanceLabel"] = *supplement->provenance_label;
+            return tool_result::json(core::JsonValue(j));
+        }
+        nlohmann::json j = {
+            {"path",     rel_path},
+            {"text",     ""},
+            {"disabled", true},
+            {"error",    "wiki corpus result not found"},
+        };
+        return tool_result::json(core::JsonValue(j));
     }
 
     // 🎯 对齐 OpenClaw: getMemoryManagerContext — if "error" in memory → disabled result
