@@ -297,9 +297,15 @@ public:
     // 如果 run 已完成，立即触发 cleanup
     bool clear_subagent_run_steer_restart(const std::string& run_id);
 
+    // ✅ 对齐 OC: subagent-registry-lifecycle.ts / run-manager.ts task integration
+    // Set task executor for background task tracking (injected from gateway)
+    void set_task_executor(std::shared_ptr<void> executor) { task_executor_ = executor; }
+    std::shared_ptr<void> task_executor() const { return task_executor_; }
+
 private:
     mutable std::mutex mutex_;
     std::map<std::string, std::shared_ptr<SubagentEntry>> entries_;
+    std::shared_ptr<void> task_executor_;  // ✅ tasks::TaskExecutor (stored as void to avoid header dep)
     
     // Helper: recursively find all descendants
     void find_descendants_recursive(

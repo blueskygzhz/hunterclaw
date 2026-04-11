@@ -9,6 +9,7 @@
 #include "hunterclaw/queue/lanes.h"
 #include "hunterclaw/queue/delivery_queue.h"   // ✅ DeliveryQueue (deliver 函数)
 #include "hunterclaw/outbound/deliver.h"        // ✅ deliver_outbound_payloads
+#include "hunterclaw/tasks/task_executor.h"     // ✅ 对齐 OC: createRunningTaskRun for agent run tracking
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 #include <thread>
@@ -222,6 +223,29 @@ core::Result<json> method_agent(
     // Gateway agent.ts: const runId = idem;
     // agent-runner-execution.ts: const runId = params.opts?.runId ?? crypto.randomUUID();
     const std::string run_id = idem;
+
+    // ✅ 对齐 OC server-methods/agent.ts: createRunningTaskRun({ runtime: "acp", ... })
+    // Create a background task record so the agent run is visible in /tasks and task audit.
+    auto task_executor = server->task_executor();
+    if (task_executor) {
+        try {
+            tasks::TaskRecord task_params;
+            task_params.runtime = tasks::TaskRuntime::ACP;
+            task_params.owner_key = session_key;
+            task_params.scope_kind = tasks::TaskScopeKind::SESSION;
+            task_params.run_id = run_id;
+            task_params.task = message.size() > 120 ? message.substr(0, 120) : message;
+            task_params.started_at = static_cast<int64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()
+                ).count()
+            );
+            task_params.last_event_at = task_params.started_at;
+            task_executor->create_running_task_run(task_params);
+        } catch (const std::exception& e) {
+            spdlog::get("default")->warn("[method_agent] Failed to create task record: {}", e.what());
+        }
+    }
 
     spdlog::get("default")->info(
         "[method_agent] Dispatching: session={}, run_id={}, deliver={}, source={}",

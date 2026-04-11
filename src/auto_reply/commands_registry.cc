@@ -109,6 +109,16 @@ void CommandsRegistry::build_commands() {
         cmd.category = CommandCategory::Status;
         add(cmd);
     }
+    // /tasks (对齐 OC: auto-reply/reply/commands-tasks.ts)
+    {
+        ChatCommandDefinition cmd;
+        cmd.key = "tasks"; cmd.native_name = "tasks";
+        cmd.description = "Show background task status.";
+        cmd.text_aliases = {"/tasks"};
+        cmd.scope = CommandScope::Both;
+        cmd.category = CommandCategory::Status;
+        add(cmd);
+    }
     // /allowlist (text-only)
     {
         ChatCommandDefinition cmd;

@@ -398,8 +398,20 @@ void CronService::force_run(const std::string& job_id) {
   patch.state = job->state;
   store_->update(job_id, patch);
 
+  // ✅ 对齐 OC ops.ts: tryCreateManualTaskRun
+  std::optional<std::string> task_run_id;
+  if (deps_.create_cron_task_run) {
+    try { task_run_id = deps_.create_cron_task_run(job_id, job->name.empty() ? job_id : job->name, job->session_key, job->agent_id, now); }
+    catch (...) {}
+  }
+
   auto outcome = execute_job_core_with_timeout(*job);
   int64_t end = deps_.now_ms();
+  // ✅ 对齐 OC ops.ts: tryFinishManualTaskRun
+  if (task_run_id && deps_.finish_cron_task_run) {
+    try { deps_.finish_cron_task_run(*task_run_id, outcome.status, outcome.error, std::nullopt, end); }
+    catch (...) {}
+  }
   {
     std::lock_guard<std::mutex> lock(mutex_);
     auto stored = store_->get(job_id);
@@ -1440,8 +1452,19 @@ void CronService::scheduler_loop() {
           int64_t started_at = deps_.now_ms();
           // Aligned with OpenClaw: emit(state, { jobId, action: "started", runAtMs })
           { CronServiceDeps::CronEvent sevt; sevt.job_id = job.id; sevt.action = "started"; sevt.run_at_ms = started_at; emit(sevt); }
+          // ✅ 对齐 OC timer.ts: tryCreateCronTaskRun — 为每次 cron 执行创建 task record
+          std::optional<std::string> task_run_id;
+          if (deps_.create_cron_task_run) {
+            try { task_run_id = deps_.create_cron_task_run(job.id, job.name.empty() ? job.id : job.name, job.session_key, job.agent_id, started_at); }
+            catch (...) {}
+          }
           auto outcome = execute_job_core_with_timeout(job);
           int64_t ended_at = deps_.now_ms();
+          // ✅ 对齐 OC timer.ts: tryFinishCronTaskRun — 更新 task record 为 completed/failed
+          if (task_run_id && deps_.finish_cron_task_run) {
+            try { deps_.finish_cron_task_run(*task_run_id, outcome.status, outcome.error, std::nullopt, ended_at); }
+            catch (...) {}
+          }
           (*tick_results_ptr)[i] = {job.id, outcome.status, outcome.error, outcome.delivered,
                                      started_at, ended_at};
         }

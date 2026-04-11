@@ -411,6 +411,22 @@ struct CronServiceDeps {
     std::optional<std::string> provider;
   };
   std::function<void(const CronEvent& evt)> on_event;
+
+  // ✅ Task lifecycle callbacks (对齐 OC cron/service/timer.ts: tryCreateCronTaskRun / tryFinishCronTaskRun)
+  // Gateway injects these to create/complete/fail task records for each cron job execution.
+  // Returns task_run_id (used to finalize the task record after execution).
+  std::function<std::optional<std::string>(
+      const std::string& job_id,
+      const std::string& job_name,
+      const std::optional<std::string>& session_key,
+      const std::optional<std::string>& agent_id,
+      int64_t started_at)> create_cron_task_run;
+
+  std::function<void(const std::string& task_run_id,
+                     CronRunStatus status,
+                     const std::optional<std::string>& error,
+                     const std::optional<std::string>& summary,
+                     int64_t ended_at)> finish_cron_task_run;
 };
 
 /**

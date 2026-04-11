@@ -280,6 +280,7 @@ cc_library(
         ":hunterclaw_infra",         # ✅ 添加 infra 依赖 (heartbeat_runner 等)
         ":hunterclaw_observability", # ✅ 添加 observability 依赖 (WebhookReceivedEvent vtable)
         ":hunterclaw_queue",         # ✅ 添加 queue 依赖 (CommandQueue)
+        ":hunterclaw_tasks",         # ✅ 添加 tasks 依赖 (TaskRegistry/TaskExecutor)
         "@ixwebsocket//:ixwebsocket",   # ✅ 添加 ixwebsocket 依赖 (WebSocket)
         "@nlohmann_json//:json",
         "@com_google_absl//absl/status",
@@ -534,6 +535,30 @@ cc_library(
     srcs = glob(["acp/*.cc"]),
     deps = [
         "//:hunterclaw_headers",
+        "@nlohmann_json//:json",
+    ],
+    copts = [
+        "-std=c++17",
+        "-Wall",
+        "-Wextra",
+        "-I/usr/include/spdlog",
+    ],
+    linkopts = [
+        "-lpthread",
+    ],
+    linkstatic = False,
+    visibility = ["//visibility:public"],
+)
+
+# ============================================================================
+# Tasks Library - Background Task Registry (对齐 OpenClaw tasks/)
+# ============================================================================
+cc_library(
+    name = "hunterclaw_tasks",
+    srcs = glob(["tasks/*.cc"]),
+    deps = [
+        "//:hunterclaw_headers",
+        ":hunterclaw_core_base",
         "@nlohmann_json//:json",
     ],
     copts = [

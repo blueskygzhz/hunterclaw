@@ -6,6 +6,7 @@
 #include "hunterclaw/agents/agent_instance.h" // AgentInstance
 #include "hunterclaw/gateway/gateway.h"    // GatewayServer, GatewayRuntimeState, ClientContext
 #include "hunterclaw/gateway/client.h"     // GatewayClient (callGateway 对齐)
+#include "hunterclaw/tasks/task_executor.h" // ✅ 对齐 OC: subagent-registry-lifecycle.ts task tracking
 #include <spdlog/spdlog.h>
 #include <iostream>
 #include <algorithm>
@@ -68,6 +69,40 @@ inline auto log() { return core::get_logger("subagent"); }
 using AgentPtr = std::shared_ptr<AgentInstance>;
 
 // ============================================================================
+// Task lifecycle helpers (对齐 OC subagent-registry-lifecycle.ts)
+// ============================================================================
+
+namespace {
+
+// ✅ 对齐 OC: safeFinalizeSubagentTaskRun — 在 subagent 完成/失败时更新 task record
+void safe_finalize_subagent_task_run(
+    const std::string& run_id,
+    const std::string& child_session_key,
+    bool has_error,
+    const std::string& error_message,
+    int64_t ended_at
+) {
+    try {
+        // 获取 gateway server 的 task_executor（通过全局 gateway 引用）
+        // 简化方式：直接通过 gateway::GatewayServer 静态获取（如果可用）
+        // 注意：这里使用 try/catch 容错，task 失败不应影响 subagent 生命周期
+        // 对齐 OC: completeTaskRunByRunId / failTaskRunByRunId 是 module-level 函数
+        // HC 中 TaskExecutor 需要通过 gateway server 获取
+        // TODO: 当 HC 有全局 task_executor 单例时，可简化此调用
+        (void)run_id;
+        (void)child_session_key;
+        (void)has_error;
+        (void)error_message;
+        (void)ended_at;
+        // 当前通过 SubagentRegistry 的 task_executor_ 成员实现（见下方 set_task_executor）
+    } catch (...) {
+        // Task record 更新失败不应阻止 subagent 生命周期
+    }
+}
+
+} // namespace
+
+// ============================================================================
 // SubagentRegistry Implementation
 // ============================================================================
 
@@ -90,6 +125,29 @@ core::Result<void> SubagentRegistry::register_subagent(const SubagentEntry& entr
     
     entries_[entry.subagent_run_id] = std::make_shared<SubagentEntry>(entry);
     
+    // ✅ 对齐 OC subagent-registry-run-manager.ts: createRunningTaskRun for subagent
+    if (task_executor_) {
+        try {
+            auto executor = std::static_pointer_cast<tasks::TaskExecutor>(task_executor_);
+            tasks::TaskRecord task_params;
+            task_params.runtime = tasks::TaskRuntime::SUBAGENT;
+            task_params.source_id = entry.subagent_run_id;
+            task_params.owner_key = entry.requester_run_id;
+            task_params.scope_kind = tasks::TaskScopeKind::SESSION;
+            task_params.run_id = entry.subagent_run_id;
+            task_params.label = entry.task;
+            task_params.task = entry.task.empty() ? "subagent run" : entry.task;
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            task_params.started_at = now;
+            task_params.last_event_at = now;
+            executor->create_running_task_run(task_params);
+        } catch (const std::exception& e) {
+            log()->warn("[SubagentRegistry] Failed to create task record for run {}: {}",
+                       entry.subagent_run_id, e.what());
+        }
+    }
+
     std::cout << "[SubagentRegistry] Registered subagent: " 
               << entry.subagent_run_id 
               << " (requester: " << entry.requester_run_id 
@@ -186,6 +244,24 @@ core::Result<void> SubagentRegistry::set_result(
     ).count();
     it->second->completed_at = now;
     
+    // ✅ 对齐 OC subagent-registry-lifecycle.ts: safeFinalizeSubagentTaskRun
+    // Update task record: complete or fail based on outcome
+    if (task_executor_) {
+        try {
+            auto executor = std::static_pointer_cast<tasks::TaskExecutor>(task_executor_);
+            if (has_error) {
+                executor->fail_task_run_by_run_id(
+                    subagent_run_id, now, error_message, tasks::TaskStatus::FAILED);
+            } else {
+                executor->complete_task_run_by_run_id(
+                    subagent_run_id, now, result_text);
+            }
+        } catch (const std::exception& e) {
+            log()->warn("[SubagentRegistry] Failed to finalize task record for run {}: {}",
+                       subagent_run_id, e.what());
+        }
+    }
+
     return core::Result<void>::Ok();
 }
 

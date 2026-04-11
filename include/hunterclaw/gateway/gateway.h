@@ -49,6 +49,14 @@ class GatewayCronIntegration;
 }
 
 namespace hunterclaw {
+namespace tasks {
+class TaskRegistry;
+class TaskExecutor;
+class TaskFlowRegistry;
+}
+}
+
+namespace hunterclaw {
 namespace gateway {
 
 // ============================================================================
@@ -398,6 +406,11 @@ public:
     // Heartbeat runner config access (for method_wake mode=now)
     // Returns the cached HeartbeatRunnerConfig built during start()
     hunterclaw::infra::HeartbeatRunnerConfig heartbeat_runner_config() const;
+
+    // ✅ Task subsystem accessors (对齐 OpenClaw: task-registry / task-executor / task-flow-registry)
+    std::shared_ptr<tasks::TaskRegistry> task_registry() const;
+    std::shared_ptr<tasks::TaskExecutor> task_executor() const;
+    std::shared_ptr<tasks::TaskFlowRegistry> task_flow_registry() const;
 
     // State access
     std::shared_ptr<GatewayRuntimeState> runtime_state() const;

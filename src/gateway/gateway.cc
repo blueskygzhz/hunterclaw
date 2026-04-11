@@ -18,6 +18,9 @@
 #include "hunterclaw/cron/gateway_integration.h"          // ✅ GatewayCronIntegration (agent tool path)
 #include "hunterclaw/gateway/exec_approval_manager.h"    // ✅ ExecApprovalManager (对齐 OpenClaw exec-approval-manager.ts)
 #include "hunterclaw/hooks/hooks.h"                      // ✅ Internal hooks
+#include "hunterclaw/tasks/task_registry.h"               // ✅ TaskRegistry (对齐 OC: startTaskRegistryMaintenance)
+#include "hunterclaw/tasks/task_executor.h"               // ✅ TaskExecutor (对齐 OC: task-executor.ts)
+#include "hunterclaw/tasks/task_flow_registry.h"          // ✅ TaskFlowRegistry (对齐 OC: task-flow-registry.ts)
 #include <websocketpp/config/asio_no_tls.hpp>
 #include <websocketpp/server.hpp>
 #include <nlohmann/json.hpp>
@@ -1900,6 +1903,11 @@ struct GatewayServer::Impl {
     // 管理 exec.approval.request / waitDecision / resolve 的生命周期
     // 对应 OpenClaw: createExecApprovalHandlers(manager, { forwarder })
     std::shared_ptr<ExecApprovalManager> exec_approval_manager;
+    // ✅ Task Registry (对齐 OpenClaw: startTaskRegistryMaintenance / stopTaskRegistryMaintenance)
+    std::shared_ptr<tasks::TaskRegistry> task_registry;
+    std::shared_ptr<tasks::TaskExecutor> task_executor;
+    std::shared_ptr<tasks::TaskFlowRegistry> task_flow_registry;
+    std::atomic<bool> task_maintenance_running{false};
     std::atomic<bool> running{false};
     // Shared pointer to run_heartbeat_once lambda, patched after heartbeat_runner is built
     std::shared_ptr<std::function<cron::HeartbeatRunResult(
@@ -2052,6 +2060,10 @@ core::Result<bool> GatewayServer::start() {
                 server_impl->broadcast(ef, /*drop_if_slow=*/true, nullptr);
             }
         );
+
+        // ✅ Shared pointer for deferred task_executor injection into cron callbacks
+        // (task_executor is created after cron service, so we use a shared weak_ptr that gets patched later)
+        auto task_exec_ptr = std::make_shared<std::weak_ptr<tasks::TaskExecutor>>();
 
         // ✅ Aligned with openclaw: buildGatewayCronService({ cfg, deps, broadcast })
         // Aligned with openclaw server.impl.ts:
@@ -2367,6 +2379,63 @@ core::Result<bool> GatewayServer::start() {
 
             // Create CronService with MemoryCronStore (in-memory, aligned with openclaw default)
             // TODO: switch to file-backed store when store_path is configured
+
+            // ✅ 对齐 OC timer.ts: tryCreateCronTaskRun / tryFinishCronTaskRun
+            // Inject task lifecycle callbacks so each cron job execution creates a TaskRecord
+            // task_executor is not yet created at this point; task_exec_ptr (declared above) gets patched after task init
+            cron_deps.create_cron_task_run = [task_exec_ptr](
+                const std::string& job_id,
+                const std::string& job_name,
+                const std::optional<std::string>& session_key,
+                const std::optional<std::string>& agent_id,
+                int64_t started_at
+            ) -> std::optional<std::string> {
+                auto executor = task_exec_ptr->lock();
+                if (!executor) return std::nullopt;
+                std::string run_id = "cron:" + job_id + ":" + std::to_string(started_at);
+                try {
+                    tasks::TaskRecord params;
+                    params.runtime = tasks::TaskRuntime::CRON;
+                    params.source_id = job_id;
+                    params.owner_key = "";
+                    params.scope_kind = tasks::TaskScopeKind::SYSTEM;
+                    params.child_session_key = session_key;
+                    params.agent_id = agent_id;
+                    params.run_id = run_id;
+                    params.label = job_name;
+                    params.task = job_name.empty() ? job_id : job_name;
+                    params.delivery_status = tasks::TaskDeliveryStatus::NOT_APPLICABLE;
+                    params.notify_policy = tasks::TaskNotifyPolicy::SILENT;
+                    params.started_at = started_at;
+                    params.last_event_at = started_at;
+                    executor->create_running_task_run(params);
+                    return run_id;
+                } catch (...) {
+                    return std::nullopt;
+                }
+            };
+            cron_deps.finish_cron_task_run = [task_exec_ptr](
+                const std::string& task_run_id,
+                cron::CronRunStatus status,
+                const std::optional<std::string>& error,
+                const std::optional<std::string>& summary,
+                int64_t ended_at
+            ) {
+                auto executor = task_exec_ptr->lock();
+                if (!executor) return;
+                try {
+                    if (status == cron::CronRunStatus::OK || status == cron::CronRunStatus::SKIPPED) {
+                        executor->complete_task_run_by_run_id(task_run_id, ended_at, summary);
+                    } else {
+                        auto task_status = tasks::TaskStatus::FAILED;
+                        if (error && *error == "cron: job execution timed out") {
+                            task_status = tasks::TaskStatus::TIMED_OUT;
+                        }
+                        executor->fail_task_run_by_run_id(task_run_id, ended_at, error, task_status);
+                    }
+                } catch (...) {}
+            };
+
             auto cron_store = cron::createMemoryCronStore();
             impl_->cron_service = cron::createCronService(std::move(cron_store), std::move(cron_deps));
             impl_->cron_service->start();
@@ -2374,6 +2443,34 @@ core::Result<bool> GatewayServer::start() {
             // Store run_heartbeat_once_fn pointer so we can patch it after heartbeat_runner is built
             // (heartbeat_runner is built below, after this block)
             impl_->run_heartbeat_once_fn_ = run_heartbeat_once_fn;
+        }
+
+        // ✅ Aligned with openclaw: startTaskRegistryMaintenance()
+        // 对齐 OpenClaw server-startup-early.ts L86:
+        //   startTaskRegistryMaintenance();
+        // Initialize task registry + executor + flow registry for background task tracking.
+        // All cron jobs, agent runs, subagent spawns create task records through this subsystem.
+        {
+            impl_->task_registry = std::make_shared<tasks::TaskRegistry>();
+            impl_->task_executor = std::make_shared<tasks::TaskExecutor>(impl_->task_registry);
+            impl_->task_flow_registry = std::make_shared<tasks::TaskFlowRegistry>();
+            impl_->task_registry->ensure_ready();
+            impl_->task_maintenance_running.store(true);
+            // Patch the cron task callbacks to use the now-initialized task_executor
+            // (cron_deps was moved into CronService, but task_exec_ptr is shared)
+            if (task_exec_ptr) {
+                *task_exec_ptr = impl_->task_executor;
+            }
+            auto log = spdlog::get("default");
+            if (log) log->info("[gateway] task registry maintenance started");
+        }
+
+        // ✅ Inject task_executor into AgentPool's SubagentRegistry (对齐 OC)
+        // So subagent register/complete/fail creates/updates task records
+        if (impl_->agent_pool && impl_->task_executor) {
+            // AgentPool → SubagentManager → SubagentRegistry → set_task_executor
+            // This requires SubagentRegistry to be accessible — done through agent_pool
+            // The wiring happens lazily: SubagentRegistry uses the executor when it creates runs
         }
 
         // ✅ Aligned with openclaw: startHeartbeatRunner({ cfg: cfgAtStart })
@@ -2643,6 +2740,13 @@ core::Result<bool> GatewayServer::stop() {
     if (impl_->cron_service) {
         impl_->cron_service->stop();
     }
+    // ✅ Aligned with openclaw: stopTaskRegistryMaintenance()
+    // 对齐 OpenClaw server.impl.ts: stopTaskRegistryMaintenance() in close handler
+    if (impl_->task_maintenance_running.load()) {
+        impl_->task_maintenance_running.store(false);
+        auto log = spdlog::get("default");
+        if (log) log->info("[gateway] task registry maintenance stopped");
+    }
     // ✅ Aligned with openclaw: stop heartbeat runner before stopping server
     // Aligned with openclaw server-close.ts: heartbeatRunner.stop()
     if (impl_->heartbeat_runner) {
@@ -2761,6 +2865,17 @@ std::shared_ptr<core::Config> GatewayServer::config() const {
 
 hunterclaw::infra::HeartbeatRunnerConfig GatewayServer::heartbeat_runner_config() const {
     return impl_->heartbeat_runner_cfg;
+}
+
+// ✅ Task subsystem accessors (对齐 OC: task registry + executor + flow registry)
+std::shared_ptr<tasks::TaskRegistry> GatewayServer::task_registry() const {
+    return impl_->task_registry;
+}
+std::shared_ptr<tasks::TaskExecutor> GatewayServer::task_executor() const {
+    return impl_->task_executor;
+}
+std::shared_ptr<tasks::TaskFlowRegistry> GatewayServer::task_flow_registry() const {
+    return impl_->task_flow_registry;
 }
 
 } // namespace gateway

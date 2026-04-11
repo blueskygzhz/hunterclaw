@@ -6,6 +6,8 @@
 #include "hunterclaw/gateway/gateway.h"
 #include "hunterclaw/gateway/method_guard.h"
 #include "hunterclaw/memory/memory_index_manager.h"
+#include "hunterclaw/tasks/task_executor.h"       // ✅ 对齐 OC: task status in doctor
+#include "hunterclaw/tasks/task_flow_registry.h"  // ✅ 对齐 OC: TaskFlow health check
 #include <nlohmann/json.hpp>
 #include <chrono>
 
@@ -173,6 +175,107 @@ core::Result<json> method_doctor_memory_status(
         }
         custom["readonlyRecovery"] = recovery;
         result["custom"] = custom;
+    }
+
+    return core::Result<json>::Ok(result);
+}
+
+// doctor.tasks.status
+// ✅ 对齐 OpenClaw doctor-workspace-status.ts: TaskFlow health check + TaskRegistry summary
+core::Result<json> method_doctor_tasks_status(
+    std::shared_ptr<GatewayServer> server,
+    std::shared_ptr<MethodGuard> method_guard,
+    const ClientContext& client_ctx,
+    const json& params
+) {
+    (void)method_guard; (void)client_ctx; (void)params;
+
+    json result;
+    result["ts"] = doctor_now_ms();
+
+    // TaskRegistry summary (对齐 OC: getInspectableTaskRegistrySummary)
+    auto task_registry = server->task_registry();
+    if (task_registry) {
+        auto summary = task_registry->get_summary();
+        json tasks_json;
+        tasks_json["total"] = summary.total;
+        tasks_json["active"] = summary.active;
+        tasks_json["terminal"] = summary.terminal;
+        tasks_json["failures"] = summary.failures;
+        tasks_json["byStatus"] = json(summary.by_status);
+        tasks_json["byRuntime"] = json(summary.by_runtime);
+        result["tasks"] = tasks_json;
+    } else {
+        result["tasks"] = nullptr;
+    }
+
+    // TaskFlowRegistry summary (对齐 OC: noteFlowRecoveryHints)
+    auto task_flow_registry = server->task_flow_registry();
+    if (task_flow_registry) {
+        auto flows = task_flow_registry->list_task_flow_records();
+        json flows_json;
+        flows_json["total"] = (int)flows.size();
+        int active = 0, blocked = 0, cancel_requested = 0;
+        json suspicious_flows = json::array();
+        for (const auto& flow : flows) {
+            if (flow.status == tasks::TaskFlowStatus::QUEUED ||
+                flow.status == tasks::TaskFlowStatus::RUNNING) {
+                active++;
+            }
+            if (flow.status == tasks::TaskFlowStatus::BLOCKED) {
+                blocked++;
+                // 对齐 OC: check blocked flow with missing blockedTaskId
+                if (flow.blocked_task_id && task_registry) {
+                    auto linked_tasks = task_registry->list_tasks_for_flow_id(flow.flow_id);
+                    bool blocked_task_found = false;
+                    for (const auto& t : linked_tasks) {
+                        if (t.task_id == *flow.blocked_task_id) {
+                            blocked_task_found = true;
+                            break;
+                        }
+                    }
+                    if (!blocked_task_found) {
+                        suspicious_flows.push_back({
+                            {"flowId", flow.flow_id},
+                            {"issue", "blocked TaskFlow points at missing task " + *flow.blocked_task_id}
+                        });
+                    }
+                }
+            }
+            if (flow.cancel_requested_at) cancel_requested++;
+            // 对齐 OC: check running managed flow with no tasks or wait state
+            if (flow.sync_mode == tasks::TaskFlowSyncMode::MANAGED &&
+                flow.status == tasks::TaskFlowStatus::RUNNING && task_registry) {
+                auto linked = task_registry->list_tasks_for_flow_id(flow.flow_id);
+                if (linked.empty() && !flow.wait_json) {
+                    suspicious_flows.push_back({
+                        {"flowId", flow.flow_id},
+                        {"issue", "running managed TaskFlow has no linked tasks or wait state"}
+                    });
+                }
+            }
+        }
+        flows_json["active"] = active;
+        flows_json["blocked"] = blocked;
+        flows_json["cancelRequested"] = cancel_requested;
+        if (!suspicious_flows.empty()) {
+            flows_json["suspiciousFlows"] = suspicious_flows;
+        }
+        result["taskFlows"] = flows_json;
+    } else {
+        result["taskFlows"] = nullptr;
+    }
+
+    // Task audit (对齐 OC: listTaskAuditFindings)
+    if (task_registry) {
+        auto all_tasks = task_registry->list_task_records();
+        auto findings = tasks::list_task_audit_findings(all_tasks, doctor_now_ms());
+        auto audit_summary = tasks::summarize_task_audit_findings(findings);
+        result["taskAudit"] = {
+            {"total", audit_summary.total},
+            {"warnings", audit_summary.warnings},
+            {"errors", audit_summary.errors}
+        };
     }
 
     return core::Result<json>::Ok(result);
