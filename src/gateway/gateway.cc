@@ -17,8 +17,7 @@
 #include "hunterclaw/cron/service.h"                     // ✅ CronService (aligned with openclaw: buildGatewayCronService)
 #include "hunterclaw/cron/gateway_integration.h"          // ✅ GatewayCronIntegration (agent tool path)
 #include "hunterclaw/gateway/exec_approval_manager.h"    // ✅ ExecApprovalManager (对齐 OpenClaw exec-approval-manager.ts)
-#include "hunterclaw/hooks/hooks.h"                      // ✅ Internal hooks (对齐 OpenClaw server-startup-post-attach.ts)
-#include "hunterclaw/hooks/hook_loader.h"                // ✅ HookLoader (对齐 OpenClaw loadInternalHooks)
+#include "hunterclaw/hooks/hooks.h"                      // ✅ Internal hooks
 #include <websocketpp/config/asio_no_tls.hpp>
 #include <websocketpp/server.hpp>
 #include <nlohmann/json.hpp>
@@ -2622,9 +2621,7 @@ core::Result<bool> GatewayServer::start() {
             std::string workspace_dir = impl_->config->data.value("workspace", ".");
             hooks::HookLoader loader;
             int hook_count = loader.load_internal_hooks(*impl_->config, workspace_dir);
-            if (hook_count > 0) {
-                spdlog::info("[gateway] Loaded {} internal hook handler(s)", hook_count);
-            }
+            (void)hook_count; // loaded count for diagnostics
             
             // Fire gateway:startup hook (对齐 OC: setTimeout → triggerInternalHook)
             auto event = hooks::create_internal_hook_event(
@@ -2633,8 +2630,8 @@ core::Result<bool> GatewayServer::start() {
                 core::JsonValue::object());
             event.context["workspaceDir"] = workspace_dir;
             hooks::HookRegistry::instance().trigger_hook(event);
-        } catch (const std::exception& e) {
-            spdlog::warn("[gateway] Hook loading failed: {}", e.what());
+        } catch (...) {
+            // Hook loading is non-fatal
         }
     }
 
