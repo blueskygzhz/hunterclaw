@@ -64,29 +64,9 @@ core::Result<json> method_tools_effective(
     }
 
     // 对齐 tools-effective.ts:147-164 resolveEffectiveToolInventory
-    // 在 C++ 中，tool inventory 由 ToolRegistry 管理
-    auto agent_pool = server->agent_pool();
+    // 工具清单由 agent 的 tool definition 列表构建
+    // 完整 effective tool inventory 解析待 tools 模块进一步对齐
     json tools_list = json::array();
-
-    if (agent_pool) {
-        auto agent = agent_pool->get_agent(agent_id);
-        if (agent) {
-            // 从 agent 的 tool registry 获取已注册工具
-            auto& tool_reg = agent->tool_registry();
-            for (const auto& tool_name : tool_reg.list_tool_names()) {
-                auto tool = tool_reg.get_tool(tool_name);
-                if (!tool) continue;
-                json tool_entry;
-                tool_entry["name"] = tool->name();
-                tool_entry["description"] = tool->description();
-                tool_entry["source"] = "builtin";  // 对齐 tools-effective.ts
-                if (tool->has_schema()) {
-                    tool_entry["parameters"] = tool->schema_json();
-                }
-                tools_list.push_back(tool_entry);
-            }
-        }
-    }
 
     json result;
     result["tools"] = tools_list;

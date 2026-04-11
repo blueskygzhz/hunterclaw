@@ -7,8 +7,8 @@
 namespace hunterclaw {
 namespace sessions {
 
-// Max length for session labels (aligned with OpenClaw: SESSION_LABEL_MAX_LENGTH = 64)
-constexpr size_t SESSION_LABEL_MAX_LENGTH = 64;
+// Max length for session labels (aligned with OpenClaw: SESSION_LABEL_MAX_LENGTH = 512)
+constexpr size_t SESSION_LABEL_MAX_LENGTH = 512;
 
 // Result type for parseSessionLabel (aligned with OpenClaw ParsedSessionLabel)
 struct ParsedSessionLabelOk {
