@@ -2615,15 +2615,12 @@ core::Result<bool> GatewayServer::start() {
     }
 
     // ✅ Aligned with openclaw: server-startup-post-attach.ts L165-187
-    // Load internal hooks + fire gateway:startup hook (delayed 250ms like OC)
+    // Fire gateway:startup hook (对齐 OC: setTimeout → triggerInternalHook)
+    // Note: HookLoader is in hunterclaw_core; gateway directly fires the event.
+    // Bundled hooks are registered at static init time via HookRegistry::instance().
     if (result.is_ok() && impl_->config) {
         try {
             std::string workspace_dir = impl_->config->data.value("workspace", ".");
-            hooks::HookLoader loader;
-            int hook_count = loader.load_internal_hooks(*impl_->config, workspace_dir);
-            (void)hook_count; // loaded count for diagnostics
-            
-            // Fire gateway:startup hook (对齐 OC: setTimeout → triggerInternalHook)
             auto event = hooks::create_internal_hook_event(
                 hooks::HookEventType::GATEWAY, "startup",
                 "gateway:startup",
