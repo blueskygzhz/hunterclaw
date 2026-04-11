@@ -57,6 +57,7 @@ struct DeliverOutboundPayloadsParams {
     bool best_effort = false;
     bool silent = false;
     bool gif_playback = false;
+    std::string session_key;  // 对齐 OC: sessionKeyForInternalHooks — used to fire internal message:sent hook
 
     // Abort signal (对齐 openclaw abortSignal)
     std::shared_ptr<std::atomic<bool>> abort_signal;

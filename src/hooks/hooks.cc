@@ -46,32 +46,34 @@ void HookRegistry::clear_hooks() {
 }
 
 void HookRegistry::trigger_hook(const InternalHookEvent& event) {
-    std::string event_key = get_event_key(event);
-    
-    std::vector<InternalHookHandler> handlers;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = handlers_.find(event_key);
-        if (it != handlers_.end()) {
-            handlers = it->second;
-        }
-    }
-    
-    if (handlers.empty()) {
-        //spdlog::trace("[HookRegistry] No hooks registered for event '{}'", event_key);
+    if (!has_listeners(event.type, event.action)) {
         return;
     }
     
-    //spdlog::debug("[HookRegistry] Triggering {} hook(s) for event '{}'", 
-//              handlers.size(), event_key);
+    std::string type_key = get_event_key(event.type, "");
+    type_key.pop_back(); // remove trailing ':'
+    std::string specific_key = get_event_key(event);
     
-    // Execute all handlers
-    for (const auto& handler : handlers) {
+    std::vector<InternalHookHandler> all_handlers;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // Type-level handlers (e.g., "command")
+        auto it_type = handlers_.find(type_key);
+        if (it_type != handlers_.end()) {
+            all_handlers.insert(all_handlers.end(), it_type->second.begin(), it_type->second.end());
+        }
+        // Specific handlers (e.g., "command:new")
+        auto it_specific = handlers_.find(specific_key);
+        if (it_specific != handlers_.end()) {
+            all_handlers.insert(all_handlers.end(), it_specific->second.begin(), it_specific->second.end());
+        }
+    }
+    
+    for (const auto& handler : all_handlers) {
         try {
             handler(event);
-        } catch (const std::exception& e) {
-            //spdlog::error("[HookRegistry] Hook handler failed for event '{}': {}",
-            //              event_key, e.what());
+        } catch (const std::exception& /*e*/) {
+            // Hook handler error — fire-and-forget, swallow exceptions
         }
     }
 }
@@ -117,6 +119,33 @@ std::string HookRegistry::get_event_key(HookEventType type, const std::string& a
     }
     
     return type_str + ":" + action;
+}
+
+bool HookRegistry::has_listeners(HookEventType type, const std::string& action) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::string type_str;
+    switch (type) {
+        case HookEventType::COMMAND: type_str = "command"; break;
+        case HookEventType::SESSION: type_str = "session"; break;
+        case HookEventType::AGENT: type_str = "agent"; break;
+        case HookEventType::GATEWAY: type_str = "gateway"; break;
+        case HookEventType::MESSAGE: type_str = "message"; break;
+        default: return false;
+    }
+    auto it_type = handlers_.find(type_str);
+    if (it_type != handlers_.end() && !it_type->second.empty()) return true;
+    auto it_specific = handlers_.find(type_str + ":" + action);
+    return it_specific != handlers_.end() && !it_specific->second.empty();
+}
+
+std::vector<std::string> HookRegistry::get_registered_event_keys() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<std::string> keys;
+    keys.reserve(handlers_.size());
+    for (const auto& [key, _] : handlers_) {
+        keys.push_back(key);
+    }
+    return keys;
 }
 
 // ============================================================================
@@ -342,6 +371,46 @@ bool is_gateway_startup_event(const InternalHookEvent& event) {
 
 bool is_message_sent_event(const InternalHookEvent& event) {
     return event.type == HookEventType::MESSAGE && event.action == "sent";
+}
+
+bool is_message_received_event(const InternalHookEvent& event) {
+    return event.type == HookEventType::MESSAGE && event.action == "received";
+}
+
+bool is_message_transcribed_event(const InternalHookEvent& event) {
+    return event.type == HookEventType::MESSAGE && event.action == "transcribed";
+}
+
+bool is_message_preprocessed_event(const InternalHookEvent& event) {
+    return event.type == HookEventType::MESSAGE && event.action == "preprocessed";
+}
+
+bool is_session_patch_event(const InternalHookEvent& event) {
+    return event.type == HookEventType::SESSION && event.action == "patch";
+}
+
+SessionPatchEvent create_session_patch_event(const SessionPatchContext& context) {
+    SessionPatchEvent event;
+    event.patch_context = context;
+    event.context = core::JsonValue::object();
+    event.context["patch"] = context.patch;
+    event.context["sessionEntry"] = context.session_entry;
+    return event;
+}
+
+InternalHookEvent create_internal_hook_event(
+    HookEventType type,
+    const std::string& action,
+    const std::string& session_key,
+    const core::JsonValue& context
+) {
+    InternalHookEvent event;
+    event.type = type;
+    event.action = action;
+    event.session_key = session_key;
+    event.context = context;
+    event.timestamp = std::chrono::system_clock::now();
+    return event;
 }
 
 }  // namespace hooks

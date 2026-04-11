@@ -133,11 +133,14 @@ enum class HookEventType {
 };
 
 /// Base internal hook event
-/// 对齐: InternalHookEvent
+/// 对齐: InternalHookEvent (internal-hooks.ts:175-188)
 struct InternalHookEvent {
     HookEventType type;
     std::string action;
-    core::JsonValue context;  // Context data as JSON
+    std::string session_key;                    // 对齐: sessionKey — OC 所有 hook 都携带
+    core::JsonValue context;                    // Context data as JSON
+    std::chrono::system_clock::time_point timestamp = std::chrono::system_clock::now(); // 对齐: timestamp
+    std::vector<std::string> messages;          // 对齐: messages — hooks can push reply messages
     
     virtual ~InternalHookEvent() = default;
 };
@@ -304,6 +307,27 @@ struct MessagePreprocessedEvent : public InternalHookEvent {
 };
 
 // ========================================================================
+// Session Events
+// ========================================================================
+
+/// Session patch context (对齐: SessionPatchHookContext)
+struct SessionPatchContext {
+    core::JsonValue session_entry;  // SessionEntry as JSON
+    core::JsonValue patch;          // SessionsPatchParams as JSON
+    std::optional<core::Config> config;
+};
+
+/// Session patch event (对齐: SessionPatchHookEvent)
+struct SessionPatchEvent : public InternalHookEvent {
+    SessionPatchContext patch_context;
+    
+    SessionPatchEvent() {
+        type = HookEventType::SESSION;
+        action = "patch";
+    }
+};
+
+// ========================================================================
 // Hook Handler
 // ========================================================================
 
@@ -339,6 +363,14 @@ public:
     
     /// Get handlers for event key
     std::vector<InternalHookHandler> get_handlers(const std::string& event_key) const;
+    
+    /// Check if any listeners registered for type:action
+    /// 对齐: hasInternalHookListeners(type, action)
+    bool has_listeners(HookEventType type, const std::string& action) const;
+    
+    /// Get all registered event keys (debugging)
+    /// 对齐: getRegisteredEventKeys()
+    std::vector<std::string> get_registered_event_keys() const;
     
     /// Get event key from event
     /// 对齐: createInternalHookEvent() 的 eventKey 生成逻辑
@@ -383,6 +415,18 @@ MessageTranscribedEvent create_message_transcribed_event(const MessageTranscribe
 /// 对齐: createInternalHookEvent({ type: "message", action: "preprocessed", ... })
 MessagePreprocessedEvent create_message_preprocessed_event(const MessagePreprocessedContext& context);
 
+/// Create session patch event
+/// 对齐: createInternalHookEvent({ type: "session", action: "patch", ... })
+SessionPatchEvent create_session_patch_event(const SessionPatchContext& context);
+
+/// Create internal hook event (generic factory)
+/// 对齐: createInternalHookEvent(type, action, sessionKey, context)
+InternalHookEvent create_internal_hook_event(
+    HookEventType type,
+    const std::string& action,
+    const std::string& session_key,
+    const core::JsonValue& context = core::JsonValue::object());
+
 /// Check if event is agent bootstrap event
 /// 对齐: isAgentBootstrapEvent(event)
 bool is_agent_bootstrap_event(const InternalHookEvent& event);
@@ -391,9 +435,25 @@ bool is_agent_bootstrap_event(const InternalHookEvent& event);
 /// 对齐: isGatewayStartupEvent(event)
 bool is_gateway_startup_event(const InternalHookEvent& event);
 
+/// Check if event is message received event
+/// 对齐: isMessageReceivedEvent(event)
+bool is_message_received_event(const InternalHookEvent& event);
+
 /// Check if event is message sent event
 /// 对齐: isMessageSentEvent(event)
 bool is_message_sent_event(const InternalHookEvent& event);
+
+/// Check if event is message transcribed event
+/// 对齐: isMessageTranscribedEvent(event)
+bool is_message_transcribed_event(const InternalHookEvent& event);
+
+/// Check if event is message preprocessed event
+/// 对齐: isMessagePreprocessedEvent(event)
+bool is_message_preprocessed_event(const InternalHookEvent& event);
+
+/// Check if event is session patch event
+/// 对齐: isSessionPatchEvent(event)
+bool is_session_patch_event(const InternalHookEvent& event);
 
 }  // namespace hooks
 }  // namespace hunterclaw

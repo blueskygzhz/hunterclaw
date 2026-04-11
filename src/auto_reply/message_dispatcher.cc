@@ -27,6 +27,8 @@
 #include "hunterclaw/llm/llm_client.h"
 #include "hunterclaw/core/utils.h"
 #include "hunterclaw/tools/tool_hooks.h"    // 🎯 message_received hook
+#include "hunterclaw/hooks/hooks.h"          // 🎯 Internal hooks (message:received)
+#include "hunterclaw/hooks/message_hook_mappers.h" // 🎯 toInternalMessageReceivedContext
 #include "hunterclaw/agents/agent_pool.h"      // ✅ 对齐 OpenClaw: ACP dispatch 需要 agent_pool
 #include "hunterclaw/agents/agent_instance.h"  // ✅ 需要完整类型以访问 context().last_channel 等字段
 #include "hunterclaw/acp/acp_session_manager.h"  // ✅ 对齐 OpenClaw: ACP 控制平面
@@ -391,6 +393,26 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
             } catch (const std::exception& e) {
                 log()->warn("dispatch_reply_from_config: message_received hook failed: {}", e.what());
             }
+        }
+        
+        // 🎯 对齐 OpenClaw: dispatch-from-config.ts L499-503
+        // triggerInternalHook(createInternalHookEvent("message", "received", sessionKey, ...))
+        if (!session_key.empty()) {
+            try {
+                hooks::CanonicalInboundMessageHookContext canonical;
+                canonical.from = message.sender_id;
+                canonical.content = message.text;
+                canonical.channel_id = message.channel;
+                canonical.account_id = message.account_id;
+                canonical.conversation_id = message.chat_id.empty()
+                    ? message.sender_id : message.chat_id;
+                canonical.is_group = !message.chat_id.empty() &&
+                    message.chat_id != message.sender_id;
+                auto internal_ctx = hooks::to_internal_message_received_context(canonical);
+                auto event = hooks::create_message_received_event(internal_ctx);
+                event.session_key = session_key;
+                hooks::HookRegistry::instance().trigger_hook(event);
+            } catch (...) {}  // fire-and-forget
         }
     }
 

@@ -20,6 +20,8 @@
 #include "hunterclaw/outbound/deliver.h"
 #include "hunterclaw/channels/plugin.h"
 #include "hunterclaw/tools/tool_hooks.h"    // 🎯 message_sending / message_sent hooks
+#include "hunterclaw/hooks/hooks.h"          // 🎯 Internal hooks (message:sent)
+#include "hunterclaw/hooks/message_hook_mappers.h" // 🎯 toInternalMessageSentContext
 #include "hunterclaw/observability/diagnostic_events.h"
 #include <spdlog/spdlog.h>
 #include <algorithm>
@@ -420,6 +422,21 @@ core::Result<std::vector<OutboundDeliveryResult>> deliver_outbound_payloads_core
                 ? std::nullopt : std::make_optional(to);
             try {
                 hook_mgr->run_message_sent(mst_event, mst_ctx);
+            } catch (...) {}  // fire-and-forget
+        }
+        
+        // 🎯 对齐 OpenClaw: deliver.ts L421-427
+        // fireAndForgetHook(triggerInternalHook(createInternalHookEvent("message", "sent", sessionKey, ...)))
+        if (!params.session_key.empty()) {
+            try {
+                auto sent_ctx = hooks::build_canonical_sent_message_context(
+                    to, msg_text, success, channel_id,
+                    error_str.empty() ? std::nullopt : std::make_optional(error_str),
+                    params.account_id);
+                auto internal_ctx = hooks::to_internal_message_sent_context(sent_ctx);
+                auto event = hooks::create_message_sent_event(internal_ctx);
+                event.session_key = params.session_key;
+                hooks::HookRegistry::instance().trigger_hook(event);
             } catch (...) {}  // fire-and-forget
         }
     };
