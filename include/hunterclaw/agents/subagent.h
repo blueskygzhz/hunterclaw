@@ -521,5 +521,179 @@ private:
     std::shared_ptr<SubagentAnnouncer> announcer_;
 };
 
+// ============================================================================
+// 🎯 对齐 OpenClaw: subagent-capabilities.ts
+// Subagent Capabilities (role, scope, spawn permissions)
+// ============================================================================
+
+struct SubagentCapabilities {
+    int depth = 0;                              // Current spawn depth
+    std::string role = "main";                  // "main" | "orchestrator" | "leaf"
+    std::string control_scope = "children";     // "children" | "none"
+    bool can_spawn = true;                      // Can this session spawn children
+    bool can_control_children = true;           // Can this session control its children
+};
+
+/// 🎯 对齐 OpenClaw: resolveSubagentRoleForDepth({ depth, maxSpawnDepth })
+std::string resolve_subagent_role_for_depth(int depth, int max_spawn_depth = 5);
+
+/// 🎯 对齐 OpenClaw: resolveSubagentControlScopeForRole(role)
+std::string resolve_subagent_control_scope_for_role(const std::string& role);
+
+/// 🎯 对齐 OpenClaw: resolveSubagentCapabilities({ depth, maxSpawnDepth })
+SubagentCapabilities resolve_subagent_capabilities(int depth, int max_spawn_depth = 5);
+
+/// 🎯 对齐 OpenClaw: resolveStoredSubagentCapabilities(sessionKey, opts)
+SubagentCapabilities resolve_stored_subagent_capabilities(
+    const std::string& session_key,
+    const core::Config* cfg = nullptr
+);
+
+// ============================================================================
+// 🎯 对齐 OpenClaw: subagent-depth.ts
+// Subagent Depth Tracking
+// ============================================================================
+
+/// 🎯 对齐 OpenClaw: getSubagentDepthFromSessionStore(sessionKey, opts)
+int get_subagent_depth_from_session_store(
+    const std::string& session_key,
+    const core::Config* cfg = nullptr
+);
+
+// ============================================================================
+// 🎯 对齐 OpenClaw: subagent-list.ts
+// Subagent List Building
+// ============================================================================
+
+struct SubagentListItem {
+    int index = 0;
+    std::string line;
+    std::string run_id;
+    std::string session_key;
+    std::string label;
+    std::string task;
+    std::string status;
+    int pending_descendants = 0;
+    std::string runtime;
+    int64_t runtime_ms = 0;
+    std::vector<std::string> child_sessions;
+    std::string model;
+    int64_t total_tokens = 0;
+    uint64_t started_at = 0;
+    uint64_t ended_at = 0;
+};
+
+struct BuiltSubagentList {
+    int total = 0;
+    std::vector<SubagentListItem> active;
+    std::vector<SubagentListItem> recent;
+    std::string text;
+};
+
+struct SubagentRunIndex {
+    std::map<std::string, std::shared_ptr<SubagentEntry>> latest_by_child_session_key;
+    std::map<std::string, std::vector<std::string>> child_sessions_by_controller;
+};
+
+/// 🎯 对齐 OpenClaw: buildLatestSubagentRunIndex(runs)
+SubagentRunIndex build_latest_subagent_run_index(
+    const std::map<std::string, std::shared_ptr<SubagentEntry>>& runs
+);
+
+/// 🎯 对齐 OpenClaw: isActiveSubagentRun(entry, pendingDescendantCount)
+bool is_active_subagent_run(const SubagentEntry& entry, int pending_descendant_count);
+
+/// 🎯 对齐 OpenClaw: buildSubagentList({ cfg, runs, recentMinutes, taskMaxChars })
+BuiltSubagentList build_subagent_list(
+    const std::vector<SubagentEntry>& runs,
+    int recent_minutes = 30,
+    int task_max_chars = 72
+);
+
+// ============================================================================
+// 🎯 对齐 OpenClaw: subagent-control.ts
+// Subagent Control (steer, kill, reply)
+// ============================================================================
+
+struct SubagentController {
+    std::string controller_session_key;
+    std::string caller_session_key;
+    bool caller_is_subagent = false;
+    std::string control_scope = "children";     // "children" | "none"
+};
+
+struct KillSubagentResult {
+    bool killed = false;
+    std::string session_id;
+    std::string error;
+};
+
+struct CascadeKillResult {
+    int killed = 0;
+    std::vector<std::string> labels;
+};
+
+/// 🎯 对齐 OpenClaw: resolveSubagentController({ cfg, agentSessionKey })
+SubagentController resolve_subagent_controller(
+    const core::Config& cfg,
+    const std::string& agent_session_key
+);
+
+/// 🎯 对齐 OpenClaw: listControlledSubagentRuns(controllerSessionKey)
+std::vector<std::shared_ptr<SubagentEntry>> list_controlled_subagent_runs(
+    SubagentRegistry& registry,
+    const std::string& controller_session_key
+);
+
+/// 🎯 对齐 OpenClaw: killSubagentRun({ cfg, entry, cache })
+KillSubagentResult kill_subagent_run(
+    SubagentRegistry& registry,
+    const std::string& run_id
+);
+
+/// 🎯 对齐 OpenClaw: cascadeKillChildren({ cfg, parentChildSessionKey, ... })
+CascadeKillResult cascade_kill_children(
+    SubagentRegistry& registry,
+    const std::string& parent_child_session_key
+);
+
+/// 🎯 对齐 OpenClaw: steerSubagent
+core::Result<std::string> steer_subagent(
+    SubagentRegistry& registry,
+    gateway::GatewayClient& gw,
+    const std::string& run_id,
+    const std::string& message,
+    const SubagentController& controller
+);
+
+/// 🎯 对齐 OpenClaw: getSubagentReply
+core::Result<std::string> get_subagent_reply(
+    SubagentRegistry& registry,
+    const std::string& run_id,
+    const SubagentController& controller
+);
+
+// ============================================================================
+// 🎯 对齐 OpenClaw: subagent-orphan-recovery.ts
+// Orphan Session Recovery
+// ============================================================================
+
+/// 🎯 对齐 OpenClaw: resumeOrphanedSession(params)
+bool resume_orphaned_session(
+    gateway::GatewayClient& gw,
+    SubagentRegistry& registry,
+    const std::string& session_key,
+    const std::string& task,
+    const std::string& last_human_message,
+    const std::string& original_run_id
+);
+
+/// 🎯 对齐 OpenClaw: recoverOrphanedSubagentSessions()
+void recover_orphaned_subagent_sessions(
+    gateway::GatewayClient& gw,
+    SubagentRegistry& registry,
+    int64_t recovery_delay_ms = 5000
+);
+
 } // namespace agents
 } // namespace hunterclaw

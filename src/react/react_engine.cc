@@ -203,10 +203,27 @@ ReactResult ReactEngine::run(
         auto result = execute_loop(user_input, history, callbacks);
         
         // ✅ ContextEngine: afterTurn (严格对齐 OpenClaw attempt.ts:2610-2660)
-        // 当前 ReactResult 没有 messages_snapshot，跳过 context ingest
-        // TODO: 添加 messages_snapshot 到 ReactResult 后启用
-        if (context_engine_) {
-            log()->debug("[ContextEngine] afterTurn skipped: messages_snapshot not yet available in ReactResult");
+        if (context_engine_ && !result.messages_snapshot.empty()) {
+            try {
+                std::vector<std::string> message_texts;
+                for (const auto& msg : result.messages_snapshot) {
+                    if (msg.is_object() && msg.contains("content")) {
+                        message_texts.push_back(msg["content"].as_string());
+                    }
+                }
+                context_engine_->after_turn(
+                    "",     // session_id (not available in ReactEngine scope)
+                    "main", // agent_id
+                    message_texts,
+                    result.tool_calls,
+                    std::nullopt,
+                    false,
+                    std::nullopt,
+                    context::ContextEngineRuntimeContext{}
+                );
+            } catch (...) {
+                // afterTurn is best-effort
+            }
         }
         
         // ✅ Span 成功标记

@@ -546,15 +546,86 @@ PdfAnalysisResult PDFTool::analyze_with_anthropic(
     std::string pdf_data((std::istreambuf_iterator<char>(f)),
                           std::istreambuf_iterator<char>());
 
-    // TODO: call Anthropic API with native PDF support
-    // For now, return stub
+    // ✅ 对齐 OC: pdf-native-providers.ts — Anthropic 原生 PDF 分析
+    // 使用 HTTP client 直接调用 Anthropic Messages API
+    std::string api_key;
+    const char* env_key = std::getenv("ANTHROPIC_API_KEY");
+    if (env_key && env_key[0] != '\0') api_key = env_key;
+
+    if (api_key.empty()) {
+        PdfAnalysisResult result;
+        result.analysis = "[Anthropic PDF analysis: no ANTHROPIC_API_KEY set]";
+        result.model = model;
+        result.used_native_pdf = false;
+        result.used_extraction_fallback = true;
+        return result;
+    }
+
+    // Base64 encode PDF data
+    std::string base64_pdf;
+    {
+        static const char* b64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        base64_pdf.reserve(pdf_data.size() * 4 / 3 + 4);
+        unsigned val = 0; int bits = -6;
+        for (unsigned char c : pdf_data) {
+            val = (val << 8) + c; bits += 8;
+            while (bits >= 0) { base64_pdf.push_back(b64[(val >> bits) & 0x3F]); bits -= 6; }
+        }
+        if (bits > -6) base64_pdf.push_back(b64[((val << 8) >> (bits + 8)) & 0x3F]);
+        while (base64_pdf.size() % 4) base64_pdf.push_back('=');
+    }
+
+    // Build Anthropic Messages API request with document content block
+    nlohmann::json request_body;
+    request_body["model"] = model.empty() ? "claude-sonnet-4-20250514" : model;
+    request_body["max_tokens"] = max_tokens > 0 ? max_tokens : 4096;
+    request_body["messages"] = nlohmann::json::array({
+        {{"role", "user"}, {"content", nlohmann::json::array({
+            {{"type", "document"},
+             {"source", {{"type", "base64"}, {"media_type", "application/pdf"}, {"data", base64_pdf}}}},
+            {{"type", "text"},
+             {"text", prompt.empty() ? "Analyze this PDF document comprehensively." : prompt}}
+        })}}
+    });
+
+    infra::HttpRequestOptions http_opts;
+    http_opts.body = request_body.dump();
+    http_opts.timeout_ms = 120000; // 2 min for PDF analysis
+    http_opts.headers = {
+        {"Content-Type", "application/json"},
+        {"x-api-key", api_key},
+        {"anthropic-version", "2023-06-01"},
+        {"anthropic-beta", "pdfs-2024-09-25"}
+    };
+
+    auto http = infra::HttpClient::create();
+    auto response = http->post("https://api.anthropic.com/v1/messages", http_opts);
+
     PdfAnalysisResult result;
-    result.analysis = "[Anthropic native PDF analysis - stub]";
-    result.model = model;
-    result.input_tokens = 0;
-    result.output_tokens = 0;
+    result.model = model.empty() ? "claude-sonnet-4-20250514" : model;
     result.used_native_pdf = true;
     result.used_extraction_fallback = false;
+
+    if (response.is_ok()) {
+        try {
+            auto resp_json = nlohmann::json::parse(response.get().body);
+            if (resp_json.contains("content") && resp_json["content"].is_array()) {
+                for (const auto& block : resp_json["content"]) {
+                    if (block.value("type", "") == "text") {
+                        result.analysis += block.value("text", "");
+                    }
+                }
+            }
+            if (resp_json.contains("usage")) {
+                result.input_tokens = resp_json["usage"].value("input_tokens", 0);
+                result.output_tokens = resp_json["usage"].value("output_tokens", 0);
+            }
+        } catch (...) {
+            result.analysis = "[Anthropic PDF: response parse error]";
+        }
+    } else {
+        result.analysis = "[Anthropic PDF analysis error: " + response.error + "]";
+    }
     return result;
 }
 

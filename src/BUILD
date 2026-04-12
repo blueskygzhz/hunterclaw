@@ -569,6 +569,7 @@ cc_library(
     ],
     linkopts = [
         "-lpthread",
+        "-lsqlite3",  # ✅ SQLite persistence (task/flow stores)
     ],
     linkstatic = False,
     visibility = ["//visibility:public"],
@@ -683,6 +684,7 @@ cc_library(
         ":hunterclaw_observability",  # ✅ 添加 observability 依赖
         ":hunterclaw_outbound",  # ✅ 添加 outbound 依赖 (deliver_outbound_payloads)
         ":hunterclaw_queue",     # ✅ 添加 queue 依赖 (CommandQueue)
+        ":hunterclaw_tasks",     # ✅ 添加 tasks 依赖 (auto_reply/commands_tasks.cc)
         "@ixwebsocket//:ixwebsocket",  # ✅ 添加 ixwebsocket 依赖
         "//:hunterclaw_headers",
         "//third_party:httplib",

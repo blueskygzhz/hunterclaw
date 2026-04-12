@@ -20,6 +20,22 @@ namespace hunterclaw {
 namespace tasks {
 
 // ============================================================================
+// TaskFlowRegistryStore interface (对齐 OC: task-flow-registry.store.ts)
+// ============================================================================
+
+struct TaskFlowRegistrySnapshot {
+    std::vector<TaskFlowRecord> flows;
+};
+
+struct TaskFlowRegistryStore {
+    std::function<TaskFlowRegistrySnapshot()> load_snapshot;
+    std::function<void(const TaskFlowRegistrySnapshot&)> save_snapshot;
+    std::function<void(const TaskFlowRecord&)> upsert_flow;
+    std::function<void(const std::string&)> delete_flow;
+    std::function<void()> close;
+};
+
+// ============================================================================
 // TaskFlowRegistry (对齐 OC: task-flow-registry.ts)
 // ============================================================================
 
@@ -34,6 +50,12 @@ class TaskFlowRegistry {
 public:
     TaskFlowRegistry();
     ~TaskFlowRegistry();
+
+    /// Configure persistence store (对齐 OC: configureTaskFlowRegistryRuntime)
+    void configure_store(std::shared_ptr<TaskFlowRegistryStore> store);
+
+    /// Ensure registry is loaded from store (对齐 OC: ensureTaskFlowRegistryReady)
+    void ensure_ready();
 
     /// Create flow record (对齐 OC: createFlowRecord)
     TaskFlowRecord create_flow_record(const TaskFlowRecord& params);
@@ -86,6 +108,11 @@ public:
 private:
     mutable std::mutex mutex_;
     std::map<std::string, TaskFlowRecord> flows_;
+    std::shared_ptr<TaskFlowRegistryStore> store_;
+    bool restored_ = false;
+
+    void persist_upsert(const TaskFlowRecord& flow);
+    void persist_delete(const std::string& flow_id);
 };
 
 // ============================================================================

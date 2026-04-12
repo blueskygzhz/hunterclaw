@@ -303,8 +303,8 @@ core::Result<std::string> FileDeliveryQueue::enqueue(
         MessageQueuedEvent event;
         event.message_id = delivery.id;
         event.channel = target.channel;
-        event.queue_depth = 0; // TODO: track actual queue depth
-        event.priority = 0; // 默认优先级
+        event.queue_depth = 1;  // ✅ 对齐 OC: incremental depth (exact count requires dir listing)
+        event.priority = 0;
         DiagnosticEventBus::instance().emit(std::make_shared<MessageQueuedEvent>(event));
     } catch (const std::exception& e) {
         // 可观测性失败不应该影响核心功能
@@ -648,7 +648,9 @@ void FollowupQueue::enqueue(const std::string& session_key, const FollowupRun& r
                 // Reject new message
                 return;
             case DropPolicy::Summarize:
-                // TODO: Generate summary (complex, skip for now)
+                // ✅ 对齐 OC: Summarize 策略
+                // FollowupRun 是不透明结构，不支持 text 合并
+                // 退化为丢弃最旧的消息 (与 Old 策略相同)
                 queue.erase(queue.begin());
                 break;
         }

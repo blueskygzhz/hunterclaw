@@ -21,6 +21,9 @@
 #include "hunterclaw/tasks/task_registry.h"               // ✅ TaskRegistry (对齐 OC: startTaskRegistryMaintenance)
 #include "hunterclaw/tasks/task_executor.h"               // ✅ TaskExecutor (对齐 OC: task-executor.ts)
 #include "hunterclaw/tasks/task_flow_registry.h"          // ✅ TaskFlowRegistry (对齐 OC: task-flow-registry.ts)
+#include "hunterclaw/tasks/task_registry_maintenance.h"   // ✅ TaskRegistryMaintenance (对齐 OC: task-registry.maintenance.ts)
+#include "hunterclaw/tasks/task_registry_sqlite_store.h"  // ✅ SQLite persistence (对齐 OC: task-registry.store.sqlite.ts)
+#include "hunterclaw/tasks/task_flow_registry_sqlite_store.h" // ✅ Flow SQLite persistence
 #include <websocketpp/config/asio_no_tls.hpp>
 #include <websocketpp/server.hpp>
 #include <nlohmann/json.hpp>
@@ -1907,7 +1910,7 @@ struct GatewayServer::Impl {
     std::shared_ptr<tasks::TaskRegistry> task_registry;
     std::shared_ptr<tasks::TaskExecutor> task_executor;
     std::shared_ptr<tasks::TaskFlowRegistry> task_flow_registry;
-    std::atomic<bool> task_maintenance_running{false};
+    std::shared_ptr<tasks::TaskRegistryMaintenance> task_maintenance;
     std::atomic<bool> running{false};
     // Shared pointer to run_heartbeat_once lambda, patched after heartbeat_runner is built
     std::shared_ptr<std::function<cron::HeartbeatRunResult(
@@ -2454,8 +2457,23 @@ core::Result<bool> GatewayServer::start() {
             impl_->task_registry = std::make_shared<tasks::TaskRegistry>();
             impl_->task_executor = std::make_shared<tasks::TaskExecutor>(impl_->task_registry);
             impl_->task_flow_registry = std::make_shared<tasks::TaskFlowRegistry>();
+            // ✅ 对齐 OC: configureTaskRegistryRuntime — SQLite 持久化
+            // Configure SQLite persistence so task/flow data survives gateway restarts.
+            {
+                auto task_db_path = tasks::resolve_task_registry_sqlite_path();
+                auto task_store = tasks::make_sqlite_task_registry_store(task_db_path);
+                impl_->task_registry->configure_store(task_store);
+
+                auto flow_db_path = tasks::resolve_task_flow_registry_sqlite_path();
+                auto flow_store = tasks::make_sqlite_task_flow_registry_store(flow_db_path);
+                impl_->task_flow_registry->configure_store(flow_store);
+            }
             impl_->task_registry->ensure_ready();
-            impl_->task_maintenance_running.store(true);
+            impl_->task_flow_registry->ensure_ready();
+            // ✅ Start actual maintenance sweep loop (对齐 OC: startTaskRegistryMaintenance)
+            impl_->task_maintenance = std::make_shared<tasks::TaskRegistryMaintenance>(
+                impl_->task_registry, impl_->task_flow_registry);
+            impl_->task_maintenance->start();
             // Patch the cron task callbacks to use the now-initialized task_executor
             // (cron_deps was moved into CronService, but task_exec_ptr is shared)
             if (task_exec_ptr) {
@@ -2742,8 +2760,8 @@ core::Result<bool> GatewayServer::stop() {
     }
     // ✅ Aligned with openclaw: stopTaskRegistryMaintenance()
     // 对齐 OpenClaw server.impl.ts: stopTaskRegistryMaintenance() in close handler
-    if (impl_->task_maintenance_running.load()) {
-        impl_->task_maintenance_running.store(false);
+    if (impl_->task_maintenance) {
+        impl_->task_maintenance->stop();
         auto log = spdlog::get("default");
         if (log) log->info("[gateway] task registry maintenance stopped");
     }

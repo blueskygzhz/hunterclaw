@@ -686,24 +686,158 @@ int get_rate_limit_remaining(const FixedWindowRateLimit& limiter) {
 // Archive Utilities (Simplified)
 // ============================================================================
 
+// ✅ 对齐 OC: archive.ts + archive-helpers.ts — tar.gz 归档实现
+// 使用 system tar 命令 + POSIX API 实现 (无 std::filesystem 依赖)
+
+namespace {
+std::string make_temp_path(const std::string& prefix) {
+    char tmpl[256];
+    snprintf(tmpl, sizeof(tmpl), "/tmp/%s_XXXXXX", prefix.c_str());
+    int fd = mkstemp(tmpl);
+    if (fd >= 0) close(fd);
+    return std::string(tmpl);
+}
+
+void mkdir_p(const std::string& path) {
+    std::string cmd = "mkdir -p " + path + " 2>/dev/null";
+    (void)std::system(cmd.c_str());
+}
+
+void rm_rf(const std::string& path) {
+    std::string cmd = "rm -rf " + path + " 2>/dev/null";
+    (void)std::system(cmd.c_str());
+}
+
+std::vector<uint8_t> read_file_binary(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) return {};
+    return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)),
+                                 std::istreambuf_iterator<char>());
+}
+
+void write_file_binary(const std::string& path, const void* data, size_t size) {
+    std::ofstream f(path, std::ios::binary);
+    if (f.is_open()) f.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
+}
+} // namespace
+
 std::vector<uint8_t> create_tar_gz(const std::vector<ArchiveEntry>& entries) {
-    // TODO: Implement tar.gz creation using libarchive
-    return {};
+    if (entries.empty()) return {};
+
+    auto temp_dir = make_temp_path("hc_tar");
+    rm_rf(temp_dir);
+    mkdir_p(temp_dir);
+
+    try {
+        for (const auto& entry : entries) {
+            auto entry_path = temp_dir + "/" + entry.path;
+            // Create parent directories
+            auto last_slash = entry_path.rfind('/');
+            if (last_slash != std::string::npos) {
+                mkdir_p(entry_path.substr(0, last_slash));
+            }
+            if (entry.is_directory) {
+                mkdir_p(entry_path);
+            } else {
+                write_file_binary(entry_path, entry.data.data(), entry.data.size());
+            }
+        }
+
+        auto output_path = temp_dir + ".tar.gz";
+        std::string cmd = "tar -czf " + output_path + " -C " + temp_dir + " . 2>/dev/null";
+        int ret = std::system(cmd.c_str());
+        if (ret != 0) { rm_rf(temp_dir); return {}; }
+
+        auto result = read_file_binary(output_path);
+        rm_rf(temp_dir);
+        std::remove(output_path.c_str());
+        return result;
+    } catch (...) {
+        rm_rf(temp_dir);
+        return {};
+    }
 }
 
 std::vector<ArchiveEntry> extract_tar_gz(const std::vector<uint8_t>& data) {
-    // TODO: Implement tar.gz extraction using libarchive
-    return {};
+    if (data.empty()) return {};
+
+    auto temp_dir = make_temp_path("hc_untar");
+    rm_rf(temp_dir);
+    mkdir_p(temp_dir);
+
+    try {
+        auto tar_path = temp_dir + ".tar.gz";
+        write_file_binary(tar_path, data.data(), data.size());
+
+        std::string cmd = "tar -xzf " + tar_path + " -C " + temp_dir + " 2>/dev/null";
+        int ret = std::system(cmd.c_str());
+        if (ret != 0) { rm_rf(temp_dir); std::remove(tar_path.c_str()); return {}; }
+
+        // List files using find
+        std::vector<ArchiveEntry> entries;
+        std::string find_cmd = "find " + temp_dir + " -mindepth 1 2>/dev/null";
+        FILE* fp = popen(find_cmd.c_str(), "r");
+        if (fp) {
+            char line[4096];
+            while (fgets(line, sizeof(line), fp)) {
+                std::string full_path(line);
+                while (!full_path.empty() && (full_path.back() == '\n' || full_path.back() == '\r'))
+                    full_path.pop_back();
+                if (full_path.empty()) continue;
+
+                ArchiveEntry entry;
+                entry.path = full_path.substr(temp_dir.size() + 1);
+                struct stat st;
+                if (stat(full_path.c_str(), &st) == 0) {
+                    entry.is_directory = S_ISDIR(st.st_mode);
+                    if (!entry.is_directory) {
+                        entry.data = read_file_binary(full_path);
+                    }
+                }
+                entries.push_back(std::move(entry));
+            }
+            pclose(fp);
+        }
+
+        rm_rf(temp_dir);
+        std::remove(tar_path.c_str());
+        return entries;
+    } catch (...) {
+        rm_rf(temp_dir);
+        return {};
+    }
 }
 
 std::vector<uint8_t> archive_directory(const std::string& dir_path) {
-    // TODO: Implement directory archiving
-    return {};
+    struct stat st;
+    if (stat(dir_path.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) return {};
+
+    auto output_path = make_temp_path("hc_archive") + std::string(".tar.gz");
+    std::string cmd = "tar -czf " + output_path + " -C " + dir_path + " . 2>/dev/null";
+    int ret = std::system(cmd.c_str());
+    if (ret != 0) return {};
+
+    auto result = read_file_binary(output_path);
+    std::remove(output_path.c_str());
+    return result;
 }
 
 bool extract_to_directory(const std::vector<uint8_t>& data, const std::string& dest_dir) {
-    // TODO: Implement extraction to directory
-    return false;
+    if (data.empty()) return false;
+
+    mkdir_p(dest_dir);
+    auto tar_path = make_temp_path("hc_extract") + std::string(".tar.gz");
+
+    try {
+        write_file_binary(tar_path, data.data(), data.size());
+        std::string cmd = "tar -xzf " + tar_path + " -C " + dest_dir + " 2>/dev/null";
+        int ret = std::system(cmd.c_str());
+        std::remove(tar_path.c_str());
+        return ret == 0;
+    } catch (...) {
+        std::remove(tar_path.c_str());
+        return false;
+    }
 }
 
 // ============================================================================

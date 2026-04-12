@@ -62,6 +62,9 @@ struct ReactResult {
     // Mirrors subscribeEmbeddedPiSession().assistantTexts
     std::vector<std::string> assistant_texts;
 
+    // ✅ 对齐 OC attempt.ts:2610-2660: messages_snapshot for context engine afterTurn
+    std::vector<core::JsonValue> messages_snapshot;
+
     // 统计信息
     int total_steps = 0;
     int tool_calls = 0;

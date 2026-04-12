@@ -311,9 +311,34 @@ ModelRef resolve_default_model_for_agent(
     const core::Config& cfg,
     const std::string& agent_id
 ) {
-    // 对齐 OC: resolveDefaultModelForAgent
-    // TODO: agent-level model override (resolveAgentEffectiveModelPrimary)
-    (void)agent_id;
+    // ✅ 对齐 OC: resolveDefaultModelForAgent + resolveAgentEffectiveModelPrimary
+    // Check agent-specific model override first
+    if (!agent_id.empty() && agent_id != "main" && cfg.data.contains("agents")) {
+        const auto& agents = cfg.data["agents"];
+        if (agents.contains("entries") && agents["entries"].is_object() &&
+            agents["entries"].contains(agent_id)) {
+            const auto& agent_cfg = agents["entries"][agent_id];
+            if (agent_cfg.is_object() && agent_cfg.contains("model")) {
+                const auto& model_val = agent_cfg["model"];
+                std::string raw_model;
+                if (model_val.is_string()) {
+                    raw_model = trim(model_val.get<std::string>());
+                } else if (model_val.is_object() && model_val.contains("primary")) {
+                    raw_model = trim(model_val["primary"].get<std::string>());
+                }
+                if (!raw_model.empty()) {
+                    auto alias_index = build_model_alias_index(cfg, DEFAULT_PROVIDER);
+                    auto resolved = resolve_model_ref_from_string(
+                        raw_model, DEFAULT_PROVIDER, &alias_index);
+                    if (resolved) return resolved->ref;
+                    // Bare model name
+                    auto parsed = parse_model_ref(raw_model, DEFAULT_PROVIDER);
+                    if (parsed) return *parsed;
+                }
+            }
+        }
+    }
+    // Fallback to global default
     return resolve_configured_model_ref(cfg, DEFAULT_PROVIDER, DEFAULT_MODEL);
 }
 

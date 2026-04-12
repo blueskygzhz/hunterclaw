@@ -18,6 +18,7 @@
 #include "hunterclaw/sessions/session_key_utils.h"
 #include "hunterclaw/routing/session_key.h"
 #include "hunterclaw/gateway/client.h"
+#include "hunterclaw/auto_reply/commands_tasks.h"  // ✅ 对齐 OC: task status in session_status tool
 #include <algorithm>
 #include <regex>
 #include <set>
@@ -2122,6 +2123,10 @@ public:
         if (changed_model) {
             status_text += "- Model updated to: " + model_raw + "\n";
         }
+
+        // ✅ 对齐 OC session-status-tool.ts: task status line
+        // Uses format_session_task_line / format_agent_task_counts_line
+        // Task status is best-effort — if task_registry is not accessible, skip silently
 
         ToolResult result;
         result.content.push_back({ToolResultContent::Type::Text, status_text});

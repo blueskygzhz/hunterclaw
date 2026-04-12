@@ -520,10 +520,58 @@ core::Result<HttpResponse> HttpClient::recv_response(
         buffer[received] = '\0';
         response_str += buffer;
         
-        // Check if we received complete response (simple check)
-        if (response_str.find("\r\n\r\n") != std::string::npos) {
-            // For simple responses without chunked encoding, this is enough
-            // TODO: Handle chunked transfer encoding and Content-Length
+        // ✅ 对齐 OC: 完整 HTTP 响应接收 — 支持 Content-Length 和 chunked transfer encoding
+        auto header_end_pos = response_str.find("\r\n\r\n");
+        if (header_end_pos != std::string::npos) {
+            auto headers_part = response_str.substr(0, header_end_pos);
+            auto body_start = header_end_pos + 4;
+            
+            // Check for chunked transfer encoding
+            bool is_chunked = false;
+            {
+                auto te_pos = headers_part.find("Transfer-Encoding:");
+                if (te_pos == std::string::npos) te_pos = headers_part.find("transfer-encoding:");
+                if (te_pos != std::string::npos) {
+                    auto line_end = headers_part.find("\r\n", te_pos);
+                    auto te_value = headers_part.substr(te_pos + 18, line_end - te_pos - 18);
+                    is_chunked = (te_value.find("chunked") != std::string::npos);
+                }
+            }
+            
+            if (is_chunked) {
+                // Chunked: read until we see "0\r\n\r\n" terminator
+                if (response_str.find("\r\n0\r\n\r\n") != std::string::npos ||
+                    response_str.find("\r\n0\r\n") != std::string::npos) {
+                    break;
+                }
+                // Keep reading for more chunks
+                continue;
+            }
+            
+            // Check Content-Length
+            size_t content_length = 0;
+            bool has_content_length = false;
+            {
+                auto cl_pos = headers_part.find("Content-Length:");
+                if (cl_pos == std::string::npos) cl_pos = headers_part.find("content-length:");
+                if (cl_pos != std::string::npos) {
+                    auto line_end = headers_part.find("\r\n", cl_pos);
+                    auto cl_value = headers_part.substr(cl_pos + 15, line_end - cl_pos - 15);
+                    try { content_length = std::stoul(cl_value); has_content_length = true; } catch (...) {}
+                }
+            }
+            
+            if (has_content_length) {
+                // Have Content-Length — check if body is complete
+                if (response_str.size() - body_start >= content_length) {
+                    break;
+                }
+                // Keep reading for more body bytes
+                continue;
+            }
+            
+            // No Content-Length and not chunked — use simple heuristic
+            // (connection close or small delay indicates end)
             break;
         }
     }

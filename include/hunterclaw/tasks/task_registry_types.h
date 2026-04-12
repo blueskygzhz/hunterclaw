@@ -30,6 +30,14 @@ inline std::string task_runtime_string(TaskRuntime r) {
     return "subagent";
 }
 
+inline std::optional<TaskRuntime> task_runtime_from_string(const std::string& s) {
+    if (s == "subagent") return TaskRuntime::SUBAGENT;
+    if (s == "acp") return TaskRuntime::ACP;
+    if (s == "cli") return TaskRuntime::CLI;
+    if (s == "cron") return TaskRuntime::CRON;
+    return std::nullopt;
+}
+
 // ============================================================================
 // TaskStatus (对齐 OC: TaskStatus)
 // ============================================================================
@@ -57,6 +65,17 @@ inline bool is_terminal_task_status(TaskStatus s) {
            s == TaskStatus::LOST;
 }
 
+inline std::optional<TaskStatus> task_status_from_string(const std::string& s) {
+    if (s == "queued") return TaskStatus::QUEUED;
+    if (s == "running") return TaskStatus::RUNNING;
+    if (s == "succeeded") return TaskStatus::SUCCEEDED;
+    if (s == "failed") return TaskStatus::FAILED;
+    if (s == "timed_out") return TaskStatus::TIMED_OUT;
+    if (s == "cancelled") return TaskStatus::CANCELLED;
+    if (s == "lost") return TaskStatus::LOST;
+    return std::nullopt;
+}
+
 inline bool is_active_task_status(TaskStatus s) {
     return s == TaskStatus::QUEUED || s == TaskStatus::RUNNING;
 }
@@ -81,6 +100,14 @@ inline std::string task_delivery_status_string(TaskDeliveryStatus s) {
     return "pending";
 }
 
+inline std::optional<TaskDeliveryStatus> task_delivery_status_from_string(const std::string& s) {
+    if (s == "pending") return TaskDeliveryStatus::PENDING;
+    if (s == "delivered") return TaskDeliveryStatus::DELIVERED;
+    if (s == "failed") return TaskDeliveryStatus::FAILED;
+    if (s == "not_applicable") return TaskDeliveryStatus::NOT_APPLICABLE;
+    return std::nullopt;
+}
+
 // ============================================================================
 // TaskNotifyPolicy (对齐 OC: TaskNotifyPolicy)
 // ============================================================================
@@ -96,12 +123,41 @@ inline std::string task_notify_policy_string(TaskNotifyPolicy p) {
     return "done_only";
 }
 
+inline std::optional<TaskNotifyPolicy> task_notify_policy_from_string(const std::string& s) {
+    if (s == "done_only") return TaskNotifyPolicy::DONE_ONLY;
+    if (s == "state_changes") return TaskNotifyPolicy::STATE_CHANGES;
+    if (s == "silent") return TaskNotifyPolicy::SILENT;
+    return std::nullopt;
+}
+
 // ============================================================================
 // TaskTerminalOutcome / TaskScopeKind (对齐 OC)
 // ============================================================================
 
 enum class TaskTerminalOutcome { SUCCEEDED, BLOCKED };
 enum class TaskScopeKind { SESSION, SYSTEM };
+
+inline std::string task_terminal_outcome_string(TaskTerminalOutcome o) {
+    switch (o) {
+        case TaskTerminalOutcome::SUCCEEDED: return "succeeded";
+        case TaskTerminalOutcome::BLOCKED: return "blocked";
+    }
+    return "succeeded";
+}
+
+inline std::optional<TaskTerminalOutcome> task_terminal_outcome_from_string(const std::string& s) {
+    if (s == "succeeded") return TaskTerminalOutcome::SUCCEEDED;
+    if (s == "blocked") return TaskTerminalOutcome::BLOCKED;
+    return std::nullopt;
+}
+
+inline std::string task_scope_kind_string(TaskScopeKind k) {
+    switch (k) {
+        case TaskScopeKind::SESSION: return "session";
+        case TaskScopeKind::SYSTEM: return "system";
+    }
+    return "session";
+}
 
 // ============================================================================
 // TaskEventRecord (对齐 OC: TaskEventRecord)
@@ -194,6 +250,20 @@ enum class TaskFlowStatus {
 inline bool is_terminal_flow_status(TaskFlowStatus s) {
     return s == TaskFlowStatus::SUCCEEDED || s == TaskFlowStatus::FAILED ||
            s == TaskFlowStatus::CANCELLED || s == TaskFlowStatus::LOST;
+}
+
+inline std::string task_flow_status_string(TaskFlowStatus s) {
+    switch (s) {
+        case TaskFlowStatus::QUEUED:    return "queued";
+        case TaskFlowStatus::RUNNING:   return "running";
+        case TaskFlowStatus::WAITING:   return "waiting";
+        case TaskFlowStatus::BLOCKED:   return "blocked";
+        case TaskFlowStatus::SUCCEEDED: return "succeeded";
+        case TaskFlowStatus::FAILED:    return "failed";
+        case TaskFlowStatus::CANCELLED: return "cancelled";
+        case TaskFlowStatus::LOST:      return "lost";
+    }
+    return "queued";
 }
 
 // ============================================================================

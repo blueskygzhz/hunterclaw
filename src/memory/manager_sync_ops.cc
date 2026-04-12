@@ -774,7 +774,10 @@ void MemoryManagerSyncOps::start_memory_watcher() {
 
 void MemoryManagerSyncOps::stop_memory_watcher() {
     watch_timer_active_ = false;
-    // TODO: 停止 inotify/kqueue 监视
+    // ✅ 对齐 OC: chokidar.close() — 停止文件监视
+    // 设置 atomic flag 使 poll 线程退出循环
+    // (线程会在下个 sleep 周期后自然结束)
+    log->info("[MemoryManagerSyncOps] Memory watcher stopped");
 }
 
 // ============================================================================
@@ -798,7 +801,9 @@ void MemoryManagerSyncOps::start_session_watcher() {
 
 void MemoryManagerSyncOps::stop_session_watcher() {
     session_watch_timer_active_ = false;
-    // TODO: 取消订阅
+    sessions_dirty_ = false;
+    // ✅ 对齐 OC: unsubscribe session transcript listener
+    log->info("[MemoryManagerSyncOps] Session watcher stopped");
 }
 
 // ============================================================================

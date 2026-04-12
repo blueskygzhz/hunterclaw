@@ -52,6 +52,38 @@ namespace {
 TaskFlowRegistry::TaskFlowRegistry() = default;
 TaskFlowRegistry::~TaskFlowRegistry() = default;
 
+void TaskFlowRegistry::configure_store(std::shared_ptr<TaskFlowRegistryStore> store) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    store_ = std::move(store);
+}
+
+void TaskFlowRegistry::ensure_ready() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (restored_) return;
+    restored_ = true;
+    if (!store_ || !store_->load_snapshot) return;
+    try {
+        auto snapshot = store_->load_snapshot();
+        for (const auto& flow : snapshot.flows) {
+            flows_[flow.flow_id] = flow;
+        }
+    } catch (...) {
+        // restore failure is non-fatal
+    }
+}
+
+void TaskFlowRegistry::persist_upsert(const TaskFlowRecord& flow) {
+    if (store_ && store_->upsert_flow) {
+        try { store_->upsert_flow(flow); } catch (...) {}
+    }
+}
+
+void TaskFlowRegistry::persist_delete(const std::string& flow_id) {
+    if (store_ && store_->delete_flow) {
+        try { store_->delete_flow(flow_id); } catch (...) {}
+    }
+}
+
 TaskFlowRecord TaskFlowRegistry::create_flow_record(const TaskFlowRecord& params) {
     std::lock_guard<std::mutex> lock(mutex_);
     TaskFlowRecord record = params;
@@ -59,6 +91,7 @@ TaskFlowRecord TaskFlowRegistry::create_flow_record(const TaskFlowRecord& params
     if (record.created_at == 0) record.created_at = now_ms();
     if (record.updated_at == 0) record.updated_at = record.created_at;
     flows_[record.flow_id] = record;
+    persist_upsert(record);
     return record;
 }
 
