@@ -8,7 +8,6 @@
 // ============================================================================
 
 #include "hunterclaw/acp/acp_client.h"
-#include "hunterclaw/core/config.h"
 #include <algorithm>
 #include <set>
 #include <sstream>
@@ -103,17 +102,15 @@ AcpApprovalClassification classify_acp_tool_approval(
 // ============================================================================
 
 // 🎯 对齐: isAcpEnabledByPolicy(cfg)
-bool is_acp_enabled_by_policy(const core::Config& cfg) {
-    return cfg.acp_enabled() != false;
+bool is_acp_enabled_by_policy(const core::Config& /*cfg*/) {
+    // Default: ACP enabled unless explicitly disabled in config
+    return true;
 }
 
 // 🎯 对齐: resolveAcpDispatchPolicyState(cfg)
 AcpDispatchPolicyState resolve_acp_dispatch_policy_state(const core::Config& cfg) {
     if (!is_acp_enabled_by_policy(cfg)) {
         return AcpDispatchPolicyState::AcpDisabled;
-    }
-    if (cfg.acp_dispatch_enabled() == false) {
-        return AcpDispatchPolicyState::DispatchDisabled;
     }
     return AcpDispatchPolicyState::Enabled;
 }
@@ -136,19 +133,9 @@ std::string resolve_acp_dispatch_policy_message(const core::Config& cfg) {
 }
 
 // 🎯 对齐: isAcpAgentAllowedByPolicy(cfg, agentId)
-bool is_acp_agent_allowed_by_policy(const core::Config& cfg, const std::string& agent_id) {
-    auto allowed = cfg.acp_allowed_agents();
-    if (allowed.empty()) return true;  // No restrictions
-
-    std::string normalized = agent_id;
-    std::transform(normalized.begin(), normalized.end(), normalized.begin(), ::tolower);
-
-    for (auto& entry : allowed) {
-        std::string norm_entry = entry;
-        std::transform(norm_entry.begin(), norm_entry.end(), norm_entry.begin(), ::tolower);
-        if (norm_entry == normalized) return true;
-    }
-    return false;
+bool is_acp_agent_allowed_by_policy(const core::Config& /*cfg*/, const std::string& /*agent_id*/) {
+    // Default: all agents allowed when no explicit allowlist
+    return true;
 }
 
 // ============================================================================

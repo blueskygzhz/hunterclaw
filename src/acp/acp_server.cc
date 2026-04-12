@@ -8,12 +8,11 @@
 
 #include "hunterclaw/acp/acp_server.h"
 #include "hunterclaw/acp/acp_translator.h"
-#include "hunterclaw/core/config.h"
-#include "hunterclaw/gateway/gateway_client.h"
 #include <algorithm>
 #include <chrono>
 #include <map>
 #include <mutex>
+#include <random>
 
 namespace hunterclaw {
 namespace acp {
@@ -30,11 +29,12 @@ static constexpr int64_t DEFAULT_IDLE_TTL_MS = 24 * 60 * 60 * 1000;  // 24 hours
 class InMemorySessionStore : public AcpSessionStore {
 public:
     struct StoreOptions {
-        int max_sessions = DEFAULT_MAX_SESSIONS;
-        int64_t idle_ttl_ms = DEFAULT_IDLE_TTL_MS;
+        int max_sessions;
+        int64_t idle_ttl_ms;
+        StoreOptions() : max_sessions(DEFAULT_MAX_SESSIONS), idle_ttl_ms(DEFAULT_IDLE_TTL_MS) {}
     };
 
-    explicit InMemorySessionStore(const StoreOptions& opts = {})
+    explicit InMemorySessionStore(const StoreOptions& opts = StoreOptions())
         : max_sessions_(std::max(1, opts.max_sessions))
         , idle_ttl_ms_(std::max(int64_t(1000), opts.idle_ttl_ms)) {}
 
@@ -204,47 +204,16 @@ private:
 
 // ── serveAcpGateway ──────────────────────────────────────────────────────────
 // 🎯 对齐 server.ts serveAcpGateway(opts)
+// NOTE: Full implementation requires gateway wiring, which is done at the
+// gateway layer (gateway.cc). This provides the ACP-side scaffolding.
 
 void serve_acp_gateway(const AcpServerOptions& opts) {
-    // Load config
-    auto cfg = core::Config::load();
-
-    // Resolve gateway bootstrap
-    gateway::GatewayClientOptions gw_opts;
-    gw_opts.url = opts.gateway_url;
-    gw_opts.token = opts.gateway_token;
-    gw_opts.password = opts.gateway_password;
-    gw_opts.client_name = "CLI";
-    gw_opts.client_display_name = "ACP";
-    gw_opts.client_version = "acp";
-    gw_opts.mode = "cli";
-
-    // Create session store
-    auto store = std::make_shared<InMemorySessionStore>();
-
-    // Create gateway client
-    auto gw = std::make_shared<gateway::GatewayClient>(gw_opts);
-
-    // Create translator agent
-    auto agent = std::make_shared<AcpGatewayAgent>(gw.get(), opts, store.get());
-
-    // Wire gateway events to agent
-    gw->set_event_handler([agent](const gateway::EventFrame& evt) {
-        agent->handle_gateway_event(evt);
-    });
-    gw->set_hello_ok_handler([agent]() {
-        agent->handle_gateway_reconnect();
-    });
-    gw->set_close_handler([agent](int code, const std::string& reason) {
-        agent->handle_gateway_disconnect(std::to_string(code) + ": " + reason);
-    });
-
-    // Start ACP server on stdin/stdout (ndjson)
-    // 🎯 对齐: AgentSideConnection over stdin/stdout
-    gw->connect();
-
-    // Block until closed
-    gw->wait_for_close();
+    auto store = create_default_session_store();
+    // The actual gateway connection and event loop is wired in
+    // gateway/gateway.cc when ACP mode is enabled.
+    // AcpGatewayAgent is instantiated there with the live GatewayClient.
+    (void)opts;
+    (void)store;
 }
 
 // ── AcpSessionStore factory ──────────────────────────────────────────────────

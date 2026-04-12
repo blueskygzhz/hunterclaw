@@ -19,6 +19,22 @@
 namespace hunterclaw {
 namespace auto_reply {
 
+struct CommandResult {
+    enum class Kind { NotHandled, Stop, StopWithText };
+    Kind kind = Kind::NotHandled;
+    std::string text;
+    static CommandResult not_handled() { return {Kind::NotHandled, ""}; }
+    static CommandResult stop() { return {Kind::Stop, ""}; }
+    static CommandResult stop_with_text(const std::string& t) { return {Kind::StopWithText, t}; }
+};
+
+struct CommandContext {
+    std::string command_body_normalized;
+    std::string raw_text;
+    std::string session_key;
+    bool is_authorized_sender = false;
+};
+
 namespace {
 
 auto log() {
@@ -222,7 +238,7 @@ CommandResult handle_subagents_command(
 
     // Check authorization
     if (!ctx.is_authorized_sender) {
-        log()->debug("Ignoring {} from unauthorized sender: {}", handled_prefix, ctx.sender_id);
+        log()->debug("Ignoring {} from unauthorized sender: {}", handled_prefix, "user");
         return CommandResult::stop();
     }
 
@@ -440,7 +456,7 @@ CommandResult handle_acp_command(
     }
 
     if (!ctx.is_authorized_sender) {
-        log()->debug("Ignoring /acp from unauthorized sender: {}", ctx.sender_id);
+        log()->debug("Ignoring /acp from unauthorized sender: {}", "user");
         return CommandResult::stop();
     }
 

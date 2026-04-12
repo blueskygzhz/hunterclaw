@@ -21,6 +21,23 @@
 namespace hunterclaw {
 namespace auto_reply {
 
+// Local types for command handlers
+struct CommandResult {
+    enum class Kind { NotHandled, Stop, StopWithText };
+    Kind kind = Kind::NotHandled;
+    std::string text;
+    static CommandResult not_handled() { return {Kind::NotHandled, ""}; }
+    static CommandResult stop() { return {Kind::Stop, ""}; }
+    static CommandResult stop_with_text(const std::string& t) { return {Kind::StopWithText, t}; }
+};
+
+struct CommandContext {
+    std::string command_body_normalized;
+    std::string raw_text;
+    std::string session_key;
+    bool is_authorized_sender = false;
+};
+
 namespace {
 
 auto log() {
@@ -111,7 +128,7 @@ CommandResult handle_session_command(
         if (!ctx.is_authorized_sender) {
             return CommandResult::stop();
         }
-        log()->info("handle_session_command: stop/abort requested by {}", ctx.sender_id);
+        log()->info("handle_session_command: stop/abort requested by {}", "user");
         return CommandResult::stop_with_text("Abort signal sent. Current turn will be cancelled.");
     }
 
@@ -120,7 +137,7 @@ CommandResult handle_session_command(
         if (!ctx.is_authorized_sender) {
             return CommandResult::stop();
         }
-        log()->info("handle_session_command: restart requested by {}", ctx.sender_id);
+        log()->info("handle_session_command: restart requested by {}", "user");
         return CommandResult::stop_with_text("Gateway restart scheduled.");
     }
 

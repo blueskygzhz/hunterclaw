@@ -12,6 +12,7 @@
 
 #include "hunterclaw/agents/subagent.h"
 #include "hunterclaw/agents/agent_scope.h"
+#include "hunterclaw/agents/agent_paths.h"
 #include "hunterclaw/core/utils.h"
 #include "hunterclaw/core/json.h"
 #include <spdlog/spdlog.h>
@@ -181,7 +182,7 @@ const SessionCapabilityEntry* resolve_session_capability_entry(
     auto parsed = AgentScopeManager::parse_agent_session_key(session_key);
     if (!parsed.has_value() || parsed->agent_id.empty()) return nullptr;
 
-    std::string state_dir = agents::resolve_state_dir();
+    std::string state_dir = resolve_state_dir();
     std::string store_path = state_dir + "/agents/" + parsed->agent_id + "/sessions.json";
 
     // Simple cache (invalidated on path change)

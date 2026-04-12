@@ -226,7 +226,7 @@ CascadeKillResult cascade_kill_children(
         auto kill_result = kill_subagent_run(registry, child->subagent_run_id);
         if (kill_result.killed) {
             result.killed++;
-            result.labels.push_back(resolve_subagent_label(*child));
+            result.labels.push_back(child->label.empty() ? child->subagent_run_id : child->label);
         }
 
         // Recurse into grandchildren

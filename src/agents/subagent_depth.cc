@@ -12,6 +12,7 @@
 
 #include "hunterclaw/agents/subagent.h"
 #include "hunterclaw/agents/agent_scope.h"
+#include "hunterclaw/agents/agent_paths.h"
 #include "hunterclaw/core/utils.h"
 #include "hunterclaw/core/json.h"
 #include <spdlog/spdlog.h>
@@ -230,7 +231,7 @@ const SessionDepthEntry* resolve_entry_for_session_key(ResolveDepthParams& param
         if (!parsed.has_value() || parsed->agent_id.empty()) continue;
 
         // Resolve store path for this agent
-        std::string state_dir = agents::resolve_state_dir();
+        std::string state_dir = resolve_state_dir();
         std::string store_path = state_dir + "/agents/" + parsed->agent_id + "/sessions.json";
 
         auto cache_it = params.cache.find(store_path);
