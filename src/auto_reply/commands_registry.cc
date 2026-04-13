@@ -2,6 +2,7 @@
 // Aligned with openclaw: src/auto-reply/commands-registry.data.ts
 #include "hunterclaw/auto_reply/commands_registry.h"
 #include "hunterclaw/auto_reply/thinking.h"
+#include "hunterclaw/skills/skill.h"
 #include <algorithm>
 #include <sstream>
 #include <stdexcept>
@@ -728,6 +729,27 @@ std::vector<ChatCommandDefinition> CommandsRegistry::list_chat_commands() const 
     return commands_;
 }
 
+// 对齐 OC: listChatCommands({ skillCommands }) — commands-registry-list.ts:23-31
+// Appends skill command definitions after builtin commands.
+std::vector<ChatCommandDefinition> CommandsRegistry::list_chat_commands(
+    const std::vector<skills::SkillCommandSpec>& skill_commands) const {
+    if (skill_commands.empty()) return commands_;
+    auto result = commands_;
+    for (const auto& spec : skill_commands) {
+        ChatCommandDefinition def;
+        def.key = "skill:" + spec.skill_name;
+        def.native_name = spec.name;
+        def.description = spec.description;
+        def.text_aliases = {"/" + spec.name};
+        def.accepts_args = true;
+        def.args_parsing = CommandArgsParsing::None;
+        def.scope = CommandScope::Both;
+        def.category = CommandCategory::Tools;
+        result.push_back(std::move(def));
+    }
+    return result;
+}
+
 std::vector<NativeCommandSpec> CommandsRegistry::list_native_command_specs(
     const std::string& provider) const
 {
@@ -740,6 +762,21 @@ std::vector<NativeCommandSpec> CommandsRegistry::list_native_command_specs(
         spec.description = cmd.description;
         spec.accepts_args = cmd.accepts_args;
         spec.args = cmd.args;
+        specs.push_back(std::move(spec));
+    }
+    return specs;
+}
+
+// 对齐 OC: listNativeCommandSpecs({ skillCommands, provider })
+std::vector<NativeCommandSpec> CommandsRegistry::list_native_command_specs(
+    const std::vector<skills::SkillCommandSpec>& skill_commands,
+    const std::string& provider) const {
+    auto specs = list_native_command_specs(provider);
+    for (const auto& sc : skill_commands) {
+        NativeCommandSpec spec;
+        spec.name = sc.name;
+        spec.description = sc.description;
+        spec.accepts_args = true;
         specs.push_back(std::move(spec));
     }
     return specs;

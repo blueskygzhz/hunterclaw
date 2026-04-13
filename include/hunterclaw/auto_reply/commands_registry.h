@@ -12,6 +12,9 @@
 #include <regex>
 #include <memory>
 
+// Forward declaration for skill commands integration
+namespace hunterclaw { namespace skills { struct SkillCommandSpec; } }
+
 namespace hunterclaw {
 namespace auto_reply {
 
@@ -124,8 +127,18 @@ public:
     // Aligned with OpenClaw: listChatCommands()
     std::vector<ChatCommandDefinition> list_chat_commands() const;
 
+    // Aligned with OpenClaw: listChatCommands({ skillCommands })
+    // Returns builtin commands + skill command definitions
+    std::vector<ChatCommandDefinition> list_chat_commands(
+        const std::vector<skills::SkillCommandSpec>& skill_commands) const;
+
     // Aligned with OpenClaw: listNativeCommandSpecs()
     std::vector<NativeCommandSpec> list_native_command_specs(
+        const std::string& provider = "") const;
+
+    // Aligned with OpenClaw: listNativeCommandSpecs({ skillCommands })
+    std::vector<NativeCommandSpec> list_native_command_specs(
+        const std::vector<skills::SkillCommandSpec>& skill_commands,
         const std::string& provider = "") const;
 
     // ── Find commands ──────────────────────────────────────────────────────
@@ -216,6 +229,12 @@ CommandsRegistry& get_commands_registry();
 // Convenience free functions
 inline std::vector<ChatCommandDefinition> list_chat_commands() {
     return get_commands_registry().list_chat_commands();
+}
+
+// Skill-aware variant (对齐 OC: listChatCommands({ skillCommands }))
+inline std::vector<ChatCommandDefinition> list_chat_commands(
+    const std::vector<skills::SkillCommandSpec>& skill_commands) {
+    return get_commands_registry().list_chat_commands(skill_commands);
 }
 
 inline bool is_command_message(const std::string& raw) {

@@ -38,20 +38,37 @@ enum class TypingPolicy {
     Heartbeat         // "heartbeat"
 };
 
-// Reply payload (aligned with OpenClaw: ReplyPayload)
+// Reply payload (aligned with OpenClaw: ReplyPayload — reply-payload.ts:3-27)
 struct ReplyPayload {
     std::optional<std::string> text;
     std::optional<std::string> media_url;
     std::vector<std::string> media_urls;
+    // Interactive reply (aligned with OC: interactive?: InteractiveReply)
+    struct InteractiveReply {
+        std::string type;  // "button" | "list" | etc.
+        std::string body;
+        std::vector<std::pair<std::string, std::string>> options; // id → label
+    };
+    std::optional<InteractiveReply> interactive;
+    // BTW follow-up question (aligned with OC: btw?: { question: string })
+    struct BtwPayload {
+        std::string question;
+    };
+    std::optional<BtwPayload> btw;
     std::optional<std::string> reply_to_id;
     bool reply_to_tag = false;
     bool reply_to_current = false;  // [[reply_to_current]] not yet mapped
     bool audio_as_voice = false;    // send audio as voice bubble
     bool is_error = false;
     bool is_reasoning = false;      // marks reasoning/thinking block
-    // Channel-specific payload data
-    // (simplified: use string map instead of Record<string, unknown>)
+    bool is_compaction_notice = false; // marks compaction status notice (start/end)
+    // Channel-specific payload data (aligned with OC: channelData?: Record<string, unknown>)
     std::vector<std::pair<std::string, std::string>> channel_data;
+};
+
+// Reply payload metadata (aligned with OC: ReplyPayloadMetadata)
+struct ReplyPayloadMetadata {
+    std::optional<int> assistant_message_index;
 };
 
 // Bootstrap context mode (aligned with OpenClaw: bootstrapContextMode)
@@ -74,7 +91,7 @@ struct GetReplyOptions {
     std::optional<std::vector<std::string>> skill_filter;
     std::optional<int> timeout_override_seconds;
 
-    // Callbacks (simplified as flags/values since C++ doesn't have JS-style callbacks easily)
+    // Callbacks (aligned with OC: GetReplyOptions callbacks)
     std::function<void(const std::string& run_id)> on_agent_run_start;
     std::function<void()> on_reply_start;
     std::function<void()> on_typing_cleanup;
@@ -82,11 +99,18 @@ struct GetReplyOptions {
     std::function<void(const ReplyPayload&)> on_reasoning_stream;
     std::function<void()> on_reasoning_end;
     std::function<void()> on_assistant_message_start;
+    // Synchronous block-reply-queued (aligned with OC: onBlockReplyQueued)
+    std::function<void(const ReplyPayload&, const BlockReplyContext&)> on_block_reply_queued;
     std::function<void(const ReplyPayload&, const BlockReplyContext&)> on_block_reply;
     std::function<void(const ReplyPayload&)> on_tool_result;
+    // Tool phase start/update (aligned with OC: onToolStart)
+    std::function<void(const std::string& name, const std::string& phase)> on_tool_start;
     std::function<void(const ModelSelectedContext&)> on_model_selected;
     std::function<void()> on_compaction_start;
     std::function<void()> on_compaction_end;
+
+    // Mutable ref for reply tracking (aligned with OC: hasRepliedRef)
+    bool* has_replied_ref = nullptr;
 
     bool disable_block_streaming = false;
 };
