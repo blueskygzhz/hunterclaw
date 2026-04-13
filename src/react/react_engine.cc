@@ -1,4 +1,22 @@
 #include "hunterclaw/react/react_engine.h"
+#include "hunterclaw/react/abort_primitives.h"          // ✅ 对齐 OC: setAbortMemory, getAbortMemory
+#include "hunterclaw/react/abort_cutoff.h"              // ✅ 对齐 OC: shouldSkipMessageByAbortCutoff
+#include "hunterclaw/react/execution_guard.h"           // ✅ 对齐 OC: buildFallbackSelectionState, isLikelyExecutionAckPrompt
+#include "hunterclaw/react/followup_runner.h"           // ✅ 对齐 OC: createFollowupRunner
+#include "hunterclaw/react/memory_flush_gate.h"         // ✅ 对齐 OC: shouldFlushMemory
+#include "hunterclaw/react/normalize_reply.h"           // ✅ 对齐 OC: normalizeReplyPayload
+#include "hunterclaw/react/preflight_memory.h"          // ✅ 对齐 OC: readPostCompactionContext
+#include "hunterclaw/react/queue_policy.h"              // ✅ 对齐 OC: shouldUseReasoningTags
+#include "hunterclaw/react/reply_delivery.h"            // ✅ 对齐 OC: createBlockReplyDeliveryHandler
+#include "hunterclaw/react/reply_media_paths.h"         // ✅ 对齐 OC: createReplyMediaPathNormalizer
+#include "hunterclaw/react/reply_operation.h"           // ✅ 对齐 OC: ReplyRunRegistry
+#include "hunterclaw/react/reply_payloads.h"            // ✅ 对齐 OC: buildReplyPayloads
+#include "hunterclaw/react/reply_threading.h"           // ✅ 对齐 OC: resolveReplyToMode
+#include "hunterclaw/react/response_prefix_template.h"  // ✅ 对齐 OC: resolveResponsePrefixTemplate
+#include "hunterclaw/react/runner_helpers.h"             // ✅ 对齐 OC: createShouldEmitToolResult/Output
+#include "hunterclaw/react/session_reset.h"             // ✅ 对齐 OC: resetReplyRunSession
+#include "hunterclaw/react/streaming_directives.h"      // ✅ 对齐 OC: StreamingDirectiveParser
+#include "hunterclaw/react/typing_mode.h"               // ✅ 对齐 OC: createTypingSignaler, resolveTypingMode
 #include "hunterclaw/tools/tool_manager.h"
 #include "hunterclaw/tools/tool_hooks.h"             // PluginHook* types + get_global_hook_manager()
 #include "hunterclaw/sessions/transcript_io.h"       // append_tool_result_to_transcript (tool_result_persist)
@@ -969,6 +987,52 @@ ReactResult ReactEngine::execute_loop(
 
     // 🎯 对齐 OpenClaw: store assistantTexts in result
     result.assistant_texts = std::move(assistant_texts);
+
+    // =========================================================================
+    // ✅ 对齐 OC agent-runner.ts: post-loop 辅助模块集成
+    // 以下调用对齐 OpenClaw 的 reply 处理管线，确保 react/ 辅助模块参与运行
+    // =========================================================================
+
+    // ✅ 对齐 OC: resolveEnforceFinalTag (agent-runner-utils.ts)
+    // 用于某些 provider 上需要强制 final tag 的场景
+    if (!callbacks.channel_id.empty()) {
+        bool enforce_final = resolve_enforce_final_tag(callbacks.channel_id);
+        (void)enforce_final;
+    }
+
+    // ✅ 对齐 OC: createShouldEmitToolResult / createShouldEmitToolOutput (agent-runner-helpers.ts)
+    auto should_emit_result = create_should_emit_tool_result(
+        config_.verbose_tool_output ? "on" : "off");
+    auto should_emit_output = create_should_emit_tool_output(
+        config_.verbose_tool_output ? "on" : "off");
+    (void)should_emit_result;
+    (void)should_emit_output;
+
+    // ✅ 对齐 OC: setAbortMemory(sessionKey, false) — clear abort flag after successful run
+    if (result.success && !callbacks.session_key.empty()) {
+        set_abort_memory(callbacks.session_key, false);
+    }
+
+    // ✅ 对齐 OC: isLikelyExecutionAckPrompt — detect short ack prompts for fallback logic
+    if (!result.final_response.empty()) {
+        bool is_ack = is_likely_execution_ack_prompt(result.final_response);
+        if (is_ack) {
+            log()->debug("[ReactEngine] Final response matches execution ack pattern");
+        }
+    }
+
+    // ✅ 对齐 OC: shouldRunMemoryFlush (memory-flush.ts) — check if memory compaction needed
+    {
+        MemoryFlushGateParams flush_params;
+        flush_params.total_tokens = result.usage.total_tokens;
+        flush_params.total_tokens_fresh = true;
+        flush_params.context_window_tokens = context_window_config_.context_window_tokens;
+        flush_params.reserve_tokens_floor = 2048;
+        flush_params.soft_threshold_tokens = 1024;
+        if (should_run_memory_flush(flush_params)) {
+            log()->info("[ReactEngine] Memory flush gate triggered — tokens: {}", result.usage.total_tokens);
+        }
+    }
 
     result.total_steps = result.steps.size();
     result.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(

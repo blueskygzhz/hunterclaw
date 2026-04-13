@@ -17,6 +17,13 @@
 #include "hunterclaw/auto_reply/message_dispatcher.h"
 #include "hunterclaw/auto_reply/command_detection.h"
 #include "hunterclaw/auto_reply/heartbeat.h"
+#include "hunterclaw/react/abort_primitives.h"     // ✅ 对齐 OC: import { isAbortRequestText, getAbortMemory, setAbortMemory } from "./reply/abort-primitives.js"
+#include "hunterclaw/react/abort_cutoff.h"         // ✅ 对齐 OC: import { shouldSkipMessageByAbortCutoff, resolveAbortCutoffFromContext } from "./reply/abort-cutoff.js"
+#include "hunterclaw/react/normalize_reply.h"      // ✅ 对齐 OC: import { normalizeReplyPayload } from "./normalize-reply.js"
+#include "hunterclaw/react/queue_policy.h"         // ✅ 对齐 OC: import { resolveActiveRunQueueAction } from "./queue-policy.js"
+#include "hunterclaw/react/reply_operation.h"      // ✅ 对齐 OC: import { replyRunRegistry } from "./reply-run-registry.js"
+#include "hunterclaw/react/typing_mode.h"          // ✅ 对齐 OC: import { createTypingSignaler, resolveTypingMode } from "./typing-mode.js"
+#include "hunterclaw/react/streaming_directives.h" // ✅ 对齐 OC: import { createStreamingDirectiveAccumulator } from "./streaming-directives.js"
 #include "hunterclaw/routing/router.h"
 #include "hunterclaw/sessions/session_manager.h"
 #include "hunterclaw/queue/delivery_queue.h"
@@ -2180,7 +2187,9 @@ MessageDispatcher::FastAbortResult MessageDispatcher::try_fast_abort_from_messag
     if (raw.empty()) return result;
 
     // Aligned with openclaw: isAbortRequestText(stripped)
-    if (CommandDetection::is_abort_request_text(raw)) {
+    // ✅ 对齐 OC: 优先使用 react::is_abort_request_text (与 gateway/chat-abort 共享)
+    // CommandDetection::is_abort_request_text 作为扩展覆盖更多触发词
+    if (react::is_abort_request_text(raw) || CommandDetection::is_abort_request_text(raw)) {
         result.should_abort = true;
         result.reason = "abort_trigger";
         log()->debug("try_fast_abort_from_message: abort trigger detected: '{}'", raw);

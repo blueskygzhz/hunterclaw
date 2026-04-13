@@ -6,6 +6,7 @@
 // ============================================================================
 
 #include "hunterclaw/llm/model_selection.h"
+#include "hunterclaw/react/model_catalog.h"  // ✅ 对齐 OC: import { loadModelCatalog } from "../agents/model-catalog.js"
 #include <algorithm>
 #include <sstream>
 #include <cctype>
@@ -512,9 +513,15 @@ bool resolve_reasoning_default(
     const std::string& provider,
     const std::string& model
 ) {
-    // 对齐 OC: resolveReasoningDefault
-    // Uses model_catalog to check if model supports reasoning
-    // Simplified: check known reasoning model patterns
+    // ✅ 对齐 OC: resolveReasoningDefault → loadModelCatalog() → entry.reasoning
+    // 优先查 ModelCatalog，命中则使用 entry.reasoning
+    auto& catalog = react::ModelCatalog::instance();
+    auto entry = catalog.find_model(provider, model);
+    if (entry.has_value()) {
+        return entry->reasoning.value_or(false);
+    }
+
+    // Fallback: 字符串匹配 (对齐 OC 兜底逻辑)
     auto lp = to_lower(provider);
     auto lm = to_lower(model);
     

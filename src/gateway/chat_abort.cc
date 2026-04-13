@@ -10,6 +10,7 @@
 // ============================================================================
 
 #include "hunterclaw/gateway/gateway.h"
+#include "hunterclaw/react/abort_primitives.h"  // ✅ 对齐 OC: import { isAbortRequestText } from "../auto-reply/reply/abort-primitives.js"
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <chrono>
@@ -20,17 +21,11 @@ using json = nlohmann::json;
 namespace hunterclaw {
 namespace gateway {
 
-// 对齐 chat-abort.ts:13 isChatStopCommandText
+// ✅ 对齐 chat-abort.ts:13 isChatStopCommandText
+// OC 原文: export function isChatStopCommandText(text: string) { return isAbortRequestText(text); }
+// 直接委托给 react::is_abort_request_text (对齐 abort-primitives.ts)
 bool is_chat_stop_command_text(const std::string& text) {
-    std::string lower = text;
-    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-    // trim
-    auto s = lower.find_first_not_of(" \t\n\r");
-    if (s == std::string::npos) return false;
-    auto e = lower.find_last_not_of(" \t\n\r");
-    lower = lower.substr(s, e - s + 1);
-    return lower == "stop" || lower == "/stop" || lower == "cancel" || lower == "/cancel" ||
-           lower == "abort" || lower == "/abort";
+    return react::is_abort_request_text(text);
 }
 
 // 对齐 chat-abort.ts:17-30 resolveChatRunExpiresAtMs

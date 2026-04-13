@@ -11,6 +11,9 @@
 // ============================================================================
 
 #include "hunterclaw/gateway/gateway.h"
+#include "hunterclaw/react/abort.h"              // ✅ 对齐 OC: import { stopSubagentsForRequester } from "../auto-reply/reply/abort.js"
+#include "hunterclaw/react/abort_primitives.h"   // ✅ 对齐 OC: setAbortMemory
+#include "hunterclaw/react/reply_operation.h"    // ✅ 对齐 OC: replyRunRegistry.abortActiveRuns
 #include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
@@ -205,12 +208,18 @@ SessionResetResult reset_session_core(
     SessionResetResult result;
 
     try {
+        // ✅ 对齐 OC session-reset-service.ts:167-175
+        // Step 0: Set abort memory for the session (对齐 OC: setAbortMemory)
+        react::set_abort_memory(opts.session_key, true);
+
         // Step 1: 中止当前运行的 agent
+        // ✅ 对齐 OC: stopSubagentsForRequester(sessionKey)
         if (abort_session) {
             abort_session(opts.session_key);
         }
 
         // Step 2: 清理命令队列
+        // ✅ 对齐 OC: clearSessionQueues(sessionKey)
         if (clear_session_lane) {
             clear_session_lane(opts.session_key);
         }
