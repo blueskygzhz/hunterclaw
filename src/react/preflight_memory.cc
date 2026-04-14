@@ -1,4 +1,5 @@
 #include "hunterclaw/react/preflight_memory.h"
+#include "hunterclaw/react/memory_flush_gate.h"
 #include "hunterclaw/sessions/transcript_io.h"
 #include "hunterclaw/llm/llm_client.h"
 #include <fstream>
@@ -487,10 +488,15 @@ MemoryFlushResult run_memory_flush_if_needed(const MemoryFlushParams& params) {
                  force_flush);
 
     // 对齐 OC L686-699: shouldFlushMemory
-    bool should_flush = should_run_memory_flush(
-        projected, params.persisted_total_tokens, params.total_tokens_fresh,
-        params.context_window_tokens, params.reserve_tokens_floor, params.soft_threshold_tokens,
-        params.compaction_count, params.memory_flush_compaction_count);
+    MemoryFlushGateParams flush_gate_params;
+    flush_gate_params.total_tokens = projected.value_or(0);
+    flush_gate_params.total_tokens_fresh = has_fresh;
+    flush_gate_params.context_window_tokens = params.context_window_tokens;
+    flush_gate_params.reserve_tokens_floor = params.reserve_tokens_floor;
+    flush_gate_params.soft_threshold_tokens = params.soft_threshold_tokens;
+    flush_gate_params.compaction_count = params.compaction_count;
+    flush_gate_params.memory_flush_compaction_count = params.memory_flush_compaction_count;
+    bool should_flush = should_run_memory_flush(flush_gate_params);
 
     if (!should_flush && force_flush &&
         !has_already_flushed_for_current_compaction(
