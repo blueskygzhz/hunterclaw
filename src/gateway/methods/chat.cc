@@ -5,9 +5,12 @@
 #include "hunterclaw/agents/agent_pool.h"
 #include "hunterclaw/agents/agent_instance.h"
 #include "hunterclaw/react/react_engine.h"
+#include "hunterclaw/react/abort_primitives.h"   // ✅ 对齐 OC: isAbortRequestText / isChatStopCommandText
+#include "hunterclaw/react/abort_cutoff.h"       // ✅ 对齐 OC: persist_abort_target_entry (channel 路径)
 #include "hunterclaw/tools/tool.h"
 #include "hunterclaw/tools/tool_hooks.h"   // get_global_hook_manager(), PluginHook* types
 #include "hunterclaw/sessions/transcript_io.h"
+#include "hunterclaw/sessions/session_manager.h" // ✅ SessionEntry (for abort cutoff persist)
 #include "hunterclaw/queue/command_queue.h"
 #include "hunterclaw/queue/lanes.h"
 #include "hunterclaw/auto_reply/message_dispatcher.h"  // ✅ run_reply_agent (queue mode)
@@ -42,17 +45,23 @@ static std::shared_ptr<spdlog::logger> get_logger() {
 // ============================================================================
 
 // ============================================================================
-// Helper: Stop Command Detection (对齐 OpenClaw)
+// Helper: Stop Command Detection (对齐 OpenClaw chat-abort.ts:13-14)
+// isChatStopCommandText → isAbortRequestText (支持多语言: stop, 停止, やめて, etc.)
 // ============================================================================
 static bool is_stop_command(const std::string& message) {
-    std::string lower = message;
-    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-    std::string trimmed = lower;
-    trimmed.erase(0, trimmed.find_first_not_of(" \t\n\r"));
-    trimmed.erase(trimmed.find_last_not_of(" \t\n\r") + 1);
-    
-    return trimmed == "stop" || trimmed == "cancel" || trimmed == "abort";
+    // ✅ 对齐 OC: isChatStopCommandText(text) → isAbortRequestText(text)
+    return react::is_abort_request_text(message);
 }
+
+// ============================================================================
+// Types: AbortedPartialSnapshot (对齐 OC chat.ts L100-105)
+// ============================================================================
+struct AbortedPartialSnapshot {
+    std::string run_id;
+    std::string session_id;
+    std::string text;
+    std::string abort_origin;  // "rpc" | "stop-command"
+};
 
 // ============================================================================
 // Helper: Message Sanitization (对齐 OpenClaw)
@@ -90,6 +99,96 @@ static std::vector<std::string> abort_chat_runs_for_session_key(
     std::shared_ptr<GatewayServer> server,
     const std::string& session_key,
     const std::string& stop_reason);
+
+// ============================================================================
+// collectSessionAbortPartials — 对齐 OC chat.ts L1306-1329
+// 在 abort 前采集每个 run 的缓冲文本快照
+// ============================================================================
+static std::vector<AbortedPartialSnapshot> collect_session_abort_partials(
+    std::shared_ptr<GatewayServer> server,
+    const std::vector<std::string>& run_ids,
+    const std::string& abort_origin
+) {
+    std::vector<AbortedPartialSnapshot> out;
+    auto state = server->runtime_state();
+    if (!state || !state->chat_run_state) return out;
+
+    for (const auto& run_id : run_ids) {
+        // 对齐 OC: chatAbortControllers.get(runId) → active.sessionId
+        auto ctrl_it = state->chat_abort_controllers.find(run_id);
+        if (ctrl_it == state->chat_abort_controllers.end()) continue;
+
+        // 对齐 OC: chatRunBuffers.get(runId) → text
+        std::string text;
+        {
+            std::lock_guard<std::mutex> lock(state->chat_run_state->buffers_mutex);
+            auto buf_it = state->chat_run_state->buffers.find(run_id);
+            if (buf_it != state->chat_run_state->buffers.end()) {
+                text = buf_it->second;
+            }
+        }
+        // 对齐 OC: if (!text || !text.trim()) continue;
+        std::string trimmed = text;
+        trimmed.erase(0, trimmed.find_first_not_of(" \t\n\r"));
+        trimmed.erase(trimmed.find_last_not_of(" \t\n\r") + 1);
+        if (trimmed.empty()) continue;
+
+        AbortedPartialSnapshot snap;
+        snap.run_id = run_id;
+        snap.session_id = ctrl_it->second.session_id;
+        snap.text = text;
+        snap.abort_origin = abort_origin;
+        out.push_back(std::move(snap));
+    }
+    return out;
+}
+
+// ============================================================================
+// persistAbortedPartials — 对齐 OC chat.ts L1331-1361
+// 将部分回复写入 transcript（幂等，带 abort 元数据）
+// ============================================================================
+static void persist_aborted_partials(
+    std::shared_ptr<GatewayServer> server,
+    const std::string& session_key,
+    const std::vector<AbortedPartialSnapshot>& snapshots
+) {
+    if (snapshots.empty()) return;
+
+    // 对齐 OC: loadSessionEntry(sessionKey) → { storePath, entry }
+    auto agent_pool = server->agent_pool();
+    if (!agent_pool) return;
+
+    auto agent = agent_pool->get_or_create_agent(session_key);
+    if (!agent) return;
+
+    std::string sessions_dir = std::filesystem::path(
+        agent->context().workspace_dir).parent_path().string();
+
+    for (const auto& snap : snapshots) {
+        std::string sid = snap.session_id.empty() ? snap.run_id : snap.session_id;
+        std::string transcript_path = sessions::resolve_transcript_path(
+            sid, agent->context().agent_id, sessions_dir);
+
+        // 对齐 OC: 幂等 key = ${runId}:assistant
+        std::string idem_key = snap.run_id + ":assistant";
+
+        // 对齐 OC: appendAssistantTranscriptMessage with abortMeta
+        sessions::AppendTranscriptOptions opts;
+        opts.message = snap.text;
+        opts.idempotency_key = idem_key;
+        opts.create_if_missing = true;
+        opts.aborted = true;
+        opts.abort_origin = snap.abort_origin;
+        opts.abort_run_id = snap.run_id;
+
+        auto result = sessions::append_assistant_message_to_transcript(
+            transcript_path, opts);
+        if (!result.ok) {
+            get_logger()->warn("[chat.abort] transcript append failed: {}",
+                result.error);
+        }
+    }
+}
 
 // 13. chat.send - Send message (对齐 OpenClaw 完整实现)
 // 参考: openclaw-analysis/src/gateway/server-methods/chat.ts
@@ -144,7 +243,8 @@ core::Result<json> method_chat_send(
 
         // ✅ 对齐 OpenClaw: abortChatRunsForSessionKeyWithPartials (abortOrigin: "stop-command")
         // 通过 chatAbortControllers 精确 abort 所有 sessionKey 匹配的 run
-        auto aborted_ids = abort_chat_runs_for_session_key(server, session_id, "stop");
+        auto aborted_ids = abort_chat_runs_for_session_key(
+            server, session_id, "stop", "stop-command");
         get_logger()->info("[chat.send] Aborted via stop command: session={}, runIds={}",
             session_id, aborted_ids.size());
 
@@ -754,24 +854,29 @@ static bool abort_chat_run_by_id(
 }
 
 // ============================================================================
-// abortChatRunsForSessionKey — 对齐 OpenClaw chat-abort.ts L108-127
+// abortChatRunsForSessionKeyWithPartials — 对齐 OpenClaw chat.ts L1473-1520
 // 遍历 chatAbortControllers，abort 所有 sessionKey 匹配的 run
+// 在 abort 前采集 partial 快照，abort 后持久化到 transcript
 // ============================================================================
 static std::vector<std::string> abort_chat_runs_for_session_key(
     std::shared_ptr<GatewayServer> server,
     const std::string& session_key,
-    const std::string& stop_reason
+    const std::string& stop_reason,
+    const std::string& abort_origin = "rpc"  // "rpc" | "stop-command"
 ) {
     auto state = server->runtime_state();
     if (!state) return {};
     
-    // 收集所有 sessionKey 匹配的 runId (对齐 OpenClaw: for (const [runId, active] of ops.chatAbortControllers))
+    // 收集所有 sessionKey 匹配的 runId (对齐 OpenClaw: resolveAuthorizedRunIdsForSession)
     std::vector<std::string> matching_run_ids;
     for (const auto& [rid, entry] : state->chat_abort_controllers) {
         if (entry.session_key == session_key) {
             matching_run_ids.push_back(rid);
         }
     }
+
+    // 对齐 OC: collectSessionAbortPartials — 在 abort 前采集 partial 快照
+    auto snapshots = collect_session_abort_partials(server, matching_run_ids, abort_origin);
     
     // 逐个 abort (对齐 OpenClaw: abortChatRunById for each)
     std::vector<std::string> aborted_ids;
@@ -779,6 +884,11 @@ static std::vector<std::string> abort_chat_runs_for_session_key(
         if (abort_chat_run_by_id(server, rid, session_key, stop_reason)) {
             aborted_ids.push_back(rid);
         }
+    }
+
+    // 对齐 OC: if (res.aborted) { persistAbortedPartials({ snapshots }) }
+    if (!aborted_ids.empty()) {
+        persist_aborted_partials(server, session_key, snapshots);
     }
     
     // 如果没有任何 registered run 被找到，仍然做 session-level 清理
@@ -865,8 +975,8 @@ core::Result<json> method_chat_abort(
     
     if (run_id.empty()) {
         // ── 无 runId: session 级别 abort ──
-        // 对齐 OpenClaw: abortChatRunsForSessionKeyWithPartials
-        aborted_run_ids = abort_chat_runs_for_session_key(server, session_key, "rpc");
+        // 对齐 OpenClaw: abortChatRunsForSessionKeyWithPartials (abortOrigin: "rpc")
+        aborted_run_ids = abort_chat_runs_for_session_key(server, session_key, "rpc", "rpc");
         aborted = !aborted_run_ids.empty();
         
         // 如果没有 registered run 但 session 确实在运行，也视为 aborted
@@ -878,7 +988,7 @@ core::Result<json> method_chat_abort(
         }
     } else {
         // ── 有 runId: per-run 精确 abort ──
-        // 对齐 OpenClaw chat.abort L1024-1066
+        // 对齐 OpenClaw chat.abort L1707-1749
         auto state = server->runtime_state();
         if (state) {
             auto it = state->chat_abort_controllers.find(run_id);
@@ -896,10 +1006,18 @@ core::Result<json> method_chat_abort(
             }
         }
         
+        // 对齐 OC L1725: 在 abort 前采集 partial 文本
+        auto snapshots = collect_session_abort_partials(
+            server, {run_id}, "rpc");
+        
         // 精确 abort 此 run
         aborted = abort_chat_run_by_id(server, run_id, session_key, "rpc");
         if (aborted) {
             aborted_run_ids.push_back(run_id);
+            // 对齐 OC L1731-1743: 持久化 partial 到 transcript
+            if (!snapshots.empty()) {
+                persist_aborted_partials(server, session_key, snapshots);
+            }
         }
     }
     

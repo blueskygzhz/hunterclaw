@@ -19,6 +19,7 @@
 #include "hunterclaw/auto_reply/heartbeat.h"
 #include "hunterclaw/react/abort_primitives.h"     // ✅ 对齐 OC: import { isAbortRequestText, getAbortMemory, setAbortMemory } from "./reply/abort-primitives.js"
 #include "hunterclaw/react/abort_cutoff.h"         // ✅ 对齐 OC: import { shouldSkipMessageByAbortCutoff, resolveAbortCutoffFromContext } from "./reply/abort-cutoff.js"
+#include "hunterclaw/react/abort.h"                // ✅ 对齐 OC: import { handleAbortCommand } from "./commands-session-abort.js"
 #include "hunterclaw/react/normalize_reply.h"      // ✅ 对齐 OC: import { normalizeReplyPayload } from "./normalize-reply.js"
 #include "hunterclaw/react/queue_policy.h"         // ✅ 对齐 OC: import { resolveActiveRunQueueAction } from "./queue-policy.js"
 #include "hunterclaw/react/reply_operation.h"      // ✅ 对齐 OC: import { replyRunRegistry } from "./reply-run-registry.js"
@@ -432,15 +433,62 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
         : message.sender_id;
 
     // ── Step 3: tryFastAbortFromMessage ─────────────────────────────────────
-    // Aligned with openclaw: abort.ts — checks ABORT_TRIGGERS set
+    // 对齐 OpenClaw: commands-session-abort.ts handleStopCommand + handleAbortTrigger
+    //   → resolveAbortTarget → applyAbortTarget → persistAbortTargetEntry
     // NOTE: markProcessing() is called here (aligned with openclaw: before fastAbort check)
     log()->debug("dispatch_reply_from_config: markProcessing session={}", session_key);
     auto fast_abort = try_fast_abort_from_message(message, config);
     if (fast_abort.should_abort) {
-        // Aligned with openclaw: send abort reply text
-        const std::string abort_text = "⚙️ Agent was aborted.";
+        // 对齐 OC: handle_abort_command — 完整 abort 流程:
+        //   setAbortMemory + abort embedded run + stop subagents + clear queues
+        //   + persistAbortTargetEntry (写 cutoff 到 session entry)
+        react::AbortSessionParams abort_params;
+        abort_params.session_key = session_key;
+        abort_params.command_text = message.text;
+        abort_params.message_sid = message.message_id.empty()
+            ? std::nullopt : std::optional<std::string>(message.message_id);
+        abort_params.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            message.timestamp.time_since_epoch()).count();
+
+        // 回调: abort embedded run
+        abort_params.abort_embedded_run = [this](const std::string& sk) {
+            this->abort_embedded_session(sk);
+        };
+        // 回调: clear session queues
+        abort_params.clear_session_queues = [](const std::string& sk) {
+            auto& cmd_queue = queue::CommandQueue::Instance();
+            cmd_queue.clear_command_lane(queue::ResolveSessionLane(sk));
+        };
+
+        // Session store 参数 (对齐 OC: persistAbortTargetEntry)
+        if (session_entry_for_dispatch.has_value() && session_manager_) {
+            abort_params.session_entry = &*session_entry_for_dispatch;
+            // Note: session_store map 在 channel 路径不容易获取，
+            // handle_abort_command 内部的 persist_abort_target_entry 会通过
+            // session_manager_->update_session 直接持久化
+        }
+
+        auto abort_result = react::handle_abort_command(abort_params);
+
+        // 对齐 OC: 如果 session entry 有效，手动应用 abort fields
+        // (因为 channel 路径没有全局 session_store map)
+        if (session_entry_for_dispatch.has_value()) {
+            session_entry_for_dispatch->aborted_last_run = true;
+            if (abort_result.cutoff.has_value()) {
+                react::apply_abort_cutoff_to_session_entry(
+                    *session_entry_for_dispatch, abort_result.cutoff);
+            }
+            session_entry_for_dispatch->updated_at =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+            if (session_manager_) {
+                session_manager_->update_session(*session_entry_for_dispatch);
+            }
+        }
+
+        // 发送 abort 回复
         ::hunterclaw::queue::MessagePayload abort_payload;
-        abort_payload.text = abort_text;
+        abort_payload.text = abort_result.reply_text;
 
         outbound::DeliverOutboundPayloadsParams deliver_params;
         deliver_params.channel = message.channel;
@@ -454,7 +502,8 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
 
         result.fast_aborted = true;
         result.skip_reason = fast_abort.reason;
-        log()->debug("dispatch_reply_from_config: fast abort: {}", fast_abort.reason);
+        log()->debug("dispatch_reply_from_config: fast abort: {} (cutoff={})",
+                     fast_abort.reason, abort_result.cutoff.has_value() ? "yes" : "no");
         return result;
     }
 
