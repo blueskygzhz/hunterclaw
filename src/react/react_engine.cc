@@ -4,7 +4,8 @@
 #include "hunterclaw/react/execution_guard.h"           // ✅ engine: classify_error, isLikelyExecutionAckPrompt
 #include "hunterclaw/react/memory_flush_gate.h"         // ✅ engine: shouldRunMemoryFlush (run 结束后检查)
 #include "hunterclaw/react/runner_helpers.h"             // ✅ engine: shouldEmitToolResult/Output (工具执行时)
-#include "hunterclaw/react/verbose_reasoning_config.h"  // ✅ engine: 推理展示配置
+#include "hunterclaw/react/verbose_reasoning_config.h"  // ✅ engine: format_reasoning_text
+#include "hunterclaw/react/queue_policy.h"              // ✅ engine: resolve_enforce_final_tag
 // ── 以下模块在 dispatcher 层 (message_dispatcher.cc) 使用，此处保留 include 供编译 ──
 // abort_cutoff, normalize_reply, response_prefix_template, reply_delivery,
 // reply_media_paths, reply_operation, reply_payloads, reply_threading,
@@ -36,22 +37,7 @@ auto log() {
     return logger;
 }
 
-// ========== OpenClaw 对齐: 格式化推理消息 (不添加前缀) ==========
-// 注意: ReactEngine 内部只做流式提取，格式化由上层处理
-// 参考: openclaw-analysis/src/agents/pi-embedded-utils.ts:273-287
-std::string format_reasoning_text(const std::string& text) {
-    // ReactEngine 内部不添加 "Reasoning:" 前缀
-    // 只返回 trim 后的原始内容
-    std::string trimmed = text;
-    auto start = trimmed.find_first_not_of(" \t\n\r");
-    auto end = trimmed.find_last_not_of(" \t\n\r");
-    
-    if (start == std::string::npos) {
-        return "";
-    }
-    
-    return trimmed.substr(start, end - start + 1);
-}
+// format_reasoning_text — 已在 verbose_reasoning_config.h 中声明，verbose_reasoning_config.cc 中实现
 
 // 获取 CPU 核心数 (用于默认线程池大小)
 int get_hardware_concurrency() {

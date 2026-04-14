@@ -70,39 +70,8 @@ std::optional<int> estimate_prompt_tokens_from_session_transcript(
     const std::string& session_file = ""
 );
 
-// ============================================================================
-// 对齐 memory-flush.ts L87-101: shouldRunPreflightCompaction
-// ============================================================================
-bool should_run_preflight_compaction(
-    std::optional<int> token_count,
-    std::optional<int> persisted_total_tokens,
-    bool total_tokens_fresh,
-    int context_window_tokens,
-    int reserve_tokens_floor,
-    int soft_threshold_tokens
-);
-
-// ============================================================================
-// 对齐 memory-flush.ts L60-85: shouldRunMemoryFlush
-// ============================================================================
-bool should_run_memory_flush(
-    std::optional<int> token_count,
-    std::optional<int> persisted_total_tokens,
-    bool total_tokens_fresh,
-    int context_window_tokens,
-    int reserve_tokens_floor,
-    int soft_threshold_tokens,
-    std::optional<int> compaction_count,
-    std::optional<int> memory_flush_compaction_count
-);
-
-// ============================================================================
-// 对齐 memory-flush.ts L108-114: hasAlreadyFlushedForCurrentCompaction
-// ============================================================================
-bool has_already_flushed_for_current_compaction(
-    std::optional<int> compaction_count,
-    std::optional<int> memory_flush_compaction_count
-);
+// shouldRunPreflightCompaction / shouldRunMemoryFlush / hasAlreadyFlushedForCurrentCompaction
+// → 已在 memory_flush_gate.h 中声明（使用 struct params 版本）
 
 // ============================================================================
 // 对齐 memory-flush.ts L125-131: computeContextHash

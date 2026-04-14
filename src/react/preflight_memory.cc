@@ -1,6 +1,6 @@
 #include "hunterclaw/react/preflight_memory.h"
 #include "hunterclaw/sessions/transcript_io.h"
-#include "hunterclaw/llm/llm_message.h"
+#include "hunterclaw/llm/llm_client.h"
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
@@ -35,14 +35,6 @@ constexpr int MAX_CONTEXT_CHARS = 3000;
 int estimate_tokens(const std::string& text) {
     if (text.empty()) return 0;
     return std::max(1, static_cast<int>(text.size() / 4));
-}
-
-// 对齐 OC memory-flush.ts L24-28: resolvePositiveTokenCount
-std::optional<int> resolve_positive_token_count(std::optional<int> value) {
-    if (!value.has_value()) return std::nullopt;
-    int v = *value;
-    if (v <= 0) return std::nullopt;
-    return v;
 }
 
 } // anon
@@ -267,101 +259,10 @@ std::optional<int> estimate_prompt_tokens_from_session_transcript(
     }
 }
 
-// ============================================================================
-// 对齐 memory-flush.ts L30-58: resolveMemoryFlushGateState
-// ============================================================================
-namespace {
-struct MemoryFlushGateState {
-    int total_tokens = 0;
-    int threshold = 0;
-    bool valid = false;
-};
-
-MemoryFlushGateState resolve_memory_flush_gate_state(
-    std::optional<int> token_count,
-    std::optional<int> persisted_total_tokens,
-    bool total_tokens_fresh,
-    int context_window_tokens,
-    int reserve_tokens_floor,
-    int soft_threshold_tokens
-) {
-    MemoryFlushGateState state;
-
-    // 对齐 OC: resolvePositiveTokenCount(params.tokenCount) ?? resolveFreshSessionTotalTokens(entry)
-    int total = 0;
-    auto explicit_count = resolve_positive_token_count(token_count);
-    if (explicit_count.has_value()) {
-        total = *explicit_count;
-    } else if (total_tokens_fresh && persisted_total_tokens.has_value() && *persisted_total_tokens > 0) {
-        total = *persisted_total_tokens;
-    }
-
-    if (total <= 0) return state;
-
-    int ctx = std::max(1, context_window_tokens);
-    int reserve = std::max(0, reserve_tokens_floor);
-    int soft = std::max(0, soft_threshold_tokens);
-    int threshold = std::max(0, ctx - reserve - soft);
-    if (threshold <= 0) return state;
-
-    state.total_tokens = total;
-    state.threshold = threshold;
-    state.valid = true;
-    return state;
-}
-} // anon
-
-// ============================================================================
-// 对齐 memory-flush.ts L108-114: hasAlreadyFlushedForCurrentCompaction
-// ============================================================================
-bool has_already_flushed_for_current_compaction(
-    std::optional<int> compaction_count,
-    std::optional<int> memory_flush_compaction_count
-) {
-    int cc = compaction_count.value_or(0);
-    if (!memory_flush_compaction_count.has_value()) return false;
-    return *memory_flush_compaction_count == cc;
-}
-
-// ============================================================================
-// 对齐 memory-flush.ts L87-101: shouldRunPreflightCompaction
-// ============================================================================
-bool should_run_preflight_compaction(
-    std::optional<int> token_count,
-    std::optional<int> persisted_total_tokens,
-    bool total_tokens_fresh,
-    int context_window_tokens,
-    int reserve_tokens_floor,
-    int soft_threshold_tokens
-) {
-    auto state = resolve_memory_flush_gate_state(
-        token_count, persisted_total_tokens, total_tokens_fresh,
-        context_window_tokens, reserve_tokens_floor, soft_threshold_tokens);
-    return state.valid && state.total_tokens >= state.threshold;
-}
-
-// ============================================================================
-// 对齐 memory-flush.ts L60-85: shouldRunMemoryFlush
-// ============================================================================
-bool should_run_memory_flush(
-    std::optional<int> token_count,
-    std::optional<int> persisted_total_tokens,
-    bool total_tokens_fresh,
-    int context_window_tokens,
-    int reserve_tokens_floor,
-    int soft_threshold_tokens,
-    std::optional<int> compaction_count,
-    std::optional<int> memory_flush_compaction_count
-) {
-    auto state = resolve_memory_flush_gate_state(
-        token_count, persisted_total_tokens, total_tokens_fresh,
-        context_window_tokens, reserve_tokens_floor, soft_threshold_tokens);
-    if (!state.valid || state.total_tokens < state.threshold) return false;
-    if (has_already_flushed_for_current_compaction(compaction_count, memory_flush_compaction_count)) {
-        return false;
-    }
-    return true;
-}
+// has_already_flushed_for_current_compaction — 已在 memory_flush_gate.cc 中实现
+// should_run_preflight_compaction — 已在 memory_flush_gate.cc 中实现 (使用 struct params 版本)
+// should_run_memory_flush — 已在 memory_flush_gate.cc 中实现 (使用 struct params 版本)
+// compute_context_hash — 新增函数，仅在此定义
 
 // ============================================================================
 // 对齐 memory-flush.ts L125-131: computeContextHash
@@ -451,9 +352,12 @@ PreflightCompactionResult run_preflight_compaction_if_needed(
     if (threshold <= 0) return result;
 
     // 对齐 OC L430-436: shouldRunPreflightCompaction
-    bool should_compact = should_run_preflight_compaction(
-        projected_count, params.persisted_total_tokens, params.total_tokens_fresh,
-        params.context_window_tokens, params.reserve_tokens_floor, params.soft_threshold_tokens);
+    PreflightCompactionParams compact_gate_params;
+    compact_gate_params.total_tokens = projected_count.value_or(0);
+    compact_gate_params.context_window_tokens = params.context_window_tokens;
+    compact_gate_params.reserve_tokens_floor = params.reserve_tokens_floor;
+    compact_gate_params.soft_threshold_tokens = params.soft_threshold_tokens;
+    bool should_compact = should_run_preflight_compaction(compact_gate_params);
 
     if (!should_compact) return result;
 
