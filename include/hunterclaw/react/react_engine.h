@@ -161,6 +161,11 @@ struct StreamCallbacks {
     // 使得 per-run-id 的精确 abort 能直接中断该 run 的执行，
     // 而不需要通过 session-level 的 abort_embedded_session。
     std::shared_ptr<std::atomic<bool>> abort_signal;
+
+    // ✅ 对齐 OC agent-runner-memory.ts: memory flush 触发回调
+    // engine run 结束后检查 memory_flush_gate, 如果超过阈值则通知上层执行 flush
+    // 上层 (dispatcher/agent-runner) 负责调用 run_memory_flush_if_needed
+    std::function<void(int total_tokens)> on_memory_flush_needed;
 };
 
 // ReAct 配置

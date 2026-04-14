@@ -1,9 +1,9 @@
 #pragma once
 // ============================================================================
-// preflight_memory.h — 严格对齐 OpenClaw agent-runner-memory.ts (830行)
-//
-// Pre-run compaction + memory flush 完整执行流
-// 门控逻辑在 memory_flush_gate.h 中，本文件是执行层
+// preflight_memory.h — 严格对齐 OpenClaw:
+//   agent-runner-memory.ts  (849行) — pre-run compaction + memory flush
+//   memory-flush.ts          (132行) — 门控函数 + context hash
+//   post-compaction-context.ts (237行) — 压缩后上下文恢复
 // ============================================================================
 
 #include <string>
@@ -11,17 +11,18 @@
 #include <optional>
 #include <functional>
 #include <cstdint>
+#include <utility>
 
 namespace hunterclaw {
 namespace react {
 
 // ============================================================================
-// 对齐 agent-runner-memory.ts:75-86: estimatePromptTokensForMemoryFlush
+// 对齐 agent-runner-memory.ts:90-101: estimatePromptTokensForMemoryFlush
 // ============================================================================
 std::optional<int> estimate_prompt_tokens_for_memory_flush(const std::string& prompt);
 
 // ============================================================================
-// 对齐 agent-runner-memory.ts:88-99: resolveEffectivePromptTokens
+// 对齐 agent-runner-memory.ts:103-114: resolveEffectivePromptTokens
 // ============================================================================
 int resolve_effective_prompt_tokens(
     int base_prompt_tokens = 0,
@@ -30,7 +31,7 @@ int resolve_effective_prompt_tokens(
 );
 
 // ============================================================================
-// 对齐 agent-runner-memory.ts:101-104: SessionTranscriptUsageSnapshot
+// 对齐 agent-runner-memory.ts:116-119: SessionTranscriptUsageSnapshot
 // ============================================================================
 struct SessionTranscriptUsageSnapshot {
     std::optional<int> prompt_tokens;
@@ -38,7 +39,7 @@ struct SessionTranscriptUsageSnapshot {
 };
 
 // ============================================================================
-// 对齐 agent-runner-memory.ts:212-252: readSessionLogSnapshot
+// 对齐 agent-runner-memory.ts:200-203 + 227-267: SessionLogSnapshot
 // ============================================================================
 struct SessionLogSnapshot {
     std::optional<int64_t> byte_size;
@@ -52,14 +53,16 @@ SessionLogSnapshot read_session_log_snapshot(
 );
 
 // ============================================================================
-// 对齐 agent-runner-memory.ts:254-284: readLastNonzeroUsageFromSessionLog
+// 对齐 agent-runner-memory.ts:269-298: readLastNonzeroUsageFromSessionLog
+// 多 chunk 向前扫描
 // ============================================================================
 std::optional<SessionTranscriptUsageSnapshot> read_last_nonzero_usage_from_session_log(
     const std::string& log_path
 );
 
 // ============================================================================
-// 对齐 agent-runner-memory.ts:286-312: estimatePromptTokensFromSessionTranscript
+// 对齐 agent-runner-memory.ts:301-327: estimatePromptTokensFromSessionTranscript
+// 实际读取 transcript 消息并估算 token 数
 // ============================================================================
 std::optional<int> estimate_prompt_tokens_from_session_transcript(
     const std::string& session_id,
@@ -68,7 +71,49 @@ std::optional<int> estimate_prompt_tokens_from_session_transcript(
 );
 
 // ============================================================================
-// 对齐 agent-runner-memory.ts:331-484: runPreflightCompactionIfNeeded
+// 对齐 memory-flush.ts L87-101: shouldRunPreflightCompaction
+// ============================================================================
+bool should_run_preflight_compaction(
+    std::optional<int> token_count,
+    std::optional<int> persisted_total_tokens,
+    bool total_tokens_fresh,
+    int context_window_tokens,
+    int reserve_tokens_floor,
+    int soft_threshold_tokens
+);
+
+// ============================================================================
+// 对齐 memory-flush.ts L60-85: shouldRunMemoryFlush
+// ============================================================================
+bool should_run_memory_flush(
+    std::optional<int> token_count,
+    std::optional<int> persisted_total_tokens,
+    bool total_tokens_fresh,
+    int context_window_tokens,
+    int reserve_tokens_floor,
+    int soft_threshold_tokens,
+    std::optional<int> compaction_count,
+    std::optional<int> memory_flush_compaction_count
+);
+
+// ============================================================================
+// 对齐 memory-flush.ts L108-114: hasAlreadyFlushedForCurrentCompaction
+// ============================================================================
+bool has_already_flushed_for_current_compaction(
+    std::optional<int> compaction_count,
+    std::optional<int> memory_flush_compaction_count
+);
+
+// ============================================================================
+// 对齐 memory-flush.ts L125-131: computeContextHash
+// SHA-256 截断为 16 hex chars，用于 flush 去重
+// ============================================================================
+std::string compute_context_hash(
+    const std::vector<std::pair<std::string, std::string>>& messages // {role, content}
+);
+
+// ============================================================================
+// 对齐 agent-runner-memory.ts:346-503: runPreflightCompactionIfNeeded
 // ============================================================================
 
 struct PreflightRunParams {
@@ -111,7 +156,8 @@ PreflightCompactionResult run_preflight_compaction_if_needed(
 );
 
 // ============================================================================
-// 对齐 agent-runner-memory.ts:486-829: runMemoryFlushIfNeeded
+// 对齐 agent-runner-memory.ts:505-848: runMemoryFlushIfNeeded
+// 完整: near-threshold output 读取 + transcript token 回写 + session rotation
 // ============================================================================
 
 struct MemoryFlushParams {
@@ -143,10 +189,13 @@ struct MemoryFlushParams {
     std::string flush_write_path;
     std::string flush_system_prompt;
     std::string flush_prompt;
+    std::string session_log_path;  // ✅ 新增: transcript 文件路径 (用于 session log 读取)
 
     // Callbacks
     std::function<void(const std::string& prompt, const std::string& system_prompt)> run_flush_agent;
     std::function<void(int new_compaction_count, const std::string& new_session_id)> on_flush_complete;
+    // ✅ 新增: 回写 transcript-derived token 到 session store (对齐 OC L622-649)
+    std::function<void(int derived_total_tokens)> persist_session_tokens;
 };
 
 struct MemoryFlushResult {
@@ -158,10 +207,13 @@ struct MemoryFlushResult {
 MemoryFlushResult run_memory_flush_if_needed(const MemoryFlushParams& params);
 
 // ============================================================================
-// 对齐 agent-runner-memory.ts:190-210: appendPostCompactionRefreshPrompt
+// 对齐 post-compaction-context.ts:64-156: readPostCompactionContext
+// 支持: custom sections config, default/custom prose 区分, 完整 timeLine
 // ============================================================================
 std::optional<std::string> read_post_compaction_context(
-    const std::string& workspace_dir
+    const std::string& workspace_dir,
+    const std::vector<std::string>& configured_sections = {},  // 空=使用默认
+    int64_t now_ms = 0  // 0=使用当前时间
 );
 
 } // namespace react
