@@ -330,7 +330,10 @@ public:
         int messages_after = 0;
         int tokens_saved = 0;
     };
-    CompactionResult trigger_compaction(std::vector<LLMMessage>& messages);
+    CompactionResult trigger_compaction(
+        std::vector<LLMMessage>& messages,
+        const std::string& transcript_path = ""  // 对齐 OC: compaction 后持久化到 transcript
+    );
     
 private:
     ReactEngine(

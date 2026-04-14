@@ -130,6 +130,65 @@ std::vector<llm::LLMMessage> read_transcript_messages(
 );
 
 // ============================================================================
+// Compaction 持久化 (对齐 OpenClaw sessionManager.appendCompaction)
+// ============================================================================
+
+/**
+ * Compaction 条目参数
+ * 对齐 OC: pi-agent-core CustomAgentMessages.compactionSummary
+ */
+struct AppendCompactionOptions {
+    std::string summary;                            // LLM 生成的摘要
+    std::string first_kept_entry_id;                // 从此条目开始保留 (未被摘要覆盖的尾部起点)
+    int tokens_before = 0;                          // compaction 前 token 数
+    std::optional<int> tokens_after;                // compaction 后 token 数
+    std::optional<std::string> details_json;        // 额外详情 (readFiles, modifiedFiles)
+};
+
+/**
+ * 追加 compaction 条目到 transcript
+ * 对齐 OC: sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details)
+ *
+ * 写入 JSONL 行: {"type":"compaction","id":"...","parentId":"...","summary":"...","firstKeptEntryId":"...","tokensBefore":...}
+ * buildSessionContext 读回时用 firstKeptEntryId 跳过已摘要的消息。
+ */
+AppendTranscriptResult append_compaction_to_transcript(
+    const std::string& transcript_path,
+    const AppendCompactionOptions& options
+);
+
+// ============================================================================
+// Session Truncation (对齐 OpenClaw session-truncation.ts)
+// ============================================================================
+
+/**
+ * Truncation 结果
+ */
+struct TruncationResult {
+    bool truncated = false;
+    int entries_removed = 0;
+    int64_t bytes_before = 0;
+    int64_t bytes_after = 0;
+    std::string reason;
+};
+
+/**
+ * Compaction 后物理截断 session transcript 文件。
+ * 对齐 OC: truncateSessionAfterCompaction (session-truncation.ts)
+ *
+ * 移除 firstKeptEntryId 之前的 message 条目 (这些已被摘要覆盖)。
+ * 保留: header, 非 message 状态条目, firstKeptEntryId 之后的条目, compaction 条目。
+ * 被移除条目的子条目会 re-parent 到最近的保留祖先。
+ *
+ * @param truncate_after_compaction 配置开关 (对齐 OC: config.agents.defaults.compaction.truncateAfterCompaction)
+ */
+TruncationResult truncate_session_after_compaction(
+    const std::string& transcript_path,
+    bool truncate_after_compaction = false,
+    const std::optional<std::string>& archive_path = std::nullopt
+);
+
+// ============================================================================
 // 幂等性检查 (对齐 OpenClaw)
 // ============================================================================
 

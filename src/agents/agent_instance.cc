@@ -902,7 +902,7 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
                 // ✅ 触发 Compaction (对齐 OpenClaw)
                 spdlog::get("default")->info("[AgentInstance] Triggering compaction to resolve overflow...");
                 
-                auto compact_result = react_engine_->trigger_compaction(history);
+                auto compact_result = react_engine_->trigger_compaction(history, transcript_path);
                 
                 if (compact_result.compacted) {
                     spdlog::get("default")->info(
@@ -947,7 +947,7 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
                            attempt + 1, MAX_OVERFLOW_ATTEMPTS);
                 
                 // 尝试 compaction 并重试
-                auto compact_result = react_engine_->trigger_compaction(history);
+                auto compact_result = react_engine_->trigger_compaction(history, transcript_path);
                 
                 if (compact_result.compacted) {
                     spdlog::get("default")->info(

@@ -7,6 +7,8 @@
 #include <sstream>
 #include <filesystem>
 #include <chrono>
+#include <set>
+#include <unordered_map>
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -497,7 +499,7 @@ AppendTranscriptResult append_tool_result_to_transcript(
 }
 
 // ============================================================================
-// Transcript 读取
+// Transcript 读取 (对齐 OC buildSessionContext + firstKeptEntryId 跳过机制)
 // ============================================================================
 
 std::vector<llm::LLMMessage> read_transcript_messages(
@@ -518,52 +520,110 @@ std::vector<llm::LLMMessage> read_transcript_messages(
             return messages;
         }
         
-        // 读取所有行 (跳过 header)
-        std::vector<std::string> lines;
+        // ── Pass 1: 读取所有行，找到最新的 compaction 条目 ──
+        // 对齐 OC: buildSessionContext() 找到最新 compaction，跳过 firstKeptEntryId 之前的消息
+        struct ParsedEntry {
+            std::string raw_line;
+            std::string type;        // "session" | "message" | "compaction"
+            std::string id;
+            std::string first_kept_entry_id;  // compaction 条目才有
+            std::string summary;              // compaction 条目才有
+            int tokens_before = 0;
+        };
+        
+        std::vector<ParsedEntry> entries;
         std::string line;
-        bool first = true;
         
         while (std::getline(ifs, line)) {
-            if (line.empty()) {
+            if (line.empty()) continue;
+            
+            ParsedEntry entry;
+            entry.raw_line = line;
+            
+            try {
+                json parsed = json::parse(line);
+                entry.type = parsed.value("type", "");
+                entry.id = parsed.value("id", "");
+                
+                if (entry.type == "compaction") {
+                    entry.first_kept_entry_id = parsed.value("firstKeptEntryId", "");
+                    entry.summary = parsed.value("summary", "");
+                    entry.tokens_before = parsed.value("tokensBefore", 0);
+                }
+            } catch (...) {
+                entry.type = "unknown";
+            }
+            
+            entries.push_back(std::move(entry));
+        }
+        ifs.close();
+        
+        // ── Pass 2: 找到最新的 compaction 条目 ──
+        int latest_compaction_idx = -1;
+        for (int i = static_cast<int>(entries.size()) - 1; i >= 0; --i) {
+            if (entries[i].type == "compaction") {
+                latest_compaction_idx = i;
+                break;
+            }
+        }
+        
+        // ── Pass 3: 确定跳过哪些消息 ──
+        // 对齐 OC: buildSessionContext() 跳过 firstKeptEntryId 之前的 message 条目
+        std::string first_kept_id;
+        if (latest_compaction_idx >= 0) {
+            first_kept_id = entries[latest_compaction_idx].first_kept_entry_id;
+        }
+        
+        // 找到 firstKeptEntryId 在 entries 中的位置
+        int first_kept_idx = -1;
+        if (!first_kept_id.empty()) {
+            for (int i = 0; i < latest_compaction_idx; ++i) {
+                if (entries[i].id == first_kept_id) {
+                    first_kept_idx = i;
+                    break;
+                }
+            }
+        }
+        
+        // ── Pass 4: 构建消息列表 ──
+        std::vector<llm::LLMMessage> all_messages;
+        
+        for (int i = 0; i < static_cast<int>(entries.size()); ++i) {
+            const auto& entry = entries[i];
+            
+            // 跳过 header
+            if (entry.type == "session") continue;
+            
+            // 对齐 OC: compaction 条目 → 注入摘要作为 system 消息
+            if (entry.type == "compaction") {
+                if (!entry.summary.empty()) {
+                    llm::LLMMessage summary_msg;
+                    summary_msg.role = llm::LLMMessageRole::System;
+                    summary_msg.content = "[Previous conversation summary]\n\n" + entry.summary;
+                    all_messages.push_back(summary_msg);
+                }
                 continue;
             }
             
-            // 跳过 header 行 (type: "session")
-            if (first) {
-                first = false;
-                try {
-                    json parsed = json::parse(line);
-                    if (parsed.value("type", "") == "session") {
-                        continue;
-                    }
-                } catch (...) {
-                    // 解析失败,继续
+            // 对齐 OC: 如果有 compaction，跳过 firstKeptEntryId 之前的 message 条目
+            if (latest_compaction_idx >= 0 && entry.type == "message" && i < latest_compaction_idx) {
+                // 如果在 firstKeptEntryId 之前 → 跳过（已被摘要覆盖）
+                if (first_kept_idx >= 0 && i < first_kept_idx) {
+                    continue;
+                }
+                // 如果没找到 firstKeptEntryId (被 truncation 移除了) → firstKeptEntryId 之前的全跳
+                if (first_kept_idx < 0 && !first_kept_id.empty()) {
+                    continue;
                 }
             }
             
-            lines.push_back(line);
-        }
-        
-        ifs.close();
-        
-        // 从后往前取 limit 条
-        int start = std::max(0, static_cast<int>(lines.size()) - limit);
-        
-        for (int i = start; i < static_cast<int>(lines.size()); ++i) {
+            if (entry.type != "message") continue;
+            
             try {
-                json parsed = json::parse(lines[i]);
-                
-                if (parsed.value("type", "") != "message") {
-                    continue;
-                }
-                
-                if (!parsed.contains("message")) {
-                    continue;
-                }
+                json parsed = json::parse(entry.raw_line);
+                if (!parsed.contains("message")) continue;
                 
                 json msg_json = parsed["message"];
-                
-                // 转换为 LLMMessage
                 llm::LLMMessage msg;
                 
                 std::string role = msg_json.value("role", "");
@@ -576,10 +636,9 @@ std::vector<llm::LLMMessage> read_transcript_messages(
                 } else if (role == "tool") {
                     msg.role = llm::LLMMessageRole::Tool;
                 } else {
-                    continue;  // 未知角色,跳过
+                    continue;
                 }
                 
-                // Content
                 if (msg_json.contains("content") && msg_json["content"].is_array()) {
                     std::string content_text;
                     for (const auto& item : msg_json["content"]) {
@@ -590,21 +649,320 @@ std::vector<llm::LLMMessage> read_transcript_messages(
                     msg.content = content_text;
                 }
                 
-                messages.push_back(msg);
+                all_messages.push_back(msg);
                 
             } catch (const std::exception& e) {
                 log()->warn("Failed to parse transcript line: {}", e.what());
-                continue;
             }
         }
         
-        log()->debug("Read {} messages from transcript: {}", messages.size(), transcript_path);
+        // 从后往前取 limit 条 (limit=0 表示全部)
+        if (limit > 0 && static_cast<int>(all_messages.size()) > limit) {
+            messages.assign(all_messages.end() - limit, all_messages.end());
+        } else {
+            messages = std::move(all_messages);
+        }
+        
+        log()->debug("Read {} messages from transcript (compaction={}, firstKept={}): {}",
+            messages.size(),
+            latest_compaction_idx >= 0 ? "yes" : "no",
+            first_kept_id.empty() ? "(none)" : first_kept_id,
+            transcript_path);
         
     } catch (const std::exception& e) {
         log()->error("Failed to read transcript: {}", e.what());
     }
     
     return messages;
+}
+
+// ============================================================================
+// Compaction 持久化 (对齐 OC sessionManager.appendCompaction)
+// ============================================================================
+
+AppendTranscriptResult append_compaction_to_transcript(
+    const std::string& transcript_path,
+    const AppendCompactionOptions& options
+) {
+    try {
+        if (!fs::exists(transcript_path)) {
+            return { false, "", "Transcript file not found" };
+        }
+        
+        // 生成 compaction entry ID
+        std::string compaction_id = core::utils::generate_uuid();
+        
+        // 读取最后一行获取 parentId
+        std::string parent_id;
+        {
+            std::ifstream rf(transcript_path);
+            if (rf.is_open()) {
+                std::string last_line, cur_line;
+                while (std::getline(rf, cur_line)) {
+                    if (!cur_line.empty()) last_line = cur_line;
+                }
+                if (!last_line.empty()) {
+                    try {
+                        auto last_json = json::parse(last_line);
+                        if (last_json.contains("id") && last_json["id"].is_string()) {
+                            parent_id = last_json["id"].get<std::string>();
+                        }
+                    } catch (...) {}
+                }
+            }
+        }
+        
+        // 构建 compaction JSONL 行
+        // 对齐 OC: { type: "compaction", id, parentId, summary, firstKeptEntryId, tokensBefore, ... }
+        json entry;
+        entry["type"] = "compaction";
+        entry["id"] = compaction_id;
+        if (!parent_id.empty()) {
+            entry["parentId"] = parent_id;
+        } else {
+            entry["parentId"] = nullptr;
+        }
+        entry["summary"] = options.summary;
+        entry["firstKeptEntryId"] = options.first_kept_entry_id;
+        entry["tokensBefore"] = options.tokens_before;
+        
+        if (options.tokens_after.has_value()) {
+            entry["tokensAfter"] = *options.tokens_after;
+        }
+        if (options.details_json.has_value()) {
+            try {
+                entry["details"] = json::parse(*options.details_json);
+            } catch (...) {
+                entry["details"] = *options.details_json;
+            }
+        }
+        
+        auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count();
+        entry["timestamp"] = now_ms;
+        
+        // 追加到文件
+        std::ofstream ofs(transcript_path, std::ios::app);
+        if (!ofs.is_open()) {
+            return { false, "", "Failed to open transcript file for appending" };
+        }
+        
+        ofs << entry.dump() << "\n";
+        ofs.close();
+        
+        log()->info("[compaction] Appended compaction entry to transcript: {} "
+                    "(id={}, firstKeptEntryId={}, tokensBefore={})",
+            transcript_path, compaction_id,
+            options.first_kept_entry_id, options.tokens_before);
+        
+        return { true, compaction_id, "" };
+        
+    } catch (const std::exception& e) {
+        return { false, "", e.what() };
+    }
+}
+
+// ============================================================================
+// Session Truncation (对齐 OC session-truncation.ts)
+// ============================================================================
+
+TruncationResult truncate_session_after_compaction(
+    const std::string& transcript_path,
+    bool truncate_after_compaction,
+    const std::optional<std::string>& archive_path
+) {
+    TruncationResult result;
+    
+    if (!truncate_after_compaction) {
+        result.reason = "truncation disabled";
+        return result;
+    }
+    
+    try {
+        if (!fs::exists(transcript_path)) {
+            result.reason = "file not found";
+            return result;
+        }
+        
+        // 获取文件大小
+        result.bytes_before = static_cast<int64_t>(fs::file_size(transcript_path));
+        
+        // 读取所有行
+        std::vector<std::string> raw_lines;
+        {
+            std::ifstream ifs(transcript_path);
+            std::string line;
+            while (std::getline(ifs, line)) {
+                if (!line.empty()) raw_lines.push_back(line);
+            }
+        }
+        
+        if (raw_lines.empty()) {
+            result.reason = "empty file";
+            return result;
+        }
+        
+        // 解析所有条目
+        struct Entry {
+            std::string raw;
+            std::string type;
+            std::string id;
+            std::string parent_id;
+            std::string first_kept_entry_id;
+            bool is_header = false;
+        };
+        
+        std::vector<Entry> entries;
+        for (const auto& raw : raw_lines) {
+            Entry e;
+            e.raw = raw;
+            try {
+                json parsed = json::parse(raw);
+                e.type = parsed.value("type", "");
+                e.id = parsed.value("id", "");
+                if (parsed.contains("parentId") && parsed["parentId"].is_string()) {
+                    e.parent_id = parsed["parentId"].get<std::string>();
+                }
+                if (e.type == "compaction") {
+                    e.first_kept_entry_id = parsed.value("firstKeptEntryId", "");
+                }
+                e.is_header = (e.type == "session");
+            } catch (...) {
+                e.type = "unknown";
+            }
+            entries.push_back(std::move(e));
+        }
+        
+        // 找到最新的 compaction 条目
+        int latest_compaction_idx = -1;
+        for (int i = static_cast<int>(entries.size()) - 1; i >= 0; --i) {
+            if (entries[i].type == "compaction") {
+                latest_compaction_idx = i;
+                break;
+            }
+        }
+        
+        if (latest_compaction_idx < 0) {
+            result.reason = "no compaction entry found";
+            return result;
+        }
+        
+        if (latest_compaction_idx == 0) {
+            result.reason = "compaction already at root";
+            return result;
+        }
+        
+        std::string first_kept_id = entries[latest_compaction_idx].first_kept_entry_id;
+        
+        // 对齐 OC: 收集被摘要的条目 ID (firstKeptEntryId 之前的)
+        std::set<std::string> summarized_ids;
+        for (int i = 0; i < latest_compaction_idx; ++i) {
+            if (!first_kept_id.empty() && entries[i].id == first_kept_id) {
+                break;  // 从这里开始是未摘要尾部
+            }
+            summarized_ids.insert(entries[i].id);
+        }
+        
+        // 对齐 OC: 只移除被摘要的 message 条目，保留非 message 状态
+        std::set<std::string> removed_ids;
+        for (const auto& e : entries) {
+            if (summarized_ids.count(e.id) && e.type == "message") {
+                removed_ids.insert(e.id);
+            }
+        }
+        
+        if (removed_ids.empty()) {
+            result.reason = "no entries to remove";
+            return result;
+        }
+        
+        // 对齐 OC: 可选归档
+        if (archive_path.has_value() && !archive_path->empty()) {
+            try {
+                fs::create_directories(fs::path(*archive_path).parent_path());
+                fs::copy_file(transcript_path, *archive_path,
+                    fs::copy_options::overwrite_existing);
+                log()->info("[session-truncation] Archived pre-truncation file to {}",
+                    *archive_path);
+            } catch (const std::exception& e) {
+                log()->warn("[session-truncation] Failed to archive: {}", e.what());
+            }
+        }
+        
+        // 对齐 OC: 构建 id→entry map 用于 re-parenting
+        std::unordered_map<std::string, std::string> parent_map;  // id → parentId
+        for (const auto& e : entries) {
+            if (!e.id.empty()) {
+                parent_map[e.id] = e.parent_id;
+            }
+        }
+        
+        // 对齐 OC: 保留未被移除的条目，re-parent 必要时
+        std::vector<std::string> kept_lines;
+        for (const auto& e : entries) {
+            if (removed_ids.count(e.id)) {
+                continue;
+            }
+            
+            // 对齐 OC: 沿 parent chain 找到最近的保留祖先
+            std::string new_parent = e.parent_id;
+            while (!new_parent.empty() && removed_ids.count(new_parent)) {
+                auto it = parent_map.find(new_parent);
+                new_parent = (it != parent_map.end()) ? it->second : "";
+            }
+            
+            if (new_parent != e.parent_id && !e.is_header) {
+                // Re-parent: 修改 JSON 中的 parentId
+                try {
+                    json parsed = json::parse(e.raw);
+                    if (new_parent.empty()) {
+                        parsed["parentId"] = nullptr;
+                    } else {
+                        parsed["parentId"] = new_parent;
+                    }
+                    kept_lines.push_back(parsed.dump());
+                } catch (...) {
+                    kept_lines.push_back(e.raw);  // fallback: 保留原始行
+                }
+            } else {
+                kept_lines.push_back(e.raw);
+            }
+        }
+        
+        // 对齐 OC: 原子写入 (tmp + rename)
+        std::string content;
+        for (const auto& l : kept_lines) {
+            content += l + "\n";
+        }
+        
+        std::string tmp_file = transcript_path + ".truncate-tmp";
+        {
+            std::ofstream ofs(tmp_file);
+            ofs << content;
+        }
+        fs::rename(tmp_file, transcript_path);
+        
+        result.truncated = true;
+        result.entries_removed = static_cast<int>(removed_ids.size());
+        result.bytes_after = static_cast<int64_t>(content.size());
+        
+        double reduction = result.bytes_before > 0
+            ? (1.0 - static_cast<double>(result.bytes_after) / result.bytes_before) * 100.0
+            : 0.0;
+        
+        log()->info("[session-truncation] Truncated session file: "
+                    "entriesBefore={} entriesAfter={} removed={} "
+                    "bytesBefore={} bytesAfter={} reduction={:.1f}%",
+            entries.size(), kept_lines.size(), result.entries_removed,
+            result.bytes_before, result.bytes_after, reduction);
+        
+    } catch (const std::exception& e) {
+        result.reason = e.what();
+        log()->warn("[session-truncation] Failed: {}", e.what());
+    }
+    
+    return result;
 }
 
 }  // namespace sessions

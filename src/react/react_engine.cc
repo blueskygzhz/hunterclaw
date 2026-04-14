@@ -18,6 +18,7 @@
 #include "hunterclaw/observability/diagnostic_events.h"  // ✅ 可观测性集成
 #include <regex>
 #include <algorithm>
+#include <fstream>
 #include <future>
 #include <thread>
 #include <set>
@@ -650,7 +651,7 @@ ReactResult ReactEngine::execute_loop(
 
                     // Fallback 到 compaction_mgr_ (如果 CE compact 失败)
                     if (!compact_ok && compaction_mgr_) {
-                        auto compact_result = trigger_compaction(messages);
+                        auto compact_result = trigger_compaction(messages, callbacks.transcript_path);
                         compact_ok = compact_result.compacted;
                         if (!compact_ok) {
                             log()->warn("[ReactEngine] CompactionManager also failed: {}",
@@ -755,7 +756,7 @@ ReactResult ReactEngine::execute_loop(
                 data["phase"] = "start";
                 callbacks.on_agent_event({"compaction", std::move(data)});
             }
-            auto compact_result = trigger_compaction(messages);
+            auto compact_result = trigger_compaction(messages, callbacks.transcript_path);
             if (callbacks.on_agent_event) {
                 core::JsonValue data;
                 data["phase"] = "end";
@@ -2408,7 +2409,8 @@ std::optional<int> ReactEngine::extract_overflow_token_count(const std::string& 
 
 // 触发 Compaction (对齐 OpenClaw)
 ReactEngine::CompactionResult ReactEngine::trigger_compaction(
-    std::vector<LLMMessage>& messages
+    std::vector<LLMMessage>& messages,
+    const std::string& transcript_path
 ) {
     CompactionResult result;
     
@@ -2517,6 +2519,66 @@ ReactEngine::CompactionResult ReactEngine::trigger_compaction(
     result.messages_before = messages_before;
     result.messages_after = messages.size();
     result.tokens_saved = compact_data.tokens_saved;
+
+    // =========================================================================
+    // 对齐 OC: appendCompaction — 持久化 compaction 条目到 transcript
+    // OC compact.ts L1003-1008: session.compact() 后 SDK 自动调用 appendCompaction
+    // HC 需要显式调用，因为没有 SDK SessionManager
+    // =========================================================================
+    if (!transcript_path.empty()) {
+        // 确定 firstKeptEntryId: 最后保留的原始消息的 entry ID
+        // compressed_messages = [summary(system), recent_msg_1, ..., recent_msg_N]
+        // firstKeptEntryId 对应第一条保留的原始消息 (不包括 summary)
+        // 简化实现: 用最后一条原始消息的位置标记
+        std::string first_kept_entry_id;
+
+        // 读取 transcript 最后几行获取保留消息对应的 entry ID
+        {
+            std::ifstream rf(transcript_path);
+            if (rf.is_open()) {
+                std::vector<std::pair<std::string, std::string>> entry_ids; // {id, type}
+                std::string line;
+                while (std::getline(rf, line)) {
+                    if (line.empty()) continue;
+                    try {
+                        auto parsed = nlohmann::json::parse(line);
+                        std::string id = parsed.value("id", "");
+                        std::string type = parsed.value("type", "");
+                        if (!id.empty() && type == "message") {
+                            entry_ids.push_back({id, type});
+                        }
+                    } catch (...) {}
+                }
+                // 保留了最后 keep_count 条消息，firstKeptEntryId = 倒数第 keep_count 条的 ID
+                int keep_count = std::min(5, static_cast<int>(entry_ids.size()));
+                if (keep_count > 0 && static_cast<int>(entry_ids.size()) >= keep_count) {
+                    first_kept_entry_id = entry_ids[entry_ids.size() - keep_count].first;
+                }
+            }
+        }
+
+        sessions::AppendCompactionOptions comp_opts;
+        comp_opts.summary = compact_data.summary;
+        comp_opts.first_kept_entry_id = first_kept_entry_id;
+        comp_opts.tokens_before = compact_data.tokens_before;
+        comp_opts.tokens_after = compact_data.tokens_after;
+
+        auto append_result = sessions::append_compaction_to_transcript(
+            transcript_path, comp_opts);
+
+        if (append_result.ok) {
+            log()->info("[ReactEngine] Compaction persisted to transcript: "
+                       "firstKeptEntryId={}", first_kept_entry_id);
+
+            // 对齐 OC: 可选 truncation (config.agents.defaults.compaction.truncateAfterCompaction)
+            // 目前默认不开启，但提供接口
+            // auto trunc_result = sessions::truncate_session_after_compaction(
+            //     transcript_path, config_.truncate_after_compaction);
+        } else {
+            log()->warn("[ReactEngine] Failed to persist compaction to transcript: {}",
+                       append_result.error);
+        }
+    }
 
     // =========================================================================
     // Hook: after_compaction
