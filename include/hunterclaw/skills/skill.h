@@ -390,5 +390,205 @@ private:
     static std::vector<DangerousPattern> get_patterns();
 };
 
+// ============================================================================
+// ClawHub Registry Types (对齐 OC skills-clawhub.ts)
+// ============================================================================
+
+struct ClawHubSkillOrigin {
+    int version = 1;
+    std::string registry;          // base URL
+    std::string slug;
+    std::string installed_version;
+    int64_t installed_at = 0;      // epoch ms
+};
+
+struct ClawHubSkillsLockfile {
+    int version = 1;
+    struct LockEntry {
+        std::string version;
+        int64_t installed_at = 0;
+    };
+    std::map<std::string, LockEntry> skills;
+};
+
+struct ClawHubSkillSearchResult {
+    double score = 0;
+    std::string slug;
+    std::string display_name;
+    std::string summary;
+    std::string version;
+    int64_t updated_at = 0;
+};
+
+struct ClawHubSkillDetail {
+    struct SkillInfo {
+        std::string slug;
+        std::string display_name;
+        std::string summary;
+        int64_t created_at = 0;
+        int64_t updated_at = 0;
+    };
+    std::optional<SkillInfo> skill;
+    struct VersionInfo {
+        std::string version;
+        int64_t created_at = 0;
+        std::string changelog;
+    };
+    std::optional<VersionInfo> latest_version;
+};
+
+struct InstallClawHubSkillResult {
+    bool ok = false;
+    std::string slug;
+    std::string version;
+    std::string target_dir;
+    std::string error;
+};
+
+struct UpdateClawHubSkillResult {
+    bool ok = false;
+    std::string slug;
+    std::string previous_version;
+    std::string version;
+    bool changed = false;
+    std::string target_dir;
+    std::string error;
+};
+
+// ============================================================================
+// ClawHub Manager (对齐 OC skills-clawhub.ts)
+// ============================================================================
+
+class ClawHubManager {
+public:
+    ClawHubManager();
+    ~ClawHubManager();
+
+    // 对齐 OC: searchSkillsFromClawHub
+    std::vector<ClawHubSkillSearchResult> search(
+        const std::string& query = "*",
+        int limit = 20,
+        const std::string& base_url = ""
+    ) const;
+
+    // 对齐 OC: installSkillFromClawHub
+    InstallClawHubSkillResult install(
+        const std::string& workspace_dir,
+        const std::string& slug,
+        const std::string& version = "",
+        const std::string& base_url = "",
+        bool force = false
+    );
+
+    // 对齐 OC: updateSkillsFromClawHub
+    std::vector<UpdateClawHubSkillResult> update(
+        const std::string& workspace_dir,
+        const std::string& slug = "",
+        const std::string& base_url = ""
+    );
+
+    // 对齐 OC: readTrackedClawHubSkillSlugs
+    std::vector<std::string> list_tracked_slugs(const std::string& workspace_dir) const;
+
+    // 对齐 OC: computeSkillFingerprint
+    static std::string compute_fingerprint(const std::string& skill_dir);
+
+    // Lockfile read/write
+    static ClawHubSkillsLockfile read_lockfile(const std::string& workspace_dir);
+    static void write_lockfile(const std::string& workspace_dir, const ClawHubSkillsLockfile& lock);
+
+    // Origin read/write
+    static std::optional<ClawHubSkillOrigin> read_origin(const std::string& skill_dir);
+    static void write_origin(const std::string& skill_dir, const ClawHubSkillOrigin& origin);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+// ============================================================================
+// Skill Status Report (对齐 OC skills-status.ts)
+// ============================================================================
+
+struct SkillInstallOption {
+    std::string id;
+    SkillInstallSpec::Kind kind;
+    std::string label;
+    std::vector<std::string> bins;
+};
+
+struct SkillStatusEntry {
+    std::string name;
+    std::string description;
+    std::string source;
+    bool bundled = false;
+    std::string file_path;
+    std::string base_dir;
+    std::string skill_key;
+    std::string primary_env;
+    std::string emoji;
+    std::string homepage;
+    bool always = false;
+    bool disabled = false;
+    bool blocked_by_allowlist = false;
+    bool eligible = false;
+    SkillRequirements requirements;
+    SkillRequirements missing;
+    std::vector<SkillInstallOption> install;
+};
+
+struct SkillStatusReport {
+    std::string workspace_dir;
+    std::string managed_skills_dir;
+    std::vector<SkillStatusEntry> skills;
+};
+
+// 对齐 OC: buildWorkspaceSkillStatus
+SkillStatusReport build_workspace_skill_status(
+    const std::string& workspace_dir,
+    std::shared_ptr<core::Config> config = nullptr,
+    const SkillEligibilityContext* eligibility = nullptr
+);
+
+// ============================================================================
+// Skills Remote (对齐 OC infra/skills-remote.ts)
+// ============================================================================
+
+struct RemoteNodeRecord {
+    std::string node_id;
+    std::string display_name;
+    std::string platform;
+    std::string device_family;
+    std::vector<std::string> commands;
+    std::set<std::string> bins;
+    std::string remote_ip;
+};
+
+class SkillsRemote {
+public:
+    static SkillsRemote& instance();
+
+    // 对齐 OC: recordRemoteNodeInfo / removeRemoteNodeInfo
+    void record_node(const RemoteNodeRecord& node);
+    void remove_node(const std::string& node_id);
+
+    // 对齐 OC: recordRemoteNodeBins
+    void record_bins(const std::string& node_id, const std::vector<std::string>& bins);
+
+    // 对齐 OC: getRemoteSkillEligibility
+    std::optional<RemoteSkillEligibility> get_eligibility(bool advertise_exec_node = true) const;
+
+    // 对齐 OC: refreshRemoteNodeBins
+    void refresh_bins(const std::string& node_id, std::shared_ptr<core::Config> config);
+
+    // 对齐 OC: primeRemoteSkillsCache
+    void prime_cache();
+
+private:
+    SkillsRemote();
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 } // namespace skills
 } // namespace hunterclaw
