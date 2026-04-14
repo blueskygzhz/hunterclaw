@@ -3,33 +3,80 @@
 #include <optional>
 #include <string>
 #include <cstdint>
+#include <functional>
+#include <unordered_map>
 
-// 严格对齐 OpenClaw src/auto-reply/reply/abort-cutoff.ts (100行)
-// Abort cutoff 时间戳管理 — 用于跳过 abort 前排队的消息
+// 严格对齐 OpenClaw:
+//   src/auto-reply/reply/abort-cutoff.ts        (107行 — types + resolve + read + has + apply + shouldSkip + shouldPersist)
+//   src/auto-reply/reply/abort-cutoff.runtime.ts (33行 — clearAbortCutoffInSessionRuntime)
+//   src/auto-reply/reply/commands-session-store.ts (53行 — persistAbortTargetEntry)
 
 namespace hunterclaw {
+
+// Forward declare to avoid circular include
+namespace sessions {
+struct SessionEntry;
+}
+
 namespace react {
 
 // ============================================================================
-// AbortCutoff (对齐 abort-cutoff.ts:8-20)
+// AbortCutoff (对齐 abort-cutoff.ts:5-8)
 // ============================================================================
 struct AbortCutoff {
-    int64_t timestamp_ms = 0;   // abort 发出的时间戳
-    std::string session_key;    // 被 abort 的 session key
+    std::optional<std::string> message_sid;  // ✅ 对齐 OC: messageSid
+    std::optional<int64_t> timestamp_ms;     // ✅ 对齐 OC: timestamp
 };
 
 // ============================================================================
-// resolveAbortCutoffFromContext (对齐 abort-cutoff.ts:22-42)
-// 从当前 context 解析 abort cutoff
+// resolveAbortCutoffFromContext (对齐 abort-cutoff.ts:12-21)
+// 从当前消息 context 解析 abort cutoff (message_sid + timestamp)
 // ============================================================================
-std::optional<AbortCutoff> resolve_abort_cutoff_from_context(
-    const std::string& command_session_key,
-    int64_t now_ms = 0
+AbortCutoff resolve_abort_cutoff_from_context(
+    const std::optional<std::string>& message_sid,
+    std::optional<int64_t> timestamp_ms = std::nullopt
 );
 
 // ============================================================================
-// shouldPersistAbortCutoff (对齐 abort-cutoff.ts:44-58)
+// readAbortCutoffFromSessionEntry (对齐 abort-cutoff.ts:23-38)
+// 从 SessionEntry 读取已存储的 abort cutoff
+// ============================================================================
+std::optional<AbortCutoff> read_abort_cutoff_from_session_entry(
+    const sessions::SessionEntry* entry
+);
+
+// ============================================================================
+// hasAbortCutoff (对齐 abort-cutoff.ts:40-42)
+// ============================================================================
+bool has_abort_cutoff(const sessions::SessionEntry* entry);
+
+// ============================================================================
+// applyAbortCutoffToSessionEntry (对齐 abort-cutoff.ts:44-50)
+// 将 abort cutoff 写入 SessionEntry（传 nullopt 则清除）
+// ============================================================================
+void apply_abort_cutoff_to_session_entry(
+    sessions::SessionEntry& entry,
+    const std::optional<AbortCutoff>& cutoff
+);
+
+// ============================================================================
+// shouldSkipMessageByAbortCutoff (对齐 abort-cutoff.ts:64-91)
+// 判断消息是否应被 abort cutoff 跳过
+// 优先比较 message_sid (BigInt 数值比较), fallback 到 timestamp
+// ============================================================================
+struct AbortCutoffCompareParams {
+    std::optional<std::string> cutoff_message_sid;  // 对齐 OC: cutoffMessageSid
+    std::optional<int64_t> cutoff_timestamp;        // 对齐 OC: cutoffTimestamp
+    std::optional<std::string> message_sid;          // 对齐 OC: messageSid
+    std::optional<int64_t> timestamp;                // 对齐 OC: timestamp
+};
+
+bool should_skip_message_by_abort_cutoff(const AbortCutoffCompareParams& params);
+
+// ============================================================================
+// shouldPersistAbortCutoff (对齐 abort-cutoff.ts:93-106)
 // 判断是否需要持久化 abort cutoff
+// 仅当 command source 和 target 是同一个 session 时才持久化
 // ============================================================================
 bool should_persist_abort_cutoff(
     const std::string& command_session_key,
@@ -37,26 +84,39 @@ bool should_persist_abort_cutoff(
 );
 
 // ============================================================================
-// applyAbortCutoffToSessionEntry (对齐 abort-cutoff.ts:60-80)
-// 将 abort cutoff 应用到 session entry
+// clearAbortCutoffInSessionRuntime (对齐 abort-cutoff.runtime.ts:5-33)
+// 当一条新消息到达且比 cutoff 更新时，清除 session 上的 abort cutoff
 // ============================================================================
-struct SessionEntryAbortFields {
-    std::optional<int64_t> abort_cutoff_ms;
-    bool aborted_last_run = false;
+struct ClearAbortCutoffParams {
+    sessions::SessionEntry* session_entry = nullptr;
+    std::unordered_map<std::string, sessions::SessionEntry>* session_store = nullptr;
+    std::string session_key;
+    std::string store_path;
+    // 持久化回调 (对齐 OC: updateSessionStore)
+    std::function<void(const std::string& store_path,
+                       std::function<void(std::unordered_map<std::string, sessions::SessionEntry>&)>)>
+        update_session_store;
 };
 
-SessionEntryAbortFields apply_abort_cutoff_to_session_entry(
-    const AbortCutoff& cutoff
-);
+bool clear_abort_cutoff_in_session_runtime(const ClearAbortCutoffParams& params);
 
 // ============================================================================
-// shouldSkipMessageByAbortCutoff (对齐 abort-cutoff.ts:82-100)
-// 判断消息是否应被 abort cutoff 跳过
+// persistAbortTargetEntry (对齐 commands-session-store.ts:22-53)
+// 将 abort cutoff 持久化到目标 session entry
 // ============================================================================
-bool should_skip_message_by_abort_cutoff(
-    int64_t message_timestamp_ms,
-    std::optional<int64_t> abort_cutoff_ms
-);
+struct PersistAbortTargetParams {
+    sessions::SessionEntry* entry = nullptr;
+    std::string key;
+    std::unordered_map<std::string, sessions::SessionEntry>* session_store = nullptr;
+    std::string store_path;
+    std::optional<AbortCutoff> abort_cutoff;
+    // 持久化回调
+    std::function<void(const std::string& store_path,
+                       std::function<void(std::unordered_map<std::string, sessions::SessionEntry>&)>)>
+        update_session_store;
+};
+
+bool persist_abort_target_entry(const PersistAbortTargetParams& params);
 
 }  // namespace react
 }  // namespace hunterclaw

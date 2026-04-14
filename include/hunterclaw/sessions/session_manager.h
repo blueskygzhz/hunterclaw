@@ -85,6 +85,11 @@ struct SessionEntry {
     bool system_sent = false;         // ✅ 对齐 OpenClaw: systemSent
     bool aborted_last_run = false;    // ✅ 对齐 OpenClaw: abortedLastRun
 
+    // Abort cutoff (对齐 OpenClaw: abortCutoffMessageSid / abortCutoffTimestamp)
+    // /stop 收到时记录的截断点，用于跳过 abort 前排队的消息
+    std::optional<std::string> abort_cutoff_message_sid;  // ✅ 对齐 OC: abortCutoffMessageSid
+    std::optional<int64_t>     abort_cutoff_ms;           // ✅ 对齐 OC: abortCutoffTimestamp
+
     // 基础元数据
     SessionMetadata metadata;
 

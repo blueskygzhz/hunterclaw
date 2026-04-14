@@ -458,6 +458,71 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
         return result;
     }
 
+    // ── Step 3b: Inline abort cutoff check ──────────────────────────────────
+    // 对齐 OpenClaw: get-reply-inline-actions.ts L310-337
+    // 如果当前消息不是 /stop，检查 session 是否有 abort cutoff：
+    //   - 如果消息在 cutoff 之前 → 跳过（丢弃 abort 前排队的老消息）
+    //   - 如果消息在 cutoff 之后 → 清除 cutoff（恢复正常处理）
+    if (!fast_abort.should_abort && session_entry_for_dispatch.has_value()) {
+        const bool is_stop_like = react::is_abort_request_text(message.text);
+        if (!is_stop_like) {
+            auto cutoff = react::read_abort_cutoff_from_session_entry(
+                &*session_entry_for_dispatch);
+            if (cutoff.has_value()) {
+                // 对齐 OC: resolveAbortCutoffFromContext(ctx) → incoming
+                // InboundMessage 用 message_id 作为 SID, timestamp 转 ms
+                const int64_t msg_ts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    message.timestamp.time_since_epoch()
+                ).count();
+
+                auto incoming = react::resolve_abort_cutoff_from_context(
+                    message.message_id.empty()
+                        ? std::nullopt
+                        : std::optional<std::string>(message.message_id),
+                    msg_ts_ms > 0
+                        ? std::optional<int64_t>(msg_ts_ms)
+                        : std::nullopt
+                );
+
+                // 对齐 OC: shouldSkipMessageByAbortCutoff
+                bool should_skip = react::should_skip_message_by_abort_cutoff({
+                    .cutoff_message_sid = cutoff->message_sid,
+                    .cutoff_timestamp = cutoff->timestamp_ms,
+                    .message_sid = incoming.message_sid,
+                    .timestamp = incoming.timestamp_ms
+                });
+
+                if (should_skip) {
+                    // 对齐 OC: typing.cleanup(); return { kind: "reply", reply: undefined };
+                    log()->debug("dispatch_reply_from_config: skipping stale message by abort cutoff "
+                                 "session={} msg_sid={} cutoff_sid={}",
+                                 session_key,
+                                 incoming.message_sid.value_or("(none)"),
+                                 cutoff->message_sid.value_or("(none)"));
+                    result.skipped = true;
+                    result.skip_reason = "abort_cutoff_stale";
+                    return result;
+                }
+
+                // 对齐 OC: 消息比 cutoff 更新 → clearAbortCutoffInSessionRuntime
+                auto entry_copy = *session_entry_for_dispatch;
+                react::apply_abort_cutoff_to_session_entry(entry_copy, std::nullopt);
+                entry_copy.updated_at = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()
+                ).count();
+                session_entry_for_dispatch = entry_copy;
+
+                // 持久化清除
+                if (session_manager_) {
+                    session_manager_->update_session(entry_copy);
+                }
+
+                log()->debug("dispatch_reply_from_config: cleared abort cutoff for session={}",
+                             session_key);
+            }
+        }
+    }
+
     // ── Step 4: bypassAcpForCommand (aligned with openclaw: shouldBypassAcpDispatchForCommand) ──
     // Aligned with openclaw: computed BEFORE sendPolicy check, used in BOTH sendPolicy and acpDispatch.
     // Commands that start with ! or are registered slash-commands bypass send policy and ACP.

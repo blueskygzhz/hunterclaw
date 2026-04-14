@@ -1,5 +1,10 @@
 #include "hunterclaw/react/abort.h"
+#include "hunterclaw/sessions/session_manager.h"
 #include <spdlog/spdlog.h>
+
+// 严格对齐 OpenClaw:
+//   src/auto-reply/reply/abort.ts (345行)
+//   src/auto-reply/reply/commands-session-abort.ts (applyAbortTarget)
 
 namespace hunterclaw {
 namespace react {
@@ -69,7 +74,7 @@ StopSubagentsResult stop_subagents_for_requester(
 }
 
 // ============================================================================
-// handleAbortCommand (对齐 abort.ts:100-345)
+// handleAbortCommand (对齐 abort.ts:100-345 + commands-session-abort.ts)
 // ============================================================================
 
 AbortResult handle_abort_command(const AbortSessionParams& params) {
@@ -86,10 +91,10 @@ AbortResult handle_abort_command(const AbortSessionParams& params) {
         : params.target_session_key;
 
     // 对齐: setAbortMemory(abortKey, true)
-    std::string abort_key = target_key;
+    std::string abort_key = params.abort_key.empty() ? target_key : params.abort_key;
     set_abort_memory(abort_key, true);
 
-    // 对齐: abort the embedded run
+    // 对齐: abort the embedded run (replyRunRegistry.abort(abortTarget.key))
     if (params.abort_embedded_run) {
         try {
             params.abort_embedded_run(target_key);
@@ -116,20 +121,45 @@ AbortResult handle_abort_command(const AbortSessionParams& params) {
         }
     }
 
-    // 对齐: resolve abort cutoff
+    // ── 对齐: resolve abort cutoff + persist (commands-session-abort.ts:64-110) ──
+    // resolveAbortCutoffForTarget → shouldPersistAbortCutoff + resolveAbortCutoffFromContext
+    std::optional<AbortCutoff> abort_cutoff;
     if (should_persist_abort_cutoff(params.session_key, target_key)) {
-        auto cutoff = resolve_abort_cutoff_from_context(
-            params.session_key, params.timestamp_ms);
-        if (cutoff.has_value()) {
-            result.cutoff = cutoff;
+        abort_cutoff = resolve_abort_cutoff_from_context(
+            params.message_sid, params.timestamp_ms);
+    }
+    result.cutoff = abort_cutoff;
+
+    // ── 对齐: applyAbortTarget → persistAbortTargetEntry (commands-session-abort.ts:96-110) ──
+    // 将 cutoff 持久化到 session entry
+    if (params.session_entry && params.session_store) {
+        bool persisted = persist_abort_target_entry({
+            .entry = params.session_entry,
+            .key = target_key,
+            .session_store = params.session_store,
+            .store_path = params.store_path,
+            .abort_cutoff = abort_cutoff,
+            .update_session_store = params.update_session_store
+        });
+
+        // 对齐 OC: if (!persisted && params.abortKey) { setAbortMemory(abortKey, true); }
+        // abort memory 已在上面设置过，这里只是防御性补充
+        if (!persisted && !abort_key.empty()) {
+            set_abort_memory(abort_key, true);
+        }
+    } else {
+        // 对齐 OC: 没有 session entry 时使用 abortKey 内存标记
+        if (!abort_key.empty()) {
+            set_abort_memory(abort_key, true);
         }
     }
 
     result.aborted = true;
     result.reply_text = format_abort_reply_text(result.stopped_subagents);
 
-    log()->info("Abort completed for session '{}': stopped {} subagents",
-                target_key, result.stopped_subagents);
+    log()->info("Abort completed for session '{}': stopped {} subagents, cutoff={}",
+                target_key, result.stopped_subagents,
+                abort_cutoff.has_value() ? "yes" : "no");
 
     return result;
 }

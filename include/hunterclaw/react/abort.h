@@ -6,12 +6,19 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // 严格对齐 OpenClaw src/auto-reply/reply/abort.ts (345行)
-// 完整 abort 系统：格式化回复、子代理级联停止、session abort 流程
+// + src/auto-reply/reply/commands-session-abort.ts (applyAbortTarget)
+// 完整 abort 系统：格式化回复、子代理级联停止、session abort 流程 + cutoff 持久化
 
 namespace hunterclaw {
+
+namespace sessions {
+struct SessionEntry;
+}
+
 namespace react {
 
 // ============================================================================
@@ -31,11 +38,13 @@ struct AbortResult {
 
 // ============================================================================
 // AbortSessionParams (对齐 abort.ts:100-180 handleAbortCommand 参数)
+// + commands-session-abort.ts: applyAbortTarget session store 参数
 // ============================================================================
 struct AbortSessionParams {
     std::string session_key;
     std::string target_session_key;  // 可以 abort 其他 session
     std::string command_text;
+    std::optional<std::string> message_sid;  // ✅ 对齐 OC: ctx.MessageSid
     int64_t timestamp_ms = 0;
 
     // 回调：中止嵌入式 PI 运行 (对齐 abortEmbeddedPiRun)
@@ -50,11 +59,22 @@ struct AbortSessionParams {
 
     // 回调：清除 session 队列 (对齐 clearSessionQueues)
     std::function<void(const std::string& session_key)> clear_session_queues;
+
+    // ── Session store 参数 (对齐 commands-session-abort.ts: applyAbortTarget) ──
+    sessions::SessionEntry* session_entry = nullptr;
+    std::unordered_map<std::string, sessions::SessionEntry>* session_store = nullptr;
+    std::string store_path;
+    std::string abort_key;  // ✅ 对齐 OC: command.abortKey
+
+    // 持久化回调 (对齐 OC: updateSessionStore)
+    std::function<void(const std::string& store_path,
+                       std::function<void(std::unordered_map<std::string, sessions::SessionEntry>&)>)>
+        update_session_store;
 };
 
 // ============================================================================
-// handleAbortCommand (对齐 abort.ts:100-345)
-// 处理 /abort 或 /stop 命令
+// handleAbortCommand (对齐 abort.ts:100-345 + commands-session-abort.ts)
+// 处理 /abort 或 /stop 命令，含 cutoff 持久化
 // ============================================================================
 AbortResult handle_abort_command(const AbortSessionParams& params);
 
