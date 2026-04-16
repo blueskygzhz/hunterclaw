@@ -103,6 +103,8 @@ core::Result<ResolvedRoute> DefaultMessageRouter::resolve_route(const RouteInput
             route.matched_by = ResolvedRoute::MatchType::BindingPeer; break;
         case ::hunterclaw::routing::RouteMatchSource::BINDING_PEER_PARENT:
             route.matched_by = ResolvedRoute::MatchType::BindingPeerParent; break;
+        case ::hunterclaw::routing::RouteMatchSource::BINDING_PEER_WILDCARD:
+            route.matched_by = ResolvedRoute::MatchType::BindingPeerWildcard; break;
         case ::hunterclaw::routing::RouteMatchSource::BINDING_GUILD_ROLES:
             route.matched_by = ResolvedRoute::MatchType::BindingGuildRoles; break;
         case ::hunterclaw::routing::RouteMatchSource::BINDING_GUILD:

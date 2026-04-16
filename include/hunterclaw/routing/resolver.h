@@ -171,14 +171,15 @@ struct AgentRouteBinding {
 
 // ✅ 对齐 OpenClaw: matchedBy 字符串
 enum class RouteMatchSource {
-  BINDING_PEER,         // "binding.peer"
-  BINDING_PEER_PARENT,  // "binding.peer.parent"
-  BINDING_GUILD_ROLES,  // "binding.guild+roles"
-  BINDING_GUILD,        // "binding.guild"
-  BINDING_TEAM,         // "binding.team"
-  BINDING_ACCOUNT,      // "binding.account"
-  BINDING_CHANNEL,      // "binding.channel"
-  DEFAULT               // "default"
+  BINDING_PEER,           // "binding.peer"
+  BINDING_PEER_PARENT,    // "binding.peer.parent"
+  BINDING_PEER_WILDCARD,  // "binding.peer.wildcard" ✅ 对齐 OpenClaw
+  BINDING_GUILD_ROLES,    // "binding.guild+roles"
+  BINDING_GUILD,          // "binding.guild"
+  BINDING_TEAM,           // "binding.team"
+  BINDING_ACCOUNT,        // "binding.account"
+  BINDING_CHANNEL,        // "binding.channel"
+  DEFAULT                 // "default"
 };
 
 std::string route_match_source_to_string(RouteMatchSource source);

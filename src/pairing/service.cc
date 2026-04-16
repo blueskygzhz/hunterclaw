@@ -250,6 +250,66 @@ std::optional<PairingRequest> PairingStore::get_request(const std::string& code)
 
 std::vector<PairingRequest> PairingStore::list_requests() const { return impl_->requests; }
 
+// ✅ 对齐 OpenClaw: listChannelPairingRequests — account-scoped listing
+std::vector<PairingRequest> PairingStore::list_requests(const std::string& account_id) const {
+  if (account_id.empty()) return impl_->requests;
+  std::string lower_account = to_lower(account_id);
+  std::vector<PairingRequest> result;
+  for (const auto& req : impl_->requests) {
+    auto it = req.meta.find("accountId");
+    if (it != req.meta.end() && to_lower(it->second) == lower_account) {
+      result.push_back(req);
+    } else if (lower_account == "default") {
+      // ✅ 对齐 OpenClaw: DEFAULT_ACCOUNT_ID 匹配无 accountId 的请求
+      if (it == req.meta.end() || it->second.empty()) {
+        result.push_back(req);
+      }
+    }
+  }
+  return result;
+}
+
+// ✅ 对齐 OpenClaw: approveChannelPairingCode (pairing-store.ts:829-882)
+std::optional<PairingStore::ApproveResult> PairingStore::approve_code(
+    const std::string& code, const std::string& account_id) {
+  prune_expired_requests();
+
+  std::string upper_code = code;
+  std::transform(upper_code.begin(), upper_code.end(), upper_code.begin(), ::toupper);
+  if (upper_code.empty()) return std::nullopt;
+
+  std::string lower_account = to_lower(account_id);
+
+  // Find matching request
+  auto it = std::find_if(impl_->requests.begin(), impl_->requests.end(),
+      [&](const PairingRequest& req) {
+        std::string req_code = req.code;
+        std::transform(req_code.begin(), req_code.end(), req_code.begin(), ::toupper);
+        if (req_code != upper_code) return false;
+        if (lower_account.empty()) return true;
+        auto meta_it = req.meta.find("accountId");
+        if (meta_it == req.meta.end()) return lower_account == "default";
+        return to_lower(meta_it->second) == lower_account;
+      });
+
+  if (it == impl_->requests.end()) return std::nullopt;
+
+  PairingRequest entry = *it;
+  impl_->requests.erase(it);
+
+  // ✅ 对齐 OpenClaw: 审批后将 sender 加入 allow-from
+  std::string effective_account = account_id;
+  if (effective_account.empty()) {
+    auto meta_it = entry.meta.find("accountId");
+    if (meta_it != entry.meta.end()) effective_account = meta_it->second;
+    if (effective_account.empty()) effective_account = "default";
+  }
+  add_allow_from(effective_account, entry.id);
+
+  save();
+  return ApproveResult{entry.id, entry};
+}
+
 bool PairingStore::remove_request(const std::string& code) {
   auto it = std::remove_if(impl_->requests.begin(), impl_->requests.end(),
                            [&code](const PairingRequest& req) { return req.code == code; });

@@ -362,14 +362,15 @@ ChatType normalize_chat_type(const std::string& raw) {
 
 std::string route_match_source_to_string(RouteMatchSource source) {
   switch (source) {
-    case RouteMatchSource::BINDING_PEER:        return "binding.peer";
-    case RouteMatchSource::BINDING_PEER_PARENT: return "binding.peer.parent";
-    case RouteMatchSource::BINDING_GUILD_ROLES: return "binding.guild+roles";
-    case RouteMatchSource::BINDING_GUILD:       return "binding.guild";
-    case RouteMatchSource::BINDING_TEAM:        return "binding.team";
-    case RouteMatchSource::BINDING_ACCOUNT:     return "binding.account";
-    case RouteMatchSource::BINDING_CHANNEL:     return "binding.channel";
-    default:                                    return "default";
+    case RouteMatchSource::BINDING_PEER:          return "binding.peer";
+    case RouteMatchSource::BINDING_PEER_PARENT:   return "binding.peer.parent";
+    case RouteMatchSource::BINDING_PEER_WILDCARD: return "binding.peer.wildcard";
+    case RouteMatchSource::BINDING_GUILD_ROLES:   return "binding.guild+roles";
+    case RouteMatchSource::BINDING_GUILD:         return "binding.guild";
+    case RouteMatchSource::BINDING_TEAM:          return "binding.team";
+    case RouteMatchSource::BINDING_ACCOUNT:       return "binding.account";
+    case RouteMatchSource::BINDING_CHANNEL:       return "binding.channel";
+    default:                                      return "default";
   }
 }
 
@@ -392,7 +393,7 @@ std::string resolve_inbound_last_route_session_key(const ResolvedAgentRoute& rou
 
 // ── 内部类型 ──────────────────────────────────────────────────────────────────
 
-enum class PeerConstraintState { NONE, INVALID, VALID };
+enum class PeerConstraintState { NONE, INVALID, WILDCARD_KIND, VALID };
 
 struct NormalizedPeerConstraint {
   PeerConstraintState state = PeerConstraintState::NONE;
@@ -435,12 +436,17 @@ static bool peer_kind_matches(ChatType binding_kind, ChatType scope_kind) {
 }
 
 // ── normalizePeerConstraint ───────────────────────────────────────────────────
+// ✅ 对齐 OpenClaw: normalizePeerConstraint (resolve-route.ts:483-498)
 static NormalizedPeerConstraint normalize_peer_constraint(
     const std::optional<RoutePeer>& peer) {
   if (!peer) return {PeerConstraintState::NONE};
   const std::string id = trim(peer->id);
   if (peer->kind == ChatType::UNKNOWN || id.empty()) {
     return {PeerConstraintState::INVALID};
+  }
+  // ✅ 对齐 OpenClaw: id === "*" → wildcard-kind
+  if (id == "*") {
+    return {PeerConstraintState::WILDCARD_KIND, peer->kind, ""};
   }
   return {PeerConstraintState::VALID, peer->kind, to_lower(id)};
 }
@@ -458,7 +464,7 @@ static NormalizedBindingMatch normalize_binding_match(const BindingMatchConstrai
 }
 
 // ── matchesBindingScope ────────────────────────────────────────────────────────
-// ✅ 对齐 OpenClaw: matchesBindingScope (resolve-route.ts:584-612)
+// ✅ 对齐 OpenClaw: matchesBindingScope (resolve-route.ts:584-628)
 static bool matches_binding_scope(
     const NormalizedBindingMatch& match,
     const std::optional<RoutePeer>& scope_peer,
@@ -470,6 +476,11 @@ static bool matches_binding_scope(
     if (!scope_peer) return false;
     if (!peer_kind_matches(match.peer.kind, scope_peer->kind)) return false;
     if (to_lower(trim(scope_peer->id)) != match.peer.id) return false;
+  }
+  // ✅ 对齐 OpenClaw: wildcard-kind — kind 必须匹配但 id 通配
+  if (match.peer.state == PeerConstraintState::WILDCARD_KIND) {
+    if (!scope_peer) return false;
+    if (!peer_kind_matches(match.peer.kind, scope_peer->kind)) return false;
   }
   if (!match.guild_id.empty() && match.guild_id != scope_guild_id) return false;
   if (!match.team_id.empty() && match.team_id != scope_team_id) return false;
@@ -485,6 +496,7 @@ static bool matches_binding_scope(
 // ── EvaluatedBindingsIndex ────────────────────────────────────────────────────
 struct EvaluatedBindingsIndex {
   std::unordered_map<std::string, std::vector<int>> by_peer;          // key→binding 下标
+  std::vector<int> by_peer_wildcard;  // ✅ 对齐 OpenClaw: byPeerWildcard
   std::unordered_map<std::string, std::vector<int>> by_guild_roles;
   std::unordered_map<std::string, std::vector<int>> by_guild;
   std::unordered_map<std::string, std::vector<int>> by_team;
@@ -501,6 +513,9 @@ static EvaluatedBindingsIndex build_bindings_index(
       for (const auto& key : peer_lookup_keys(b.match.peer.kind, b.match.peer.id)) {
         idx.by_peer[key].push_back(i);
       }
+    } else if (b.match.peer.state == PeerConstraintState::WILDCARD_KIND) {
+      // ✅ 对齐 OpenClaw: wildcard-kind bindings
+      idx.by_peer_wildcard.push_back(i);
     } else if (!b.match.guild_id.empty() && !b.match.roles.empty()) {
       idx.by_guild_roles[b.match.guild_id].push_back(i);
     } else if (!b.match.guild_id.empty()) {
@@ -672,27 +687,30 @@ ResolvedAgentRoute RouteResolver::resolve_route(const ResolveAgentRouteInput& in
     // Tier 2: binding.peer.parent
     {RouteMatchSource::BINDING_PEER_PARENT, bool(input.parent_peer && !trim(input.parent_peer->id).empty()),
      input.parent_peer, collect_peer_bindings(input.parent_peer)},
-    // Tier 3: binding.guild+roles
+    // Tier 3: binding.peer.wildcard ✅ 对齐 OpenClaw: binding.peer.wildcard
+    {RouteMatchSource::BINDING_PEER_WILDCARD, bool(input.peer),
+     input.peer, impl_->index.by_peer_wildcard},
+    // Tier 4: binding.guild+roles
     {RouteMatchSource::BINDING_GUILD_ROLES, bool(!guild_id.empty() && !input.member_role_ids.empty()),
      input.peer, [&]{
        auto it2 = impl_->index.by_guild_roles.find(guild_id);
        return it2 != impl_->index.by_guild_roles.end() ? it2->second : std::vector<int>{};
      }()},
-    // Tier 4: binding.guild
+    // Tier 5: binding.guild
     {RouteMatchSource::BINDING_GUILD, bool(!guild_id.empty()),
      input.peer, [&]{
        auto it2 = impl_->index.by_guild.find(guild_id);
        return it2 != impl_->index.by_guild.end() ? it2->second : std::vector<int>{};
      }()},
-    // Tier 5: binding.team
+    // Tier 6: binding.team
     {RouteMatchSource::BINDING_TEAM, bool(!team_id.empty()),
      input.peer, [&]{
        auto it2 = impl_->index.by_team.find(team_id);
        return it2 != impl_->index.by_team.end() ? it2->second : std::vector<int>{};
      }()},
-    // Tier 6: binding.account
+    // Tier 7: binding.account
     {RouteMatchSource::BINDING_ACCOUNT, true, input.peer, impl_->index.by_account},
-    // Tier 7: binding.channel (wildcard)
+    // Tier 8: binding.channel (wildcard)
     {RouteMatchSource::BINDING_CHANNEL, true, input.peer, impl_->index.by_channel},
   };
 

@@ -51,6 +51,7 @@ struct ResolvedRoute {
     enum class MatchType {
         BindingPeer,         // 精确匹配对话ID
         BindingPeerParent,   // 线程继承父对话
+        BindingPeerWildcard, // 通配peer kind (peer.id="*") ✅ 对齐 OpenClaw
         BindingGuildRoles,   // Discord服务器+角色
         BindingGuild,        // Discord服务器
         BindingTeam,         // Slack团队

@@ -104,8 +104,19 @@ class PairingStore {
       const std::string& id, const std::unordered_map<std::string, std::string>& meta);
   std::optional<PairingRequest> get_request(const std::string& code) const;
   std::vector<PairingRequest> list_requests() const;
+  // ✅ 对齐 OpenClaw: listChannelPairingRequests — account-scoped listing
+  std::vector<PairingRequest> list_requests(const std::string& account_id) const;
   bool remove_request(const std::string& code);
   void prune_expired_requests();
+
+  // ✅ 对齐 OpenClaw: approveChannelPairingCode (pairing-store.ts:829-882)
+  // Finds request by code, removes it, adds sender to allow-from
+  struct ApproveResult {
+    std::string id;
+    PairingRequest entry;
+  };
+  std::optional<ApproveResult> approve_code(const std::string& code,
+                                             const std::string& account_id = "");
 
   // Allow-from management
   void add_allow_from(const std::string& entry);

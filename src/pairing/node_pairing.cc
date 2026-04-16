@@ -8,6 +8,7 @@
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <random>
+#include <set>
 
 #include "hunterclaw/infra/utilities.h"
 
@@ -294,20 +295,35 @@ NodePairingRequestResult request_node_pairing(
   return {NodePairingRequestResult::Status::PENDING, req, true};
 }
 
-std::optional<NodePairingApprovalResult> approve_node_pairing(
-    const std::string& request_id, const std::string& base_dir) {
+// ✅ 对齐 OpenClaw: approveNodePairing (node-pairing.ts:223-268)
+ApproveNodePairingResult approve_node_pairing(
+    const std::string& request_id,
+    const std::vector<std::string>& caller_scopes,
+    const std::string& base_dir) {
   std::lock_guard<std::mutex> lock(g_node_pairing_mutex);
   auto state = load_state(base_dir);
 
   auto pending_it = state.pending_by_id.find(request_id);
   if (pending_it == state.pending_by_id.end()) {
-    return std::nullopt;
+    return {ApproveNodePairingResult::Status::APPROVED, std::nullopt, std::nullopt};
   }
 
   const auto& pending = pending_it->second;
+
+  // ✅ 对齐 OpenClaw: scope 授权检查
+  auto required_scopes = resolve_node_pair_approval_scopes(pending.commands);
+  std::set<std::string> caller_set(caller_scopes.begin(), caller_scopes.end());
+  for (const auto& scope : required_scopes) {
+    if (caller_set.find(scope) == caller_set.end()) {
+      return {ApproveNodePairingResult::Status::FORBIDDEN,
+              std::nullopt,
+              NodePairingForbiddenResult{scope}};
+    }
+  }
+
   int64_t now = infra::current_timestamp_ms();
 
-  // Get existing or create new (node-pairing.ts:158-175)
+  // Get existing or create new (node-pairing.ts:244-262)
   auto existing_it = state.paired_by_node_id.find(pending.node_id);
   int64_t created_at_ms =
       existing_it != state.paired_by_node_id.end()
@@ -320,12 +336,14 @@ std::optional<NodePairingApprovalResult> approve_node_pairing(
   node.created_at_ms = created_at_ms;
   node.approved_at_ms = now;
 
-  // Remove pending and add to paired (node-pairing.ts:177-180)
+  // Remove pending and add to paired (node-pairing.ts:264-267)
   state.pending_by_id.erase(request_id);
   state.paired_by_node_id[pending.node_id] = node;
   persist_state(state, base_dir);
 
-  return NodePairingApprovalResult{request_id, node};
+  return {ApproveNodePairingResult::Status::APPROVED,
+          NodePairingApprovalResult{request_id, node},
+          std::nullopt};
 }
 
 std::optional<NodePairingRejectionResult> reject_node_pairing(
@@ -449,6 +467,10 @@ std::string generate_pairing_token() {
 
 bool verify_pairing_token(const std::string& provided,
                            const std::string& expected) {
+  // ✅ 对齐 OpenClaw: pairing-token.ts:10-14 — 空字符串防护
+  if (infra::trim(provided).empty() || infra::trim(expected).empty()) {
+    return false;
+  }
   // Constant-time comparison
   if (provided.size() != expected.size()) {
     return false;
@@ -460,6 +482,68 @@ bool verify_pairing_token(const std::string& provided,
   }
 
   return result == 0;
+}
+
+// ============================================================================
+// Node Pairing Authorization
+// ✅ 严格对齐 OpenClaw: infra/node-pairing-authz.ts:9-22
+// ============================================================================
+
+std::vector<std::string> resolve_node_pair_approval_scopes(
+    const std::vector<std::string>& commands) {
+  // ✅ 对齐 OpenClaw: resolveNodePairApprovalScopes
+  // 如果 commands 包含系统级 run 命令 → pairing + admin
+  // 如果有任何 commands → pairing + write
+  // 否则 → pairing only
+  const auto& system_cmds = node_system_run_commands();
+
+  bool has_system_run = false;
+  for (const auto& cmd : commands) {
+    for (const auto& sys_cmd : system_cmds) {
+      if (cmd == sys_cmd) {
+        has_system_run = true;
+        break;
+      }
+    }
+    if (has_system_run) break;
+  }
+
+  if (has_system_run) {
+    return {OPERATOR_PAIRING_SCOPE, OPERATOR_ADMIN_SCOPE};
+  }
+  if (!commands.empty()) {
+    return {OPERATOR_PAIRING_SCOPE, OPERATOR_WRITE_SCOPE};
+  }
+  return {OPERATOR_PAIRING_SCOPE};
+}
+
+// ============================================================================
+// Channel Pairing Labels
+// ✅ 对齐 OpenClaw: pairing/pairing-labels.ts:4-6
+// ============================================================================
+
+std::string resolve_pairing_id_label(const std::string& channel) {
+  // ✅ 对齐 OpenClaw: getPairingAdapter(channel)?.idLabel ?? "userId"
+  // Channel-specific ID labels (aligned with each channel's pairing adapter)
+  std::string lower = channel;
+  std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+
+  if (lower == "telegram") return "userId";
+  if (lower == "discord") return "userId";
+  if (lower == "slack") return "userId";
+  if (lower == "whatsapp") return "phoneNumber";
+  if (lower == "signal") return "phoneNumber";
+  if (lower == "matrix") return "matrixId";
+  if (lower == "irc") return "nick";
+  if (lower == "msteams") return "userId";
+  if (lower == "googlechat") return "userId";
+  if (lower == "feishu") return "userId";
+  if (lower == "line") return "userId";
+  if (lower == "zalo") return "userId";
+  if (lower == "nostr") return "pubkey";
+  if (lower == "bluebubbles") return "handle";
+
+  return "userId";  // Default fallback
 }
 
 }  // namespace pairing

@@ -127,9 +127,25 @@ NodePairingRequestResult request_node_pairing(
     bool silent = false,
     const std::string& base_dir = "");
 
-// Approve node pairing request (node-pairing.ts:146-182)
-std::optional<NodePairingApprovalResult> approve_node_pairing(
+// ✅ Node Pairing Approval Result (对齐 OpenClaw ApproveNodePairingResult)
+struct NodePairingForbiddenResult {
+  std::string missing_scope;
+};
+
+// Approve node pairing request (node-pairing.ts:223-268)
+// ✅ 对齐 OpenClaw: callerScopes 参数用于 scope 授权检查
+struct ApproveNodePairingResult {
+  enum class Status { APPROVED, FORBIDDEN };
+  Status status;
+  // APPROVED
+  std::optional<NodePairingApprovalResult> approval;
+  // FORBIDDEN
+  std::optional<NodePairingForbiddenResult> forbidden;
+};
+
+ApproveNodePairingResult approve_node_pairing(
     const std::string& request_id,
+    const std::vector<std::string>& caller_scopes = {},
     const std::string& base_dir = "");
 
 // Reject node pairing request (node-pairing.ts:184-201)
@@ -160,6 +176,7 @@ bool unpair_node(const std::string& node_id, const std::string& base_dir = "");
 
 // ============================================================================
 // Pairing Token Management
+// ✅ 对齐 OpenClaw: infra/pairing-token.ts
 // ============================================================================
 
 // Generate pairing token (32-byte random, Base64-encoded)
@@ -168,6 +185,46 @@ std::string generate_pairing_token();
 // Verify pairing token (constant-time comparison)
 bool verify_pairing_token(const std::string& provided,
                            const std::string& expected);
+
+// ============================================================================
+// Node Pairing Authorization
+// ✅ 严格对齐 OpenClaw: infra/node-pairing-authz.ts
+// ============================================================================
+
+// ✅ 对齐 OpenClaw: NodeApprovalScope = "operator.pairing" | "operator.write" | "operator.admin"
+constexpr const char* OPERATOR_PAIRING_SCOPE = "operator.pairing";
+constexpr const char* OPERATOR_WRITE_SCOPE   = "operator.write";
+constexpr const char* OPERATOR_ADMIN_SCOPE   = "operator.admin";
+
+// ✅ 对齐 OpenClaw: NODE_SYSTEM_RUN_COMMANDS (node-commands.ts)
+// 节点声明了系统级 run commands → 需要 admin scope
+inline const std::vector<std::string>& node_system_run_commands() {
+  static const std::vector<std::string> cmds = {
+    "system.run", "system.exec", "system.shell"
+  };
+  return cmds;
+}
+
+// ✅ 对齐 OpenClaw: resolveNodePairApprovalScopes (node-pairing-authz.ts:9-22)
+// 根据节点声明的 commands 决定审批所需的 operator scopes
+std::vector<std::string> resolve_node_pair_approval_scopes(
+    const std::vector<std::string>& commands);
+
+// ============================================================================
+// Channel Pairing Labels
+// ✅ 对齐 OpenClaw: pairing/pairing-labels.ts
+// ============================================================================
+
+// ✅ 对齐 OpenClaw: resolvePairingIdLabel — 返回 channel 的配对 ID 标签
+std::string resolve_pairing_id_label(const std::string& channel);
+
+// ============================================================================
+// Channel Pairing Message Constants
+// ✅ 对齐 OpenClaw: channels/plugins/pairing-message.ts
+// ============================================================================
+
+constexpr const char* PAIRING_APPROVED_MESSAGE =
+    "✅ HunterClaw access approved. Send a message to start chatting.";
 
 }  // namespace pairing
 }  // namespace hunterclaw
