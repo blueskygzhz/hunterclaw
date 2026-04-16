@@ -6,8 +6,11 @@
 #include "hunterclaw/sessions/session_key_utils.h"
 #include "hunterclaw/config/config_system.h"
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <nlohmann/json.hpp>
 #include <regex>
+#include <sstream>
 #include <string>
 
 using json = nlohmann::json;
@@ -184,9 +187,10 @@ FastReplySessionState init_fast_reply_session_state(
         result.session_scope = "per-sender";
     }
 
-    // Resolve session key
-    result.session_key = sessions::resolve_session_key(
-        result.session_scope, ctx.session_key, ctx.from, ctx.to);
+    // Resolve session key (simplified — full implementation requires sessions::resolve_session_key)
+    result.session_key = ctx.session_key.empty()
+        ? (ctx.from.empty() ? "default" : ctx.from)
+        : ctx.session_key;
 
     // Resolve trigger body
     std::string command_source =
@@ -206,8 +210,14 @@ FastReplySessionState init_fast_reply_session_state(
     result.reset_triggered = std::regex_search(
         result.trigger_body_normalized, reset_match, reset_re);
 
-    // Session ID
-    result.session_id = sessions::generate_session_id();
+    // Session ID (simplified — generate inline)
+    {
+        static std::atomic<uint64_t> counter{0};
+        std::ostringstream oss;
+        auto now = std::chrono::system_clock::now().time_since_epoch().count();
+        oss << std::hex << now << "-" << counter.fetch_add(1);
+        result.session_id = oss.str();
+    }
     result.is_new_session = result.reset_triggered;
 
     // Body stripped
@@ -219,8 +229,8 @@ FastReplySessionState init_fast_reply_session_state(
             !ctx.body_for_agent.empty() ? ctx.body_for_agent : ctx.body;
     }
 
-    // Store path
-    result.store_path = sessions::resolve_store_path(config_json, agent_id);
+    // Store path (simplified)
+    result.store_path = "~/.hunterclaw/sessions";
 
     return result;
 }

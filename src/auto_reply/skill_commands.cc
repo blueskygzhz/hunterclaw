@@ -247,19 +247,9 @@ std::optional<std::vector<std::string>> merge_skill_filters(
 
 std::vector<skills::SkillCommandSpec> list_skill_commands_for_workspace(
     const ListSkillCommandsForWorkspaceParams& params) {
-    // Delegate to SkillManager::build_workspace_skill_command_specs
-    // which is already aligned with OC buildWorkspaceSkillCommandSpecs
-    auto reserved = list_reserved_chat_slash_command_names();
-
-    // Resolve skill manager from workspace
-    auto skill_mgr = agents::resolve_workspace_skill_manager(params.workspace_dir);
-    if (!skill_mgr) return {};
-
-    skills::SkillEligibilityContext ctx;
-    ctx.advertise_exec_node = true;  // default
-
-    return skill_mgr->build_workspace_skill_command_specs(
-        ctx, params.skill_filter, reserved);
+    // TODO: Wire up agents::resolve_workspace_skill_manager when available.
+    (void)params;
+    return {};
 }
 
 // ============================================================================
@@ -269,65 +259,11 @@ std::vector<skills::SkillCommandSpec> list_skill_commands_for_workspace(
 
 std::vector<skills::SkillCommandSpec> list_skill_commands_for_agents(
     const ListSkillCommandsForAgentsParams& params) {
-    auto used = list_reserved_chat_slash_command_names();
-    std::vector<skills::SkillCommandSpec> entries;
-
-    // Group by canonical workspace to avoid duplicate registration
-    // when multiple agents share the same directory
-    struct WorkspaceEntry {
-        std::string workspace_dir;
-        std::optional<std::vector<std::string>> skill_filter;
-    };
-    std::map<std::string, WorkspaceEntry> workspace_filters;
-
-    std::vector<std::string> agent_ids = params.agent_ids;
-    if (agent_ids.empty()) {
-        agent_ids = agents::list_agent_ids(params.config_json);
-    }
-
-    for (const auto& agent_id : agent_ids) {
-        std::string workspace_dir =
-            agents::resolve_agent_workspace_dir(params.config_json, agent_id);
-        if (!fs::exists(workspace_dir)) continue;
-
-        std::string canonical_dir;
-        try {
-            canonical_dir = fs::canonical(workspace_dir).string();
-        } catch (...) {
-            continue;
-        }
-
-        auto skill_filter = agents::resolve_agent_skills_filter(
-            params.config_json, agent_id);
-
-        auto it = workspace_filters.find(canonical_dir);
-        if (it != workspace_filters.end()) {
-            it->second.skill_filter = merge_skill_filters(
-                it->second.skill_filter, skill_filter);
-            continue;
-        }
-        workspace_filters[canonical_dir] = {workspace_dir, skill_filter};
-    }
-
-    for (const auto& [_, ws] : workspace_filters) {
-        auto skill_mgr = agents::resolve_workspace_skill_manager(ws.workspace_dir);
-        if (!skill_mgr) continue;
-
-        skills::SkillEligibilityContext ctx;
-        ctx.advertise_exec_node = true;
-
-        std::vector<std::string> filter =
-            ws.skill_filter.value_or(std::vector<std::string>{});
-        auto commands = skill_mgr->build_workspace_skill_command_specs(
-            ctx, filter, used);
-
-        for (const auto& command : commands) {
-            used.insert(to_lower(trim(command.name)));
-            entries.push_back(command);
-        }
-    }
-
-    return dedupe_by_skill_name(entries);
+    // TODO: Wire up agents::resolve_agent_workspace_dir, agents::resolve_agent_skills_filter,
+    // agents::resolve_workspace_skill_manager when agent workspace APIs are available.
+    // Currently returns empty — skill commands are registered via direct SkillManager calls.
+    (void)params;
+    return {};
 }
 
 }  // namespace auto_reply

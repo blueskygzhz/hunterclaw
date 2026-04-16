@@ -142,7 +142,7 @@ core::JsonValue ScreenRecordTool::route_to_node(
     const core::JsonValue& params
 ) {
     if (node_registry_) {
-        auto nodes = node_registry_->list_nodes();
+        auto nodes = node_registry_->list_connected();
         for (const auto& n : nodes) {
             // Check if node has screen_record capability
             bool has_cap = false;
@@ -151,8 +151,8 @@ core::JsonValue ScreenRecordTool::route_to_node(
             }
             if (has_cap) {
                 auto result = node_registry_->invoke(n.node_id, action, params.to_json().dump());
-                if (result.is_ok() && result.get().success) {
-                    auto parse_result = core::JsonValue::parse(result.get().result_json);
+                if (result.ok && result.payload_json.has_value()) {
+                    auto parse_result = core::JsonValue::parse(*result.payload_json);
                     if (parse_result.is_ok()) return parse_result.get();
                 }
             }

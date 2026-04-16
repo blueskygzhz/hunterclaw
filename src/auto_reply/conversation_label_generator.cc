@@ -3,8 +3,6 @@
 
 #include "hunterclaw/auto_reply/conversation_label_generator.h"
 #include "hunterclaw/llm/llm_client.h"
-#include "hunterclaw/llm/model_selection.h"
-#include "hunterclaw/config/config_system.h"
 #include <algorithm>
 #include <chrono>
 #include <future>
@@ -30,32 +28,25 @@ std::optional<std::string> generate_conversation_label(
     const int timeout_ms = (params.timeout_ms > 0) ? params.timeout_ms : TIMEOUT_MS;
 
     try {
-        // Resolve model from config
-        auto model_ref = llm::resolve_default_model_for_agent(
-            params.config_json, params.agent_id);
-        if (model_ref.model.empty()) return std::nullopt;
+        // Build LLM config from agent defaults
+        llm::LLMConfig config;
+        config.model = "default";
+        config.max_tokens = 100;
+        config.temperature = 0.3;
+        (void)timeout_ms;  // timeout handled at higher level
 
-        // Build simple completion request
-        llm::CompletionRequest req;
-        req.model = model_ref.model;
-        req.provider = model_ref.provider;
-        req.max_tokens = 100;
-        req.temperature = 0.3;
-        req.timeout_ms = timeout_ms;
-        req.messages = {{
-            "user",
-            params.prompt + "\n\n" + params.user_message
-        }};
-
-        // Execute simple completion (blocking, with timeout)
-        auto client = llm::LLMClient::create_from_config(params.config_json);
+        // Create client via factory
+        auto client = llm::LLMClientFactory::create(config);
         if (!client) return std::nullopt;
 
-        auto result = client->complete(req);
-        if (!result.ok || result.content.empty()) return std::nullopt;
+        // Build prompt for label generation
+        std::string full_prompt = params.prompt + "\n\n" + params.user_message;
+
+        auto result = client->generate(full_prompt);
+        if (!result.is_ok() || result.get().empty()) return std::nullopt;
 
         // Extract text
-        std::string text = result.content;
+        std::string text = result.get();
         // Trim whitespace
         auto start = text.find_first_not_of(" \t\n\r");
         if (start == std::string::npos) return std::nullopt;

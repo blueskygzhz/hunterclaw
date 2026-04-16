@@ -50,6 +50,7 @@ struct SkillRequirements {
     std::vector<std::string> any_bins;    // Any of these (OR logic)
     std::vector<std::string> env;         // Required env vars
     std::vector<std::string> config;      // Required config paths
+    std::vector<std::string> os;          // Supported OS list (empty = all)
 };
 
 struct OpenClawSkillMetadata {

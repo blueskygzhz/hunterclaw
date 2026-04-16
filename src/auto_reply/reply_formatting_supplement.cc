@@ -11,6 +11,7 @@
 // Total OC: ~31KB
 
 #include "hunterclaw/auto_reply/message_dispatcher.h"
+#include "hunterclaw/auto_reply/types.h"
 #include "hunterclaw/auto_reply/tokens.h"
 #include "hunterclaw/auto_reply/heartbeat.h"
 #include "hunterclaw/auto_reply/media_note.h"

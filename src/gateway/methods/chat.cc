@@ -98,7 +98,8 @@ static bool abort_chat_run_by_id(
 static std::vector<std::string> abort_chat_runs_for_session_key(
     std::shared_ptr<GatewayServer> server,
     const std::string& session_key,
-    const std::string& stop_reason);
+    const std::string& stop_reason,
+    const std::string& abort_origin = "rpc");
 
 // ============================================================================
 // collectSessionAbortPartials — 对齐 OC chat.ts L1306-1329
@@ -862,7 +863,7 @@ static std::vector<std::string> abort_chat_runs_for_session_key(
     std::shared_ptr<GatewayServer> server,
     const std::string& session_key,
     const std::string& stop_reason,
-    const std::string& abort_origin = "rpc"  // "rpc" | "stop-command"
+    const std::string& abort_origin  // "rpc" | "stop-command"
 ) {
     auto state = server->runtime_state();
     if (!state) return {};

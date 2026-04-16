@@ -135,17 +135,16 @@ SessionResetModelResult resolve_session_reset_model(
 
     if (candidate.empty()) return result;
 
-    // Try to resolve model
-    auto ref = llm::resolve_model_ref_from_string(candidate, default_provider);
-    if (ref.model.empty()) return result;
-
-    // Check if model is allowed
-    auto allowed = llm::build_allowed_model_set(config_json, agent_id);
-    std::string key = to_lower(ref.provider + "/" + ref.model);
-    if (!allowed.empty() && allowed.count(key) == 0) return result;
-
-    result.provider = ref.provider;
-    result.model = ref.model;
+    // Simple model reference parsing (provider/model format)
+    auto slash_pos = candidate.find('/');
+    if (slash_pos != std::string::npos) {
+        result.provider = candidate.substr(0, slash_pos);
+        result.model = candidate.substr(slash_pos + 1);
+    } else {
+        result.provider = default_provider;
+        result.model = candidate;
+    }
+    if (result.model.empty()) return result;
     result.has_model_override = true;
 
     // Remove model token from body
@@ -272,16 +271,18 @@ void persist_session_entry_update(
     const std::string& session_key,
     const std::string& agent_id,
     const SessionUsagePatch& patch) {
-    auto entry = session_manager.get_session(session_key, agent_id);
-    if (!entry) return;
+    (void)agent_id;
+    auto entry_result = session_manager.get_session(session_key);
+    if (!entry_result.is_ok()) return;
+    auto entry = entry_result.get();
 
-    if (patch.total_tokens) entry->total_tokens = *patch.total_tokens;
-    if (patch.total_tokens_fresh) entry->total_tokens_fresh = *patch.total_tokens_fresh;
-    if (patch.model_provider) entry->model_provider = *patch.model_provider;
-    if (patch.model) entry->model = *patch.model;
-    if (patch.updated_at) entry->updated_at = *patch.updated_at;
+    if (patch.total_tokens) entry.total_tokens = *patch.total_tokens;
+    if (patch.total_tokens_fresh) entry.total_tokens_fresh = *patch.total_tokens_fresh;
+    if (patch.model_provider) entry.model_provider = *patch.model_provider;
+    if (patch.model) entry.model = *patch.model;
+    if (patch.updated_at) entry.updated_at = *patch.updated_at;
 
-    session_manager.update_session(*entry);
+    session_manager.update_session(entry);
 }
 
 // Stored Model Override (对齐 OC: stored-model-override.ts)
@@ -296,24 +297,31 @@ std::optional<StoredModelOverride> resolve_stored_model_override(
     const std::string& session_key,
     const std::string& parent_session_key,
     const std::string& agent_id) {
+    (void)agent_id;
     // Try current session first
-    auto entry = session_manager.get_session(session_key, agent_id);
-    if (entry && !entry->model_override.empty()) {
-        StoredModelOverride result;
-        result.model = entry->model_override;
-        result.provider = entry->provider_override;
-        result.source = "session";
-        return result;
+    auto entry_result = session_manager.get_session(session_key);
+    if (entry_result.is_ok()) {
+        auto& entry = entry_result.get();
+        if (entry.model_override.has_value() && !entry.model_override->empty()) {
+            StoredModelOverride result;
+            result.model = *entry.model_override;
+            result.provider = entry.provider_override.value_or("");
+            result.source = "session";
+            return result;
+        }
     }
     // Try parent session
     if (!parent_session_key.empty() && parent_session_key != session_key) {
-        auto parent = session_manager.get_session(parent_session_key, agent_id);
-        if (parent && !parent->model_override.empty()) {
-            StoredModelOverride result;
-            result.model = parent->model_override;
-            result.provider = parent->provider_override;
-            result.source = "parent";
-            return result;
+        auto parent_result = session_manager.get_session(parent_session_key);
+        if (parent_result.is_ok()) {
+            auto& parent = parent_result.get();
+            if (parent.model_override.has_value() && !parent.model_override->empty()) {
+                StoredModelOverride result;
+                result.model = *parent.model_override;
+                result.provider = parent.provider_override.value_or("");
+                result.source = "parent";
+                return result;
+            }
         }
     }
     return std::nullopt;

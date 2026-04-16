@@ -9,12 +9,14 @@
 // Total OC: ~27KB
 
 #include "hunterclaw/auto_reply/message_dispatcher.h"
+#include "hunterclaw/auto_reply/types.h"
 #include "hunterclaw/sessions/session_manager.h"
 #include "hunterclaw/auto_reply/tokens.h"
 #include "hunterclaw/auto_reply/chunk.h"
 #include "hunterclaw/config/config_system.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <functional>
@@ -22,6 +24,7 @@
 #include <mutex>
 #include <optional>
 #include <regex>
+#include <sstream>
 #include <set>
 #include <sstream>
 #include <string>
@@ -63,7 +66,14 @@ SessionForkResult fork_session_from_parent(
 
     try {
         // Create a branched session by copying parent transcript
-        result.session_id = sessions::generate_session_id();
+        // Generate a simple session ID (UUID-like)
+        {
+            static std::atomic<uint64_t> counter{0};
+            std::ostringstream oss;
+            auto now = std::chrono::system_clock::now().time_since_epoch().count();
+            oss << std::hex << now << "-fork-" << counter.fetch_add(1);
+            result.session_id = oss.str();
+        }
         result.session_file = (fs::path(sessions_dir) /
             ("agent-" + agent_id) /
             ("session-" + result.session_id + ".jsonl")).string();

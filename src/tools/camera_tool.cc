@@ -176,7 +176,7 @@ ToolResult CameraTool::action_photos_latest(const ToolParams& params) {
 
 std::string CameraTool::select_camera_node() {
     if (node_registry_) {
-        auto nodes = node_registry_->list_nodes();
+        auto nodes = node_registry_->list_connected();
         for (const auto& n : nodes) {
             // Check if node has camera capability
             for (const auto& cap : n.caps) {
@@ -194,13 +194,13 @@ core::Result<core::JsonValue> CameraTool::invoke_node_command(
 ) {
     if (node_registry_) {
         auto result = node_registry_->invoke(node_id, command, command_params.to_json().dump());
-        if (!result.is_ok())
-            return core::Result<core::JsonValue>::Err(result.error);
-        const auto& invoke_result = result.get();
-        if (!invoke_result.success)
-            return core::Result<core::JsonValue>::Err(invoke_result.error_message);
-        // Parse result_json back to JsonValue
-        auto parse_result = core::JsonValue::parse(invoke_result.result_json);
+        if (!result.ok) {
+            std::string err_msg = result.error.has_value() ? result.error->message : "invoke failed";
+            return core::Result<core::JsonValue>::Err(err_msg);
+        }
+        if (!result.payload_json.has_value())
+            return core::Result<core::JsonValue>::Ok(core::JsonValue::object());
+        auto parse_result = core::JsonValue::parse(*result.payload_json);
         if (!parse_result.is_ok())
             return core::Result<core::JsonValue>::Ok(core::JsonValue::object());
         return core::Result<core::JsonValue>::Ok(parse_result.get());
