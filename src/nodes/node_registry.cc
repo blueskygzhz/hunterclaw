@@ -1,316 +1,314 @@
+// 🎯 对齐 OpenClaw: gateway/node-registry.ts (完整 NodeRegistry 类)
+// 核心: register/unregister/listConnected/get/invoke/handleInvokeResult/sendEvent
+
 #include "hunterclaw/nodes/node_registry.h"
-#include "hunterclaw/tools/tool_manager.h"
-#include "hunterclaw/sandbox/sandbox.h"  // ✅ 修复: SandboxManager 在 sandbox.h 中
 #include <chrono>
-#include <sstream>
+#include <thread>
+#include <condition_variable>
+#include <nlohmann/json.hpp>
+
+using json = nlohmann::json;
 
 namespace hunterclaw {
 namespace nodes {
 
-NodeRegistry::NodeRegistry(std::shared_ptr<tools::ToolManager> tool_manager,
-                           std::shared_ptr<sandbox::SandboxManager> sandbox_manager)
-    : tool_manager_(tool_manager)
-    , sandbox_manager_(sandbox_manager) {
+// 🎯 对齐 OpenClaw: gateway/node-registry.ts:40-43
+NodeRegistry::NodeRegistry() = default;
+
+// ============================================================================
+// register — 对齐 OpenClaw: gateway/node-registry.ts:45-83
+// ============================================================================
+
+NodeSession NodeRegistry::register_node(
+    const std::string& conn_id,
+    const std::string& node_id,
+    const std::string& client_id,
+    const std::string& client_mode,
+    const std::string& display_name,
+    const std::string& platform,
+    const std::string& version,
+    const std::string& core_version,
+    const std::string& ui_version,
+    const std::string& device_family,
+    const std::string& model_identifier,
+    const std::string& remote_ip,
+    const std::vector<std::string>& caps,
+    const std::vector<std::string>& commands,
+    const std::map<std::string, bool>& permissions,
+    const std::string& path_env) {
+
+    NodeSession session;
+    session.node_id = node_id;
+    session.conn_id = conn_id;
+    session.client_id = client_id;
+    session.client_mode = client_mode;
+    session.display_name = display_name;
+    session.platform = platform;
+    session.version = version;
+    session.core_version = core_version;
+    session.ui_version = ui_version;
+    session.device_family = device_family;
+    session.model_identifier = model_identifier;
+    session.remote_ip = remote_ip;
+    session.caps = caps;
+    session.commands = commands;
+    session.permissions = permissions;
+    session.path_env = path_env;
+    session.connected_at_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    // 🎯 对齐 OpenClaw: this.nodesById.set(nodeId, session)
+    nodes_by_id_[node_id] = session;
+    // 🎯 对齐 OpenClaw: this.nodesByConn.set(client.connId, nodeId)
+    nodes_by_conn_[conn_id] = node_id;
+
+    return session;
 }
 
-core::Result<void> NodeRegistry::register_node(const Node& node) {
-    auto validation = validate_node(node);
-    if (!validation.is_ok()) {
-        return validation;
-    }
-    
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    // Check if already registered
-    if (nodes_.count(node.node_id) > 0) {
-        return core::Result<void>::Err("Node already registered: " + node.node_id);
-    }
-    
-    // Register node
-    nodes_[node.node_id] = node;
-    
-    // Emit event
-    if (event_callback_) {
-        event_callback_(node.node_id, "node.registered", "{}");
-    }
-    
-    return core::Result<void>::Ok();
-}
+// ============================================================================
+// unregister — 对齐 OpenClaw: gateway/node-registry.ts:85-101
+// ============================================================================
 
-core::Result<void> NodeRegistry::unregister_node(const std::string& node_id) {
+std::optional<std::string> NodeRegistry::unregister(const std::string& conn_id) {
     std::lock_guard<std::mutex> lock(mutex_);
-    
-    auto it = nodes_.find(node_id);
-    if (it == nodes_.end()) {
-        return core::Result<void>::Err("Node not found: " + node_id);
-    }
-    
-    nodes_.erase(it);
-    
-    // Emit event
-    if (event_callback_) {
-        event_callback_(node_id, "node.unregistered", "{}");
-    }
-    
-    return core::Result<void>::Ok();
-}
 
-void NodeRegistry::update_node_status(const std::string& node_id, NodeStatus status) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    auto it = nodes_.find(node_id);
-    if (it != nodes_.end()) {
-        it->second.status = status;
-        if (status == NodeStatus::CONNECTED) {
-            it->second.connected_at_ms = current_time_ms();
-        }
-    }
-}
-
-void NodeRegistry::update_heartbeat(const std::string& node_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    auto it = nodes_.find(node_id);
-    if (it != nodes_.end()) {
-        it->second.last_ping_ms = current_time_ms();
-    }
-}
-
-std::vector<Node> NodeRegistry::list_nodes() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    std::vector<Node> result;
-    result.reserve(nodes_.size());
-    
-    for (const auto& [id, node] : nodes_) {
-        result.push_back(node);
-    }
-    
-    return result;
-}
-
-std::optional<Node> NodeRegistry::get_node(const std::string& node_id) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    auto it = nodes_.find(node_id);
-    if (it == nodes_.end()) {
+    auto conn_it = nodes_by_conn_.find(conn_id);
+    if (conn_it == nodes_by_conn_.end()) {
         return std::nullopt;
     }
-    
-    return it->second;
-}
+    std::string node_id = conn_it->second;
+    nodes_by_conn_.erase(conn_it);
+    nodes_by_id_.erase(node_id);
 
-std::vector<Node> NodeRegistry::find_nodes_by_platform(const std::string& platform) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    std::vector<Node> result;
-    
-    for (const auto& [id, node] : nodes_) {
-        if (node.platform == platform) {
-            result.push_back(node);
-        }
-    }
-    
-    return result;
-}
-
-std::vector<Node> NodeRegistry::find_nodes_by_capability(const std::string& capability) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    std::vector<Node> result;
-    
-    for (const auto& [id, node] : nodes_) {
-        auto& caps = node.caps;
-        if (std::find(caps.begin(), caps.end(), capability) != caps.end()) {
-            result.push_back(node);
-        }
-    }
-    
-    return result;
-}
-
-core::Result<NodeInvokeResult> NodeRegistry::invoke(
-    const std::string& node_id,
-    const std::string& command,
-    const std::string& params_json,
-    int timeout_ms,
-    const std::string& idempotency_key
-) {
-    ++total_invocations_;
-    
-    auto start_time = current_time_ms();
-    
-    // Get node
-    Node node;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = nodes_.find(node_id);
-        if (it == nodes_.end()) {
-            ++failed_invocations_;
-            return core::Result<NodeInvokeResult>::Err("Node not found: " + node_id);
-        }
-        node = it->second;
-    }
-    
-    // Check connection status
-    if (!node.is_connected()) {
-        ++failed_invocations_;
-        return core::Result<NodeInvokeResult>::Err("Node not connected: " + node_id);
-    }
-    
-    // Check command support
-    if (!node.supports_command(command)) {
-        ++failed_invocations_;
-        return core::Result<NodeInvokeResult>::Err("Command not supported by node: " + command);
-    }
-    
-    // Check permission
-    if (!check_permission(node, command)) {
-        ++failed_invocations_;
-        return core::Result<NodeInvokeResult>::Err("Permission denied for command: " + command);
-    }
-    
-    // Route to ToolManager with node context
-    // Parse params_json to JsonValue
-    auto params_result = core::JsonValue::parse(params_json);
-    if (!params_result.is_ok()) {
-        ++failed_invocations_;
-        return core::Result<NodeInvokeResult>::Err("Invalid JSON parameters");
-    }
-    core::JsonValue params = params_result.get();
-    
-    // Execute tool (metadata in ToolContext will be available to the tool)
-    auto tool_result = tool_manager_->execute_tool(command, params);
-    
-    // Build result
-    NodeInvokeResult result;
-    result.node_id = node_id;
-    result.command = command;
-    result.duration_ms = current_time_ms() - start_time;
-    
-    // ToolResult 已经包含 success 和 error 字段
-    result.success = tool_result.success;
-    if (!tool_result.content.empty()) {
-        // 使用第一个content item的text
-        result.result_json = tool_result.content[0].text;
-    }
-    result.error_message = tool_result.error;
-    
-    if (!result.success) {
-        ++failed_invocations_;
-    }
-    
-    return core::Result<NodeInvokeResult>::Ok(result);
-}
-
-core::Result<std::string> NodeRegistry::describe(const std::string& node_id) const {
-    auto node_opt = get_node(node_id);
-    if (!node_opt) {
-        return core::Result<std::string>::Err("Node not found: " + node_id);
-    }
-    
-    auto& node = *node_opt;
-    
-    // Build JSON description
-    std::ostringstream oss;
-    oss << "{";
-    oss << "\"nodeId\":\"" << node.node_id << "\",";
-    oss << "\"displayName\":\"" << node.display_name << "\",";
-    oss << "\"platform\":\"" << node.platform << "\",";
-    oss << "\"status\":\"" << (node.is_connected() ? "connected" : "disconnected") << "\",";
-    oss << "\"connectedAtMs\":" << node.connected_at_ms << ",";
-    oss << "\"caps\":[";
-    for (size_t i = 0; i < node.caps.size(); ++i) {
-        if (i > 0) oss << ",";
-        oss << "\"" << node.caps[i] << "\"";
-    }
-    oss << "],";
-    oss << "\"commands\":[";
-    for (size_t i = 0; i < node.commands.size(); ++i) {
-        if (i > 0) oss << ",";
-        oss << "\"" << node.commands[i] << "\"";
-    }
-    oss << "]";
-    oss << "}";
-    
-    return core::Result<std::string>::Ok(oss.str());
-}
-
-void NodeRegistry::set_event_callback(NodeEventCallback callback) {
-    event_callback_ = callback;
-}
-
-void NodeRegistry::emit_event(const std::string& node_id,
-                              const std::string& event_type,
-                              const std::string& event_data) {
-    if (event_callback_) {
-        event_callback_(node_id, event_type, event_data);
-    }
-}
-
-int NodeRegistry::cleanup_stale_nodes(int64_t threshold_ms) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    int removed = 0;
-    auto current = current_time_ms();
-    
-    auto it = nodes_.begin();
-    while (it != nodes_.end()) {
-        auto& node = it->second;
-        if (node.status == NodeStatus::DISCONNECTED &&
-            (current - node.last_ping_ms) > threshold_ms) {
-            it = nodes_.erase(it);
-            ++removed;
+    // 🎯 对齐 OpenClaw: 拒绝此 nodeId 所有 pending invokes
+    // for (const [id, pending] of this.pendingInvokes.entries()) {
+    //   if (pending.nodeId !== nodeId) continue;
+    //   clearTimeout(pending.timer);
+    //   pending.reject(new Error(`node disconnected (${pending.command})`));
+    //   this.pendingInvokes.delete(id);
+    // }
+    auto it = pending_invokes_.begin();
+    while (it != pending_invokes_.end()) {
+        if (it->second.node_id == node_id) {
+            if (it->second.reject) {
+                it->second.reject("node disconnected (" + it->second.command + ")");
+            }
+            it = pending_invokes_.erase(it);
         } else {
             ++it;
         }
     }
-    
-    return removed;
+
+    return node_id;
 }
 
-std::string NodeRegistry::get_statistics() const {
+// ============================================================================
+// listConnected — 对齐 OpenClaw: gateway/node-registry.ts:103-105
+// ============================================================================
+
+std::vector<NodeSession> NodeRegistry::list_connected() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    
-    int connected = 0;
-    for (const auto& [id, node] : nodes_) {
-        if (node.is_connected()) {
-            ++connected;
+    std::vector<NodeSession> result;
+    result.reserve(nodes_by_id_.size());
+    for (const auto& [id, session] : nodes_by_id_) {
+        result.push_back(session);
+    }
+    return result;
+}
+
+// ============================================================================
+// get — 对齐 OpenClaw: gateway/node-registry.ts:107-109
+// ============================================================================
+
+std::optional<NodeSession> NodeRegistry::get(const std::string& node_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = nodes_by_id_.find(node_id);
+    if (it == nodes_by_id_.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+// ============================================================================
+// invoke — 对齐 OpenClaw: gateway/node-registry.ts:111-159
+// ============================================================================
+
+NodeInvokeResult NodeRegistry::invoke(
+    const std::string& node_id,
+    const std::string& command,
+    const std::string& params_json,
+    int timeout_ms,
+    const std::string& idempotency_key) {
+
+    // 🎯 对齐 OpenClaw: const node = this.nodesById.get(params.nodeId)
+    NodeSession node;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = nodes_by_id_.find(node_id);
+        if (it == nodes_by_id_.end()) {
+            // 🎯 对齐 OpenClaw: { ok: false, error: { code: "NOT_CONNECTED", message: "node not connected" } }
+            NodeInvokeResult result;
+            result.ok = false;
+            result.error = NodeInvokeResult::Error{"NOT_CONNECTED", "node not connected"};
+            return result;
+        }
+        node = it->second;
+    }
+
+    // 🎯 对齐 OpenClaw: 构建 node.invoke.request payload
+    // const payload = { id: requestId, nodeId, command, paramsJSON, timeoutMs, idempotencyKey }
+    std::string request_id = std::to_string(next_timer_id_++);  // 简化替代 randomUUID
+
+    json payload;
+    payload["id"] = request_id;
+    payload["nodeId"] = node_id;
+    payload["command"] = command;
+    if (!params_json.empty()) {
+        payload["paramsJSON"] = params_json;
+    } else {
+        payload["paramsJSON"] = nullptr;
+    }
+    if (timeout_ms > 0) {
+        payload["timeoutMs"] = timeout_ms;
+    }
+    if (!idempotency_key.empty()) {
+        payload["idempotencyKey"] = idempotency_key;
+    }
+
+    // 🎯 对齐 OpenClaw: const ok = this.sendEventToSession(node, "node.invoke.request", payload)
+    bool sent = send_event_to_session(node, "node.invoke.request", payload.dump());
+    if (!sent) {
+        NodeInvokeResult result;
+        result.ok = false;
+        result.error = NodeInvokeResult::Error{"UNAVAILABLE", "failed to send invoke to node"};
+        return result;
+    }
+
+    // 🎯 对齐 OpenClaw: return await new Promise<NodeInvokeResult>((resolve, reject) => {
+    //   const timer = setTimeout(() => { ... resolve({ ok: false, error: { code: "TIMEOUT" } }) }, timeoutMs);
+    //   this.pendingInvokes.set(requestId, { nodeId, command, resolve, reject, timer });
+    // })
+    // C++ 同步版本: 使用 condition_variable 等待
+    std::mutex result_mutex;
+    std::condition_variable result_cv;
+    NodeInvokeResult invoke_result;
+    bool result_ready = false;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        PendingInvoke pending;
+        pending.request_id = request_id;
+        pending.node_id = node_id;
+        pending.command = command;
+        pending.resolve = [&](NodeInvokeResult r) {
+            std::lock_guard<std::mutex> lk(result_mutex);
+            invoke_result = std::move(r);
+            result_ready = true;
+            result_cv.notify_one();
+        };
+        pending.reject = [&](const std::string& err) {
+            std::lock_guard<std::mutex> lk(result_mutex);
+            invoke_result.ok = false;
+            invoke_result.error = NodeInvokeResult::Error{"REJECTED", err};
+            result_ready = true;
+            result_cv.notify_one();
+        };
+        pending_invokes_[request_id] = std::move(pending);
+    }
+
+    // 等待结果或超时
+    int effective_timeout = (timeout_ms > 0) ? timeout_ms : 30000;
+    {
+        std::unique_lock<std::mutex> lk(result_mutex);
+        bool ok = result_cv.wait_for(lk, std::chrono::milliseconds(effective_timeout),
+                                     [&] { return result_ready; });
+        if (!ok) {
+            // 🎯 对齐 OpenClaw: 超时处理
+            // this.pendingInvokes.delete(requestId);
+            // resolve({ ok: false, error: { code: "TIMEOUT", message: "node invoke timed out" } })
+            {
+                std::lock_guard<std::mutex> lock2(mutex_);
+                pending_invokes_.erase(request_id);
+            }
+            invoke_result.ok = false;
+            invoke_result.error = NodeInvokeResult::Error{"TIMEOUT", "node invoke timed out"};
         }
     }
-    
-    std::ostringstream oss;
-    oss << "{";
-    oss << "\"totalNodes\":" << nodes_.size() << ",";
-    oss << "\"connectedNodes\":" << connected << ",";
-    oss << "\"totalInvocations\":" << total_invocations_.load() << ",";
-    oss << "\"failedInvocations\":" << failed_invocations_.load();
-    oss << "}";
-    
-    return oss.str();
+
+    return invoke_result;
 }
 
-bool NodeRegistry::check_permission(const Node& node, const std::string& command) const {
-    return node.has_permission(command);
+// ============================================================================
+// handleInvokeResult — 对齐 OpenClaw: gateway/node-registry.ts:161-185
+// ============================================================================
+
+bool NodeRegistry::handle_invoke_result(
+    const std::string& request_id,
+    const std::string& node_id,
+    bool ok,
+    const std::string& payload_json,
+    const std::optional<NodeInvokeResult::Error>& error) {
+
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    auto it = pending_invokes_.find(request_id);
+    if (it == pending_invokes_.end()) {
+        return false;
+    }
+
+    // 🎯 对齐 OpenClaw: if (pending.nodeId !== params.nodeId) return false
+    if (it->second.node_id != node_id) {
+        return false;
+    }
+
+    auto resolve_fn = std::move(it->second.resolve);
+    pending_invokes_.erase(it);
+
+    // 🎯 对齐 OpenClaw: pending.resolve({ ok, payload, payloadJSON, error })
+    if (resolve_fn) {
+        NodeInvokeResult result;
+        result.ok = ok;
+        result.payload_json = payload_json.empty() ? std::nullopt : std::optional<std::string>(payload_json);
+        result.error = error;
+        resolve_fn(std::move(result));
+    }
+
+    return true;
 }
 
-core::Result<void> NodeRegistry::validate_node(const Node& node) const {
-    if (node.node_id.empty()) {
-        return core::Result<void>::Err("Node ID cannot be empty");
+// ============================================================================
+// sendEvent — 对齐 OpenClaw: gateway/node-registry.ts:187-193
+// ============================================================================
+
+bool NodeRegistry::send_event(const std::string& node_id, const std::string& event,
+                              const std::string& payload_json) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = nodes_by_id_.find(node_id);
+    if (it == nodes_by_id_.end()) {
+        return false;
     }
-    if (node.platform.empty()) {
-        return core::Result<void>::Err("Platform cannot be empty");
-    }
-    if (node.commands.empty()) {
-        return core::Result<void>::Err("Node must support at least one command");
-    }
-    return core::Result<void>::Ok();
+    return send_event_to_session(it->second, event, payload_json);
 }
 
-int64_t NodeRegistry::current_time_ms() const {
-    auto now = std::chrono::system_clock::now();
-    auto duration = now.time_since_epoch();
-    return std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
+void NodeRegistry::set_send_event_fn(SendEventToSessionFn fn) {
+    send_event_fn_ = std::move(fn);
+}
+
+// ============================================================================
+// sendEventToSession — 对齐 OpenClaw: gateway/node-registry.ts:195-212
+// ============================================================================
+
+bool NodeRegistry::send_event_to_session(const NodeSession& session, const std::string& event,
+                                          const std::string& payload_json) {
+    if (!send_event_fn_) {
+        return false;
+    }
+    try {
+        return send_event_fn_(session, event, payload_json);
+    } catch (...) {
+        return false;
+    }
 }
 
 } // namespace nodes
