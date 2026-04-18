@@ -7,11 +7,14 @@
 #include "hunterclaw/llm/llm_client.h"       // ✅ LLMClient
 #include "hunterclaw/tools/tool.h"            // ✅ ToolManager
 #include "hunterclaw/tools/tool_manager.h"    // ✅ ToolManager::create
+#include "hunterclaw/mcp/mcporter_client.h"   // ✅ McporterConfig
+#include "hunterclaw/mcp/mcp_config.h"        // ✅ list_configured_mcp_servers
 #include "hunterclaw/sessions/transcript_io.h"  // ✅ 对齐 OpenClaw: transcript 读写
 #include <spdlog/spdlog.h>
 #include <filesystem>
 #include <sstream>
 #include <vector>
+#include <cstdlib>
 
 namespace hunterclaw {
 namespace agents {
@@ -144,6 +147,58 @@ AgentInstance::AgentInstance(
         tool_context.agent_id = ctx_.agent_id;
         
         auto tool_mgr = tools::ToolManager::create(tool_context);
+        
+        // ============================================================================
+        // MCP 集成:自动从 ~/.hunterclaw/config.json 读取 MCP server 配置并启用
+        // ============================================================================
+        //   - 底层实现: NativeMcpClient (纯 C++,零外部依赖)
+        //   - 可通过环境变量 HUNTERCLAW_MCP=0 强制禁用
+        //   - 发现的 MCP 工具会通过 McpToolAdapter 注册到 tool_mgr
+        // ============================================================================
+        try {
+            const char* mcp_disabled = std::getenv("HUNTERCLAW_MCP");
+            bool mcp_enabled_by_env = (mcp_disabled == nullptr ||
+                                       std::string(mcp_disabled) != "0");
+
+            if (mcp_enabled_by_env) {
+                auto servers = mcp::list_configured_mcp_servers();
+                if (servers.ok && !servers.mcp_servers.empty()) {
+                    mcp::McporterConfig mcp_cfg;
+                    mcp_cfg.enabled = true;
+                    mcp_cfg.start_daemon = true;
+                    mcp_cfg.timeout_ms = 30000;
+
+                    spdlog::get("default")->info(
+                        "[AgentInstance] Enabling MCP (NativeMcpClient): {} server(s) configured",
+                        servers.mcp_servers.size()
+                    );
+
+                    auto result = tool_mgr->enable_mcp(mcp_cfg);
+                    if (result.is_ok()) {
+                        spdlog::get("default")->info(
+                            "[AgentInstance] MCP registered {} tool(s) for session={}",
+                            result.value.value_or(0), session_id
+                        );
+                    } else {
+                        spdlog::get("default")->warn(
+                            "[AgentInstance] MCP enable failed: {}", result.error
+                        );
+                    }
+                } else {
+                    spdlog::get("default")->debug(
+                        "[AgentInstance] No MCP servers configured, skipping MCP integration"
+                    );
+                }
+            } else {
+                spdlog::get("default")->info(
+                    "[AgentInstance] MCP disabled by HUNTERCLAW_MCP=0"
+                );
+            }
+        } catch (const std::exception& e) {
+            spdlog::get("default")->warn(
+                "[AgentInstance] MCP integration error (non-fatal): {}", e.what()
+            );
+        }
         
         // ✅ 从 Agent 配置创建 LLMClient
         llm::LLMConfig llm_config;

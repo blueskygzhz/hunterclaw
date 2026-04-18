@@ -582,6 +582,118 @@ ToolResult ToolManager::execute_tool(
 //                 config_path.empty() ? "default" : config_path);
 // }
 // 
+// ============================================================================
+// 基础 Setter 实现(补齐头文件声明)
+// ============================================================================
+
+void ToolManager::set_policy_enabled(bool enabled) {
+    policy_enabled_ = enabled;
+}
+
+void ToolManager::set_policy_pipeline(std::shared_ptr<PolicyPipeline> pipeline) {
+    policy_pipeline_ = pipeline;
+}
+
+void ToolManager::set_approval_manager(std::shared_ptr<ApprovalManager> manager) {
+    approval_manager_ = manager;
+}
+
+void ToolManager::set_hook_manager(std::shared_ptr<ToolHookManager> manager) {
+    hook_manager_ = manager;
+}
+
+void ToolManager::set_loop_detector(std::shared_ptr<ToolLoopDetector> detector) {
+    loop_detector_ = detector;
+}
+
+void ToolManager::set_result_processor(std::shared_ptr<ResultProcessingPipeline> processor) {
+    result_processor_ = processor;
+}
+
+void ToolManager::set_mcp_registry(std::shared_ptr<void> registry) {
+    mcp_registry_ = registry;
+}
+
+// ============================================================================
+// MCP 集成实现
+// ============================================================================
+//
+// 通过 McporterClient::create() 统一入口,返回 NativeMcpClient:
+//   - 纯 C++ 实现,无外部依赖
+//   - 支持 Stdio / StreamableHttp / SSE 三种传输
+//
+// ============================================================================
+
+core::Result<int> ToolManager::enable_mcp(const mcp::McporterConfig& config) {
+    if (!config.enabled) {
+        log()->info("[ToolManager] MCP is disabled in config");
+        return core::Result<int>::Ok(0);
+    }
+
+    log()->info("[ToolManager] Enabling MCP integration (NativeMcpClient)...");
+
+    // 1. 创建 MCP 客户端 (NativeMcpClient)
+    mcp_client_ = mcp_impl::McporterClient::create(config);
+    if (!mcp_client_) {
+        return core::Result<int>::Err("Failed to create MCP client");
+    }
+
+    // 2. 创建 McpToolRegistry
+    mcp_registry_typed_ = mcp_impl::McpToolRegistry::create(mcp_client_);
+
+    // 3. 确保 daemon/连接池已启动
+    auto ensure_result = mcp_client_->ensure_daemon_started();
+    if (ensure_result.is_err()) {
+        log()->error("[ToolManager] Failed to ensure MCP daemon: {}", ensure_result.error);
+        mcp_client_.reset();
+        mcp_registry_typed_.reset();
+        return core::Result<int>::Err("ensure_daemon failed: " + ensure_result.error);
+    }
+
+    // 4. 发现并注册所有 MCP 工具
+    auto register_result = mcp_registry_typed_->discover_and_register(*this);
+    if (register_result.is_err()) {
+        log()->warn("[ToolManager] MCP tool discovery failed: {}", register_result.error);
+        // 不返回错误:客户端可能可用但工具发现失败(例如 server 离线)
+        // 保留 mcp_client_,允许后续 refresh
+        return core::Result<int>::Ok(0);
+    }
+
+    int count = register_result.value.value_or(0);
+    log()->info("[ToolManager] MCP enabled: registered {} tools", count);
+    return core::Result<int>::Ok(count);
+}
+
+core::Result<int> ToolManager::refresh_mcp_tools(
+    const std::vector<std::string>& server_names
+) {
+    if (!mcp_registry_typed_) {
+        return core::Result<int>::Err("MCP not enabled (call enable_mcp first)");
+    }
+
+    log()->info("[ToolManager] Refreshing MCP tools...");
+
+    auto result = mcp_registry_typed_->discover_and_register(*this, server_names);
+    if (result.is_ok()) {
+        log()->info("[ToolManager] Refreshed {} MCP tools", result.value.value_or(0));
+    } else {
+        log()->error("[ToolManager] Failed to refresh MCP tools: {}", result.error);
+    }
+    return result;
+}
+
+std::shared_ptr<mcp_impl::McporterClient> ToolManager::get_mcp_client() const {
+    return mcp_client_;
+}
+
+std::shared_ptr<mcp_impl::McpToolRegistry> ToolManager::get_mcp_registry() const {
+    return mcp_registry_typed_;
+}
+
+bool ToolManager::is_mcp_enabled() const {
+    return mcp_client_ != nullptr;
+}
+
 // Tool结果辅助函数实现
 namespace tool_result {
 

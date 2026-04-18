@@ -130,9 +130,9 @@ sed -i 's/# set(QUEUE_SOURCES/set(QUEUE_SOURCES/g' CMakeLists.txt
 sed -i 's/#     src\/queue/    src\/queue/g' CMakeLists.txt
 
 # 启用 MCP Client (需要替换 stub)
-echo "启用 MCP Client..."
+echo "启用 MCP Client (NativeMcpClient,纯 C++)..."
 sed -i 's/src\/mcp\/mcp_stub.cc/# src\/mcp\/mcp_stub.cc/g' CMakeLists.txt
-sed -i 's/# src\/mcp\/mcporter_client.cc/src\/mcp\/mcporter_client.cc/g' CMakeLists.txt
+sed -i 's/# src\/mcp\/native_mcp_client.cc/src\/mcp\/native_mcp_client.cc/g' CMakeLists.txt
 sed -i 's/# src\/mcp\/mcp_tool_adapter.cc/src\/mcp\/mcp_tool_adapter.cc/g' CMakeLists.txt
 
 # 添加外部库路径
@@ -236,7 +236,7 @@ if command -v nm &> /dev/null; then
     
     echo ""
     echo "MCP Client:"
-    nm libhunterclaw_core.so | grep -i "mcporter" | head -5 || echo "  (未找到符号)"
+    nm libhunterclaw_core.so | grep -i "NativeMcpClient\|McporterClient" | head -5 || echo "  (未找到符号)"
     
     echo ""
     echo "Session Manager:"

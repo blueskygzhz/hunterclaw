@@ -316,6 +316,7 @@ cc_library(
     srcs = glob(["mcp/*.cc"]),
     deps = [
         "//:hunterclaw_headers",
+        ":hunterclaw_infra",   # ✅ NativeMcpClient: HttpClient (SSE/StreamableHttp)
         "@nlohmann_json//:json",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -410,6 +411,7 @@ cc_library(
         ":hunterclaw_sessions",
         ":hunterclaw_observability",  # ✅ 添加 observability 依赖
         ":hunterclaw_queue",          # ✅ 添加 queue 依赖 (CommandQueue)
+        ":hunterclaw_mcp",            # ✅ 添加 mcp 依赖 (ToolManager::enable_mcp)
         "@ixwebsocket//:ixwebsocket", # ✅ sessions_tool.cc 需要 gateway/client.h
         "@nlohmann_json//:json",
         "@com_google_absl//absl/status",
@@ -588,6 +590,7 @@ cc_library(
         ":hunterclaw_skills",
         ":hunterclaw_tools",   # ✅ 添加 tools 依赖 (ToolManager::create)
         ":hunterclaw_react",   # ✅ 添加 react 依赖 (ReactEngine::create)
+        ":hunterclaw_mcp",     # ✅ 添加 mcp 依赖 (AgentInstance 自动启用 MCP)
         "@ixwebsocket//:ixwebsocket",  # ✅ acp_spawn.cc 需要 gateway/client.h
         "@nlohmann_json//:json",
         "@com_google_absl//absl/status",

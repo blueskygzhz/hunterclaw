@@ -147,23 +147,17 @@ echo ""
 echo -e "${BLUE}[6/7] MCP 集成对齐${NC}"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-if check_file_exists 'src/mcp/mcporter_client.cc'; then
-    check_module "MCP Client (完整)" "check_symbol_exists 'libhunterclaw_core.so' 'McporterClient'" 2
+# HunterClaw 使用纯 C++ 原生 MCP 客户端 (NativeMcpClient)
+# 不再依赖外部 mcporter CLI
+if check_file_exists 'src/mcp/native_mcp_client.cc'; then
+    check_module "MCP Native Client (纯 C++)" "check_file_exists 'src/mcp/native_mcp_client.cc'" 1
     check_module "MCP Tool 适配器" "check_file_exists 'src/mcp/mcp_tool_adapter.cc'" 1
+    check_module "MCP 传输配置" "check_file_exists 'src/mcp/mcp_transport_config.cc'" 1
 elif check_file_exists 'src/mcp/mcp_stub.cc'; then
     echo -e "${YELLOW}⚠${NC} MCP Client (Stub - 需要完整实现)"
     PASSED_CHECKS=$((PASSED_CHECKS + 1))
     TOTAL_CHECKS=$((TOTAL_CHECKS + 3))
 fi
-
-# 检查 mcporter 命令是否可用
-if command -v mcporter &> /dev/null; then
-    echo -e "${GREEN}✓${NC} mcporter CLI 已安装"
-    PASSED_CHECKS=$((PASSED_CHECKS + 1))
-else
-    echo -e "${YELLOW}⚠${NC} mcporter CLI 未安装 (可选)"
-fi
-TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
 
 echo ""
 
