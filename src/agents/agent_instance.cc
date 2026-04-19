@@ -4,6 +4,7 @@
 #include "hunterclaw/core/utils.h"
 #include "hunterclaw/core/logging.h"
 #include "hunterclaw/react/react_engine.h"  // ✅ ReactEngine
+#include "hunterclaw/context/context_pruning.h"  // ✅ 对齐 OC: pi-hooks/context-pruning
 #include "hunterclaw/llm/llm_client.h"       // ✅ LLMClient
 #include "hunterclaw/tools/tool.h"            // ✅ ToolManager
 #include "hunterclaw/tools/tool_manager.h"    // ✅ ToolManager::create
@@ -227,7 +228,29 @@ AgentInstance::AgentInstance(
         react_config.max_steps = 20;
         react_config.reasoning_mode = react::ReactConfig::ReasoningMode::Off;
         react_config.parallel_tool_calls = false;
-        
+
+        // 🎯 严格对齐 OC: pi-embedded-runner/extensions.ts buildContextPruningFactory
+        // 读取 agent 配置中的 contextPruning JSON 块（对齐 OC:
+        //   config.agents.defaults.contextPruning），当 mode=cache-ttl 时启用
+        {
+            auto it = ctx_.config.extra.find("contextPruning");
+            if (it != ctx_.config.extra.end()) {
+                react_config.context_pruning =
+                    context::parse_context_pruning_config_from_json(it->second);
+                if (react_config.context_pruning.mode !=
+                    context::ContextPruningMode::OFF) {
+                    spdlog::get("default")->info(
+                        "[AgentInstance] context pruning enabled: mode=cache-ttl "
+                        "ttl_ms={} keepLastAssistants={} softTrim={}/{} hardClear={}",
+                        react_config.context_pruning.ttl_ms,
+                        react_config.context_pruning.keep_last_assistants,
+                        react_config.context_pruning.soft_trim_ratio,
+                        react_config.context_pruning.hard_clear_ratio,
+                        react_config.context_pruning.hard_clear.enabled);
+                }
+            }
+        }
+
         react_engine_ = react::ReactEngine::create(tool_mgr, llm_client, react_config);
         spdlog::get("default")->info("[AgentInstance] ReactEngine initialized: model={}, provider={}", 
                    llm_config.model, llm_config.provider);

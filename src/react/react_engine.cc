@@ -16,6 +16,8 @@
 #include "hunterclaw/sessions/transcript_io.h"       // append_tool_result_to_transcript (tool_result_persist)
 #include "hunterclaw/observability/observability.h"  // ✅ Span, Tracer, SpanKind
 #include "hunterclaw/observability/diagnostic_events.h"  // ✅ 可观测性集成
+#include "hunterclaw/react/preflight_memory.h"       // ✅ 对齐 OC post-compaction-context.ts: readPostCompactionContext
+#include "hunterclaw/infra/system_events.h"          // ✅ 对齐 OC system-events: enqueueSystemEvent
 #include <regex>
 #include <algorithm>
 #include <fstream>
@@ -562,6 +564,10 @@ ReactResult ReactEngine::execute_loop(
     // ReAct 循环: Reason → Act → Observe → ...
     int step_count = 0;
     std::string accumulated_response;
+    // 🎯 对齐 OpenClaw agent-runner.ts:770 — autoCompactionCount
+    // 本轮 run 内累计发生的 auto-compaction 次数
+    // Run 结束时若 > 0, 触发 post-compaction context 注入 (enqueueSystemEvent)
+    int auto_compaction_count = 0;
     // 🎯 对齐 OpenClaw: assistantTexts accumulator (mirrors state.assistantTexts)
     std::vector<std::string> assistant_texts;
     
@@ -671,6 +677,8 @@ ReactResult ReactEngine::execute_loop(
                         log()->info("[ReactEngine] Auto-compaction succeeded (attempt {}); retrying prompt",
                                    overflow_compaction_attempts);
                         compaction_succeeded = true;
+                        // 🎯 对齐 OC agent-runner.ts:770: 记录 auto-compaction 发生
+                        ++auto_compaction_count;
                         break;
                     }
                 }
@@ -745,6 +753,11 @@ ReactResult ReactEngine::execute_loop(
             callbacks.on_assistant_message_start();
         }
 
+        // 🎯 对齐 OpenClaw pi-hooks/context-pruning/extension.ts:
+        //   api.on("context", (event, ctx) => ...) — 在每次向 LLM 发起请求前
+        //   对 in-memory messages 做剪枝 (仅影响本次请求 payload，不改写 transcript)
+        (void)maybe_prune_context(messages);
+
         // 步骤 1: Reason (推理)
         auto llm_response = call_llm(messages, callbacks);
 
@@ -765,8 +778,12 @@ ReactResult ReactEngine::execute_loop(
             }
             if (compact_result.compacted) {
                 log()->info("[ReactEngine] Emergency compaction succeeded, retrying LLM call");
+                // 🎯 对齐 OC agent-runner.ts:770: 记录 auto-compaction 发生
+                ++auto_compaction_count;
                 streaming_state_.reset_assistant_message_state(
                     static_cast<int>(assistant_texts.size()));
+                // 🎯 对齐 OC: compaction 之后 retry 前再次 prune (对齐 extension.ts 每次 on("context"))
+                (void)maybe_prune_context(messages);
                 llm_response = call_llm(messages, callbacks);
             }
         }
@@ -1080,7 +1097,60 @@ ReactResult ReactEngine::execute_loop(
     } catch (...) {
         // 故障隔离
     }
-    
+
+    // ========================================================================
+    // 🎯 严格对齐 OpenClaw agent-runner.ts:770-807
+    //
+    //   if (autoCompactionCount > 0) {
+    //     ...
+    //     if (sessionKey) {
+    //       const workspaceDir = process.cwd();
+    //       readPostCompactionContext(workspaceDir, cfg).then(content => {
+    //         if (content) enqueueSystemEvent(content, { sessionKey });
+    //       }).catch(() => {});
+    //     }
+    //   }
+    //
+    // 行为: 本轮 run 发生过 auto-compaction 时, 读取 AGENTS.md 的
+    //       Session Startup / Red Lines sections, 作为 SystemEvent 入队.
+    //       下一轮 agent run 开始时, 该事件会被 prepend 到 prompt
+    //       (通过 extraSystemPrompt 或直接作为 user turn 注入).
+    //
+    //       这是 best-effort — 任何失败都静默忽略, 不影响主流程.
+    // ========================================================================
+    if (auto_compaction_count > 0 && !callbacks.session_key.empty()) {
+        try {
+            auto refresh_prompt = react::read_post_compaction_context(
+                callbacks.workspace_dir,
+                /*configured_sections=*/{},  // 空 → 使用默认 Session Startup / Red Lines
+                /*now_ms=*/0                 // 0 → 当前时间
+            );
+            if (refresh_prompt && !refresh_prompt->empty()) {
+                bool added = infra::enqueue_system_event(
+                    *refresh_prompt,
+                    callbacks.session_key,
+                    /*context_key=*/std::nullopt
+                );
+                log()->info(
+                    "[ReactEngine] post-compaction context refresh enqueued "
+                    "(session_key={}, compactions={}, added={})",
+                    callbacks.session_key, auto_compaction_count, added
+                );
+            } else {
+                log()->debug(
+                    "[ReactEngine] post-compaction context refresh skipped "
+                    "(no AGENTS.md sections found in workspace={})",
+                    callbacks.workspace_dir
+                );
+            }
+        } catch (const std::exception& e) {
+            // Silent failure — post-compaction context is best-effort
+            log()->debug("[ReactEngine] post-compaction context injection failed: {}", e.what());
+        } catch (...) {
+            log()->debug("[ReactEngine] post-compaction context injection failed: unknown");
+        }
+    }
+
     return result;
 }
 
@@ -2407,7 +2477,96 @@ std::optional<int> ReactEngine::extract_overflow_token_count(const std::string& 
     return std::nullopt;
 }
 
-// 触发 Compaction (对齐 OpenClaw)
+// ═══════════════════════════════════════════════════════════════════════════
+// 🎯 严格对齐 OpenClaw pi-hooks/context-pruning/extension.ts
+//   + runtime.ts (cache-ttl touch 更新)
+//   + cache-ttl.ts (provider eligibility)
+//
+// 等价 OC:
+//   api.on("context", (event, ctx) => {
+//     const runtime = getContextPruningRuntime(ctx.sessionManager);
+//     if (!runtime) return undefined;                    // 未启用
+//     if (runtime.settings.mode === "cache-ttl") {
+//       const lastTouch = runtime.lastCacheTouchAt;
+//       if (!lastTouch || Date.now() - lastTouch < ttlMs) return undefined;
+//     }
+//     const next = pruneContextMessages({ messages, settings, ctx, ... });
+//     if (next === event.messages) return undefined;
+//     if (mode === "cache-ttl") runtime.lastCacheTouchAt = Date.now();
+//     return { messages: next };
+//   });
+// ═══════════════════════════════════════════════════════════════════════════
+bool ReactEngine::maybe_prune_context(std::vector<LLMMessage>& messages) {
+    // 🎯 对齐 OC: runtime 未注册（mode=off）→ 直接返回
+    if (config_.context_pruning.mode == context::ContextPruningMode::OFF) {
+        return false;
+    }
+
+    // 🎯 对齐 OC: computeEffectiveSettings 懒缓存
+    if (!effective_pruning_settings_.has_value()) {
+        auto computed = context::compute_effective_settings(config_.context_pruning);
+        if (!computed.has_value()) {
+            // mode != cache-ttl → 永久禁用
+            return false;
+        }
+        effective_pruning_settings_ = *computed;
+    }
+    const auto& settings = *effective_pruning_settings_;
+
+    // 🎯 对齐 OC cache-ttl.ts: isCacheTtlEligibleProvider
+    // 只对支持 prompt cache 的 provider 启用 cache-ttl 剪枝
+    const std::string provider = llm_client_ ? llm_client_->get_config().provider : "";
+    const std::string model_id = llm_client_ ? llm_client_->get_config().model : "";
+    if (settings.mode == context::ContextPruningMode::CACHE_TTL &&
+        !context::is_cache_ttl_eligible_provider(provider, model_id, /*model_api=*/"")) {
+        return false;
+    }
+
+    // 🎯 对齐 OC extension.ts: cache-ttl 模式下 TTL 未到 → 不剪枝（保护 cache）
+    if (settings.mode == context::ContextPruningMode::CACHE_TTL) {
+        const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count();
+        if (last_cache_touch_at_ms_ == 0) {
+            // 从未 touch → 记录当前时间、不剪（第一次请求让 cache 建立起来）
+            last_cache_touch_at_ms_ = now_ms;
+            return false;
+        }
+        if (settings.ttl_ms > 0 && (now_ms - last_cache_touch_at_ms_) < settings.ttl_ms) {
+            return false;  // TTL 未到
+        }
+    }
+
+    // 🎯 对齐 OC: pruneContextMessages
+    context::PruneContextParams params;
+    params.messages = messages;  // 传入拷贝
+    params.settings = settings;
+    params.context_window_tokens = context_window_config_.context_window_tokens;
+    // predicate 使用默认（由 settings.tools 生成）
+    auto result = context::prune_context_messages(params);
+
+    if (!result.changed) {
+        return false;
+    }
+
+    // 🎯 对齐 OC extension.ts: 已剪枝 → 更新 lastCacheTouchAt
+    if (settings.mode == context::ContextPruningMode::CACHE_TTL) {
+        last_cache_touch_at_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count();
+    }
+
+    messages = std::move(result.messages);
+
+    spdlog::get("default")->info(
+        "[ReactEngine] context pruning: {} chars -> {} chars "
+        "(soft_trim={}, hard_clear={})",
+        result.total_chars_before, result.total_chars_after,
+        result.soft_trimmed_count, result.hard_cleared_count);
+    return true;
+}
+
+
 ReactEngine::CompactionResult ReactEngine::trigger_compaction(
     std::vector<LLMMessage>& messages,
     const std::string& transcript_path

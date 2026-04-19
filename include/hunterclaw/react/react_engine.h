@@ -7,6 +7,7 @@
 #include "hunterclaw/llm/provider.h"  // For Response, ToolCall, Usage
 #include "hunterclaw/memory/compaction_manager.h"  // ✅ Compaction 支持
 #include "hunterclaw/context/context_engine.h"    // ✅ Context Engine 支持
+#include "hunterclaw/context/context_pruning.h"   // ✅ 对齐 OC: pi-hooks/context-pruning
 #include "hunterclaw/react/loop_detection.h"       // ✅ 对齐 OpenClaw: tool loop detection
 #include <string>
 #include <vector>
@@ -264,6 +265,13 @@ struct ReactConfig {
         // Fallback model to use if primary model fails (thinking level degradation)
         std::string fallback_model;
     } failover;
+
+    // ============================================================================
+    // 🎯 对齐 OpenClaw: pi-hooks/context-pruning/ (extension.ts + runtime.ts)
+    // Opt-in microcompact: 在每次调用 LLM 前对 in-memory messages 做剪枝
+    // （仅修改本次请求的 payload，不改写 session transcript）
+    // ============================================================================
+    context::ContextPruningConfig context_pruning;
 };
 
 // ReAct 引擎 - 对齐 OpenClaw
@@ -550,6 +558,19 @@ private:
         int soft_threshold_tokens = 4000;
     };
     ContextWindowConfig context_window_config_;
+
+    // ✅ 对齐 OpenClaw pi-hooks/context-pruning/runtime.ts:
+    //   cache-ttl 模式下记录上一次 prompt cache 写入时间戳
+    // - 单位: 毫秒 since epoch; 0 = 尚未 touched
+    // - 每次剪枝后更新 (对齐 OC extension.ts: runtime.lastCacheTouchAt = Date.now())
+    int64_t last_cache_touch_at_ms_ = 0;
+
+    // ✅ 对齐 OC: 归一化的剪枝设置 (懒初始化，避免每次 run 重算)
+    mutable std::optional<context::EffectiveContextPruningSettings> effective_pruning_settings_;
+
+    // ✅ 对齐 OC: pruner.ts pruneContextMessages
+    //   在每次 call_llm 之前调用，返回值表示是否有修改 (used for cache-touch update)
+    bool maybe_prune_context(std::vector<LLMMessage>& messages);
 
 public:
     // ✅ 新增: 设置 CompactionManager (从 AgentInstance 调用)

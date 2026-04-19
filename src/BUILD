@@ -499,7 +499,11 @@ cc_library(
 # ============================================================================
 cc_library(
     name = "hunterclaw_react",
-    srcs = glob(["react/*.cc"]),
+    srcs = glob(["react/*.cc"]) + [
+        # ✅ 对齐 OC pi-hooks/context-pruning: ReactEngine 直接依赖 pruner，
+        # 放在此处避免与 hunterclaw_core 形成循环依赖。
+        "context/context_pruning.cc",
+    ],
     deps = [
         "//:hunterclaw_headers",
         ":hunterclaw_core_base",     # ✅ 添加 core_base 依赖 (ThreadPool)
@@ -667,6 +671,8 @@ cc_library(
         "nodes/*.cc",
     ], exclude = [
         "main.cc",
+        # ✅ context/context_pruning.cc 已挪至 hunterclaw_react 以避免循环依赖
+        "context/context_pruning.cc",
     ]),
     deps = [
         ":hunterclaw_core_base",  # ✅ 依赖 core_base (core/*.cc)
