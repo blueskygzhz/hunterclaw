@@ -167,6 +167,58 @@ struct StreamCallbacks {
     // engine run 结束后检查 memory_flush_gate, 如果超过阈值则通知上层执行 flush
     // 上层 (dispatcher/agent-runner) 负责调用 run_memory_flush_if_needed
     std::function<void(int total_tokens)> on_memory_flush_needed;
+
+    // ════════════════════════════════════════════════════════════════════
+    // 🎯 严格对齐 OpenClaw agent-runner-memory.ts 三大入口：
+    //   runPreflightCompactionIfNeeded → runMemoryFlushIfNeeded
+    // 由 engine 内部在 run() 的 pre/post 阶段调用。上层（dispatcher/agent_instance/
+    // chat handler）通过下面的 function 字段注入实际执行逻辑。
+    //
+    // 可选字段 —— 不注入则跳过对应阶段（向后兼容）。
+    // ════════════════════════════════════════════════════════════════════
+
+    // 对齐 OC agent-runner-memory.ts L396-449: session 当前 totalTokens 的"新鲜值"
+    // （从 session store 读取），engine 用它判断是否需要 preflight compaction
+    std::optional<int> persisted_total_tokens;
+    bool total_tokens_fresh = false;
+    std::optional<int> compaction_count;
+    std::optional<int> memory_flush_compaction_count;
+
+    // 对齐 OC agent-runner-memory.ts preflight callbacks:
+    //   1) compact_session_fn: 真正执行 compaction 的动作
+    //      (返回是否成功、压缩后的 tokens、新 session_id)
+    //   2) on_compaction_complete_fn: compaction 成功后回写 session store
+    std::function<bool(const std::string& session_id, int token_count)>
+        compact_session_fn;
+    std::function<void(int new_compaction_count)> on_compaction_complete_fn;
+
+    // 对齐 OC agent-runner-memory.ts L693-848 memory flush callbacks:
+    //   1) run_flush_agent_fn: 起 flush agent 子进程写 MEMORY.md
+    //   2) persist_session_tokens_fn: 回写 transcript-derived token 到 session store
+    //   3) on_flush_complete_fn: flush 完成后 session rotation (新 session_id)
+    std::function<void(const std::string& prompt, const std::string& system_prompt)>
+        run_flush_agent_fn;
+    std::function<void(int derived_total_tokens)>
+        persist_session_tokens_fn;
+    std::function<void(int new_compaction_count,
+                       const std::string& new_session_id)>
+        on_flush_complete_fn;
+
+    // Memory flush 执行路径额外需要的配置（对齐 OC agent-runner-memory.ts L564-620）：
+    //   - flush_write_path: MEMORY.md 目标路径
+    //   - flush_system_prompt / flush_prompt: flush agent 的 system/user prompt 模板
+    //   - force_flush_transcript_bytes: transcript 超过多少字节强制 flush
+    std::string flush_write_path;
+    std::string flush_system_prompt;
+    std::string flush_prompt;
+    int64_t force_flush_transcript_bytes = 2 * 1024 * 1024;  // 默认 2MB
+    bool memory_flush_writable = true;
+    bool is_heartbeat = false;
+    bool is_cli = false;
+    std::string provider;  // 对齐 OC: 传给 flush agent 作为 context
+    std::string model;     // 对齐 OC: 当前模型名
+    std::string default_model;  // 对齐 OC: fallback 模型名
+    std::optional<int> agent_cfg_context_tokens;
 };
 
 // ReAct 配置
@@ -571,6 +623,13 @@ private:
     // ✅ 对齐 OC: pruner.ts pruneContextMessages
     //   在每次 call_llm 之前调用，返回值表示是否有修改 (used for cache-touch update)
     bool maybe_prune_context(std::vector<LLMMessage>& messages);
+
+    // 🎯 严格对齐 OpenClaw pi-embedded-runner/tools-payload.ts:
+    //   每次调用 LLM 前，从 ToolManager 收集全部工具 (内置 + MCP)，
+    //   构造 LLM 原生 tools 参数 (API `tools: [...]` 字段)。
+    //   - 与 system_prompt 无关 (OC 的工具声明严格走 API 参数通道)
+    //   - 与 skills 不冲突 (skills 走 system_prompt 的 <available_skills> 块)
+    std::vector<llm::ToolDefinition> build_tool_definitions() const;
 
 public:
     // ✅ 新增: 设置 CompactionManager (从 AgentInstance 调用)

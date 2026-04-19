@@ -198,7 +198,73 @@ ReactResult ReactEngine::run(
             log()->warn("[ContextEngine] bootstrap failed: {}", e.what());
         }
     }
-    
+
+    // ════════════════════════════════════════════════════════════════════
+    // 🎯 严格对齐 OC agent-runner-memory.ts:346-503:
+    //   runPreflightCompactionIfNeeded(agent, user_input, runtime_ctx)
+    //
+    // 在发起第一次 LLM 调用之前检查：
+    //   - session 累积 token 是否已接近 context_window 上限
+    //   - transcript 文件是否超过 force_flush_transcript_bytes
+    // 若触发 → 调用外层 compact_session_fn 压缩 session，再进入 execute_loop。
+    //
+    // 可选执行 —— 外层未注入 compact_session_fn 则跳过。
+    // heartbeat / CLI / 空 session_key 自动跳过（对齐 OC）。
+    // ════════════════════════════════════════════════════════════════════
+    if (callbacks.compact_session_fn &&
+        !callbacks.session_key.empty() &&
+        !callbacks.session_id.empty() &&
+        !callbacks.is_heartbeat && !callbacks.is_cli) {
+        try {
+            react::PreflightRunParams pre;
+            pre.session_key = callbacks.session_key;
+            pre.session_id = callbacks.session_id;
+            pre.session_file = callbacks.transcript_path;
+            pre.store_path = "";  // HC 当前用 transcript_path 替代
+            pre.workspace_dir = callbacks.workspace_dir;
+            pre.provider = callbacks.provider.empty() && llm_client_
+                ? llm_client_->get_config().provider : callbacks.provider;
+            pre.model = callbacks.model.empty() && llm_client_
+                ? llm_client_->get_config().model : callbacks.model;
+            pre.default_model = callbacks.default_model;
+            pre.agent_cfg_context_tokens = callbacks.agent_cfg_context_tokens;
+            pre.is_heartbeat = callbacks.is_heartbeat;
+            pre.is_cli = callbacks.is_cli;
+            pre.persisted_total_tokens = callbacks.persisted_total_tokens;
+            pre.total_tokens_fresh = callbacks.total_tokens_fresh;
+            pre.compaction_count = callbacks.compaction_count;
+            pre.prompt_for_estimate = user_input;
+            pre.context_window_tokens =
+                context_window_config_.context_window_tokens;
+            pre.reserve_tokens_floor =
+                context_window_config_.reserve_tokens_floor;
+            pre.soft_threshold_tokens =
+                context_window_config_.soft_threshold_tokens;
+
+            // 把外层的 callbacks 映射到 preflight 所需签名
+            pre.compact_session = callbacks.compact_session_fn;
+            if (callbacks.on_compaction_complete_fn) {
+                pre.on_compaction_complete = callbacks.on_compaction_complete_fn;
+            }
+
+            auto preflight_result =
+                react::run_preflight_compaction_if_needed(pre);
+            if (preflight_result.compacted) {
+                log()->info(
+                    "[ReactEngine] preflight compaction: session={} tokens_after={} new_session_id={}",
+                    callbacks.session_key,
+                    preflight_result.tokens_after.value_or(-1),
+                    preflight_result.new_session_id.value_or("<unchanged>"));
+                // 对齐 OC: preflight 成功后可能 rotate 了 session_id,
+                // 但当前 run 仍使用原 session 继续 (OC 同语义)
+            }
+        } catch (const std::exception& e) {
+            log()->warn("[ReactEngine] preflight compaction failed: {}", e.what());
+        } catch (...) {
+            log()->warn("[ReactEngine] preflight compaction failed: unknown");
+        }
+    }
+
     try {
         auto result = execute_loop(user_input, history, callbacks);
         
@@ -758,8 +824,12 @@ ReactResult ReactEngine::execute_loop(
         //   对 in-memory messages 做剪枝 (仅影响本次请求 payload，不改写 transcript)
         (void)maybe_prune_context(messages);
 
+        // 🎯 对齐 OC tools-payload.ts: 每次 LLM 调用前打包工具 schema
+        // (内置 + MCP + sandbox, 统一走 API 原生 tools 参数)
+        auto tool_defs = build_tool_definitions();
+
         // 步骤 1: Reason (推理)
-        auto llm_response = call_llm(messages, callbacks);
+        auto llm_response = call_llm(messages, callbacks, tool_defs);
 
         // 🎯 对齐 OpenClaw: context overflow from LLM error → compaction → retry
         if (llm_response.context_overflow && compaction_mgr_) {
@@ -784,7 +854,9 @@ ReactResult ReactEngine::execute_loop(
                     static_cast<int>(assistant_texts.size()));
                 // 🎯 对齐 OC: compaction 之后 retry 前再次 prune (对齐 extension.ts 每次 on("context"))
                 (void)maybe_prune_context(messages);
-                llm_response = call_llm(messages, callbacks);
+                // 🎯 对齐 OC: compaction 后重建 tool_defs (工具集可能未变，但保持一致性)
+                auto retry_tool_defs = build_tool_definitions();
+                llm_response = call_llm(messages, callbacks, retry_tool_defs);
             }
         }
         
@@ -1020,7 +1092,7 @@ ReactResult ReactEngine::execute_loop(
 
     // ✅ 对齐 OC: shouldRunMemoryFlush (memory-flush.ts) — check if memory flush needed after run
     // OC 中这个检查在 agent-runner-memory.ts runMemoryFlushIfNeeded 中完成
-    // HC 在 engine run 结束后做门控检查，通过 callback 通知上层执行 flush
+    // HC engine 负责门控判断 + 触发 run_memory_flush_if_needed (如果外层注入了执行器)
     {
         MemoryFlushGateParams flush_params;
         flush_params.total_tokens = result.usage.total_tokens;
@@ -1028,11 +1100,87 @@ ReactResult ReactEngine::execute_loop(
         flush_params.context_window_tokens = context_window_config_.context_window_tokens;
         flush_params.reserve_tokens_floor = 2048;
         flush_params.soft_threshold_tokens = 1024;
+        flush_params.compaction_count = callbacks.compaction_count;
+        flush_params.memory_flush_compaction_count =
+            callbacks.memory_flush_compaction_count;
+
         if (should_run_memory_flush(flush_params)) {
-            log()->info("[ReactEngine] Memory flush gate triggered — tokens: {}", result.usage.total_tokens);
-            // 对齐 OC: 通知上层需要执行 memory flush
+            log()->info("[ReactEngine] Memory flush gate triggered — tokens: {}",
+                        result.usage.total_tokens);
+
+            // 对齐 OC: 保留观察性 callback（向后兼容上层打日志/埋点）
             if (callbacks.on_memory_flush_needed) {
                 callbacks.on_memory_flush_needed(result.usage.total_tokens);
+            }
+
+            // 🎯 严格对齐 OC agent-runner-memory.ts:505-848:
+            //   runMemoryFlushIfNeeded(agent, session_ctx, runtime_ctx)
+            //
+            // 如果外层注入了 run_flush_agent_fn，engine 直接驱动 flush 全流程：
+            //   1) 再次门控（has_already_flushed_for_current_compaction）
+            //   2) 起 flush agent 子进程写 MEMORY.md (run_flush_agent_fn)
+            //   3) 回写 transcript-derived token (persist_session_tokens_fn)
+            //   4) session rotation (on_flush_complete_fn)
+            if (callbacks.run_flush_agent_fn &&
+                !callbacks.session_key.empty() &&
+                !callbacks.is_heartbeat && !callbacks.is_cli) {
+                try {
+                    react::MemoryFlushParams fp;
+                    fp.session_key = callbacks.session_key;
+                    fp.session_id = callbacks.session_id;
+                    fp.session_file = callbacks.transcript_path;
+                    fp.store_path = "";
+                    fp.workspace_dir = callbacks.workspace_dir;
+                    fp.provider = callbacks.provider.empty() && llm_client_
+                        ? llm_client_->get_config().provider : callbacks.provider;
+                    fp.model = callbacks.model.empty() && llm_client_
+                        ? llm_client_->get_config().model : callbacks.model;
+                    fp.default_model = callbacks.default_model;
+                    fp.agent_cfg_context_tokens = callbacks.agent_cfg_context_tokens;
+                    fp.is_heartbeat = callbacks.is_heartbeat;
+                    fp.is_cli = callbacks.is_cli;
+                    fp.memory_flush_writable = callbacks.memory_flush_writable;
+                    fp.persisted_total_tokens = result.usage.total_tokens > 0
+                        ? std::optional<int>(result.usage.total_tokens)
+                        : callbacks.persisted_total_tokens;
+                    fp.total_tokens_fresh = true;
+                    fp.compaction_count = callbacks.compaction_count;
+                    fp.memory_flush_compaction_count =
+                        callbacks.memory_flush_compaction_count;
+                    fp.reserve_tokens_floor = 2048;
+                    fp.soft_threshold_tokens = 1024;
+                    fp.context_window_tokens =
+                        context_window_config_.context_window_tokens;
+                    fp.force_flush_transcript_bytes =
+                        callbacks.force_flush_transcript_bytes;
+                    fp.flush_write_path = callbacks.flush_write_path;
+                    fp.flush_system_prompt = callbacks.flush_system_prompt;
+                    fp.flush_prompt = callbacks.flush_prompt;
+                    fp.session_log_path = callbacks.transcript_path;
+
+                    fp.run_flush_agent = callbacks.run_flush_agent_fn;
+                    if (callbacks.persist_session_tokens_fn) {
+                        fp.persist_session_tokens =
+                            callbacks.persist_session_tokens_fn;
+                    }
+                    if (callbacks.on_flush_complete_fn) {
+                        fp.on_flush_complete = callbacks.on_flush_complete_fn;
+                    }
+
+                    auto fr = react::run_memory_flush_if_needed(fp);
+                    if (fr.flushed) {
+                        log()->info(
+                            "[ReactEngine] memory flush done: session={} "
+                            "compaction_completed={} new_session_id={}",
+                            callbacks.session_key,
+                            fr.compaction_completed,
+                            fr.new_session_id.value_or("<unchanged>"));
+                    }
+                } catch (const std::exception& e) {
+                    log()->warn("[ReactEngine] memory flush failed: {}", e.what());
+                } catch (...) {
+                    log()->warn("[ReactEngine] memory flush failed: unknown");
+                }
             }
         }
     }
@@ -1505,8 +1653,23 @@ ReactEngine::LLMResponseData ReactEngine::call_llm(
 
     // 🎯 对齐 OpenClaw run.ts:412-660: Auth profile rotation + model failover
     // 调用 LLM 的流式接口 (从 messages)，支持 failover retry
+    //
+    // 🎯 严格对齐 OC tools-payload.ts: 每次请求都把完整 tool schema 打包为
+    // API 原生 `tools` 参数 (LLMClient::generate_stream_from_messages_with_tools)
+    std::vector<core::JsonValue> tools_payload;
+    tools_payload.reserve(tools.size());
+    for (const auto& td : tools) {
+        // 打包为 {name, description, input_schema} 三字段 JsonValue
+        core::JsonValue tj = core::JsonValue::object();
+        tj["name"] = core::JsonValue(td.name);
+        tj["description"] = core::JsonValue(td.description);
+        tj["input_schema"] = td.input_schema;
+        tools_payload.push_back(std::move(tj));
+    }
+
     auto attempt_llm_call = [&]() {
-        return llm_client_->generate_stream_from_messages(messages, stream_callback);
+        return llm_client_->generate_stream_from_messages_with_tools(
+            messages, tools_payload, stream_callback);
     };
 
     auto result = attempt_llm_call();
@@ -2564,6 +2727,68 @@ bool ReactEngine::maybe_prune_context(std::vector<LLMMessage>& messages) {
         result.total_chars_before, result.total_chars_after,
         result.soft_trimmed_count, result.hard_cleared_count);
     return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 🎯 严格对齐 OpenClaw pi-embedded-runner/tools-payload.ts:
+//   buildToolsPayload(agent, sdkTools, mcpTools, sandboxTools)
+//
+// HC 实现：
+//   - ToolManager 已经在启动阶段合并了 [built-in tools, MCP tools, sandbox tools]
+//     (见 AgentInstance::init() → tool_mgr->enable_mcp() + register_tool(...))
+//   - 本函数把 ToolManager 里所有工具展开为 llm::ToolDefinition 数组，
+//     供 LLMClient 通过 API 原生 `tools` 参数发送给 provider
+//
+// 注意：
+//   - 工具声明**不进** system_prompt (OC 的设计：走 API 参数通道，效果/可靠性更好)
+//   - 这与 skills 元信息 (走 system_prompt 的 <available_skills> 块) 互补
+// ═══════════════════════════════════════════════════════════════════════════
+std::vector<llm::ToolDefinition> ReactEngine::build_tool_definitions() const {
+    std::vector<llm::ToolDefinition> defs;
+    if (!tool_manager_) return defs;
+
+    auto names = tool_manager_->list_tools();
+    defs.reserve(names.size());
+
+    for (const auto& name : names) {
+        auto tool = tool_manager_->get_tool(name);
+        if (!tool) continue;
+
+        llm::ToolDefinition td;
+        td.name = tool->name();
+        td.description = tool->description();
+
+        // 🎯 对齐 OC: Tool::Schema → JSON Schema (input_schema)
+        auto schema = tool->parameters();
+        nlohmann::json schema_json;
+        schema_json["type"] = schema.type.empty() ? "object" : schema.type;
+        if (!schema.description.empty()) {
+            schema_json["description"] = schema.description;
+        }
+        // properties: map<string, JsonValue> → JSON object
+        nlohmann::json properties_json = nlohmann::json::object();
+        for (const auto& [prop_name, prop_val] : schema.properties) {
+            try {
+                properties_json[prop_name] = prop_val.to_json();
+            } catch (...) {
+                properties_json[prop_name] = nlohmann::json::object();
+            }
+        }
+        if (!properties_json.empty()) {
+            schema_json["properties"] = properties_json;
+        } else {
+            // OpenAI/Anthropic 要求 object schema 即使无参数也需要 properties 字段
+            schema_json["properties"] = nlohmann::json::object();
+        }
+        if (!schema.required.empty()) {
+            schema_json["required"] = schema.required;
+        }
+
+        td.input_schema = core::JsonValue(schema_json);
+        defs.push_back(std::move(td));
+    }
+
+    return defs;
 }
 
 
