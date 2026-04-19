@@ -206,19 +206,23 @@ ReactResult ReactEngine::run(
     // 在发起第一次 LLM 调用之前检查：
     //   - session 累积 token (projected_count) 是否已接近 context_window 上限
     //
+    // 🎯 架构对齐 OC："preflight 门控 + 执行"统一于同一份 compact 实现。
+    //   OC 里 preflight 直接调用 compactEmbeddedPiSession（trigger: "budget"），
+    //   与 /compact 手动命令、token-overflow 自动路径共用同一份代码。
+    //
+    //   HC 对齐做法：门控由 evaluate_preflight_compaction 完成，执行由
+    //   ReactEngine::trigger_compaction 完成——这是 HC 内 overflow / manual /
+    //   preflight 三条入口共用的唯一 CompactionManager 实现。
+    //
     // 🎯 注意：OC preflight **只看 token**，不看 transcript 字节数。
-    //   字节数强制路径 (force_flush_transcript_bytes) 属于 memory flush
-    //   (runMemoryFlushIfNeeded) 的语义，且被 hasAlreadyFlushedForCurrentCompaction
-    //   保护，避免 "刚 compact 完文件还大再 compact 没意义" 的无效循环。
+    //   字节数强制路径 (force_flush_transcript_bytes) 属于 memory flush 语义。
     //
-    // 若触发 → 调用外层 compact_session_fn 压缩 session，再进入 execute_loop。
-    //
-    // 可选执行 —— 外层未注入 compact_session_fn 则跳过。
-    // heartbeat / CLI / 空 session_key 自动跳过（对齐 OC）。
+    // heartbeat / CLI / 空 session_key / 无 CompactionManager 自动跳过。
     // ════════════════════════════════════════════════════════════════════
-    if (callbacks.compact_session_fn &&
+    if (compaction_mgr_ &&
         !callbacks.session_key.empty() &&
         !callbacks.session_id.empty() &&
+        !callbacks.transcript_path.empty() &&
         !callbacks.is_heartbeat && !callbacks.is_cli) {
         try {
             react::PreflightRunParams pre;
@@ -246,22 +250,40 @@ ReactResult ReactEngine::run(
             pre.soft_threshold_tokens =
                 context_window_config_.soft_threshold_tokens;
 
-            // 把外层的 callbacks 映射到 preflight 所需签名
-            pre.compact_session = callbacks.compact_session_fn;
-            if (callbacks.on_compaction_complete_fn) {
-                pre.on_compaction_complete = callbacks.on_compaction_complete_fn;
-            }
-
-            auto preflight_result =
-                react::run_preflight_compaction_if_needed(pre);
-            if (preflight_result.compacted) {
-                log()->info(
-                    "[ReactEngine] preflight compaction: session={} tokens_after={} new_session_id={}",
-                    callbacks.session_key,
-                    preflight_result.tokens_after.value_or(-1),
-                    preflight_result.new_session_id.value_or("<unchanged>"));
-                // 对齐 OC: preflight 成功后可能 rotate 了 session_id,
-                // 但当前 run 仍使用原 session 继续 (OC 同语义)
+            auto decision = react::evaluate_preflight_compaction(pre);
+            if (decision.should_compact) {
+                // 对齐 OC：preflight 触发 → 直接调用共用 compact 实现
+                // （HC 内 trigger_compaction = CompactionManager::compact_session 的包装，
+                //  内部负责 before_compaction hook / 消息重写 / appendCompaction 写 transcript）
+                auto transcript_msgs = sessions::read_transcript_messages(
+                    callbacks.transcript_path, /*limit=*/0);
+                if (!transcript_msgs.empty()) {
+                    auto compact_res = trigger_compaction(
+                        transcript_msgs, callbacks.transcript_path);
+                    if (compact_res.compacted) {
+                        log()->info(
+                            "[ReactEngine] preflight compaction: session={} "
+                            "projected_tokens={} threshold={} messages {}→{} saved={}",
+                            callbacks.session_key,
+                            decision.projected_token_count.value_or(-1),
+                            decision.threshold,
+                            compact_res.messages_before,
+                            compact_res.messages_after,
+                            compact_res.tokens_saved);
+                    } else {
+                        log()->info(
+                            "[ReactEngine] preflight compaction skipped by CompactionManager: "
+                            "session={} reason={}",
+                            callbacks.session_key, compact_res.reason);
+                    }
+                } else {
+                    log()->debug(
+                        "[ReactEngine] preflight compaction skipped: "
+                        "transcript empty (session={})", callbacks.session_key);
+                }
+            } else if (!decision.skip_reason.empty()) {
+                log()->debug("[ReactEngine] preflight gate skip: session={} reason={}",
+                             callbacks.session_key, decision.skip_reason);
             }
         } catch (const std::exception& e) {
             log()->warn("[ReactEngine] preflight compaction failed: {}", e.what());

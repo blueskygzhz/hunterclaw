@@ -184,13 +184,16 @@ struct StreamCallbacks {
     std::optional<int> compaction_count;
     std::optional<int> memory_flush_compaction_count;
 
-    // 对齐 OC agent-runner-memory.ts preflight callbacks:
-    //   1) compact_session_fn: 真正执行 compaction 的动作
-    //      (返回是否成功、压缩后的 tokens、新 session_id)
-    //   2) on_compaction_complete_fn: compaction 成功后回写 session store
-    std::function<bool(const std::string& session_id, int token_count)>
-        compact_session_fn;
-    std::function<void(int new_compaction_count)> on_compaction_complete_fn;
+    // 🎯 对齐 OC agent-runner-memory.ts：preflight compaction 执行路径
+    //
+    // OC 里 compactEmbeddedPiSession 是 preflight / /compact 命令 / token-overflow
+    // 三条入口共用的唯一 compact 实现（通过 trigger 字段区分）。HC 对齐做法：
+    // ReactEngine::run() 在 preflight 门控触发时直接调 ReactEngine::trigger_compaction
+    // （其内部调 CompactionManager::compact_session），因此**不需要任何 compact
+    // 回调注入**。CompactionManager 由 set_compaction_manager() 注入 engine 一次即可。
+    //
+    // （历史上曾有 compact_session_fn / on_compaction_complete_fn 两个空转回调——
+    //  已移除，因为 OC 本身就没有这层 indirection。）
 
     // 对齐 OC agent-runner-memory.ts L693-848 memory flush callbacks:
     //   1) run_flush_agent_fn: 起 flush agent 子进程写 MEMORY.md

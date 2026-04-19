@@ -83,6 +83,17 @@ std::string compute_context_hash(
 
 // ============================================================================
 // 对齐 agent-runner-memory.ts:346-503: runPreflightCompactionIfNeeded
+//
+// 🎯 架构说明（对齐 OC 并修正 HC 实现）：
+//   OC 里 preflight 门控与执行统一于 compactEmbeddedPiSession（trigger: "budget"），
+//   agent-runner-memory.ts 仅做"是否触发"的门控，然后直接调用 compactEmbeddedPiSession
+//   （无回调 indirection）。
+//
+//   HC 对齐做法：本头文件只暴露"门控判定"。实际 compaction 执行由 ReactEngine
+//   持有的 CompactionManager 完成（ReactEngine::trigger_compaction），这是 HC
+//   内 token-overflow / manual / preflight 三条入口共用的唯一实现。
+//
+//   即此处的函数只回答"要不要 compact"，不负责调用 compact。
 // ============================================================================
 
 struct PreflightRunParams {
@@ -108,19 +119,18 @@ struct PreflightRunParams {
     int context_window_tokens = 200000;
     int reserve_tokens_floor = 20000;
     int soft_threshold_tokens = 4000;
-
-    // Callbacks
-    std::function<bool(const std::string& session_id, int token_count)> compact_session;
-    std::function<void(int new_compaction_count)> on_compaction_complete;
 };
 
-struct PreflightCompactionResult {
-    bool compacted = false;
-    std::optional<int> tokens_after;
-    std::optional<std::string> new_session_id;
+// 对齐 OC agent-runner-memory.ts L419-445: gating decision
+// 仅表达"是否应当触发 preflight compaction"，不包含执行结果
+struct PreflightCompactionDecision {
+    bool should_compact = false;
+    std::optional<int> projected_token_count;  // transcript 估算 + prompt_estimate
+    int threshold = 0;                          // contextWindow - reserve - soft
+    std::string skip_reason;                    // 门控跳过原因（便于日志）
 };
 
-PreflightCompactionResult run_preflight_compaction_if_needed(
+PreflightCompactionDecision evaluate_preflight_compaction(
     const PreflightRunParams& params
 );
 

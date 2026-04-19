@@ -303,14 +303,27 @@ std::string compute_context_hash(
 
 // ============================================================================
 // 对齐 agent-runner-memory.ts:346-503: runPreflightCompactionIfNeeded
+//
+// 🎯 对齐修正：OC 里 preflight 门控 + 执行统一于 compactEmbeddedPiSession，
+// 无 callback indirection。HC 架构下，"执行"由 ReactEngine::trigger_compaction
+// 统一负责（与 token-overflow / manual 路径共用同一个 CompactionManager 实现）。
+//
+// 因此本函数只做门控（evaluate），返回 decision；执行由调用方（ReactEngine）
+// 直接调 trigger_compaction 完成。
 // ============================================================================
-PreflightCompactionResult run_preflight_compaction_if_needed(
+PreflightCompactionDecision evaluate_preflight_compaction(
     const PreflightRunParams& params
 ) {
-    PreflightCompactionResult result;
+    PreflightCompactionDecision decision;
 
-    if (params.session_key.empty() || params.session_id.empty()) return result;
-    if (params.is_heartbeat || params.is_cli) return result;
+    if (params.session_key.empty() || params.session_id.empty()) {
+        decision.skip_reason = "missing session_key/session_id";
+        return decision;
+    }
+    if (params.is_heartbeat || params.is_cli) {
+        decision.skip_reason = "heartbeat or cli";
+        return decision;
+    }
 
     // 对齐 OC L397: promptTokenEstimate
     auto prompt_estimate = estimate_prompt_tokens_for_memory_flush(
@@ -322,7 +335,10 @@ PreflightCompactionResult run_preflight_compaction_if_needed(
         *params.persisted_total_tokens > 0;
 
     // 对齐 OC L394: if (!shouldUseTranscriptFallback) return entry;
-    if (has_fresh_tokens) return result;
+    if (has_fresh_tokens) {
+        decision.skip_reason = "persisted totalTokens is fresh, no fallback needed";
+        return decision;
+    }
 
     // 对齐 OC L400-407: transcript-based token estimation
     auto transcript_tokens = estimate_prompt_tokens_from_session_transcript(
@@ -334,11 +350,13 @@ PreflightCompactionResult run_preflight_compaction_if_needed(
         projected_count = resolve_effective_prompt_tokens(
             *transcript_tokens, 0, prompt_estimate.value_or(0));
     }
+    decision.projected_token_count = projected_count;
 
     // 对齐 OC L419: threshold
     int threshold = params.context_window_tokens -
                     params.reserve_tokens_floor -
                     params.soft_threshold_tokens;
+    decision.threshold = threshold;
 
     log()->debug("preflightCompaction check: sessionKey={} tokenCount={} "
                  "contextWindow={} threshold={} persistedFresh={} transcriptTokens={} "
@@ -350,7 +368,10 @@ PreflightCompactionResult run_preflight_compaction_if_needed(
                  transcript_tokens.has_value() ? std::to_string(*transcript_tokens) : "undefined",
                  prompt_estimate.has_value() ? std::to_string(*prompt_estimate) : "undefined");
 
-    if (threshold <= 0) return result;
+    if (threshold <= 0) {
+        decision.skip_reason = "threshold <= 0";
+        return decision;
+    }
 
     // 对齐 OC L430-436: shouldRunPreflightCompaction
     PreflightCompactionParams compact_gate_params;
@@ -360,30 +381,17 @@ PreflightCompactionResult run_preflight_compaction_if_needed(
     compact_gate_params.soft_threshold_tokens = params.soft_threshold_tokens;
     bool should_compact = should_run_preflight_compaction(compact_gate_params);
 
-    if (!should_compact) return result;
+    if (!should_compact) {
+        decision.skip_reason = "token count below threshold";
+        return decision;
+    }
 
-    log()->info("preflightCompaction triggered: sessionKey={} tokenCount={} threshold={}",
+    decision.should_compact = true;
+    log()->info("preflightCompaction gate triggered: sessionKey={} tokenCount={} threshold={}",
                 params.session_key,
                 projected_count.has_value() ? std::to_string(*projected_count) : "undefined",
                 threshold);
-
-    // 对齐 OC L454-480: execute compaction
-    if (params.compact_session) {
-        bool ok = params.compact_session(params.session_id, projected_count.value_or(0));
-        if (ok) {
-            result.compacted = true;
-            // 对齐 OC L489-496: incrementCompactionCount
-            if (params.on_compaction_complete) {
-                params.on_compaction_complete(
-                    params.compaction_count.value_or(0) + 1);
-            }
-        } else {
-            log()->debug("preflightCompaction skipped: sessionKey={} reason=not_compacted",
-                         params.session_key);
-        }
-    }
-
-    return result;
+    return decision;
 }
 
 // ============================================================================
