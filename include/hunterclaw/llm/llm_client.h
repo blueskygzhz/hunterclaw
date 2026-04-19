@@ -141,6 +141,24 @@ public:
         }
         return result;
     }
+
+    /// 🎯 对齐 OpenClaw agents/pi-embedded-runner/tools-payload.ts:
+    ///   每次 LLM 调用时把完整 tool schema 作为 API 原生 `tools` 参数发送
+    /// （内置工具 + MCP 工具 + sandbox 工具统一打包，独立于 system prompt）
+    ///
+    /// @param messages 消息历史
+    /// @param tools    本次请求使用的工具定义 (空则不发送 tools 参数)
+    /// @param callback token 回调
+    ///
+    /// 默认实现: 忽略 tools，回退到旧接口（兼容未覆写此方法的 client）
+    virtual core::Result<std::string> generate_stream_from_messages_with_tools(
+        const std::vector<LLMMessage>& messages,
+        const std::vector<core::JsonValue>& tools,
+        std::function<void(const std::string&)> callback
+    ) {
+        (void)tools;  // 默认忽略
+        return generate_stream_from_messages(messages, callback);
+    }
     
     /// 获取配置
     virtual const LLMConfig& get_config() const = 0;

@@ -120,12 +120,37 @@ public:
         const std::vector<LLMMessage>& messages,
         std::function<void(const std::string&)> callback
     ) override {
+        // 旧路径：使用 config_.tools (保留向后兼容)
+        GenerateOptions options = build_generate_options(messages, /*explicit_tools=*/nullptr);
+        return do_generate_stream(options, callback);
+    }
+
+    // 🎯 对齐 OpenClaw pi-embedded-runner/tools-payload.ts:
+    //   ReactEngine 传入本次请求使用的工具定义,独立于 config_.tools
+    // 这是主路径 (ReactEngine::call_llm 实际走的)
+    core::Result<std::string> generate_stream_from_messages_with_tools(
+        const std::vector<LLMMessage>& messages,
+        const std::vector<core::JsonValue>& tools,
+        std::function<void(const std::string&)> callback
+    ) override {
+        GenerateOptions options = build_generate_options(messages, &tools);
+        return do_generate_stream(options, callback);
+    }
+
+private:
+    // 🎯 对齐 OC: 统一的 options 构造
+    // - 若 explicit_tools != nullptr && 非空 → 使用 explicit_tools (覆盖 config_.tools)
+    // - 否则使用 config_.tools (兼容老路径)
+    GenerateOptions build_generate_options(
+        const std::vector<LLMMessage>& messages,
+        const std::vector<core::JsonValue>* explicit_tools
+    ) {
         GenerateOptions options;
-        
+
         // 转换消息 (同 generate_from_messages)
         for (const auto& msg : messages) {
             Message provider_msg;
-            
+
             switch (msg.role) {
                 case LLMMessageRole::System:
                     provider_msg = Message::system(msg.content);
@@ -140,7 +165,7 @@ public:
                     provider_msg = Message::tool_result(msg.content, msg.tool_call_id, msg.name);
                     break;
             }
-            
+
             // 转换 tool_calls (如果有)
             if (!msg.tool_calls.empty()) {
                 for (const auto& call_json : msg.tool_calls) {
@@ -151,43 +176,65 @@ public:
                     provider_msg.tool_calls.push_back(tool_call);
                 }
             }
-            
+
             options.messages.push_back(provider_msg);
         }
-        
+
         // 设置参数
         options.max_tokens = config_.max_tokens;
         options.temperature = config_.temperature;
         options.top_p = config_.top_p;
         options.top_k = config_.top_k;
         options.stop_sequences = config_.stop_sequences;
-        
-        // 工具配置
-        if (config_.supports_tool_calls && !config_.tools.empty()) {
-            for (const auto& tool_json : config_.tools) {
+
+        // 🎯 对齐 OC: 工具配置 —— 优先 explicit_tools (主路径)
+        const std::vector<core::JsonValue>* source_tools = nullptr;
+        if (explicit_tools && !explicit_tools->empty()) {
+            source_tools = explicit_tools;
+        } else if (config_.supports_tool_calls && !config_.tools.empty()) {
+            source_tools = &config_.tools;
+        }
+
+        if (source_tools) {
+            for (const auto& tool_json : *source_tools) {
+                if (!tool_json.is_object()) continue;
+                if (!tool_json.contains("name") || !tool_json.contains("description")) {
+                    continue;
+                }
                 ToolDefinition tool;
                 tool.name = tool_json["name"].as_string();
                 tool.description = tool_json["description"].as_string();
-                tool.input_schema = tool_json["input_schema"];
+                if (tool_json.contains("input_schema")) {
+                    tool.input_schema = tool_json["input_schema"];
+                }
                 options.tools.push_back(tool);
             }
             options.tool_choice = "auto";
         }
-        
+
+        return options;
+    }
+
+    core::Result<std::string> do_generate_stream(
+        const GenerateOptions& options,
+        std::function<void(const std::string&)> callback
+    ) {
         // 流式回调适配
         auto stream_callback = [callback](const StreamChunk& chunk) {
             if (callback && !chunk.delta.empty()) {
                 callback(chunk.delta);
             }
         };
-        
+
         auto result = provider_->generate_stream(options, stream_callback);
         if (!result.is_ok()) {
             return core::Result<std::string>::Err(result.error);
         }
-        
+
         return core::Result<std::string>::Ok(result.get().content);
     }
+
+public:
     
     const LLMConfig& get_config() const override { 
         return config_; 
