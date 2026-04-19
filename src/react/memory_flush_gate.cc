@@ -74,17 +74,32 @@ bool should_run_memory_flush(const MemoryFlushGateParams& params) {
 }
 
 // ============================================================================
-// shouldRunPreflightCompaction (对齐 memory-flush.ts:97-132)
+// shouldRunPreflightCompaction (严格对齐 memory-flush.ts:87-101)
+// ============================================================================
+//
+// 🎯 严格对齐 OC: 只看 token，不看字节数。
+//
+// OC 源码（agent-runner-memory.ts:430-436 调用处 + memory-flush.ts:87-101 定义）：
+//   export function shouldRunPreflightCompaction(params: {
+//     entry?: Pick<SessionEntry, "totalTokens" | "totalTokensFresh">;
+//     tokenCount?: number;
+//     contextWindowTokens: number;
+//     reserveTokensFloor: number;
+//     softThresholdTokens: number;
+//   }): boolean {
+//     const state = resolveMemoryFlushGateState(params);
+//     return Boolean(state && state.totalTokens >= state.threshold);
+//   }
+//
+// 设计理由（你的直觉完全对）：
+//   "刚 compact 完但文件 10MB（因为 tool result 塞满）再 compact 没意义"
+//   → OC 把字节数强制路径放在 runMemoryFlushIfNeeded (flush 路径)
+//     而不是 runPreflightCompactionIfNeeded (compaction 路径),
+//     并用 !hasAlreadyFlushedForCurrentCompaction 保证同一 cycle 不重复 flush.
+//   → Compaction 只看 token 是否真的需要压缩.
 // ============================================================================
 
 bool should_run_preflight_compaction(const PreflightCompactionParams& params) {
-    // 对齐: if (forceFlushTranscriptBytes > 0 && transcriptBytes >= forceFlushTranscriptBytes) return true
-    if (params.force_flush_transcript_bytes > 0 &&
-        params.transcript_bytes >= params.force_flush_transcript_bytes) {
-        return true;
-    }
-
-    // 对齐: token-based gate
     int64_t total_tokens = 0;
     if (params.token_count_override.has_value() && *params.token_count_override > 0) {
         total_tokens = *params.token_count_override;

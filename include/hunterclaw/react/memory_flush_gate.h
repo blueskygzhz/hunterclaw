@@ -42,8 +42,11 @@ bool has_already_flushed_for_current_compaction(
 );
 
 // ============================================================================
-// shouldRunPreflightCompaction (对齐 memory-flush.ts:97-132)
+// shouldRunPreflightCompaction (严格对齐 memory-flush.ts:87-101)
 // ============================================================================
+// 🎯 严格对齐 OC: 纯 token gate, 无字节数分支.
+// 字节数强制路径在 memory flush (runMemoryFlushIfNeeded) 里独立存在,
+// 并由 !hasAlreadyFlushedForCurrentCompaction 保证同一 cycle 不重复触发.
 struct PreflightCompactionParams {
     std::optional<int64_t> total_tokens;
     bool total_tokens_fresh = false;
@@ -51,8 +54,6 @@ struct PreflightCompactionParams {
     int context_window_tokens = 128000;
     int reserve_tokens_floor = 20000;
     int soft_threshold_tokens = 4000;
-    int64_t force_flush_transcript_bytes = 2 * 1024 * 1024;
-    int64_t transcript_bytes = 0;
 };
 
 bool should_run_preflight_compaction(const PreflightCompactionParams& params);

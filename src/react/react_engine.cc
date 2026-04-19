@@ -204,8 +204,13 @@ ReactResult ReactEngine::run(
     //   runPreflightCompactionIfNeeded(agent, user_input, runtime_ctx)
     //
     // 在发起第一次 LLM 调用之前检查：
-    //   - session 累积 token 是否已接近 context_window 上限
-    //   - transcript 文件是否超过 force_flush_transcript_bytes
+    //   - session 累积 token (projected_count) 是否已接近 context_window 上限
+    //
+    // 🎯 注意：OC preflight **只看 token**，不看 transcript 字节数。
+    //   字节数强制路径 (force_flush_transcript_bytes) 属于 memory flush
+    //   (runMemoryFlushIfNeeded) 的语义，且被 hasAlreadyFlushedForCurrentCompaction
+    //   保护，避免 "刚 compact 完文件还大再 compact 没意义" 的无效循环。
+    //
     // 若触发 → 调用外层 compact_session_fn 压缩 session，再进入 execute_loop。
     //
     // 可选执行 —— 外层未注入 compact_session_fn 则跳过。
