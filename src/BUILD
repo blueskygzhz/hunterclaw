@@ -591,6 +591,7 @@ cc_library(
         "//:hunterclaw_headers",
         ":hunterclaw_memory",
         ":hunterclaw_llm",
+        ":hunterclaw_sessions",  # ✅ SessionManager::create / SessionEntry (agent_instance.cc)
         ":hunterclaw_skills",
         ":hunterclaw_tools",   # ✅ 添加 tools 依赖 (ToolManager::create)
         ":hunterclaw_react",   # ✅ 添加 react 依赖 (ReactEngine::create)

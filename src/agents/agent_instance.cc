@@ -11,6 +11,8 @@
 #include "hunterclaw/mcp/mcporter_client.h"   // ✅ McporterConfig
 #include "hunterclaw/mcp/mcp_config.h"        // ✅ list_configured_mcp_servers
 #include "hunterclaw/sessions/transcript_io.h"  // ✅ 对齐 OpenClaw: transcript 读写
+#include "hunterclaw/sessions/session_manager.h" // ✅ 对齐 OC: SessionEntry (compactionCount/memoryFlushCompactionCount)
+#include "hunterclaw/memory/memory_flush_plan.h"  // ✅ 对齐 OC extensions/memory-core/flush-plan.ts
 #include <spdlog/spdlog.h>
 #include <filesystem>
 #include <sstream>
@@ -932,6 +934,156 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
 
     // ✅ 对齐 OpenClaw: 设置 transcript_path 到 callbacks（用于 tool_result_persist hook）
     callbacks.transcript_path = transcript_path;
+
+    // ════════════════════════════════════════════════════════════════════
+    // 🎯 严格对齐 OC agent-runner-memory.ts: memory flush 执行路径注入
+    //
+    // OC 调用链：runMemoryFlushIfNeeded → memoryDeps.runEmbeddedPiAgent({
+    //   trigger: "memory", memoryFlushWritePath, prompt, extraSystemPrompt, ... })
+    //
+    // HC 等价架构：
+    //   1) build_memory_flush_plan()  ← 对齐 OC extensions/memory-core/src/flush-plan.ts
+    //      产出 flush_prompt / flush_system_prompt / 默认阈值 / memory/YYYY-MM-DD.md 路径
+    //   2) 读 SessionManager 取 compaction_count / memory_flush_compaction_count
+    //      （支持 hasAlreadyFlushedForCurrentCompaction 去重）
+    //   3) 注入 run_flush_agent_fn：起一个独立 ReactEngine run，
+    //      以 flush_prompt 为 user_input、flush_system_prompt 并入 system，
+    //      允许它通过 Write/Edit 工具把 durable memory 写到 workspace_dir/memory/YYYY-MM-DD.md
+    //   4) 注入 persist_session_tokens_fn / on_flush_complete_fn
+    //      写回 SessionManager（totalTokens/memoryFlushCompactionCount/memoryFlushAt）
+    //
+    // 关键隔离：flush 子 session 使用**全新空 history**（对齐 OC runEmbeddedPiAgent 的
+    // trigger: "memory" 入口——不读原 session transcript 作为 context，以免 context 污染
+    // 再触发一次 compact）；但 workspace_dir 共享（才能落盘到 memory/YYYY-MM-DD.md）。
+    // ════════════════════════════════════════════════════════════════════
+    {
+        // Step 1: 生成 flush plan（默认配置，无 override）
+        memory::MemoryFlushPlanOverrides plan_overrides;
+        auto maybe_plan = memory::build_memory_flush_plan(plan_overrides, /*now_ms=*/0);
+
+        if (maybe_plan.has_value()) {
+            const auto& plan = *maybe_plan;
+
+            // Step 2: 读取 session entry（用于 compaction_count 去重）
+            //   HC AgentInstance 不强依赖 SessionManager；无则跳过去重，门控仍能走。
+            std::optional<int> compaction_count;
+            std::optional<int> memory_flush_compaction_count;
+            std::optional<int> persisted_total_tokens;
+            bool total_tokens_fresh = false;
+
+            // 从 workspace 上级目录解析默认 storage_dir（对齐 OpenClaw 布局）
+            std::string storage_dir = std::filesystem::path(ctx_.workspace_dir)
+                                         .parent_path().parent_path().string();
+            auto session_mgr = sessions::SessionManager::create(storage_dir,
+                                                                sessions::SessionConfig{});
+            if (session_mgr) {
+                auto entry_r = session_mgr->get_session(ctx_.session_id);
+                if (entry_r.is_ok()) {
+                    const auto& e = entry_r.get();
+                    compaction_count = e.compaction_count;
+                    memory_flush_compaction_count = e.memory_flush_compaction_count;
+                    if (e.total_tokens > 0) {
+                        persisted_total_tokens = e.total_tokens;
+                        total_tokens_fresh = e.total_tokens_fresh;
+                    }
+                }
+            }
+
+            // Step 3: 填充 StreamCallbacks memory-flush 字段
+            callbacks.workspace_dir      = ctx_.workspace_dir;
+            callbacks.persisted_total_tokens = persisted_total_tokens;
+            callbacks.total_tokens_fresh = total_tokens_fresh;
+            callbacks.compaction_count   = compaction_count;
+            callbacks.memory_flush_compaction_count = memory_flush_compaction_count;
+            callbacks.flush_prompt        = plan.prompt;
+            callbacks.flush_system_prompt = plan.system_prompt;
+            // 对齐 OC: relativePath 是相对 workspace 的 "memory/YYYY-MM-DD.md"
+            callbacks.flush_write_path =
+                (std::filesystem::path(ctx_.workspace_dir) / plan.relative_path).string();
+            callbacks.force_flush_transcript_bytes = plan.force_flush_transcript_bytes;
+            callbacks.memory_flush_writable = true;
+            callbacks.is_heartbeat = false;  // AgentInstance 不是 heartbeat 入口
+            callbacks.is_cli       = false;
+            callbacks.provider = ctx_.config.model.provider;
+            callbacks.model    = ctx_.config.model.model;
+
+            // Step 4: run_flush_agent_fn —— 对齐 OC memoryDeps.runEmbeddedPiAgent({trigger:"memory"})
+            //
+            // 用 AgentInstance 持有的 react_engine_ 再跑一次，但 **history 为空**
+            // （对齐 OC 独立子 session 语义，避免污染当前 ReAct 流）。
+            // 它通过 Write/Edit 工具访问同一 workspace 将记忆落盘。
+            auto engine  = react_engine_;
+            auto session = ctx_.session_id;
+            auto agent   = ctx_.agent_id;
+            auto workspace = ctx_.workspace_dir;
+            callbacks.run_flush_agent_fn =
+                [engine, session, agent, workspace]
+                (const std::string& prompt, const std::string& system_prompt) {
+                    if (!engine) return;
+                    react::StreamCallbacks flush_cb;
+                    flush_cb.session_id = session + "-memflush";  // 子会话标识
+                    flush_cb.agent_id   = agent;
+                    flush_cb.workspace_dir = workspace;
+                    flush_cb.trigger       = "memory";  // 对齐 OC runEmbeddedPiAgent trigger
+                    // 关键：不设 transcript_path → 本次子 run 不写用户 transcript
+                    //       不设 compact_session 字段 → 子 run 不再触发嵌套 compact
+
+                    // 把 system_prompt 合并到 callbacks（engine 支持经 before_prompt_build
+                    // 等 hook 注入 system；这里简化：把 system_prompt 前置到 user prompt）
+                    std::string merged_prompt =
+                        system_prompt.empty()
+                            ? prompt
+                            : std::string("[System]\n") + system_prompt +
+                              "\n\n[Task]\n" + prompt;
+
+                    try {
+                        auto res = engine->run(merged_prompt, /*history=*/{}, flush_cb);
+                        spdlog::get("default")->info(
+                            "[AgentInstance] memory flush sub-run done: "
+                            "session={} success={} steps={}",
+                            session, res.success, res.total_steps);
+                    } catch (const std::exception& e) {
+                        spdlog::get("default")->warn(
+                            "[AgentInstance] memory flush sub-run failed: {}", e.what());
+                    }
+                };
+
+            // Step 5: persist_session_tokens_fn —— 对齐 OC L622-649
+            auto sess_mgr_weak = std::weak_ptr<sessions::SessionManager>(session_mgr);
+            auto sid_for_persist = ctx_.session_id;
+            callbacks.persist_session_tokens_fn =
+                [sess_mgr_weak, sid_for_persist](int derived_total_tokens) {
+                    auto mgr = sess_mgr_weak.lock();
+                    if (!mgr) return;
+                    auto entry_r = mgr->get_session(sid_for_persist);
+                    if (!entry_r.is_ok()) return;
+                    auto e = entry_r.get();
+                    e.total_tokens = derived_total_tokens;
+                    e.total_tokens_fresh = true;
+                    (void)mgr->update_session(e);
+                };
+
+            // Step 6: on_flush_complete_fn —— 对齐 OC L821-842
+            callbacks.on_flush_complete_fn =
+                [sess_mgr_weak, sid_for_persist]
+                (int new_compaction_count, const std::string& new_session_id) {
+                    auto mgr = sess_mgr_weak.lock();
+                    if (!mgr) return;
+                    auto entry_r = mgr->get_session(sid_for_persist);
+                    if (!entry_r.is_ok()) return;
+                    auto e = entry_r.get();
+                    e.memory_flush_compaction_count = new_compaction_count;
+                    e.memory_flush_at_ms =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
+                    // 对齐 OC: 可选 session rotation（有新 session_id 则更新）
+                    if (!new_session_id.empty()) {
+                        e.session_id = new_session_id;
+                    }
+                    (void)mgr->update_session(e);
+                };
+        }
+    }
 
     // ✅ Overflow 重试循环 (对齐 OpenClaw)
     for (int attempt = 0; attempt < MAX_OVERFLOW_ATTEMPTS; ++attempt) {

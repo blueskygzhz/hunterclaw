@@ -73,45 +73,16 @@ static StatResult stat_regular_file(const std::string& path) {
 }
 
 // ============================================================================
-// 🎯 embedding-model-limits (对齐 embedding-model-limits.ts:1-42)
-// 模型最大输入 token 限制表
+// 🎯 embedding-model-limits — 已迁移至 chunking.cc
+//
+// 本文件原有 resolve_embedding_max_input_tokens() 的重复定义与 chunking.cc 中
+// 的同名函数形成 ODR 违反（链接 libhunterclaw_memory.so 时报 multiple definition）。
+// 保留 chunking.cc 的版本（对齐 OC embedding-model-limits.ts:resolveEmbeddingMaxInputTokens
+// 更完整：支持 provider-level fallback、local/gemini 默认值分支、KNOWN_LIMITS 按
+// "provider:model" 组 key 精确匹配）。
+//
+// 如需使用，#include "hunterclaw/memory/chunking.h"（或相应头文件）。
 // ============================================================================
-
-struct EmbeddingModelLimit {
-    std::string pattern;
-    int max_input_tokens;
-};
-
-static const std::vector<EmbeddingModelLimit> MODEL_LIMITS = {
-    {"text-embedding-3-small", 8191},
-    {"text-embedding-3-large", 8191},
-    {"text-embedding-ada-002", 8191},
-    {"text-embedding-004", 2048},       // Gemini
-    {"gemini-embedding", 2048},
-    {"voyage-3", 32000},
-    {"voyage-3-lite", 32000},
-    {"voyage-code-3", 32000},
-    {"voyage-large-2", 16000},
-    {"voyage-2", 4000},
-    {"mistral-embed", 8192},
-    {"amazon.titan-embed", 8192},
-    {"cohere.embed", 512},
-    {"nomic-embed-text", 8192},
-};
-
-int resolve_embedding_max_input_tokens(
-    const std::string& provider_id,
-    const std::string& model,
-    std::optional<int> explicit_max
-) {
-    if (explicit_max.has_value() && *explicit_max > 0) return *explicit_max;
-    for (const auto& limit : MODEL_LIMITS) {
-        if (model.find(limit.pattern) != std::string::npos) {
-            return limit.max_input_tokens;
-        }
-    }
-    return 8191; // safe default
-}
 
 // ============================================================================
 // 🎯 embedding-input-limits (对齐 embedding-input-limits.ts:1-62)

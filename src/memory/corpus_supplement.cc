@@ -11,6 +11,14 @@ namespace memory {
 static std::mutex corpus_mutex;
 static std::vector<MemoryCorpusSupplementRegistration> corpus_supplements;
 
+// Prompt supplement 注册表（对齐 memoryPluginState.promptSupplements）
+static std::mutex prompt_supplements_mutex;
+static std::vector<MemoryPromptSupplementRegistration> prompt_supplements;
+
+// Capability 注册表（对齐 memoryPluginState.capability — exclusive slot）
+static std::mutex capability_mutex;
+static std::optional<MemoryPluginCapabilityRegistration> memory_capability;
+
 // ============================================================================
 // registerMemoryCorpusSupplement (对齐 memory-state.ts:159-168)
 // ============================================================================
@@ -133,6 +141,60 @@ std::optional<MemoryCorpusGetResult> get_memory_corpus_supplement_result(
     }
 
     return std::nullopt;
+}
+
+// ============================================================================
+// registerMemoryPromptSupplement (对齐 memory-state.ts:195-204)
+// ============================================================================
+
+void register_memory_prompt_supplement(
+    const std::string& plugin_id,
+    MemoryPromptSectionBuilder builder
+) {
+    std::lock_guard<std::mutex> lock(prompt_supplements_mutex);
+
+    // 对齐 openclaw: filter(r => r.pluginId !== pluginId), then push
+    std::vector<MemoryPromptSupplementRegistration> next;
+    next.reserve(prompt_supplements.size() + 1);
+    for (const auto& reg : prompt_supplements) {
+        if (reg.plugin_id != plugin_id) {
+            next.push_back(reg);
+        }
+    }
+    next.push_back({plugin_id, std::move(builder)});
+    prompt_supplements = std::move(next);
+}
+
+// ============================================================================
+// listMemoryPromptSupplements (对齐 memory-state.ts:225-227)
+// ============================================================================
+
+std::vector<MemoryPromptSupplementRegistration> list_memory_prompt_supplements() {
+    std::lock_guard<std::mutex> lock(prompt_supplements_mutex);
+    return prompt_supplements;  // copy
+}
+
+// ============================================================================
+// registerMemoryCapability (对齐 memory-state.ts:170-175)
+// Exclusive slot: 同 plugin_id 覆盖
+// ============================================================================
+
+void register_memory_capability(
+    const std::string& plugin_id,
+    MemoryPluginCapability capability
+) {
+    std::lock_guard<std::mutex> lock(capability_mutex);
+    memory_capability = MemoryPluginCapabilityRegistration{
+        plugin_id, std::move(capability)};
+}
+
+// ============================================================================
+// getMemoryCapabilityRegistration (对齐 memory-state.ts:177-184)
+// ============================================================================
+
+std::optional<MemoryPluginCapabilityRegistration> get_memory_capability_registration() {
+    std::lock_guard<std::mutex> lock(capability_mutex);
+    return memory_capability;
 }
 
 }  // namespace memory

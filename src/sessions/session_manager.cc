@@ -163,6 +163,14 @@ static json to_json(const SessionEntry& session) {
     j["systemSent"]       = session.system_sent;
     j["abortedLastRun"]   = session.aborted_last_run;
 
+    // ✅ 对齐 OC memory-flush.ts: hasAlreadyFlushedForCurrentCompaction 的持久化字段
+    if (session.compaction_count)
+        j["compactionCount"] = *session.compaction_count;
+    if (session.memory_flush_compaction_count)
+        j["memoryFlushCompactionCount"] = *session.memory_flush_compaction_count;
+    if (session.memory_flush_at_ms)
+        j["memoryFlushAt"] = *session.memory_flush_at_ms;
+
     if (session.context_tokens) j["contextTokens"] = *session.context_tokens;
     if (session.label)          j["label"]          = *session.label;
     if (session.display_name)   j["displayName"]    = *session.display_name;
@@ -207,6 +215,14 @@ static SessionEntry session_from_json(const json& j) {
     session.total_tokens_fresh = j.value("totalTokensFresh", false);
     session.system_sent        = j.value("systemSent", false);
     session.aborted_last_run   = j.value("abortedLastRun", false);
+
+    // ✅ 对齐 OC memory-flush.ts: hasAlreadyFlushedForCurrentCompaction 的持久化字段
+    if (j.contains("compactionCount") && j["compactionCount"].is_number())
+        session.compaction_count = j["compactionCount"].get<int>();
+    if (j.contains("memoryFlushCompactionCount") && j["memoryFlushCompactionCount"].is_number())
+        session.memory_flush_compaction_count = j["memoryFlushCompactionCount"].get<int>();
+    if (j.contains("memoryFlushAt") && j["memoryFlushAt"].is_number())
+        session.memory_flush_at_ms = j["memoryFlushAt"].get<int64_t>();
 
     if (j.contains("contextTokens") && j["contextTokens"].is_number())
         session.context_tokens = j["contextTokens"].get<int>();

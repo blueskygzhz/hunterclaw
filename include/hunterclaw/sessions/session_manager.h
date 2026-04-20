@@ -81,6 +81,14 @@ struct SessionEntry {
     int total_tokens = 0;
     bool total_tokens_fresh = false;  // ✅ 对齐 OpenClaw: totalTokensFresh
 
+    // ✅ 对齐 OpenClaw SessionEntry (config/sessions/types.ts):
+    //   compactionCount / memoryFlushCompactionCount / memoryFlushAt
+    // 用于 memory-flush.ts: hasAlreadyFlushedForCurrentCompaction 去重，
+    // 防止同一次 compact 周期内重复触发 memory flush。
+    std::optional<int>     compaction_count;               // ✅ OC: compactionCount
+    std::optional<int>     memory_flush_compaction_count;  // ✅ OC: memoryFlushCompactionCount
+    std::optional<int64_t> memory_flush_at_ms;             // ✅ OC: memoryFlushAt
+
     // 运行状态 (对齐 OpenClaw)
     bool system_sent = false;         // ✅ 对齐 OpenClaw: systemSent
     bool aborted_last_run = false;    // ✅ 对齐 OpenClaw: abortedLastRun
