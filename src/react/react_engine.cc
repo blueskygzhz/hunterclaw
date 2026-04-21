@@ -1117,6 +1117,33 @@ ReactResult ReactEngine::execute_loop(
         }
     }
 
+    // ✅ 严格对齐 OC agent-runner-utils.ts: updateSessionAccounting(...)
+    //   每轮结束后把本轮 usage 回写 session store（totalTokens/totalTokensFresh/
+    //   input/output/model/model_provider/updated_at）。未注入 callback 则跳过。
+    //
+    //   关键意义：让 preflight_memory 的 fresh 门控在同一进程的多轮之间持续生效，
+    //   而非「只在重启后第一轮」—— 之前因为没有回写链路，persisted_total_tokens
+    //   不会随 turn 刷新，fresh 门控退化。
+    if (callbacks.on_run_complete_fn) {
+        try {
+            StreamCallbacks::RunCompleteUsage ru;
+            ru.input_tokens        = result.usage.input_tokens;
+            ru.output_tokens       = result.usage.output_tokens;
+            ru.cache_read_tokens   = result.usage.cache_read_tokens;
+            ru.cache_write_tokens  = result.usage.cache_write_tokens;
+            ru.model_provider = callbacks.provider.empty() && llm_client_
+                ? llm_client_->get_config().provider : callbacks.provider;
+            ru.model = callbacks.model.empty() && llm_client_
+                ? llm_client_->get_config().model : callbacks.model;
+            ru.is_heartbeat = callbacks.is_heartbeat;
+            callbacks.on_run_complete_fn(ru);
+        } catch (const std::exception& e) {
+            log()->warn("[ReactEngine] on_run_complete_fn threw: {}", e.what());
+        } catch (...) {
+            log()->warn("[ReactEngine] on_run_complete_fn threw: unknown");
+        }
+    }
+
     // ✅ 对齐 OC: shouldRunMemoryFlush (memory-flush.ts) — check if memory flush needed after run
     // OC 中这个检查在 agent-runner-memory.ts runMemoryFlushIfNeeded 中完成
     // HC engine 负责门控判断 + 触发 run_memory_flush_if_needed (如果外层注入了执行器)

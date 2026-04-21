@@ -10,6 +10,7 @@
 // Total OC: ~33KB
 
 #include "hunterclaw/auto_reply/message_dispatcher.h"
+#include "hunterclaw/auto_reply/session_usage.h"
 #include "hunterclaw/sessions/session_manager.h"
 #include "hunterclaw/config/config_system.h"
 #include "hunterclaw/llm/model_selection.h"
@@ -212,19 +213,9 @@ std::string drain_formatted_system_events(std::vector<SystemEvent>& events) {
 
 // ═══════════════════════════════════════════════════════════════
 // Session Run Accounting (对齐 OC: session-run-accounting.ts:1-40)
+//   — struct 定义移至 include/hunterclaw/auto_reply/session_usage.h
+//   — 以支持 ReactEngine / agent_instance 跨 TU 调用
 // ═══════════════════════════════════════════════════════════════
-
-struct SessionRunAccounting {
-    int64_t started_at = 0;
-    int64_t completed_at = 0;
-    int input_tokens = 0;
-    int output_tokens = 0;
-    int cache_read_tokens = 0;
-    int cache_write_tokens = 0;
-    std::string model_provider;
-    std::string model;
-    bool is_heartbeat = false;
-};
 
 int64_t compute_run_duration_ms(const SessionRunAccounting& acct) {
     if (acct.started_at <= 0 || acct.completed_at <= 0) return 0;
@@ -237,33 +228,36 @@ int compute_total_tokens(const SessionRunAccounting& acct) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Session Usage (对齐 OC: session-usage.ts 核心逻辑)
+// Session Usage (严格对齐 OC: session-usage.ts:buildSessionUsagePatch)
 // ═══════════════════════════════════════════════════════════════
-
-struct SessionUsagePatch {
-    std::optional<int> total_tokens;
-    std::optional<int> total_tokens_fresh;
-    std::optional<int> compaction_count;
-    std::optional<std::string> model_provider;
-    std::optional<std::string> model;
-    std::optional<int64_t> updated_at;
-};
 
 SessionUsagePatch build_session_usage_patch(
     const SessionRunAccounting& acct,
-    int existing_total_tokens = 0) {
+    int existing_total_tokens) {
     SessionUsagePatch patch;
     int run_total = compute_total_tokens(acct);
-    patch.total_tokens = existing_total_tokens + run_total;
-    patch.total_tokens_fresh = run_total;
-    patch.model_provider = acct.model_provider;
-    patch.model = acct.model;
+
+    // 对齐 OC: entry.totalTokens = (existing ?? 0) + runTotal
+    patch.total_tokens = std::max(0, existing_total_tokens) + run_total;
+
+    // 对齐 OC: entry.totalTokensFresh = runTotal > 0
+    //   heartbeat / 空转 run 时 runTotal=0 → fresh=false，
+    //   下一轮 preflight 会因此走 transcript-fallback 分支
+    patch.total_tokens_fresh = (run_total > 0);
+
+    // 对齐 OC: per-run 覆盖 input/output（不累加 —— 用于展示"本次"用量）
+    //   累加语义只保留在 totalTokens 上
+    patch.input_tokens = acct.input_tokens;
+    patch.output_tokens = acct.output_tokens;
+
+    if (!acct.model_provider.empty()) patch.model_provider = acct.model_provider;
+    if (!acct.model.empty())           patch.model          = acct.model;
     patch.updated_at = now_ms();
     return patch;
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Session Updates (对齐 OC: session-updates.ts 核心逻辑)
+// Session Updates (对齐 OC: session-updates.ts:applySessionUpdates)
 // ═══════════════════════════════════════════════════════════════
 
 void persist_session_entry_update(
@@ -272,17 +266,40 @@ void persist_session_entry_update(
     const std::string& agent_id,
     const SessionUsagePatch& patch) {
     (void)agent_id;
+    if (session_key.empty()) return;
+
     auto entry_result = session_manager.get_session(session_key);
     if (!entry_result.is_ok()) return;
     auto entry = entry_result.get();
 
-    if (patch.total_tokens) entry.total_tokens = *patch.total_tokens;
+    if (patch.total_tokens)       entry.total_tokens       = *patch.total_tokens;
     if (patch.total_tokens_fresh) entry.total_tokens_fresh = *patch.total_tokens_fresh;
-    if (patch.model_provider) entry.model_provider = *patch.model_provider;
-    if (patch.model) entry.model = *patch.model;
-    if (patch.updated_at) entry.updated_at = *patch.updated_at;
+    if (patch.input_tokens)       entry.input_tokens       = *patch.input_tokens;
+    if (patch.output_tokens)      entry.output_tokens      = *patch.output_tokens;
+    if (patch.model_provider)     entry.model_provider     = *patch.model_provider;
+    if (patch.model)              entry.model              = *patch.model;
+    if (patch.updated_at)         entry.updated_at         = *patch.updated_at;
 
-    session_manager.update_session(entry);
+    (void)session_manager.update_session(entry);
+}
+
+// 对齐 OC: agent-runner-utils.ts: updateSessionAccounting(...)
+void update_session_accounting(
+    sessions::SessionManager& session_manager,
+    const std::string& session_key,
+    const std::string& agent_id,
+    const SessionRunAccounting& acct) {
+    if (session_key.empty()) return;
+
+    // 读当前 totalTokens 作为 existing 基数（对齐 OC：累加语义）
+    int existing_total_tokens = 0;
+    auto entry_result = session_manager.get_session(session_key);
+    if (entry_result.is_ok()) {
+        existing_total_tokens = entry_result.get().total_tokens;
+    }
+
+    auto patch = build_session_usage_patch(acct, existing_total_tokens);
+    persist_session_entry_update(session_manager, session_key, agent_id, patch);
 }
 
 // Stored Model Override (对齐 OC: stored-model-override.ts)

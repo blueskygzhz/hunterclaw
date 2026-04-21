@@ -207,6 +207,34 @@ struct StreamCallbacks {
                        const std::string& new_session_id)>
         on_flush_complete_fn;
 
+    // ════════════════════════════════════════════════════════════════════
+    // 🎯 严格对齐 OC agent-runner-utils.ts: updateSessionAccounting(...)
+    //
+    // 每轮 LLM run 结束后由 engine 调用一次，把本轮 usage (input/output/
+    // cache_read/cache_write + model/provider) 回写 session store。外层
+    // 注入该 callback 来衔接 SessionManager::update_session(...)。
+    //
+    // ⚠️ 关键作用：让 session entry 的 totalTokens / totalTokensFresh /
+    //    input_tokens / output_tokens 在每轮结束时被刷新。缺失此 hook 时
+    //    preflight_memory 的 fresh 门控只能靠重启时加载的值，导致同一进程
+    //    内 persisted_total_tokens 永远不更新的回归。
+    //
+    // 签名参数对齐 OC SessionRunAccounting：
+    //   input_tokens / output_tokens / cache_read_tokens / cache_write_tokens
+    //   model_provider / model / is_heartbeat
+    // 约定：未注入时 engine 跳过（向后兼容）。
+    // ════════════════════════════════════════════════════════════════════
+    struct RunCompleteUsage {
+        int64_t input_tokens = 0;
+        int64_t output_tokens = 0;
+        int64_t cache_read_tokens = 0;
+        int64_t cache_write_tokens = 0;
+        std::string model_provider;
+        std::string model;
+        bool is_heartbeat = false;
+    };
+    std::function<void(const RunCompleteUsage& usage)> on_run_complete_fn;
+
     // Memory flush 执行路径额外需要的配置（对齐 OC agent-runner-memory.ts L564-620）：
     //   - flush_write_path: MEMORY.md 目标路径
     //   - flush_system_prompt / flush_prompt: flush agent 的 system/user prompt 模板

@@ -13,6 +13,7 @@
 #include "hunterclaw/sessions/transcript_io.h"  // ✅ 对齐 OpenClaw: transcript 读写
 #include "hunterclaw/sessions/session_manager.h" // ✅ 对齐 OC: SessionEntry (compactionCount/memoryFlushCompactionCount)
 #include "hunterclaw/memory/memory_flush_plan.h"  // ✅ 对齐 OC extensions/memory-core/flush-plan.ts
+#include "hunterclaw/auto_reply/session_usage.h"  // ✅ 对齐 OC agent-runner-utils.ts: updateSessionAccounting
 #include <spdlog/spdlog.h>
 #include <filesystem>
 #include <sstream>
@@ -1081,6 +1082,36 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
                         e.session_id = new_session_id;
                     }
                     (void)mgr->update_session(e);
+                };
+
+            // Step 7: on_run_complete_fn —— 严格对齐 OC agent-runner-utils.ts:
+            //   updateSessionAccounting(agent, sessionKey, runAccounting)
+            //
+            // 每轮 LLM run 结束时由 ReactEngine 调用，把 (input/output/cache_read/
+            // cache_write + model) 累加写回 session entry 的 totalTokens，并刷新
+            // totalTokensFresh = (runTotal > 0)。
+            //
+            // ⚠️ 这条链路修复了 preflight_memory fresh 门控的「只在重启第一轮生效」
+            //    回归：没有此回调时 persisted_total_tokens 在同一进程内永远不刷新，
+            //    fresh 门控被动退化。
+            auto agent_for_acct = ctx_.agent_id;
+            callbacks.on_run_complete_fn =
+                [sess_mgr_weak, sid_for_persist, agent_for_acct]
+                (const react::StreamCallbacks::RunCompleteUsage& usage) {
+                    auto mgr = sess_mgr_weak.lock();
+                    if (!mgr) return;
+                    auto_reply::SessionRunAccounting acct;
+                    acct.started_at         = 0;  // 目前未使用 duration, 保持 0
+                    acct.completed_at       = 0;
+                    acct.input_tokens       = static_cast<int>(usage.input_tokens);
+                    acct.output_tokens      = static_cast<int>(usage.output_tokens);
+                    acct.cache_read_tokens  = static_cast<int>(usage.cache_read_tokens);
+                    acct.cache_write_tokens = static_cast<int>(usage.cache_write_tokens);
+                    acct.model_provider     = usage.model_provider;
+                    acct.model              = usage.model;
+                    acct.is_heartbeat       = usage.is_heartbeat;
+                    auto_reply::update_session_accounting(
+                        *mgr, sid_for_persist, agent_for_acct, acct);
                 };
         }
     }
