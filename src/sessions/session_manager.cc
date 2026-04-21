@@ -212,7 +212,23 @@ static SessionEntry session_from_json(const json& j) {
     session.input_tokens       = j.value("inputTokens", 0);
     session.output_tokens      = j.value("outputTokens", 0);
     session.total_tokens       = j.value("totalTokens", 0);
-    session.total_tokens_fresh = j.value("totalTokensFresh", false);
+    // ✅ 严格对齐 OC: config/sessions/types.ts::resolveFreshSessionTotalTokens
+    //
+    //   OC 语义：totalTokens 当 `totalTokensFresh === false` 时才视为 stale；
+    //   totalTokensFresh === undefined 也视为 fresh。
+    //
+    //   旧持久化 session 文件可能没有 totalTokensFresh 字段（字段是后加的），
+    //   默认成 false 会导致 preflight 的 fresh 门控永远走 transcript-fallback —
+    //   这是 OC 不会有的行为。所以：
+    //     - 字段缺失（JSON 无此 key 或为 null）→ 回退到 "是否有正 totalTokens"
+    //       作为 fresh 判据（与 OC 一致：undefined → fresh）
+    //     - 字段为 boolean → 直接使用
+    if (j.contains("totalTokensFresh") && j["totalTokensFresh"].is_boolean()) {
+        session.total_tokens_fresh = j["totalTokensFresh"].get<bool>();
+    } else {
+        // 对齐 OC：totalTokensFresh 缺失时视为 fresh（仅当有有效 totalTokens）
+        session.total_tokens_fresh = session.total_tokens > 0;
+    }
     session.system_sent        = j.value("systemSent", false);
     session.aborted_last_run   = j.value("abortedLastRun", false);
 

@@ -374,8 +374,15 @@ PreflightCompactionDecision evaluate_preflight_compaction(
     }
 
     // 对齐 OC L430-436: shouldRunPreflightCompaction
+    //
+    // ⚠️ 关键细节：transcript-fallback 派生出的 projected_count 是"即时计算值"，
+    // 不是 session entry 上的 persisted totalTokens。对齐 OC 的参数形状
+    // shouldRunPreflightCompaction({ tokenCount, ... })，应走 token_count_override
+    // 分支，而不是 {total_tokens, total_tokens_fresh} 分支（后者对应 session store
+    // 上的持久化值）。填错位置会因为 total_tokens_fresh 默认 false 导致门控永远返回
+    // false —— 即使 projected 远超 threshold 也不触发 compaction。
     PreflightCompactionParams compact_gate_params;
-    compact_gate_params.total_tokens = projected_count.value_or(0);
+    compact_gate_params.token_count_override = projected_count;
     compact_gate_params.context_window_tokens = params.context_window_tokens;
     compact_gate_params.reserve_tokens_floor = params.reserve_tokens_floor;
     compact_gate_params.soft_threshold_tokens = params.soft_threshold_tokens;
