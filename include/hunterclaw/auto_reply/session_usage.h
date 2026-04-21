@@ -38,9 +38,25 @@ struct SessionRunAccounting {
 
 // 对齐 OC: session-usage.ts SessionUsagePatch
 //
-// ⚠️ total_tokens_fresh 必须是 bool（OC 原始类型是 boolean）：
-//   true  = 本轮有实际 LLM usage，持久化的 totalTokens 是当前的
-//   false = 本轮没跑 LLM（heartbeat / 跳过），totalTokens 沿用旧值但标记陈旧
+// ⚠️ total_tokens 语义（严格对齐 OC agents/usage.ts::deriveSessionTotalTokens）：
+//
+//   SessionEntry.totalTokens 是 "**当前 context 大小的 snapshot**"，
+//   **不是** 跨 run 累加值。派生公式：
+//
+//       totalTokens = input + cacheRead + cacheWrite
+//                     （不含 output —— output 不进下一轮 context input）
+//
+//   数据源优先级：
+//     1. promptTokens override（如手动指定）
+//     2. lastCallUsage（run 末最后一次 LLM 调用，反映真实当前 context）
+//     3. 累加 usage（兜底，HC 当前使用此近似）
+//
+//   每次 run 结束**覆盖写入**，而非累加。heartbeat/skip 类空转时
+//   不更新此字段（保留上次可信值）。
+//
+// ⚠️ total_tokens_fresh：
+//   OC 原始语义：`totalTokensFresh = typeof totalTokens === "number"`
+//   即：patch 里存在 totalTokens 数值 → fresh=true；undefined → 不写
 struct SessionUsagePatch {
     std::optional<int> total_tokens;
     std::optional<bool> total_tokens_fresh;
@@ -56,14 +72,21 @@ struct SessionUsagePatch {
 int64_t compute_run_duration_ms(const SessionRunAccounting& acct);
 int     compute_total_tokens(const SessionRunAccounting& acct);
 
-// 对齐 OC: session-usage.ts buildSessionUsagePatch
+// 对齐 OC: agents/usage.ts:deriveSessionTotalTokens
 //
-// existing_total_tokens: session entry 当前持久化的 totalTokens
-// 返回 patch：
-//   total_tokens = existing + run_total
-//   total_tokens_fresh = (run_total > 0)   ← 布尔，对齐 OC
-//   input/output 设为本次 run 的值（对齐 OC：per-run 覆盖，不累加）
-//   model / model_provider / updated_at 记录本次 run 的模型与时间
+// 从 run accounting 派生 SessionEntry.totalTokens 值：
+//   input + cacheRead + cacheWrite（不含 output）
+// 非正值返回 0（对齐 OC "undefined" 语义）。
+int derive_session_total_tokens(const SessionRunAccounting& acct);
+
+// 对齐 OC: session-usage.ts:persistSessionUsageUpdate 核心逻辑
+//
+// ⚠️ 与旧实现的关键差异：
+//   - totalTokens **不再累加**（existing_total_tokens 参数忽略）
+//   - totalTokens = derive_session_total_tokens(acct) —— per-turn 覆盖
+//   - run_total=0（heartbeat/skip）时 patch 不设 totalTokens/fresh，保留旧值
+//
+// existing_total_tokens 参数保留只为 API 向后兼容。
 SessionUsagePatch build_session_usage_patch(
     const SessionRunAccounting& acct,
     int existing_total_tokens);

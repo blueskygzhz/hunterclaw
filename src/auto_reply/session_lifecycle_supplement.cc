@@ -227,28 +227,63 @@ int compute_total_tokens(const SessionRunAccounting& acct) {
            acct.cache_read_tokens + acct.cache_write_tokens;
 }
 
+// 对齐 OC: agents/usage.ts:derivePromptTokens + deriveSessionTotalTokens
+//
+// ⚠️ 关键语义（与旧 HC 实现不同）：
+//   OC SessionEntry.totalTokens 是 "当前 context 大小的 snapshot"，
+//   **不是**跨 run 累加值。公式：
+//
+//     totalTokens = input + cacheRead + cacheWrite
+//                   ^^^ 不含 output，因为 output 不进下一轮 context input
+//
+//   在 OC 里这个值应该用 `lastCallUsage`（run 末最后一次 LLM 调用）
+//   派生，而不是整轮累加。HC 当前没有 lastCallUsage 粒度，暂用
+//   accumulated usage 作为近似。
+int derive_session_total_tokens(const SessionRunAccounting& acct) {
+    int prompt_tokens = acct.input_tokens +
+                        acct.cache_read_tokens +
+                        acct.cache_write_tokens;
+    // 对齐 OC: promptTokens <= 0 → undefined（HC 用 0 表示）
+    return prompt_tokens > 0 ? prompt_tokens : 0;
+}
+
 // ═══════════════════════════════════════════════════════════════
-// Session Usage (严格对齐 OC: session-usage.ts:buildSessionUsagePatch)
+// Session Usage (严格对齐 OC: session-usage.ts::persistSessionUsageUpdate)
 // ═══════════════════════════════════════════════════════════════
 
 SessionUsagePatch build_session_usage_patch(
     const SessionRunAccounting& acct,
     int existing_total_tokens) {
     SessionUsagePatch patch;
+    (void)existing_total_tokens;  // 对齐 OC：totalTokens 不累加，covering write
+
     int run_total = compute_total_tokens(acct);
 
-    // 对齐 OC: entry.totalTokens = (existing ?? 0) + runTotal
-    patch.total_tokens = std::max(0, existing_total_tokens) + run_total;
+    // 对齐 OC: deriveSessionTotalTokens(usage, contextTokens, promptTokens)
+    //   totalTokens = input + cacheRead + cacheWrite (**prompt snapshot**, 不含 output)
+    //   当 run 无实际 LLM usage（heartbeat/skip）时 run_total=0，保持 patch 空白
+    //   语义：patch 不下发 → session entry 维持旧值（OC 一致行为，避免推翻 fresh 值）
+    int prompt_snapshot = derive_session_total_tokens(acct);
 
-    // 对齐 OC: entry.totalTokensFresh = runTotal > 0
-    //   heartbeat / 空转 run 时 runTotal=0 → fresh=false，
-    //   下一轮 preflight 会因此走 transcript-fallback 分支
-    patch.total_tokens_fresh = (run_total > 0);
+    if (run_total > 0 && prompt_snapshot > 0) {
+        // 对齐 OC L159: patch.totalTokens = totalTokens; (cover, not accumulate)
+        patch.total_tokens = prompt_snapshot;
+        // 对齐 OC L160: patch.totalTokensFresh = typeof totalTokens === "number";
+        patch.total_tokens_fresh = true;
+    }
+    // else: patch.total_tokens / total_tokens_fresh 保持 nullopt，persist_session_entry_update
+    // 不会写入这两个字段，旧持久化值保留。这严格对齐 OC：
+    // "Missing a last-call snapshot (and promptTokens fallback) means context
+    //  utilization is stale/unknown." — 此时 OC 也会写 totalTokens=undefined,
+    //  但我们保守保留旧值以避免误伤累积状态。
 
-    // 对齐 OC: per-run 覆盖 input/output（不累加 —— 用于展示"本次"用量）
-    //   累加语义只保留在 totalTokens 上
-    patch.input_tokens = acct.input_tokens;
-    patch.output_tokens = acct.output_tokens;
+    // 对齐 OC L143-151: per-run 覆盖 input/output/cacheRead/cacheWrite
+    if (run_total > 0) {
+        patch.input_tokens = acct.input_tokens;
+        patch.output_tokens = acct.output_tokens;
+        // Note: HC SessionEntry 当前无 cache_read_tokens / cache_write_tokens 字段，
+        // 如需严格对齐需扩展 sessions/session_manager.h SessionEntry。
+    }
 
     if (!acct.model_provider.empty()) patch.model_provider = acct.model_provider;
     if (!acct.model.empty())           patch.model          = acct.model;
@@ -284,6 +319,9 @@ void persist_session_entry_update(
 }
 
 // 对齐 OC: agent-runner-utils.ts: updateSessionAccounting(...)
+//
+// 重要：OC 不把 totalTokens 跨 run 累加，existing_total_tokens 参数保留是为了
+// API 兼容，实际 build_session_usage_patch 内部会忽略它（cover write 语义）。
 void update_session_accounting(
     sessions::SessionManager& session_manager,
     const std::string& session_key,
@@ -291,7 +329,7 @@ void update_session_accounting(
     const SessionRunAccounting& acct) {
     if (session_key.empty()) return;
 
-    // 读当前 totalTokens 作为 existing 基数（对齐 OC：累加语义）
+    // existing_total_tokens 仅保留 API 兼容，实际不参与 totalTokens 计算
     int existing_total_tokens = 0;
     auto entry_result = session_manager.get_session(session_key);
     if (entry_result.is_ok()) {
