@@ -9,6 +9,7 @@
 // ============================================================================
 
 #include "hunterclaw/llm/model_selection.h"
+#include "hunterclaw/llm/auth_profiles.h"
 #include "hunterclaw/core/types.h"
 #include <string>
 #include <vector>
@@ -33,6 +34,10 @@ struct ModelCandidate {
 };
 
 /// 对齐: FailoverReason
+/// ✅ 严格对齐 OC pi-embedded-helpers/types.ts FailoverReason:
+///   "rate_limit" | "overloaded" | "auth" | "auth_permanent" | "billing" |
+///   "model_not_found" | "context_overflow" | "timeout" | "network_error" |
+///   "server_error" | "format" | "session_expired" | "unknown"
 enum class FailoverReason {
     Unknown,
     RateLimit,
@@ -44,7 +49,9 @@ enum class FailoverReason {
     ContextOverflow,
     Timeout,
     NetworkError,
-    ServerError
+    ServerError,
+    Format,          // ✅ 对齐 OC: 400 bad request / format error
+    SessionExpired   // ✅ 对齐 OC: 410 gone / session expired
 };
 
 std::string failover_reason_to_string(FailoverReason reason);
@@ -67,13 +74,16 @@ class FailoverError : public std::runtime_error {
 public:
     FailoverError(const std::string& message, FailoverReason reason,
                   const std::string& provider = "", const std::string& model = "",
-                  int status = 0, const std::string& code = "");
+                  int status = 0, const std::string& code = "",
+                  const std::string& profile_id = "");
     
     FailoverReason reason() const { return reason_; }
     const std::string& provider() const { return provider_; }
     const std::string& model() const { return model_; }
     int status() const { return status_; }
     const std::string& code() const { return code_; }
+    /// ✅ 对齐 OC FailoverError.profileId
+    const std::string& profile_id() const { return profile_id_; }
     
 private:
     FailoverReason reason_;
@@ -81,6 +91,7 @@ private:
     std::string model_;
     int status_;
     std::string code_;
+    std::string profile_id_;  // ✅ 对齐 OC
 };
 
 /// 对齐: isFailoverError
@@ -164,16 +175,27 @@ std::vector<ModelCandidate> resolve_fallback_candidates(
     const std::string& model,
     const std::vector<std::string>& fallbacks_override = {});
 
+/// ✅ 对齐 OC: isLikelyContextOverflowError — 检测 context 溢出
+/// 当检测到此错误时应立即 rethrow，不尝试 fallback（其他模型窗口可能更小）
+bool is_likely_context_overflow_error(const std::string& error_msg);
+
 /// 对齐: runWithModelFallback<T> (simplified sync version for C++)
 /// In C++ we use a sync callback instead of async/await.
 /// The run function is called for each candidate until one succeeds.
+///
+/// ✅ 严格对齐 OC model-fallback.ts L626-901:
+///   1. context overflow → 立即 rethrow（不 fallback）
+///   2. AuthProfileManager 集成：查询 profile cooldown，决定 skip/probe/attempt
+///   3. soonestCooldownExpiry 传递给 FallbackSummaryError
+///   4. cooldownProbeUsedProviders 防止同 provider 重复探针
 template<typename T>
 ModelFallbackRunResult<T> run_with_model_fallback(
     const core::Config& cfg,
     const std::string& provider,
     const std::string& model,
     ModelFallbackRunFn<T> run,
-    std::function<void(const std::string&, const std::string&, const std::exception&, int, int)> on_error = nullptr)
+    std::function<void(const std::string&, const std::string&, const std::exception&, int, int)> on_error = nullptr,
+    AuthProfileManager* auth_manager = nullptr)
 {
     auto candidates = resolve_fallback_candidates(cfg, provider, model);
     if (candidates.empty()) {
@@ -182,10 +204,52 @@ ModelFallbackRunResult<T> run_with_model_fallback(
     
     std::vector<FallbackAttempt> attempts;
     std::exception_ptr last_error;
+    std::set<std::string> cooldown_probe_used_providers;
+    const bool has_fallback_candidates = candidates.size() > 1;
     
     for (size_t i = 0; i < candidates.size(); ++i) {
         const auto& candidate = candidates[i];
+        const bool is_primary = (i == 0);
         ModelFallbackRunOptions options;
+        
+        // ✅ 对齐 OC L660-767: AuthProfile cooldown 检查
+        if (auth_manager) {
+            auto now_ms = static_cast<int64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()
+                ).count()
+            );
+            auto next_profile = auth_manager->get_next_eligible_profile(
+                candidate.provider, now_ms);
+            
+            // 如果没有可用 profile（全在 cooldown）
+            if (!next_profile.has_value()) {
+                auto soonest = auth_manager->soonest_cooldown(candidate.provider, now_ms);
+                
+                // 简化版 resolveCooldownDecision：
+                //   primary + 有 fallback → 允许探针（除非已探过该 provider）
+                //   其他 → skip
+                bool should_probe = is_primary && has_fallback_candidates;
+                if (should_probe && cooldown_probe_used_providers.count(candidate.provider)) {
+                    should_probe = false;
+                }
+                
+                if (!should_probe) {
+                    attempts.push_back(FallbackAttempt{
+                        candidate.provider,
+                        candidate.model,
+                        "All profiles in cooldown for " + candidate.provider,
+                        FailoverReason::RateLimit,
+                        std::nullopt,
+                        std::nullopt
+                    });
+                    continue;
+                }
+                
+                options.allow_transient_cooldown_probe = true;
+                cooldown_probe_used_providers.insert(candidate.provider);
+            }
+        }
         
         try {
             T result = run(candidate.provider, candidate.model, options);
@@ -197,6 +261,12 @@ ModelFallbackRunResult<T> run_with_model_fallback(
             };
         } catch (const std::exception& e) {
             last_error = std::current_exception();
+            
+            // ✅ 对齐 OC L814: isLikelyContextOverflowError → 立即 rethrow
+            //   不尝试 fallback，因为其他模型的 context window 可能更小
+            if (is_likely_context_overflow_error(e.what())) {
+                std::rethrow_exception(last_error);
+            }
             
             auto described = describe_failover_error(e);
             attempts.push_back(FallbackAttempt{
@@ -230,10 +300,26 @@ ModelFallbackRunResult<T> run_with_model_fallback(
         }
     }
     
+    // ✅ 对齐 OC L895-901: soonestCooldownExpiry
+    std::optional<int64_t> soonest;
+    if (auth_manager) {
+        auto now_ms = static_cast<int64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()
+            ).count()
+        );
+        for (const auto& c : candidates) {
+            auto s = auth_manager->soonest_cooldown(c.provider, now_ms);
+            if (s.has_value() && (!soonest.has_value() || s.value() < soonest.value())) {
+                soonest = s;
+            }
+        }
+    }
+    
     throw FallbackSummaryError(
         "All models failed (" + std::to_string(attempts.size()) + "): " + summary,
         attempts,
-        std::nullopt);
+        soonest);
 }
 
 // ============================================================================

@@ -18,8 +18,12 @@ namespace llm {
 // Default Constants
 // ============================================================================
 
-const std::string DEFAULT_PROVIDER = "anthropic";
-const std::string DEFAULT_MODEL = "claude-sonnet-4-20250514";
+// ✅ 对齐 OC src/agents/defaults.ts (2026-04 版本)
+// OC: export const DEFAULT_PROVIDER = "openai";
+//     export const DEFAULT_MODEL = "gpt-5.4";
+// 保持与产品级 latest-model 基线一致
+const std::string DEFAULT_PROVIDER = "openai";
+const std::string DEFAULT_MODEL = "gpt-5.4";
 
 // ============================================================================
 // Utility

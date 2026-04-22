@@ -38,6 +38,8 @@ std::string failover_reason_to_string(FailoverReason reason) {
         case FailoverReason::Timeout:        return "timeout";
         case FailoverReason::NetworkError:   return "network_error";
         case FailoverReason::ServerError:    return "server_error";
+        case FailoverReason::Format:         return "format";
+        case FailoverReason::SessionExpired: return "session_expired";
     }
     return "unknown";
 }
@@ -54,6 +56,8 @@ FailoverReason failover_reason_from_string(const std::string& s) {
     if (lower == "timeout")        return FailoverReason::Timeout;
     if (lower == "network_error")  return FailoverReason::NetworkError;
     if (lower == "server_error")   return FailoverReason::ServerError;
+    if (lower == "format")         return FailoverReason::Format;
+    if (lower == "session_expired") return FailoverReason::SessionExpired;
     return FailoverReason::Unknown;
 }
 
@@ -67,10 +71,11 @@ FailoverError::FailoverError(
     const std::string& provider,
     const std::string& model,
     int status,
-    const std::string& code
+    const std::string& code,
+    const std::string& profile_id
 ) : std::runtime_error(message),
     reason_(reason), provider_(provider), model_(model),
-    status_(status), code_(code) {}
+    status_(status), code_(code), profile_id_(profile_id) {}
 
 bool is_failover_error(const std::exception& e) {
     return dynamic_cast<const FailoverError*>(&e) != nullptr;
@@ -172,23 +177,79 @@ bool is_fallback_summary_error(const std::exception& e) {
 // Fallback Policy (对齐 failover-policy.ts)
 // ============================================================================
 
+// ✅ 严格对齐 OC src/agents/failover-policy.ts
 bool should_allow_cooldown_probe_for_reason(FailoverReason reason) {
+    // OC: rate_limit || overloaded || billing || unknown || timeout
     return reason == FailoverReason::RateLimit ||
            reason == FailoverReason::Overloaded ||
            reason == FailoverReason::Billing ||
-           reason == FailoverReason::Unknown;
+           reason == FailoverReason::Unknown ||
+           reason == FailoverReason::Timeout;
 }
 
 bool should_use_transient_cooldown_probe_slot(FailoverReason reason) {
+    // OC: rate_limit || overloaded || unknown || timeout
     return reason == FailoverReason::RateLimit ||
            reason == FailoverReason::Overloaded ||
-           reason == FailoverReason::Unknown;
+           reason == FailoverReason::Unknown ||
+           reason == FailoverReason::Timeout;
 }
 
 bool should_preserve_transient_cooldown_probe_slot(FailoverReason reason) {
-    return reason == FailoverReason::Auth ||
+    // OC: model_not_found || format || auth || auth_permanent || session_expired
+    return reason == FailoverReason::ModelNotFound ||
+           reason == FailoverReason::Format ||
+           reason == FailoverReason::Auth ||
            reason == FailoverReason::AuthPermanent ||
-           reason == FailoverReason::Billing;
+           reason == FailoverReason::SessionExpired;
+}
+
+// ============================================================================
+// Context Overflow Detection (对齐 OC pi-embedded-helpers/errors.ts)
+// ============================================================================
+
+// ✅ 对齐 OC isLikelyContextOverflowError
+// 检测 context window 溢出错误。这类错误不应 fallback（其他模型窗口可能更小）。
+// OC 检测 pattern:
+//   /context.{0,20}(window|length|limit|overflow|exceed)/i
+//   /maximum.{0,10}context/i
+//   /token.{0,10}(limit|exceed|overflow)/i
+//   /prompt.{0,10}too.{0,10}long/i
+bool is_likely_context_overflow_error(const std::string& error_msg) {
+    if (error_msg.empty()) return false;
+    auto lower = to_lower(error_msg);
+    // context + window/length/limit/overflow/exceed (within 20 chars)
+    auto context_pos = lower.find("context");
+    if (context_pos != std::string::npos) {
+        auto region = lower.substr(context_pos, std::min<size_t>(30, lower.size() - context_pos));
+        if (region.find("window") != std::string::npos ||
+            region.find("length") != std::string::npos ||
+            region.find("limit") != std::string::npos ||
+            region.find("overflow") != std::string::npos ||
+            region.find("exceed") != std::string::npos) {
+            return true;
+        }
+    }
+    // maximum + context
+    if (lower.find("maximum") != std::string::npos && lower.find("context") != std::string::npos) {
+        return true;
+    }
+    // token + limit/exceed/overflow
+    auto token_pos = lower.find("token");
+    if (token_pos != std::string::npos) {
+        auto region = lower.substr(token_pos, std::min<size_t>(20, lower.size() - token_pos));
+        if (region.find("limit") != std::string::npos ||
+            region.find("exceed") != std::string::npos ||
+            region.find("overflow") != std::string::npos) {
+            return true;
+        }
+    }
+    // prompt too long
+    if (lower.find("prompt") != std::string::npos && lower.find("too") != std::string::npos &&
+        lower.find("long") != std::string::npos) {
+        return true;
+    }
+    return false;
 }
 
 // ============================================================================

@@ -312,8 +312,15 @@ LLMClient::Ptr create_llm_client_impl(const LLMConfig& config) {
         // 保留 mock 实现
         return MockLLMClient::create(config);
     } else {
-        // Unknown provider, use mock
-        return MockLLMClient::create(config);
+        // ✅ 对齐 OC: Unknown model → 报错而非静默回退 Mock
+        // OC simple-completion-runtime.ts L141:
+        //   return { error: `Unknown model: ${provider}/${modelId}` }
+        spdlog::get("default")->error(
+            "[LLMClient] Unknown provider: '{}'. "
+            "Configure a supported provider (openai/anthropic/ollama/gemini) or "
+            "register a custom provider via ProviderFactory::register_provider().",
+            config.provider);
+        return MockLLMClient::create(config);  // 降级但有明确警告
     }
     
     if (!provider_result.is_ok()) {

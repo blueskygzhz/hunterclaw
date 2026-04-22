@@ -58,8 +58,12 @@ struct RuntimeInfoInput {
   std::optional<std::string> shell;
   std::optional<std::string> channel;
   std::vector<std::string> capabilities;
+  /// ✅ 对齐 OC: channelActions (message actions: react, edit, unsend)
+  std::vector<std::string> channel_actions;
   std::optional<std::string> repo_root;
   std::optional<std::string> provider;
+  /// ✅ 对齐 OC: canvasRootDir
+  std::optional<std::string> canvas_root_dir;
 };
 
 /// 对齐 ProviderSystemPromptContribution (system-prompt-contribution.ts)

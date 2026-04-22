@@ -223,6 +223,35 @@ static void append_lines(std::vector<std::string>& lines, const std::vector<std:
   lines.insert(lines.end(), new_lines.begin(), new_lines.end());
 }
 
+// ✅ 对齐 OC system-prompt.ts L65-70: sanitizeContextFileContentForPrompt
+// Claude Code subscription mode rejects this exact prompt-policy quote when it
+// appears in system context. The live heartbeat user turn still carries the
+// actual instruction, and the generated heartbeat section below covers behavior.
+static const std::string DEFAULT_HEARTBEAT_PROMPT_CONTEXT_BLOCK =
+    "Default heartbeat prompt:\n`Read HEARTBEAT.md if it exists (workspace context). "
+    "Follow it strictly. Do not infer or repeat old tasks from prior chats. "
+    "If nothing needs attention, reply HEARTBEAT_OK.`";
+
+static std::string sanitize_context_file_content(const std::string& content) {
+    std::string result = content;
+    // Remove the default heartbeat prompt block
+    auto pos = result.find(DEFAULT_HEARTBEAT_PROMPT_CONTEXT_BLOCK);
+    if (pos != std::string::npos) {
+        result.erase(pos, DEFAULT_HEARTBEAT_PROMPT_CONTEXT_BLOCK.size());
+    }
+    // Collapse 3+ consecutive newlines to 2
+    size_t i = 0;
+    while (i < result.size()) {
+        if (result[i] == '\n' && i + 2 < result.size() && result[i+1] == '\n' && result[i+2] == '\n') {
+            size_t end = i + 2;
+            while (end < result.size() && result[end] == '\n') ++end;
+            result.erase(i + 2, end - (i + 2));
+        }
+        ++i;
+    }
+    return result;
+}
+
 static std::vector<std::string> build_project_context_section(
     const std::vector<EmbeddedContextFile>& files,
     const std::string& heading,
@@ -247,7 +276,8 @@ static std::vector<std::string> build_project_context_section(
   for (const auto& file : files) {
     lines.push_back("## " + file.path);
     lines.push_back("");
-    lines.push_back(file.content);
+    // ✅ 对齐 OC: sanitizeContextFileContentForPrompt
+    lines.push_back(sanitize_context_file_content(file.content));
     lines.push_back("");
   }
   return lines;
@@ -293,7 +323,7 @@ std::string build_agent_system_prompt(const BuildAgentSystemPromptParams& params
   
   // "none" mode: just identity line
   if (params.prompt_mode == PromptMode::NONE) {
-    return "You are a personal assistant operating inside OpenClaw.";
+    return "You are a personal assistant running inside OpenClaw.";
   }
   
   // Build available tools set (对齐 system-prompt.ts:370-389)
@@ -359,14 +389,84 @@ std::string build_agent_system_prompt(const BuildAgentSystemPromptParams& params
   // Assemble lines (对齐 system-prompt.ts:493-776)
   std::vector<std::string> lines;
   
-  lines.push_back("You are a personal assistant operating inside OpenClaw.");
+  // ✅ 对齐 OC system-prompt.ts L631: "running inside" (不是 "operating inside")
+  lines.push_back("You are a personal assistant running inside OpenClaw.");
   lines.push_back("");
   
-  // ## Tooling (对齐 system-prompt.ts:496-529)
+  // ## Tooling (对齐 system-prompt.ts:633-669)
+  // ✅ 严格对齐 OC: coreToolSummaries + toolOrder → 生成 "- toolName: summary" 列表
+  static const std::map<std::string, std::string> CORE_TOOL_SUMMARIES = {
+    {"read", "Read file contents"},
+    {"write", "Create or overwrite files"},
+    {"edit", "Make precise edits to files"},
+    {"apply_patch", "Apply multi-file patches"},
+    {"grep", "Search file contents for patterns"},
+    {"find", "Find files by glob pattern"},
+    {"ls", "List directory contents"},
+    {"exec", "Run shell commands (pty available for TTY-required CLIs)"},
+    {"process", "Manage background exec sessions"},
+    {"web_search", "Search the web (Brave API)"},
+    {"web_fetch", "Fetch and extract readable content from a URL"},
+    {"browser", "Control web browser"},
+    {"canvas", "Present/eval/snapshot the Canvas"},
+    {"nodes", "List/describe/notify/camera/screen on paired nodes"},
+    {"cron", "Manage cron jobs and wake events (use for reminders; when scheduling a reminder, write the systemEvent text as something that will read like a reminder when it fires, and mention that it is a reminder depending on the time gap between setting and firing; include recent context in reminder text if appropriate)"},
+    {"message", "Send messages and channel actions"},
+    {"gateway", "Restart, apply config, or run updates on the running OpenClaw process"},
+    {"agents_list", "List OpenClaw agent ids allowed for sessions_spawn"},
+    {"sessions_list", "List other sessions (incl. sub-agents) with filters/last"},
+    {"sessions_history", "Fetch history for another session/sub-agent"},
+    {"sessions_send", "Send a message to another session/sub-agent"},
+    {"sessions_spawn", "Spawn an isolated sub-agent session"},
+    {"subagents", "List, steer, or kill sub-agent runs for this requester session"},
+    {"session_status", "Show a /status-equivalent status card (usage + time + Reasoning/Verbose/Elevated); use for model-use questions"},
+    {"image", "Analyze an image with the configured image model"},
+    {"image_generate", "Generate images with the configured image-generation model"},
+  };
+  static const std::vector<std::string> TOOL_ORDER = {
+    "read", "write", "edit", "apply_patch", "grep", "find", "ls",
+    "exec", "process", "web_search", "web_fetch", "browser", "canvas",
+    "nodes", "cron", "message", "gateway", "agents_list", "sessions_list",
+    "sessions_history", "sessions_send", "subagents", "session_status",
+    "image", "image_generate"
+  };
+  
   lines.push_back("## Tooling");
-  lines.push_back("Structured tool definitions are the source of truth for tool names, descriptions, and parameters.");
-  lines.push_back("Tool names are case-sensitive. Call tools exactly as listed in the structured tool definitions.");
-  lines.push_back("If a tool is present in the structured tool definitions, it is available unless a later tool call reports a policy/runtime restriction.");
+  lines.push_back("Tool availability (filtered by policy):");
+  lines.push_back("Tool names are case-sensitive. Call tools exactly as listed.");
+  
+  // ✅ 对齐 OC: 按 toolOrder 排序 + extra tools 追加
+  {
+    std::vector<std::string> tool_lines;
+    std::set<std::string> emitted;
+    // 按 toolOrder 先输出已知工具
+    for (const auto& tool : TOOL_ORDER) {
+      if (available_tools.count(tool)) {
+        auto it = CORE_TOOL_SUMMARIES.find(tool);
+        if (it != CORE_TOOL_SUMMARIES.end()) {
+          tool_lines.push_back("- " + tool + ": " + it->second);
+        } else {
+          tool_lines.push_back("- " + tool);
+        }
+        emitted.insert(tool);
+      }
+    }
+    // 追加 extra tools（不在 TOOL_ORDER 中的）
+    for (const auto& tool : available_tools) {
+      if (!emitted.count(tool)) {
+        auto it = CORE_TOOL_SUMMARIES.find(tool);
+        if (it != CORE_TOOL_SUMMARIES.end()) {
+          tool_lines.push_back("- " + tool + ": " + it->second);
+        } else {
+          tool_lines.push_back("- " + tool);
+        }
+      }
+    }
+    for (const auto& tl : tool_lines) {
+      lines.push_back(tl);
+    }
+  }
+  
   lines.push_back("TOOLS.md does not control tool availability; it is user guidance for how to use external tools.");
   
   if (has_cron) {
@@ -380,16 +480,27 @@ std::string build_agent_system_prompt(const BuildAgentSystemPromptParams& params
   }
   
   lines.push_back("If a task is more complex or takes longer, spawn a sub-agent. Completion is push-based: it will auto-announce when done.");
-  lines.push_back("Do not poll `subagents list` / `sessions_list` in a loop; only check status on-demand.");
+  // ✅ 对齐 OC L660-667: ACP harness routing guidance
+  if (acp_harness_spawn) {
+    lines.push_back("For requests like \"do this in codex/claude code/cursor/gemini\" or similar ACP harnesses, treat it as ACP harness intent and call `sessions_spawn` with `runtime: \"acp\"`.");
+    lines.push_back("On Discord, default ACP harness requests to thread-bound persistent sessions (`thread: true`, `mode: \"session\"`) unless the user asks otherwise.");
+    lines.push_back("Set `agentId` explicitly unless `acp.defaultAgent` is configured, and do not route ACP harness requests through `subagents`/`agents_list` or local PTY exec flows.");
+    lines.push_back("For ACP harness thread spawns, do not call `message` with `action=thread-create`; use `sessions_spawn` (`runtime: \"acp\"`, `thread: true`) as the single thread creation path.");
+  }
+  lines.push_back("Do not poll `subagents list` / `sessions_list` in a loop; only check status on-demand (for intervention, debugging, or when explicitly asked).");
   lines.push_back("");
   
-  // ## Tool Call Style (对齐 system-prompt.ts:536-553)
+  // ## Tool Call Style (对齐 system-prompt.ts:676-691)
   lines.push_back("## Tool Call Style");
   lines.push_back("Default: do not narrate routine, low-risk tool calls (just call the tool).");
   lines.push_back("Narrate only when it helps: multi-step work, complex/challenging problems, sensitive actions (e.g., deletions), or when the user explicitly asks.");
   lines.push_back("Keep narration brief and value-dense; avoid repeating obvious steps.");
   lines.push_back("Use plain human language for narration unless in a technical context.");
   lines.push_back("When a first-class tool exists for an action, use the tool directly instead of asking the user to run equivalent CLI or slash commands.");
+  // ✅ 对齐 OC L687-689: exec approval guidance
+  lines.push_back("Never execute /approve through exec or any other shell/tool path; /approve is a user-facing approval command, not a shell command.");
+  lines.push_back("Treat allow-once as single-command only: if another elevated command needs approval, request a fresh /approve and do not claim prior approval covered it.");
+  lines.push_back("When approvals are required, preserve and show the full command/script exactly as provided (including chained operators like &&, ||, |, ;, or multiline shells) so the user can approve what will actually run.");
   lines.push_back("");
   
   // ## Execution Bias (对齐 system-prompt.ts:267-279)
