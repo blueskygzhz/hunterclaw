@@ -121,13 +121,21 @@ core::Result<json> method_agent(
         }
     }
 
-    // ✅ 对齐 OpenClaw: const idem = request.idempotencyKey
+    // ✅ 对齐 OpenClaw: const idem = request.idempotencyKey (NonEmptyString, required)
+    // OC 使用 AJV schema 校验 idempotencyKey 必填且非空。
+    // 当缺失时应返回 INVALID_REQUEST 而非静默生成 UUID。
     std::string idem = get_str("idempotencyKey", "idempotency_key");
     if (idem.empty()) {
         idem = get_str("runId", "run_id");
     }
     if (idem.empty()) {
+        // ✅ 对齐 OC: 协议要求 idempotencyKey 必填。
+        // 向后兼容：生成 UUID 但记录警告（未来版本应硬拒绝）
         idem = core::utils::generate_uuid();
+        spdlog::get("default")->warn(
+            "[method_agent] Missing idempotencyKey, generated fallback: {} (session={}). "
+            "Clients should always provide idempotencyKey for correct retry semantics.",
+            idem, session_key);
     }
 
     bool deliver = false;
@@ -409,9 +417,9 @@ core::Result<json> method_agent(
         auto& cmd_queue = queue::CommandQueue::Instance();
         const std::string session_lane = queue::ResolveSessionLane(session_key);
 
-        std::thread([msg_dispatcher, agent_params, &cmd_queue, session_lane]() mutable {
+        std::thread([msg_dispatcher, agent_params, &cmd_queue, session_lane,
+                     server, idem_copy = idem, run_id_copy = run_id]() mutable {
             try {
-                // ✅ 使用 std::function<void()> 避免 C++11 local type 实例化模板的限制
                 std::function<void()> task = [msg_dispatcher, agent_params]() mutable {
                     msg_dispatcher->run_reply_agent(agent_params);
                 };
@@ -421,11 +429,52 @@ core::Result<json> method_agent(
                     queue::EnqueueOptions{.label = agent_params.label, .urgent = false}
                 );
                 future.get();
+
+                // ✅ 对齐 OC dispatchAgentRunFromGateway .then(): 更新 dedupe 为终态
+                auto state = server->runtime_state();
+                if (state) {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    auto dedupe_key = "agent:" + idem_copy;
+                    json ok_payload;
+                    ok_payload["runId"] = run_id_copy;
+                    ok_payload["status"] = "ok";
+                    ok_payload["summary"] = "completed";
+                    state->dedupe[dedupe_key] = DedupeEntry{
+                        .ts = static_cast<int64_t>(
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch()
+                            ).count()
+                        ),
+                        .method = "agent",
+                        .ok = true,
+                        .payload = ok_payload,
+                    };
+                }
             } catch (const std::exception& e) {
                 spdlog::get("default")->error(
                     "[method_agent] Session lane error: session={}, error={}",
                     agent_params.session_key, e.what()
                 );
+                // ✅ 对齐 OC dispatchAgentRunFromGateway .catch(): 更新 dedupe 为 error
+                auto state = server->runtime_state();
+                if (state) {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    auto dedupe_key = "agent:" + idem_copy;
+                    json err_payload;
+                    err_payload["runId"] = run_id_copy;
+                    err_payload["status"] = "error";
+                    err_payload["summary"] = std::string(e.what());
+                    state->dedupe[dedupe_key] = DedupeEntry{
+                        .ts = static_cast<int64_t>(
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch()
+                            ).count()
+                        ),
+                        .method = "agent",
+                        .ok = false,
+                        .payload = err_payload,
+                    };
+                }
             }
         }).detach();
     } else {
@@ -433,8 +482,54 @@ core::Result<json> method_agent(
         auto captured_agent = agent;
         auto captured_message = message;
         auto captured_options = inject_options;
-        std::thread([captured_agent, captured_message, captured_options]() {
-            captured_agent->process_message(captured_message, captured_options);
+        auto captured_server = server;
+        auto captured_idem = idem;
+        auto captured_run_id = run_id;
+        std::thread([captured_agent, captured_message, captured_options,
+                     captured_server, captured_idem, captured_run_id]() {
+            try {
+                captured_agent->process_message(captured_message, captured_options);
+                // ✅ 对齐 OC: 更新 dedupe 为终态
+                auto state = captured_server->runtime_state();
+                if (state) {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    auto dedupe_key = "agent:" + captured_idem;
+                    json ok_payload;
+                    ok_payload["runId"] = captured_run_id;
+                    ok_payload["status"] = "ok";
+                    ok_payload["summary"] = "completed";
+                    state->dedupe[dedupe_key] = DedupeEntry{
+                        .ts = static_cast<int64_t>(
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch()
+                            ).count()
+                        ),
+                        .method = "agent",
+                        .ok = true,
+                        .payload = ok_payload,
+                    };
+                }
+            } catch (const std::exception& e) {
+                auto state = captured_server->runtime_state();
+                if (state) {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    auto dedupe_key = "agent:" + captured_idem;
+                    json err_payload;
+                    err_payload["runId"] = captured_run_id;
+                    err_payload["status"] = "error";
+                    err_payload["summary"] = std::string(e.what());
+                    state->dedupe[dedupe_key] = DedupeEntry{
+                        .ts = static_cast<int64_t>(
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch()
+                            ).count()
+                        ),
+                        .method = "agent",
+                        .ok = false,
+                        .payload = err_payload,
+                    };
+                }
+            }
         }).detach();
     }
 
@@ -517,6 +612,112 @@ core::Result<json> method_agent_status(
     }
 
     return core::Result<json>::Ok(result);
+}
+
+// ============================================================================
+// agent.wait — 等待 agent run 完成（对齐 OC agentHandlers["agent.wait"]）
+//
+// OC 实现要点:
+//   1. validateAgentWaitParams (runId: NonEmptyString, timeoutMs?: number)
+//   2. readTerminalSnapshotFromGatewayDedupe — 如果 dedupe 已有终态直接返回
+//   3. dual-race: lifecyclePromise vs dedupePromise (先到先赢)
+//   4. 超时返回 { runId, status: "timeout" }
+//
+// HC 简化实现: 轮询 dedupe entry（2s 间隔）直到有终态或超时
+// ============================================================================
+core::Result<json> method_agent_wait(
+    std::shared_ptr<GatewayServer> server,
+    std::shared_ptr<MethodGuard> method_guard,
+    const ClientContext& client_ctx,
+    const json& params
+) {
+    (void)method_guard;
+    (void)client_ctx;
+
+    // Step 1: 参数校验
+    std::string run_id;
+    if (params.contains("runId") && params["runId"].is_string()) {
+        run_id = params["runId"].get<std::string>();
+    }
+    if (run_id.empty()) {
+        return core::Result<json>::Err("invalid agent.wait params: runId required");
+    }
+
+    int64_t timeout_ms = 30000;  // 默认 30s
+    if (params.contains("timeoutMs") && params["timeoutMs"].is_number()) {
+        timeout_ms = std::max<int64_t>(0, params["timeoutMs"].get<int64_t>());
+    }
+
+    auto state = server->runtime_state();
+    if (!state) {
+        return core::Result<json>::Err("runtime state not available");
+    }
+
+    // Step 2: 立即检查 dedupe 终态
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        auto dedupe_key = "agent:" + run_id;
+        auto it = state->dedupe.find(dedupe_key);
+        if (it != state->dedupe.end() && it->second.ok.has_value()) {
+            // ✅ 已有终态：立即返回（对齐 OC readTerminalSnapshotFromGatewayDedupe）
+            json result;
+            result["runId"] = run_id;
+            result["status"] = it->second.ok.value() ? "ok" : "error";
+            if (it->second.payload.has_value()) {
+                result["startedAt"] = it->second.payload->value("startedAt", 0);
+                result["endedAt"] = it->second.ts;
+                if (it->second.payload->contains("summary")) {
+                    result["error"] = (*it->second.payload)["summary"];
+                }
+            }
+            return core::Result<json>::Ok(result);
+        }
+    }
+
+    // Step 3: 轮询等待（对齐 OC dual-race 简化版）
+    int64_t started_at = static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count()
+    );
+    constexpr int64_t POLL_INTERVAL_MS = 500;
+
+    while (true) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(POLL_INTERVAL_MS));
+
+        int64_t now = static_cast<int64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()
+            ).count()
+        );
+
+        // 检查超时
+        if (now - started_at > timeout_ms) {
+            json result;
+            result["runId"] = run_id;
+            result["status"] = "timeout";
+            return core::Result<json>::Ok(result);
+        }
+
+        // 检查 dedupe 终态
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            auto dedupe_key = "agent:" + run_id;
+            auto it = state->dedupe.find(dedupe_key);
+            if (it != state->dedupe.end() && it->second.ok.has_value()) {
+                json result;
+                result["runId"] = run_id;
+                result["status"] = it->second.ok.value() ? "ok" : "error";
+                if (it->second.payload.has_value()) {
+                    result["endedAt"] = it->second.ts;
+                    if (!it->second.ok.value() && it->second.payload->contains("summary")) {
+                        result["error"] = (*it->second.payload)["summary"];
+                    }
+                }
+                return core::Result<json>::Ok(result);
+            }
+        }
+    }
 }
 
 }  // namespace methods

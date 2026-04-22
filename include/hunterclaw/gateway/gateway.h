@@ -184,9 +184,17 @@ struct ClientContext {
 // Dedupe Entry (对齐 OpenClaw server-shared.ts)
 // ============================================================================
 
+// ✅ 对齐 OC server-methods/agent-wait-dedupe.ts: setGatewayDedupeEntry
+//   entry: { ts, ok, payload, error }
+// 用于 agent.wait 查询终态：dedupe entry 最初只有 in-flight ack，
+// agent 完成后被更新为终态（ok + payload 或 error）
 struct DedupeEntry {
-    int64_t ts;
+    int64_t ts = 0;
     std::string method;
+    // ✅ 终态字段（对齐 OC agent-wait-dedupe.ts）
+    std::optional<bool> ok;                 // true=completed, false=error
+    std::optional<nlohmann::json> payload;  // 终态 payload (runId, status, summary, result)
+    std::optional<nlohmann::json> error;    // 终态 error shape
 };
 
 // ============================================================================

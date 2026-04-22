@@ -2,6 +2,8 @@
 #include "hunterclaw/core/utils.h"
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
+#include <openssl/sha.h>       // ✅ 对齐 OC safeEqualSecret: SHA-256 等长化
+#include <openssl/crypto.h>    // ✅ 对齐 OC timingSafeEqual: CRYPTO_memcmp
 #include <filesystem>
 #include <fstream>
 #include <regex>
@@ -424,6 +426,20 @@ AuthResult AuthManager::authenticate_connect(
 
 // ========== Token 验证 ==========
 
+// ✅ 对齐 OC src/security/secret-equal.ts: safeEqualSecret
+// OC 实现:
+//   const hash = (s: string) => createHash("sha256").update(s).digest();
+//   return timingSafeEqual(hash(provided), hash(expected));
+// 先 SHA-256 等长化（消除长度泄漏），再 constant-time 比较
+static bool safe_equal_secret(const std::string& provided, const std::string& expected) {
+    if (provided.empty() || expected.empty()) return false;
+    unsigned char h1[SHA256_DIGEST_LENGTH];
+    unsigned char h2[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const unsigned char*>(provided.data()), provided.size(), h1);
+    SHA256(reinterpret_cast<const unsigned char*>(expected.data()), expected.size(), h2);
+    return CRYPTO_memcmp(h1, h2, SHA256_DIGEST_LENGTH) == 0;
+}
+
 bool AuthManager::validate_bearer_token(const std::string& token) const {
     const auto& auth_config = impl_->config->gateway.auth;
     
@@ -444,16 +460,16 @@ bool AuthManager::validate_bearer_token(const std::string& token) const {
     // 支持两种格式:
     // 1. "sk-hunterclaw-abc123"
     // 2. "Bearer sk-hunterclaw-abc123"
-    return token == expected || token == ("Bearer " + expected);
+    // ✅ 对齐 OC: constant-time compare（防止 timing side-channel）
+    return safe_equal_secret(token, expected) ||
+           safe_equal_secret(token, "Bearer " + expected);
 }
 
 bool AuthManager::validate_password(const std::string& password) const {
-    // ✅ 对齐 OpenClaw: 密码验证
-    // OpenClaw 使用 bcrypt 哈希比较，这里使用配置中的明文密码比较
-    // 实际部署应使用 bcrypt/argon2 等安全哈希函数
+    // ✅ 对齐 OC auth.ts L612: safeEqualSecret(password, auth.password)
     const auto& auth_config = impl_->config->gateway.auth;
     if (!auth_config.password.empty()) {
-        return password == auth_config.password;
+        return safe_equal_secret(password, auth_config.password);
     }
     return !password.empty();
 }

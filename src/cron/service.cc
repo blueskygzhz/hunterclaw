@@ -85,20 +85,60 @@ int64_t error_backoff_ms(int consecutive_errors) {
   return DEFAULT_BACKOFF_SCHEDULE_MS[idx];
 }
 
+// ✅ 对齐 OC timer.ts L225-234 TRANSIENT_PATTERNS
 // 判断是否为瞬态错误（可重试）
+// OC 按 retryOn key 分类:
+//   rate_limit: /(rate[_ ]limit|too many requests|429|resource has been exhausted|cloudflare|tokens per day)/i
+//   overloaded: /\b529\b|\boverloaded(?:_error)?\b|high demand|temporar(?:ily|y) overloaded|capacity exceeded/i
+//   network: /(network|econnreset|econnrefused|fetch failed|socket)/i
+//   timeout: /(timeout|etimedout)/i
+//   server_error: /\b5\d{2}\b/
 bool is_transient_cron_error(const std::string& error) {
   if (error.empty()) return false;
-  // 简单关键词匹配
-  static const std::vector<std::string> patterns = {
-      "rate_limit", "rate limit", "too many requests", "429",
-      "overloaded", "529", "high demand",
-      "network", "econnreset", "econnrefused", "fetch failed",
-      "timeout", "etimedout",
-  };
   std::string lower = error;
   std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-  for (const auto& p : patterns) {
-    if (lower.find(p) != std::string::npos) return true;
+
+  // rate_limit
+  if (lower.find("rate_limit") != std::string::npos ||
+      lower.find("rate limit") != std::string::npos ||
+      lower.find("too many requests") != std::string::npos ||
+      lower.find("429") != std::string::npos ||
+      lower.find("resource has been exhausted") != std::string::npos ||
+      lower.find("cloudflare") != std::string::npos ||
+      lower.find("tokens per day") != std::string::npos) {
+    return true;
+  }
+  // overloaded
+  if (lower.find("529") != std::string::npos ||
+      lower.find("overloaded") != std::string::npos ||
+      lower.find("high demand") != std::string::npos ||
+      lower.find("temporarily overloaded") != std::string::npos ||
+      lower.find("temporary overloaded") != std::string::npos ||
+      lower.find("capacity exceeded") != std::string::npos) {
+    return true;
+  }
+  // network
+  if (lower.find("network") != std::string::npos ||
+      lower.find("econnreset") != std::string::npos ||
+      lower.find("econnrefused") != std::string::npos ||
+      lower.find("fetch failed") != std::string::npos ||
+      lower.find("socket") != std::string::npos) {
+    return true;
+  }
+  // timeout
+  if (lower.find("timeout") != std::string::npos ||
+      lower.find("etimedout") != std::string::npos) {
+    return true;
+  }
+  // server_error: \b5\d{2}\b — 500-599 status codes
+  // 简化匹配：搜索 "5xx" 样式的 3 位数
+  for (size_t i = 0; i + 2 < lower.size(); ++i) {
+    if (lower[i] == '5' && std::isdigit(lower[i+1]) && std::isdigit(lower[i+2])) {
+      // 检查是否是独立词（前后不是数字）
+      bool left_boundary = (i == 0 || !std::isdigit(lower[i-1]));
+      bool right_boundary = (i + 3 >= lower.size() || !std::isdigit(lower[i+3]));
+      if (left_boundary && right_boundary) return true;
+    }
   }
   return false;
 }
@@ -849,14 +889,20 @@ CronRunOutcome CronService::execute_job_core(const CronJob& job) {
       int64_t retry_delay_ms = deps_.wake_now_heartbeat_busy_retry_delay_ms;
       int64_t wait_started_at = deps_.now_ms();
 
+      // ✅ 对齐 OC timer.ts L1173/L1192: isRecurringJob 短路
+      //   Recurring main-session cron jobs should not hold the cron lane open
+      //   while the main lane is busy, or their measured duration starts to
+      //   reflect queue wait instead of cron bookkeeping (#58833).
+      const bool is_recurring_job = (job.schedule.kind != CronSchedule::Kind::AT);
+
       for (;;) {
         // Aligned with OpenClaw: cron-triggered heartbeats pass { target: "last" }
-      // so the heartbeat delivers to the last active channel. Without this,
-      // heartbeat target defaults to "none" (since e2362d35) and cron main-session
-      // responses are silently swallowed. See: openclaw#28508
-      CronServiceDeps::HeartbeatOverride hb_override;
-      hb_override.target = "last";
-      auto hb_result = deps_.run_heartbeat_once(reason, job.agent_id, job.session_key, hb_override);
+        // so the heartbeat delivers to the last active channel. Without this,
+        // heartbeat target defaults to "none" (since e2362d35) and cron main-session
+        // responses are silently swallowed. See: openclaw#28508
+        CronServiceDeps::HeartbeatOverride hb_override;
+        hb_override.target = "last";
+        auto hb_result = deps_.run_heartbeat_once(reason, job.agent_id, job.session_key, hb_override);
 
         // 非 "requests-in-flight" 的 skipped 状态：退出循环
         if (hb_result.status != HeartbeatRunResult::Status::Skipped ||
@@ -868,6 +914,15 @@ CronRunOutcome CronService::execute_job_core(const CronJob& job) {
           } else {
             return {CronRunStatus::ERROR, hb_result.reason, text};
           }
+        }
+
+        // ✅ 对齐 OC timer.ts L1192-1201: recurring job 第一次 busy 就 fallback
+        //   不让 recurring job 长时间阻塞 cron lane
+        if (is_recurring_job) {
+          if (deps_.request_heartbeat_now) {
+            deps_.request_heartbeat_now(reason, job.agent_id, job.session_key);
+          }
+          return {CronRunStatus::OK, std::nullopt, text};
         }
 
         // busy：检查是否超时

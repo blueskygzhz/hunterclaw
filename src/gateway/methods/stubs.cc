@@ -81,19 +81,7 @@ core::Result<json> method_agent_identity_get(
 }
 
 // agent.wait
-core::Result<json> method_agent_wait(
-    std::shared_ptr<GatewayServer> server,
-    std::shared_ptr<MethodGuard> method_guard,
-    const ClientContext& client_ctx,
-    const json& params
-) {
-    (void)server; (void)method_guard; (void)client_ctx; (void)params;
-    // 🎯 OpenClaw: agent.wait returns when agent becomes idle
-    json result;
-    result["ok"] = true;
-    result["status"] = "idle";
-    return core::Result<json>::Ok(result);
-}
+// agent.wait — moved to agent.cc (real implementation, no longer a stub)
 
 // ============================================================================
 // Gateway Identity (system.ts)

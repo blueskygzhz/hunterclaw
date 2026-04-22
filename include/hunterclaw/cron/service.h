@@ -83,6 +83,9 @@ struct CronDelivery {
   std::optional<std::string> channel;  // "discord", "slack", "telegram", "last"
   std::optional<std::string> to;  // 目标用户/频道
   std::optional<std::string> account_id;
+  // ✅ 对齐 OC CronDelivery.threadId
+  // Explicit thread/topic id for channels that support threaded delivery.
+  std::optional<std::string> thread_id;
   bool best_effort = false;
   std::optional<CronFailureDestination> failure_destination;
 };
@@ -127,6 +130,9 @@ struct CronPayload {
   std::optional<std::string> channel_target;
   std::optional<std::string> to_target;
   bool best_effort_deliver = false;
+  // ✅ 对齐 OC CronAgentTurnPayloadFields.toolsAllow
+  // Optional tool allow-list; when set, only these tools are sent to the model.
+  std::optional<std::vector<std::string>> tools_allow;
 };
 
 /**
