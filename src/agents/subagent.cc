@@ -426,42 +426,125 @@ core::Result<void> SubagentRegistry::kill_subagent_tree(
 // BFS 递归遍历 child_session_key 下所有子孙 run
 // 条件: !runEnded || !cleanupCompleted (对齐 openclaw 的 countPendingDescendantRunsInternal)
 // 用于在 announce 前等待所有子孙完成，避免乱序
-int SubagentRegistry::count_pending_descendant_runs(const std::string& child_session_key) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    const std::string root = child_session_key;
-    if (root.empty()) return 0;
+// 内部 helper: 严格对齐 OC subagent-registry-queries.ts: forEachDescendantRun
+//
+// 对齐要点:
+//   1. BFS 遍历 descendants (pending queue + visited set)
+//   2. 对每个 requester，按 childSessionKey 取 createdAt 最大的 run（去重）
+//   3. 通过 findLatestRunForChildSession 验证：
+//      只访问 "该 run 是其 childSessionKey 全局最新 run" 的条目
+//      避免 steer-restart 后旧 run 被误计
+//   4. 返回 false 表示 root 为空
+//
+// 参数: visitor 回调，返回 (runId, entry)
+// 必须在持有 mutex_ 的上下文调用
+static bool for_each_descendant_run_locked(
+    const std::map<std::string, std::shared_ptr<SubagentEntry>>& entries,
+    const std::string& root_session_key,
+    const std::function<void(const std::string&, const SubagentEntry&)>& visitor
+) {
+    const std::string root = root_session_key;
+    if (root.empty()) return false;
 
-    // BFS 遍历，对齐 openclaw forEachDescendantRun
+    // 预计算: childSessionKey → latest run (createdAt 最大)
+    // 对齐 OC findLatestRunForChildSession
+    // HC 中 entry.subagent_run_id 同时作为 run_id 和 child_session_key
+    std::map<std::string, std::pair<std::string, const SubagentEntry*>> latest_by_child;
+    for (const auto& pair : entries) {
+        const auto& entry = pair.second;
+        const std::string& child_key = entry->subagent_run_id;
+        if (child_key.empty()) continue;
+        auto it = latest_by_child.find(child_key);
+        if (it == latest_by_child.end() || entry->spawned_at > it->second.second->spawned_at) {
+            latest_by_child[child_key] = {pair.first, entry.get()};
+        }
+    }
+
     std::vector<std::string> pending_queue = {root};
     std::set<std::string> visited = {root};
-    int count = 0;
 
     for (size_t idx = 0; idx < pending_queue.size(); ++idx) {
         const std::string& requester = pending_queue[idx];
-        for (const auto& pair : entries_) {
+
+        // 对齐 OC: 按 childSessionKey 聚合 requester 下的 run（每个 childKey 保留 createdAt 最大）
+        // 这样同一个 child_session_key 在 steer-restart 后的旧 run 不会被重复计数
+        std::map<std::string, std::pair<std::string, const SubagentEntry*>> latest_in_requester;
+        for (const auto& pair : entries) {
             const auto& entry = pair.second;
             if (entry->requester_run_id != requester) continue;
+            const std::string& child_key = entry->subagent_run_id;
+            auto it = latest_in_requester.find(child_key);
+            if (it == latest_in_requester.end() || entry->spawned_at > it->second.second->spawned_at) {
+                latest_in_requester[child_key] = {pair.first, entry.get()};
+            }
+        }
 
-            // ✅ 对齐 openclaw countPendingDescendantRunsInternal:
-            // const runEnded = typeof entry.endedAt === "number";
-            // const cleanupCompleted = typeof entry.cleanupCompletedAt === "number";
-            // if (!runEnded || !cleanupCompleted) count++
-            bool run_ended = (entry->completed_at > 0);
-            bool cleanup_completed = (entry->cleanup_completed_at > 0);
-            if (!run_ended || !cleanup_completed) {
-                count++;
+        for (const auto& kv : latest_in_requester) {
+            const std::string& run_id = kv.second.first;
+            const SubagentEntry* entry = kv.second.second;
+            const std::string& child_key = entry->subagent_run_id;
+
+            // 对齐 OC findLatestRunForChildSession cross-check:
+            //   若该 run 不是其 child_session_key 全局最新 run，跳过
+            auto latest_it = latest_by_child.find(child_key);
+            if (latest_it == latest_by_child.end() ||
+                latest_it->second.first != run_id ||
+                latest_it->second.second->requester_run_id != requester) {
+                continue;
             }
 
-            // 将子节点加入队列（避免重复访问）
-            const std::string& child_key = entry->subagent_run_id;
+            visitor(run_id, *entry);
+
             if (!child_key.empty() && visited.find(child_key) == visited.end()) {
                 visited.insert(child_key);
                 pending_queue.push_back(child_key);
             }
         }
     }
-    
+
+    return true;
+}
+
+int SubagentRegistry::count_pending_descendant_runs(const std::string& child_session_key) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    int count = 0;
+    if (!for_each_descendant_run_locked(entries_, child_session_key,
+            [&count](const std::string& /*run_id*/, const SubagentEntry& entry) {
+                // 对齐 OC countPendingDescendantRunsInternal:
+                //   const runEnded = typeof entry.endedAt === "number";
+                //   const cleanupCompleted = typeof entry.cleanupCompletedAt === "number";
+                //   if (!runEnded || !cleanupCompleted) count++
+                bool run_ended = (entry.completed_at > 0);
+                bool cleanup_completed = (entry.cleanup_completed_at > 0);
+                if (!run_ended || !cleanup_completed) {
+                    count++;
+                }
+            })) {
+        return 0;
+    }
+    return count;
+}
+
+// ✅ 对齐 OC: countPendingDescendantRunsExcludingRun
+// 与 countPendingDescendantRuns 同样语义，但排除指定 run_id
+// 对齐 OC subagent-registry-queries.ts:
+//   countPendingDescendantRunsInternal(runs, rootSessionKey, excludeRunId)
+int SubagentRegistry::count_pending_descendant_runs_excluding_run(
+    const std::string& child_session_key,
+    const std::string& exclude_run_id
+) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    int count = 0;
+    if (!for_each_descendant_run_locked(entries_, child_session_key,
+            [&count, &exclude_run_id](const std::string& run_id, const SubagentEntry& entry) {
+                bool run_ended = (entry.completed_at > 0);
+                bool cleanup_completed = (entry.cleanup_completed_at > 0);
+                if ((!run_ended || !cleanup_completed) && run_id != exclude_run_id) {
+                    count++;
+                }
+            })) {
+        return 0;
+    }
     return count;
 }
 
@@ -573,71 +656,115 @@ void SubagentRegistry::clear_pending_lifecycle_error(const std::string& run_id) 
         it->second->pending_lifecycle_error = false;
         it->second->pending_lifecycle_error_at = 0;
         it->second->pending_lifecycle_error_msg.clear();
-        log()->debug("[SubagentRegistry] Cleared pending lifecycle error for run: {}", run_id);
+        // ✅ 对齐 OC clearTimeout: 递增 generation token 作废已派发的 detach 线程回调
+        it->second->pending_lifecycle_error_gen++;
+        log()->debug("[SubagentRegistry] Cleared pending lifecycle error for run: {} (gen={})",
+                    run_id, it->second->pending_lifecycle_error_gen);
     }
 }
 
 // ✅ 对齐 OpenClaw: schedulePendingLifecycleError
 // 收到 lifecycle error 事件时，不立即标记失败，等 LIFECYCLE_ERROR_RETRY_GRACE_MS=15s 宽限期
 // 如果期间收到 start/end 事件则取消（provider 重试场景）
+//
+// 严格对齐 OC subagent-registry.ts L242-276:
+//   1. 先 clearPendingLifecycleError (取消前一个 timer, 对齐 clearTimeout)
+//   2. setTimeout 15s 后:
+//      - 若 entry 不存在 → 跳过
+//      - 若 entry.endedReason === COMPLETE 或 outcome.status === "ok" → 跳过
+//      - 否则调 completeSubagentRun({ outcome: error, triggerCleanup: true })
+//        → 最终进入 announce 流程（关键：不止标 Failed）
+//
+// HC clearTimeout 通过 generation token 实现:
+//   每次 schedule 递增 pending_lifecycle_error_gen_, 回调校验 token 一致才生效
 void SubagentRegistry::schedule_pending_lifecycle_error(
     const std::string& run_id,
     uint64_t ended_at,
     const std::string& error_msg
 ) {
+    uint64_t gen = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = entries_.find(run_id);
         if (it == entries_.end()) return;
-        // 如果已经有 pending error，先清除旧的
+        // ✅ 对齐 OC: clearPendingLifecycleError 先取消旧的
+        // 递增 generation 使上一个 detach 线程到期回调作废（等效 clearTimeout）
         it->second->pending_lifecycle_error = true;
         it->second->pending_lifecycle_error_at = ended_at;
         it->second->pending_lifecycle_error_msg = error_msg;
+        it->second->pending_lifecycle_error_gen++;
+        gen = it->second->pending_lifecycle_error_gen;
     }
-    log()->debug("[SubagentRegistry] Scheduled pending lifecycle error for run: {} (grace={}ms)",
-                run_id, LIFECYCLE_ERROR_RETRY_GRACE_MS);
+    log()->debug("[SubagentRegistry] Scheduled pending lifecycle error for run: {} (grace={}ms, gen={})",
+                run_id, LIFECYCLE_ERROR_RETRY_GRACE_MS, gen);
 
-    // 启动宽限期定时器（detach 线程模拟 setTimeout）
+    // 启动宽限期定时器
     // 对齐 OpenClaw: setTimeout(() => { ... }, LIFECYCLE_ERROR_RETRY_GRACE_MS)
     auto weak_registry = std::weak_ptr<SubagentRegistry>(shared_from_this());
-    std::thread([weak_registry, run_id, ended_at, error_msg]() {
+    std::thread([weak_registry, run_id, ended_at, error_msg, gen]() {
         std::this_thread::sleep_for(
             std::chrono::milliseconds(LIFECYCLE_ERROR_RETRY_GRACE_MS)
         );
         auto registry = weak_registry.lock();
         if (!registry) return;
 
-        std::lock_guard<std::mutex> lock(registry->mutex_);
-        auto it = registry->entries_.find(run_id);
-        if (it == registry->entries_.end()) return;
-        auto& entry = it->second;
+        // 分两步: 先 mutex 内检查并更新状态，再 mutex 外触发 announce 通知
+        bool should_announce = false;
+        {
+            std::lock_guard<std::mutex> lock(registry->mutex_);
+            auto it = registry->entries_.find(run_id);
+            if (it == registry->entries_.end()) return;
+            auto& entry = it->second;
 
-        // 对齐 OpenClaw: 如果宽限期内已经收到 start/end（pending_lifecycle_error 被清除），则跳过
-        if (!entry->pending_lifecycle_error) {
-            log()->debug("[SubagentRegistry] Lifecycle error grace period cancelled for run: {}", run_id);
-            return;
-        }
-        // 对齐 OpenClaw: 如果已经是 complete/ok 状态，跳过
-        if (entry->ended_reason == "complete" || 
-            (entry->state == SubagentState::Completed && !entry->has_error)) {
-            return;
+            // ✅ 对齐 OC clearTimeout: generation token 不匹配说明被 clear/重新 schedule
+            if (entry->pending_lifecycle_error_gen != gen) {
+                log()->debug("[SubagentRegistry] Lifecycle error grace superseded for run: {} "
+                            "(expected gen={}, current={})",
+                            run_id, gen, entry->pending_lifecycle_error_gen);
+                return;
+            }
+
+            // ✅ 对齐 OC: 宽限期内已收到 start/end（pending_lifecycle_error=false）→ 跳过
+            if (!entry->pending_lifecycle_error) {
+                log()->debug("[SubagentRegistry] Lifecycle error grace period cancelled for run: {}", run_id);
+                return;
+            }
+            // ✅ 对齐 OC: entry.endedReason === COMPLETE 或 outcome.status === "ok" → 跳过
+            if (entry->ended_reason == "complete" ||
+                (entry->state == SubagentState::Completed && !entry->has_error)) {
+                entry->pending_lifecycle_error = false;
+                return;
+            }
+
+            // ✅ 对齐 OC completeSubagentRun:
+            //   outcome: { status: "error", error: pending.error }
+            //   reason: SUBAGENT_ENDED_REASON_ERROR
+            //   triggerCleanup: true  ← 关键：进入 announce 流程
+            entry->pending_lifecycle_error = false;
+            entry->has_error = true;
+            entry->error_message = error_msg.empty() ? "lifecycle error" : error_msg;
+            entry->ended_reason = "error";
+            if (entry->completed_at == 0) {
+                entry->completed_at = ended_at > 0 ? ended_at : static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()
+                    ).count()
+                );
+            }
+            // ✅ 对齐 OC: state = Completing 而非 Failed，让 announcer worker_loop 将其纳入投递
+            //   OC 逻辑: completeSubagentRun 成功后进入 cleanup + announce 流程
+            //   HC 旧实现直接标 Failed，worker_loop 不再处理 → gap
+            entry->state = SubagentState::Completing;
+            should_announce = true;
+
+            log()->warn("[SubagentRegistry] Lifecycle error grace period expired for run: {} - {} "
+                       "(triggering announce)", run_id, error_msg);
         }
 
-        // 宽限期结束，正式标记为失败
-        entry->pending_lifecycle_error = false;
-        entry->has_error = true;
-        entry->error_message = error_msg.empty() ? "lifecycle error" : error_msg;
-        entry->ended_reason = "error";
-        if (entry->completed_at == 0) {
-            entry->completed_at = ended_at > 0 ? ended_at : static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()
-                ).count()
-            );
-        }
-        entry->state = SubagentState::Failed;
-        log()->warn("[SubagentRegistry] Lifecycle error grace period expired for run: {} - {}",
-                   run_id, error_msg);
+        // ✅ 对齐 OC completeSubagentRun → triggerCleanup=true
+        // worker_loop 每 2s 扫一次 list_active，state=Completing 会被拾起走 attempt_delivery
+        // 这里无需显式调用 announcer，状态改成 Completing 即可自动进入流程
+        (void)should_announce;
     }).detach();
 }
 
@@ -1618,6 +1745,37 @@ void SubagentAnnouncer::worker_loop() {
                 }
             }
 
+            // ✅ 对齐 OC subagent-registry.ts L415-419: 硬过期扫描
+            //   if (!expectsCompletionMessage && endedAt && now - endedAt > ANNOUNCE_EXPIRY_MS)
+            //     → finalizeResumedAnnounceGiveUp({ reason: "expiry" })
+            //   expectsCompletionMessage=true → ANNOUNCE_COMPLETION_HARD_EXPIRY_MS
+            {
+                auto now_ms = static_cast<int64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()
+                    ).count()
+                );
+                auto all_entries = registry_->list_active();
+                for (const auto& entry : all_entries) {
+                    if (entry->result_delivered) continue;
+                    if (entry->cleanup_completed_at > 0) continue;
+                    if (entry->completed_at == 0) continue;
+                    int64_t ended_ago = now_ms - static_cast<int64_t>(entry->completed_at);
+                    int64_t expiry = entry->expects_completion_message
+                        ? ANNOUNCE_COMPLETION_HARD_EXPIRY_MS
+                        : ANNOUNCE_EXPIRY_MS;
+                    if (ended_ago > expiry) {
+                        log()->warn("[SubagentAnnouncer] Give up (hard expiry) for run: {} "
+                                   "(ended {}s ago, expiry={}s, expects_completion={})",
+                                   entry->subagent_run_id, ended_ago / 1000,
+                                   expiry / 1000, entry->expects_completion_message);
+                        // 对齐 OC finalizeResumedAnnounceGiveUp({ reason: "expiry" })
+                        entry->cleanup_completed_at = static_cast<uint64_t>(now_ms);
+                        entry->cleanup_handled = true;
+                    }
+                }
+            }
+
             // ✅ 对齐 OpenClaw: 获取所有需要投递的 entry
             std::vector<std::shared_ptr<SubagentEntry>> to_deliver;
             {
@@ -1653,7 +1811,10 @@ void SubagentAnnouncer::worker_loop() {
                 // ✅ 对齐 OpenClaw: wake_on_descendant_settle
                 // 如果设置了此标志，检查子孙是否都已完成
                 if (entry->wake_on_descendant_settle) {
-                    int pending = registry_->count_pending_descendant_runs(entry->subagent_run_id);
+                    // 对齐 OC subagent-announce.ts L281: countPendingDescendantRunsExcludingRun
+                    //   排除自身，避免把自己算进 pending 导致死锁
+                    int pending = registry_->count_pending_descendant_runs_excluding_run(
+                        entry->subagent_run_id, entry->subagent_run_id);
                     if (pending > 0) {
                         log()->debug("[SubagentAnnouncer] Waiting for {} descendants: {}",
                                    pending, entry->subagent_run_id);
@@ -1836,6 +1997,19 @@ core::Result<void> SubagentAnnouncer::attempt_delivery(
     
     // ✅ 对齐 OpenClaw: countPendingDescendantRuns
     // 等待所有子孙完成后才 announce，避免乱序
+    //
+    // 严格对齐 OC subagent-announce.ts L281-288:
+    //   const pendingChildDescendantRuns = Math.max(0,
+    //     subagentRegistryRuntime.countPendingDescendantRuns(params.childSessionKey));
+    //   if (pendingChildDescendantRuns > 0 && announceType !== "cron job") {
+    //     shouldDeleteChildSession = false;
+    //     return false;
+    //   }
+    //
+    // 注意: 此处传的是 child_session_key (HC 中等于 entry->subagent_run_id)，
+    // 语义是统计"以该 child session 为 root 的所有子孙"。
+    // 自身 (root 所在 entry) 不会被算进来，因为 forEachDescendantRun 遍历的是 requesterSessionKey==root
+    // 的条目，而 root 自身的 entry.requesterSessionKey 指向它的父，不等于 root。
     int pending_descendants = registry_->count_pending_descendant_runs(entry->subagent_run_id);
     if (pending_descendants > 0) {
         log()->info("[SubagentAnnouncer] Deferring announce: {} pending descendants for run {}",
@@ -2300,19 +2474,23 @@ core::Result<void> SubagentAnnouncer::attempt_delivery(
 }
 
 bool SubagentAnnouncer::should_retry(const SubagentEntry& entry) {
-    // ✅ 对齐 OpenClaw: MAX_ANNOUNCE_RETRY_COUNT = 3
-    if (entry.delivery_attempts >= MAX_ANNOUNCE_RETRY_COUNT) {
+    // ✅ 对齐 OpenClaw subagent-registry.ts L407: MAX_ANNOUNCE_RETRY_COUNT = 3
+    //   if ((entry.announceRetryCount ?? 0) >= MAX_ANNOUNCE_RETRY_COUNT) → giveUp
+    // 字段统一: attempt_delivery 失败路径更新 announce_retry_count / last_announce_retry_at
+    // should_retry 必须检查同一对字段，否则退避/上限检测失效
+    if (entry.announce_retry_count >= MAX_ANNOUNCE_RETRY_COUNT) {
         return false;
     }
-    
+
     auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()
     ).count();
-    
+
     if (entry.completed_at > 0) {
         int64_t ended_ago = now - static_cast<int64_t>(entry.completed_at);
-        // ✅ 对齐 OpenClaw: completion-message 流用 ANNOUNCE_COMPLETION_HARD_EXPIRY_MS (30分钟)
-        // 非 completion-message 用 ANNOUNCE_EXPIRY_MS (5分钟)
+        // ✅ 对齐 OC subagent-registry.ts L415-419 + helpers ANNOUNCE_COMPLETION_HARD_EXPIRY_MS:
+        //   expectsCompletionMessage=true  → 30min hard expiry
+        //   expectsCompletionMessage=false → 5min expiry
         bool is_completion_flow = entry.expects_completion_message;
         int64_t expiry_ms = is_completion_flow
             ? ANNOUNCE_COMPLETION_HARD_EXPIRY_MS
@@ -2323,11 +2501,12 @@ bool SubagentAnnouncer::should_retry(const SubagentEntry& entry) {
             return false;
         }
     }
-    
-    // ✅ 对齐 OpenClaw: resolveAnnounceRetryDelayMs (指数退避)
-    // 检查是否到了重试时间
-    int delay_ms = get_retry_delay_ms(entry.delivery_attempts);
-    return (now - static_cast<int64_t>(entry.last_delivery_attempt)) >= delay_ms;
+
+    // ✅ 对齐 OC: resolveAnnounceRetryDelayMs (指数退避)
+    //   earliestRetryAt = (lastAnnounceRetryAt ?? 0) + delayMs
+    //   if (now < earliestRetryAt) 等待
+    int delay_ms = get_retry_delay_ms(entry.announce_retry_count);
+    return (now - static_cast<int64_t>(entry.last_announce_retry_at)) >= delay_ms;
 }
 
 int SubagentAnnouncer::get_retry_delay_ms(int attempt) {

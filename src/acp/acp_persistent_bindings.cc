@@ -4,9 +4,11 @@
 //   - src/acp/persistent-bindings.types.ts (ConfiguredAcpBindingSpec, 类型)
 //   - src/acp/persistent-bindings.lifecycle.ts (ensureConfiguredAcpBindingSession)
 //   - src/acp/persistent-bindings.resolve.ts (resolveConfiguredAcpBindingSpec)
+//   - src/routing/session-key.ts (normalizeAgentId / sanitizeAgentId)
 // ============================================================================
 
 #include "hunterclaw/acp/acp_persistent_bindings.h"
+#include <openssl/sha.h>     // ✅ 对齐 OC: SHA-256 (node:crypto createHash)
 #include <algorithm>
 #include <functional>
 #include <sstream>
@@ -26,6 +28,73 @@ static std::string normalize_text(const std::string& value) {
     auto end = trimmed.find_last_not_of(" \t\n\r");
     if (start == std::string::npos) return "";
     return trimmed.substr(start, end - start + 1);
+}
+
+// ── sanitizeAgentId ──────────────────────────────────────────────────────────
+// ✅ 严格对齐 OC src/routing/session-key.ts:91-109 normalizeAgentId
+//
+// OC 规则:
+//   DEFAULT_AGENT_ID   = "main"
+//   VALID_ID_RE        = /^[a-z0-9][a-z0-9_-]{0,63}$/i
+//   INVALID_CHARS_RE   = /[^a-z0-9_-]+/g
+//   1. trim + lowercase
+//   2. 若为空 → "main"
+//   3. 若匹配 VALID_ID_RE → 直接返回 lowercase 版本
+//   4. 否则 collapse 非法字符为 "-", 剥离首尾 "-", 截断 64，若为空则 "main"
+//
+// 旧 HC 实现只 tolower，违反 OC 语义（会让 session_key 被非法字符污染）
+static constexpr const char* DEFAULT_AGENT_ID = "main";
+
+static bool is_valid_agent_id_char(char c) {
+    // [a-z0-9_-]
+    return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-';
+}
+
+static std::string sanitize_agent_id(const std::string& value) {
+    // 1. trim
+    std::string trimmed = normalize_text(value);
+    if (trimmed.empty()) return DEFAULT_AGENT_ID;
+
+    // 2. lowercase
+    std::string lower = trimmed;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    // 3. Check VALID_ID_RE: ^[a-z0-9][a-z0-9_-]{0,63}$ (applied to lowercase)
+    auto is_valid = [](const std::string& s) -> bool {
+        if (s.empty() || s.size() > 64) return false;
+        char first = s[0];
+        if (!((first >= 'a' && first <= 'z') || (first >= '0' && first <= '9'))) return false;
+        for (size_t i = 1; i < s.size(); ++i) {
+            if (!is_valid_agent_id_char(s[i])) return false;
+        }
+        return true;
+    };
+    if (is_valid(lower)) return lower;
+
+    // 4. Fallback: collapse invalid chars to "-", strip leading/trailing "-", slice(0,64)
+    std::string collapsed;
+    collapsed.reserve(lower.size());
+    bool prev_dash = false;
+    for (char c : lower) {
+        if (is_valid_agent_id_char(c)) {
+            collapsed += c;
+            prev_dash = (c == '-');
+        } else {
+            if (!prev_dash) {
+                collapsed += '-';
+                prev_dash = true;
+            }
+        }
+    }
+    // strip leading "-"
+    size_t start = collapsed.find_first_not_of('-');
+    if (start == std::string::npos) return DEFAULT_AGENT_ID;
+    // strip trailing "-"
+    size_t end = collapsed.find_last_not_of('-');
+    collapsed = collapsed.substr(start, end - start + 1);
+    if (collapsed.size() > 64) collapsed = collapsed.substr(0, 64);
+    return collapsed.empty() ? DEFAULT_AGENT_ID : collapsed;
 }
 
 // ── normalizeMode ────────────────────────────────────────────────────────────
@@ -62,35 +131,44 @@ AcpBindingConfigShape normalize_binding_config(const nlohmann::json& raw) {
 }
 
 // ── buildBindingHash ─────────────────────────────────────────────────────────
-// 🎯 对齐 persistent-bindings.types.ts buildBindingHash(params)
-
+// ✅ 严格对齐 OC persistent-bindings.types.ts:60-69 buildBindingHash
+//
+// OC 实现:
+//   createHash("sha256")
+//     .update(`${channel}:${accountId}:${conversationId}`)
+//     .digest("hex")
+//     .slice(0, 16)
+//
+// 旧 HC 实现用了 FNV-1a 64-bit → hex(16)
+// 问题：同一 binding spec 在 HC 和 OC 生成的 session_key 完全不同，
+//       无法与 OC 共享 binding 存储或交叉匹配。修复为真 SHA-256。
 static std::string build_binding_hash(const std::string& channel,
                                         const std::string& account_id,
                                         const std::string& conversation_id) {
     std::string input = channel + ":" + account_id + ":" + conversation_id;
 
-    // FNV-1a 64-bit hash (lightweight alternative to SHA256 for binding keys)
-    uint64_t hash = 14695981039346656037ULL;
-    for (unsigned char c : input) {
-        hash ^= c;
-        hash *= 1099511628211ULL;
-    }
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const unsigned char*>(input.data()), input.size(), digest);
 
     std::ostringstream ss;
-    ss << std::hex << std::setfill('0') << std::setw(16) << hash;
+    ss << std::hex << std::setfill('0');
+    // slice(0, 16) hex chars = 8 bytes = first 8 bytes of digest
+    for (int i = 0; i < 8; ++i) {
+        ss << std::setw(2) << static_cast<int>(digest[i]);
+    }
     return ss.str();
 }
 
 // ── buildConfiguredAcpSessionKey ─────────────────────────────────────────────
-// 🎯 对齐 persistent-bindings.types.ts buildConfiguredAcpSessionKey(spec)
+// ✅ 严格对齐 OC persistent-bindings.types.ts:71-78
+//   return `agent:${sanitizeAgentId(spec.agentId)}:acp:binding:${channel}:${accountId}:${hash}`;
 
 std::string build_configured_acp_session_key(const ConfiguredAcpBindingSpec& spec) {
     std::string hash = build_binding_hash(
         spec.channel, spec.account_id, spec.conversation_id);
 
-    // Sanitize agent ID (lowercase, alphanumeric + hyphens)
-    std::string agent = spec.agent_id;
-    std::transform(agent.begin(), agent.end(), agent.begin(), ::tolower);
+    // ✅ 对齐 OC: sanitizeAgentId（而非简单 tolower）
+    std::string agent = sanitize_agent_id(spec.agent_id);
 
     return "agent:" + agent + ":acp:binding:" + spec.channel +
            ":" + spec.account_id + ":" + hash;

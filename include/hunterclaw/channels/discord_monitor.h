@@ -43,6 +43,19 @@ struct DiscordGatewayLifecycleParams {
 
     // Aligned with openclaw: isDisallowedIntentsError
     std::function<bool(const std::string& err)> is_disallowed_intents_error;
+
+    // ════════════════════════════════════════════════════════════════════
+    // 严格对齐 OC: WhatsApp monitor.ts L297-314
+    //   void drainPendingDeliveries({ drainKey, selectEntry, ... })
+    //
+    // 在 gateway **reconnect 成功**（READY/RESUMED 且 reconnect_attempts > 0）
+    // 后调用一次。外层注入该 callback 来衔接
+    // outbound::drain_pending_deliveries()，排空属于本 channel+account 的
+    // 积压消息。
+    //
+    // 未注入时跳过（向后兼容）。首次连接（非 reconnect）不调用。
+    // ════════════════════════════════════════════════════════════════════
+    std::function<void()> on_reconnect_connected;
 };
 
 // ============================================================================

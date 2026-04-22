@@ -174,6 +174,21 @@ void run_discord_gateway_lifecycle(DiscordGatewayLifecycleParams params) {
             const int64_t at = now_ms();
             push_status(true, at, at, nlohmann::json(nullptr));
             log->info("[{}] discord: gateway connected (READY/RESUMED)", params.account_id);
+
+            // 严格对齐 OC: WhatsApp monitor.ts L297-314
+            // Reconnect 成功后 drain 属于本 channel+account 的积压消息。
+            // 首次连接（reconnect_attempts == 0）不触发。
+            if (reconnect_attempts > 0 && params.on_reconnect_connected) {
+                try {
+                    params.on_reconnect_connected();
+                } catch (const std::exception& e) {
+                    log->warn("[{}] discord: on_reconnect_connected threw: {}",
+                              params.account_id, e.what());
+                } catch (...) {
+                    log->warn("[{}] discord: on_reconnect_connected threw unknown error",
+                              params.account_id);
+                }
+            }
         };
 
         // Aligned with openclaw: "WebSocket connection closed" → reconnect

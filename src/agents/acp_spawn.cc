@@ -424,21 +424,35 @@ SpawnAcpResult spawn_acp_direct(
     std::shared_ptr<gateway::GatewayClient> gw,
     const AcpSpawnConfig& cfg
 ) {
+    // ✅ 对齐 OC createAcpSpawnFailure: 统一的错误返回，带 error_code
+    auto make_failure = [](const std::string& status,
+                           const std::string& error_code,
+                           const std::string& error,
+                           std::optional<std::string> session_key = std::nullopt,
+                           std::optional<std::string> mode = std::nullopt) -> SpawnAcpResult {
+        SpawnAcpResult r;
+        r.status = status;
+        r.child_session_key = session_key;
+        r.mode = mode;
+        r.error = error;
+        r.error_code = error_code;
+        return r;
+    };
 
     // ── Step 1: Policy checks ─────────────────────────────────────────────
     // Aligned with openclaw: isAcpEnabledByPolicy(cfg)
     // HunterClaw: cfg.enable_acp
     if (!cfg.enable_acp) {
-        return { "forbidden", std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-                 "ACP is disabled by policy (`acp.enabled=false`)." };
+        return make_failure("forbidden", "acp_disabled",
+                            "ACP is disabled by policy (`acp.enabled=false`).");
     }
 
     const bool stream_to_parent_requested = params.stream_to.has_value() && *params.stream_to == "parent";
     const std::string parent_session_key = ctx.agent_session_key.value_or("");
 
     if (stream_to_parent_requested && parent_session_key.empty()) {
-        return { "error", std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-                 "sessions_spawn streamTo=\"parent\" requires an active requester session context." };
+        return make_failure("error", "requester_session_required",
+                            "sessions_spawn streamTo=\"parent\" requires an active requester session context.");
     }
 
     // Aligned with openclaw: resolveAcpSpawnRuntimePolicyError
@@ -449,8 +463,7 @@ SpawnAcpResult spawn_acp_direct(
         params.sandbox
     );
     if (policy_error.has_value()) {
-        return { "forbidden", std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-                 *policy_error };
+        return make_failure("forbidden", "runtime_policy", *policy_error);
     }
 
     // ── Step 2: Resolve spawn mode ────────────────────────────────────────
@@ -464,8 +477,8 @@ SpawnAcpResult spawn_acp_direct(
     }
 
     if (spawn_mode == "session" && !request_thread_binding) {
-        return { "error", std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-                 "mode=\"session\" requires thread=true so the ACP session can stay bound to a thread." };
+        return make_failure("error", "thread_required",
+                            "mode=\"session\" requires thread=true so the ACP session can stay bound to a thread.");
     }
 
     // ── Step 3: Resolve target agent ID ──────────────────────────────────
@@ -492,8 +505,8 @@ SpawnAcpResult spawn_acp_direct(
             }
         }
         if (target_agent_id.empty()) {
-            return { "error", std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-                     "ACP target agent is not configured. Pass `agentId` in `sessions_spawn` or set `acp.defaultAgent` in config." };
+            return make_failure("error", "target_agent_required",
+                "ACP target agent is not configured. Pass `agentId` in `sessions_spawn` or set `acp.defaultAgent` in config.");
         }
     }
 
@@ -504,8 +517,8 @@ SpawnAcpResult spawn_acp_direct(
             if (a == target_agent_id) { allowed = true; break; }
         }
         if (!allowed) {
-            return { "forbidden", std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-                     "ACP agent \"" + target_agent_id + "\" is not in the allowed agents list." };
+            return make_failure("forbidden", "agent_forbidden",
+                "ACP agent \"" + target_agent_id + "\" is not in the allowed agents list.");
         }
     }
 
@@ -527,8 +540,7 @@ SpawnAcpResult spawn_acp_direct(
     const std::string session_key = "agent:" + target_agent_id + ":acp:" + generate_uuid();
 
     if (!gw) {
-        return { "error", session_key, std::nullopt, spawn_mode, std::nullopt, std::nullopt,
-                 "Gateway not available" };
+        return make_failure("error", "spawn_failed", "Gateway not available", session_key, spawn_mode);
     }
 
     // ── Step 7: Create Gateway session (sessions.patch) ──────────────────
@@ -543,8 +555,8 @@ SpawnAcpResult spawn_acp_direct(
         }
         auto patch_result = gw->request("sessions.patch", patch);
         if (!patch_result.is_ok()) {
-            return { "error", session_key, std::nullopt, spawn_mode, std::nullopt, std::nullopt,
-                     patch_result.error };
+            return make_failure("error", "spawn_failed",
+                                patch_result.error, session_key, spawn_mode);
         }
     }
 
@@ -604,8 +616,8 @@ SpawnAcpResult spawn_acp_direct(
                     {"emitLifecycleHooks", false}
                 });
             } catch (...) {}
-            return { "error", session_key, std::nullopt, spawn_mode, std::nullopt, std::nullopt,
-                     response.error };
+            return make_failure("error", "spawn_failed",
+                                response.error, session_key, spawn_mode);
         }
         const auto& resp = response.get();
         if (resp.contains("run_id") && resp["run_id"].is_string()) {
@@ -631,8 +643,8 @@ SpawnAcpResult spawn_acp_direct(
                 {"emitLifecycleHooks", false}
             });
         } catch (...) {}
-        return { "error", session_key, std::nullopt, spawn_mode, std::nullopt, std::nullopt,
-                 std::string(e.what()) };
+        return make_failure("error", "spawn_failed",
+                            std::string(e.what()), session_key, spawn_mode);
     }
 
     // ── Step 10: Finalize relay ───────────────────────────────────────────
@@ -659,15 +671,16 @@ SpawnAcpResult spawn_acp_direct(
         ? ACP_SPAWN_SESSION_ACCEPTED_NOTE
         : ACP_SPAWN_ACCEPTED_NOTE;
 
-    return {
-        "accepted",
-        session_key,
-        child_run_id,
-        spawn_mode,
-        std::nullopt,  // stream_log_path
-        note,
-        std::nullopt   // error
-    };
+    SpawnAcpResult ok;
+    ok.status = "accepted";
+    ok.child_session_key = session_key;
+    ok.run_id = child_run_id;
+    ok.mode = spawn_mode;
+    ok.stream_log_path = std::nullopt;
+    ok.note = note;
+    ok.error = std::nullopt;
+    ok.error_code = std::nullopt;
+    return ok;
 }
 
 } // namespace agents

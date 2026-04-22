@@ -33,7 +33,12 @@ namespace infra {
 namespace acp {
 
 // ── ACP Protocol version ─────────────────────────────────────────────────────
-static const std::string ACP_PROTOCOL_VERSION = "2025-03-26";
+// ✅ 对齐 OC: src/acp/translator.ts 引用 @agentclientprotocol/sdk 的 PROTOCOL_VERSION
+// 根据 ACP schema (uint16 integer): "Only bumped for breaking changes.
+//   Non-breaking changes should be introduced via capabilities."
+// 当前 ACP major version = 1。Cursor CLI 等客户端明确要求 numeric 而非 string。
+// 旧实现误写为字符串 "2025-03-26"（那是 MCP 协议版本，非 ACP）→ 导致 initialize 握手失败。
+static constexpr int ACP_PROTOCOL_VERSION = 1;
 static const std::string HUNTERCLAW_VERSION = "0.1.0";
 
 // ── ACP Types ────────────────────────────────────────────────────────────────
@@ -137,10 +142,31 @@ struct InitializeRequest {
     std::string client_version;
 };
 
+// ✅ 对齐 OC translator.ts:503-524 `initialize` response
+// ACP schema 要求:
+//   protocolVersion: integer (uint16)
+//   agentCapabilities: { loadSession, promptCapabilities, mcpCapabilities, sessionCapabilities }
+//   agentInfo: { name, title, version }
+//   authMethods: AuthMethod[]
+struct AcpAgentCapabilities {
+    bool load_session = true;                // supports loadSession
+    // promptCapabilities
+    bool prompt_image = true;
+    bool prompt_audio = false;
+    bool prompt_embedded_context = true;
+    // mcpCapabilities
+    bool mcp_http = false;
+    bool mcp_sse = false;
+    // sessionCapabilities.list (empty object = supported)
+    bool session_list_supported = true;
+};
+
 struct InitializeResponse {
-    std::string protocol_version;
-    AcpAgentInfo agent;
-    std::vector<nlohmann::json> commands;
+    int protocol_version = ACP_PROTOCOL_VERSION;  // ✅ integer, not string
+    AcpAgentInfo agent;                             // agentInfo
+    AcpAgentCapabilities agent_capabilities;        // agentCapabilities
+    std::vector<nlohmann::json> auth_methods;       // authMethods (empty by default)
+    std::vector<nlohmann::json> commands;           // Legacy HC field; OC sends commands separately via sendAvailableCommands
 };
 
 struct AuthenticateRequest {

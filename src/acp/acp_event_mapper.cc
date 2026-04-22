@@ -158,22 +158,29 @@ std::string extract_text_from_prompt(const nlohmann::json& prompt) {
 }
 
 // ── extractAttachmentsFromPrompt ─────────────────────────────────────────────
-// 🎯 对齐 event-mapper.ts extractAttachmentsFromPrompt(prompt)
-
+// ✅ 严格对齐 OC event-mapper.ts:278-295 extractAttachmentsFromPrompt(prompt)
+//   - 仅处理 type === "image"
+//   - 若 !data || !mimeType → 跳过（不 fallback 默认 mime）
+//   - 输出 { type: "image", mimeType, content: data }
 std::vector<GatewayAttachment> extract_attachments_from_prompt(const nlohmann::json& prompt) {
     std::vector<GatewayAttachment> attachments;
     if (!prompt.is_array()) return attachments;
 
     for (auto& block : prompt) {
         if (!block.is_object()) continue;
-        std::string type = block.value("type", "");
-        if (type == "image" && block.contains("data")) {
-            GatewayAttachment att;
-            att.type = "image";
-            att.mime_type = block.value("mimeType", "image/png");
-            att.content = block["data"].get<std::string>();
-            attachments.push_back(std::move(att));
+        if (block.value("type", "") != "image") continue;
+
+        // ✅ 对齐 OC: 缺 data 或 mimeType 则跳过，不 fallback
+        if (!block.contains("data") || !block["data"].is_string() ||
+            !block.contains("mimeType") || !block["mimeType"].is_string()) {
+            continue;
         }
+        GatewayAttachment att;
+        att.type = "image";
+        att.mime_type = block["mimeType"].get<std::string>();
+        att.content   = block["data"].get<std::string>();
+        if (att.mime_type.empty() || att.content.empty()) continue;
+        attachments.push_back(std::move(att));
     }
     return attachments;
 }
@@ -194,75 +201,87 @@ ToolCallContent extract_tool_call_content(const std::string& tool_name,
 }
 
 // ── inferToolKind ────────────────────────────────────────────────────────────
-// 🎯 对齐 event-mapper.ts inferToolKind(toolName)
-
+// ✅ 严格对齐 OC event-mapper.ts:315-342 inferToolKind(name)
+//
+// ACP spec ToolKind 枚举:
+//   "read" | "edit" | "delete" | "move" | "search" | "execute" | "fetch" | "other"
+//
+// OC 实现使用 substring 匹配（而非精确 whitelist），优先级顺序:
+//   1. read
+//   2. write|edit  → "edit"
+//   3. delete|remove → "delete"
+//   4. move|rename → "move"
+//   5. search|find → "search"
+//   6. exec|run|bash → "execute"
+//   7. fetch|http → "fetch"
+//   8. default: "other"
+//
+// 旧 HC 实现使用精确 whitelist，且返回 "write"/"command" — 违反 ACP spec 枚举。
 std::string infer_tool_kind(const std::string& tool_name) {
     if (tool_name.empty()) return "other";
 
-    std::string lower = tool_name;
-    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    std::string n = tool_name;
+    std::transform(n.begin(), n.end(), n.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
-    // Read-only tools
-    if (lower == "read" || lower == "read_file" || lower == "search" ||
-        lower == "list_dir" || lower == "find" || lower == "grep" ||
-        lower == "web_search" || lower == "memory_search" ||
-        lower == "web_fetch" || lower == "list_files") {
-        return "read";
-    }
+    auto contains = [&n](const char* sub) {
+        return n.find(sub) != std::string::npos;
+    };
 
-    // Write tools
-    if (lower == "write" || lower == "write_file" || lower == "edit" ||
-        lower == "replace" || lower == "insert" || lower == "delete" ||
-        lower == "create" || lower == "move" || lower == "rename") {
-        return "write";
-    }
-
-    // Exec tools
-    if (lower == "exec" || lower == "bash" || lower == "shell" ||
-        lower == "spawn" || lower == "process" || lower == "terminal" ||
-        lower == "code_execution") {
-        return "command";
-    }
-
+    // 对齐 OC 匹配顺序（不可换顺序，比如 "rewrite" 同时含 write 和 re）
+    if (contains("read"))                        return "read";
+    if (contains("write") || contains("edit"))   return "edit";
+    if (contains("delete") || contains("remove"))return "delete";
+    if (contains("move")   || contains("rename"))return "move";
+    if (contains("search") || contains("find"))  return "search";
+    if (contains("exec")   || contains("run") || contains("bash")) return "execute";
+    if (contains("fetch")  || contains("http"))  return "fetch";
     return "other";
 }
 
 // ── formatToolTitle ──────────────────────────────────────────────────────────
-// 🎯 对齐 event-mapper.ts formatToolTitle(toolName, rawInput)
-
+// ✅ 严格对齐 OC event-mapper.ts:297-313 formatToolTitle(name, args)
+//
+// OC 实现:
+//   base = name ?? "tool"
+//   if (!args || Object.keys(args).length === 0) return base;
+//   parts = Object.entries(args).map(([k, v]) => {
+//     raw = typeof v === "string" ? v : JSON.stringify(v);
+//     safe = raw.length > 100 ? raw.slice(0,100)+"..." : raw;
+//     return `${k}: ${safe}`;
+//   });
+//   return escapeInlineControlChars(`${base}: ${parts.join(", ")}`);
+//
+// 旧 HC 实现只挑 path/command 展示，违反对齐语义（丢失其他 args）
 std::string format_tool_title(const std::string& tool_name,
                                 const nlohmann::json& raw_input) {
-    if (tool_name.empty()) return "Tool call";
+    const std::string base = tool_name.empty() ? "tool" : tool_name;
 
-    // Try to extract a short descriptive title
-    std::string path;
-    for (auto& key : TOOL_LOCATION_PATH_KEYS) {
-        if (raw_input.is_object() && raw_input.contains(key) && raw_input[key].is_string()) {
-            path = raw_input[key].get<std::string>();
-            break;
-        }
+    if (!raw_input.is_object() || raw_input.empty()) {
+        return base;
     }
 
-    if (!path.empty()) {
-        // Shorten the path for display
-        if (path.size() > 60) {
-            path = "..." + path.substr(path.size() - 57);
+    static constexpr size_t MAX_PART_VALUE_LEN = 100;
+    std::string parts;
+    bool first = true;
+    for (auto& [key, value] : raw_input.items()) {
+        std::string raw;
+        if (value.is_string()) {
+            raw = value.get<std::string>();
+        } else {
+            raw = value.dump();
         }
-        return tool_name + ": " + path;
+        std::string safe = (raw.size() > MAX_PART_VALUE_LEN)
+            ? raw.substr(0, MAX_PART_VALUE_LEN) + "..."
+            : raw;
+        if (!first) parts += ", ";
+        parts += key;
+        parts += ": ";
+        parts += safe;
+        first = false;
     }
-
-    // For exec-like tools, try command
-    if (raw_input.is_object()) {
-        for (auto& key : {"command", "cmd", "script"}) {
-            if (raw_input.contains(key) && raw_input[key].is_string()) {
-                std::string cmd = raw_input[key].get<std::string>();
-                if (cmd.size() > 60) cmd = cmd.substr(0, 57) + "...";
-                return tool_name + ": " + escape_inline_control_chars(cmd);
-            }
-        }
-    }
-
-    return tool_name;
+    // ✅ 对齐 OC: 最外层过 escapeInlineControlChars
+    return escape_inline_control_chars(base + ": " + parts);
 }
 
 } // namespace acp

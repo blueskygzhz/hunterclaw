@@ -168,6 +168,9 @@ struct SubagentEntry {
     bool pending_lifecycle_error = false;           // 是否有待处理的 lifecycle error
     uint64_t pending_lifecycle_error_at = 0;        // error 事件时间戳
     std::string pending_lifecycle_error_msg;        // error 消息
+    // ✅ 对齐 OC clearTimeout 语义: 每次 schedule/clear 递增 generation token
+    // detach 线程到期后校验 token 一致才生效，实现"取消已派发的 timer"
+    uint64_t pending_lifecycle_error_gen = 0;
 
     // Notifications
     std::vector<std::string> pending_notifications;  // Queued events
@@ -252,7 +255,21 @@ public:
 
     // ✅ OpenClaw对齐: 统计子孙中仍在运行的 run 数量 (countPendingDescendantRuns)
     // 用于在 announce 前等待所有子孙完成，避免乱序
+    //
+    // 严格对齐 OC subagent-registry-queries.ts: forEachDescendantRun
+    //   - BFS 遍历 descendants
+    //   - 每个 requester 下按 childSessionKey 仅保留 createdAt 最大的 run（去重 steer 后旧 run）
+    //   - 通过 findLatestRunForChildSession 验证该 run 是当前 child session 的最新 run
+    //   - pending = 未 ended 或 cleanup 未完成
     int count_pending_descendant_runs(const std::string& child_session_key);
+
+    // ✅ OpenClaw对齐: countPendingDescendantRunsExcludingRun
+    // 排除指定 run_id（用于 announce 自身调用时排除自己）
+    // 对齐 OC subagent-registry-queries.ts: countPendingDescendantRunsExcludingRunFromRuns
+    int count_pending_descendant_runs_excluding_run(
+        const std::string& child_session_key,
+        const std::string& exclude_run_id
+    );
 
     // ✅ OpenClaw对齐: 判断 requester 是否是 subagent (isInternalAnnounceRequesterSession)
     // depth >= 1 的 session 是 subagent，deliver=false；depth=0 是用户，deliver=true

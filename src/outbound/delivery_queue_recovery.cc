@@ -11,6 +11,7 @@
 // ============================================================================
 
 #include "hunterclaw/outbound/deliver.h"
+#include "hunterclaw/outbound/delivery_queue_recovery.h"
 #include <filesystem>
 #include <fstream>
 #include <chrono>
@@ -141,12 +142,7 @@ bool is_entry_eligible_for_recovery_retry(
 // RecoverySummary
 // ============================================================================
 
-struct RecoverySummary {
-    int recovered = 0;
-    int failed = 0;
-    int skipped_max_retries = 0;
-    int deferred_backoff = 0;
-};
+// RecoverySummary 定义在 include/hunterclaw/outbound/delivery_queue_recovery.h
 
 // ============================================================================
 // recoverPendingDeliveries (对齐 delivery-queue-recovery.ts:112-210)
@@ -237,30 +233,33 @@ RecoverySummary recover_pending_deliveries(
 }
 
 // ============================================================================
-// drainPendingDeliveries (对齐 delivery-queue-recovery.ts:212-310)
+// drainPendingDeliveries (严格对齐 delivery-queue-recovery.ts:212-310)
+//
+// 签名对齐 include/hunterclaw/outbound/delivery_queue_recovery.h
+// 改动点（vs 旧版）：
+//   1. 并发锁 key 从 state_dir 改为 drain_key（对齐 OC drainKey）
+//   2. matcher 收到完整 DrainEntryInfo（含 account_id/last_error/retry_count）
+//   3. 新增 log_label 用于日志
 // ============================================================================
 
-struct PendingDeliveryDrainDecision {
-    bool match = false;
-    bool bypass_backoff = false;
-};
-
 RecoverySummary drain_pending_deliveries(
+    const std::string& drain_key,
+    const std::string& log_label,
     const std::string& state_dir,
-    std::function<PendingDeliveryDrainDecision(const std::string& channel,
-                                               const std::string& to)> matcher,
-    std::function<bool(const std::string& channel, const std::string& to,
-                       const std::vector<queue::MessagePayload>& payloads,
-                       bool skip_queue)> deliver_fn
+    std::function<PendingDeliveryDrainDecision(const DrainEntryInfo& entry)> matcher,
+    DrainDeliverFn deliver_fn
 ) {
-    RecoverySummary summary;
+    queue::RecoverySummary summary;
     auto now = now_ms();
 
-    // Prevent concurrent drains for the same state_dir
+    // Prevent concurrent drains for the same drain_key (对齐 OC: drainInProgress Map)
     {
         std::lock_guard<std::mutex> lock(drain_mu);
-        if (drain_in_progress.count(state_dir)) return summary;
-        drain_in_progress.insert(state_dir);
+        if (drain_in_progress.count(drain_key)) {
+            log()->info("{}: already in progress for {}, skipping", log_label, drain_key);
+            return summary;
+        }
+        drain_in_progress.insert(drain_key);
     }
 
     auto entries = load_pending_deliveries(state_dir);
@@ -268,7 +267,15 @@ RecoverySummary drain_pending_deliveries(
     for (const auto& entry : entries) {
         if (entry.id.empty()) continue;
 
-        auto decision = matcher(entry.channel, entry.to);
+        // 构造 DrainEntryInfo 传给 matcher（对齐 OC: selectEntry(entry) 传完整 entry）
+        DrainEntryInfo info;
+        info.channel     = entry.channel;
+        info.to          = entry.to;
+        info.account_id  = entry.account_id.value_or("");
+        info.last_error  = entry.last_error;
+        info.retry_count = entry.retry_count;
+
+        auto decision = matcher(info);
         if (!decision.match) continue;
 
         {
@@ -295,7 +302,7 @@ RecoverySummary drain_pending_deliveries(
             continue;
         }
 
-        // Check backoff (unless bypassed)
+        // Check backoff (unless bypassed — 对齐 OC: bypassBackoff)
         if (!decision.bypass_backoff &&
             !is_entry_eligible_for_recovery_retry(entry.retry_count, entry.last_attempt_at, now)) {
             summary.deferred_backoff++;
@@ -329,8 +336,12 @@ RecoverySummary drain_pending_deliveries(
 
     {
         std::lock_guard<std::mutex> lock(drain_mu);
-        drain_in_progress.erase(state_dir);
+        drain_in_progress.erase(drain_key);
     }
+
+    log()->info("{}: drain complete for {} — recovered={} failed={} deferred={}",
+                log_label, drain_key,
+                summary.recovered, summary.failed, summary.deferred_backoff);
 
     return summary;
 }

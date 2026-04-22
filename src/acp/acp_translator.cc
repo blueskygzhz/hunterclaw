@@ -89,11 +89,16 @@ AcpGatewayAgent::AcpGatewayAgent(gateway::GatewayClient* /*gw*/,
 AcpGatewayAgent::~AcpGatewayAgent() = default;
 
 // ── handleInitialize ─────────────────────────────────────────────────────────
+// ✅ 严格对齐 OC translator.ts:503-524 initialize response
 InitializeResponse AcpGatewayAgent::handle_initialize(const InitializeRequest& /*req*/) {
     InitializeResponse r;
-    r.protocol_version = ACP_PROTOCOL_VERSION;
-    r.agent = impl_->info;
-    r.commands = get_available_commands();
+    r.protocol_version = ACP_PROTOCOL_VERSION;  // integer = 1
+    r.agent = impl_->info;                        // agentInfo
+    // agentCapabilities 默认值（loadSession=true, prompt image/embedded=true）
+    // HunterClaw 目前不支持 audio/mcp-http/mcp-sse，与 OC 保持一致
+    r.agent_capabilities = AcpAgentCapabilities{};
+    r.auth_methods = {};                          // authMethods: [] (对齐 OC)
+    r.commands = get_available_commands();        // 兼容旧 HC 字段（OC 通过独立 sendAvailableCommands RPC 发送）
     return r;
 }
 
@@ -170,8 +175,15 @@ PromptResponse AcpGatewayAgent::handle_prompt(const PromptRequest& req,
     // This translation layer prepares the request; the response arrives via
     // handle_gateway_event() callbacks.
 
+    // ✅ 严格对齐 OC translator.ts:957-971 finishPrompt stopReason:
+    //   state=="final"        → "end_turn" (或 "max_tokens" if rawStopReason)
+    //   state=="aborted"      → "cancelled"
+    //   state=="error" refusal→ "refusal"
+    //   其他                   → "end_turn"
+    // ACP spec StopReason 枚举是 snake_case: "end_turn" | "max_tokens" | "cancelled" | "refusal"
+    // 旧实现返回 "endTurn"（camelCase）→ Cursor/Zed 等 ACP 客户端会拒绝
     PromptResponse r;
-    r.stop_reason = "endTurn";
+    r.stop_reason = "end_turn";
     return r;
 }
 
@@ -304,12 +316,27 @@ std::string AcpGatewayAgent::format_config_value_name(const std::string& v) {
     std::string r = v; r[0] = static_cast<char>(toupper(r[0])); return r;
 }
 
+// ✅ 严格对齐 OC translator.ts:957-971:
+//   Gateway → ACP StopReason 映射。ACP spec 枚举（snake_case）:
+//     "end_turn" | "max_tokens" | "cancelled" | "refusal"
+//
+// OC 逻辑:
+//   state === "final"   → rawStopReason === "max_tokens" ? "max_tokens" : "end_turn"
+//   state === "aborted" → "cancelled"
+//   state === "error"   → errorKind === "refusal" ? "refusal" : "end_turn"
+//
+// 此 helper 用于 Gateway 事件（chat.state / chat.stopReason）→ ACP StopReason 转换
 std::string AcpGatewayAgent::map_stop_reason(const std::string& g) {
-    if (g == "end_turn" || g == "stop") return "endTurn";
-    if (g == "tool_use") return "toolUse";
-    if (g == "max_tokens") return "maxOutputTokens";
-    if (g == "content_filtered") return "contentFiltered";
-    return "endTurn";
+    // aborted / cancelled
+    if (g == "aborted" || g == "cancelled" || g == "abort") return "cancelled";
+    // max_tokens
+    if (g == "max_tokens" || g == "length") return "max_tokens";
+    // refusal
+    if (g == "refusal" || g == "content_filtered" || g == "content_filter") return "refusal";
+    // end_turn (默认，对齐 OC 最终 fallback)
+    //   OC: "stop", "end_turn", "endTurn" 全归为 "end_turn"
+    //   tool_use 在 ACP spec 中不是合法 StopReason，按 OC 统一归到 "end_turn"
+    return "end_turn";
 }
 
 std::vector<ReplayChunk> AcpGatewayAgent::extract_replay_chunks(

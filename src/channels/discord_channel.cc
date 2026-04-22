@@ -3,6 +3,8 @@
 #include "hunterclaw/channels/discord_listener.h"
 #include "hunterclaw/channels/discord_message_handler.h"
 #include "hunterclaw/channels/discord_monitor.h"
+#include "hunterclaw/outbound/deliver.h"                // deliver_outbound_payloads
+#include "hunterclaw/outbound/delivery_queue_recovery.h" // drain_pending_deliveries
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -925,6 +927,50 @@ ChannelPlugin make_discord_plugin() {
             lifecycle_params.is_disallowed_intents_error = [](const std::string& err) -> bool {
                 return err.find("4014") != std::string::npos
                     || err.find("DisallowedIntents") != std::string::npos;
+            };
+
+            // ════════════════════════════════════════════════════════════════
+            // 严格对齐 OC: WhatsApp monitor.ts L297-314
+            //   void drainPendingDeliveries({
+            //     drainKey: `whatsapp:${normalizedAccountId}`,
+            //     selectEntry: (entry) => ({
+            //       match: entry.channel === "whatsapp" && entry.accountId === id,
+            //       bypassBackoff: isNoListenerReconnectError(entry.lastError),
+            //     }),
+            //   })
+            //
+            // HC Discord 对应：reconnect 成功后 drain channel="discord" +
+            // accountId=ctx.account_id 的积压。不使用 bypassBackoff（Discord
+            // 没有 WhatsApp 的 "No active listener" 语义）。
+            // ════════════════════════════════════════════════════════════════
+            auto drain_account_id = ctx.account_id;
+            auto drain_log = ctx.log;
+            lifecycle_params.on_reconnect_connected = [drain_account_id, drain_log]() {
+                outbound::drain_pending_deliveries(
+                    "discord:" + drain_account_id,
+                    "Discord reconnect drain",
+                    "",  // state_dir="" → resolve_state_dir() default
+                    [&drain_account_id](const outbound::DrainEntryInfo& entry)
+                        -> outbound::PendingDeliveryDrainDecision {
+                        return {
+                            /* match */         entry.channel == "discord" &&
+                                                entry.account_id == drain_account_id,
+                            /* bypass_backoff */ false
+                        };
+                    },
+                    [](const std::string& channel, const std::string& to,
+                       const std::vector<queue::MessagePayload>& payloads,
+                       bool skip_queue) -> bool {
+                        outbound::DeliverOutboundPayloadsParams params;
+                        params.channel   = channel;
+                        params.to        = to;
+                        params.skip_queue = skip_queue;
+                        // payloads
+                        params.payloads  = payloads;
+                        auto r = outbound::deliver_outbound_payloads(params);
+                        return r.is_ok();
+                    }
+                );
             };
 
             // Blocks until abort_signal fires or fatal error

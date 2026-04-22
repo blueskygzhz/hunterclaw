@@ -72,6 +72,9 @@ struct SpawnAcpContext {
     std::optional<std::string> agent_account_id;    // agentAccountId
     std::optional<std::string> agent_to;            // agentTo
     std::optional<std::string> agent_thread_id;     // agentThreadId
+    /// ✅ 对齐 OC SpawnAcpContext.agentGroupId
+    /// 用于 Telegram 等区分 group vs topic 的 channel
+    std::optional<std::string> agent_group_id;      // agentGroupId
     bool sandboxed = false;
 };
 
@@ -88,6 +91,11 @@ struct SpawnAcpResult {
     std::optional<std::string> stream_log_path; // streamLogPath
     std::optional<std::string> note;
     std::optional<std::string> error;
+    /// ✅ 对齐 OC SpawnAcpFailure.errorCode
+    /// 结构化错误码: "acp_disabled" | "requester_session_required" | "runtime_policy" |
+    ///   "thread_required" | "target_agent_required" | "agent_forbidden" |
+    ///   "thread_binding_invalid" | "cwd_resolution_failed" | "spawn_failed"
+    std::optional<std::string> error_code;
 };
 
 // ============================================================================
