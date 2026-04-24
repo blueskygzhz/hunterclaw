@@ -1,8 +1,6 @@
 #include "hunterclaw/react/abort_cutoff.h"
 #include "hunterclaw/sessions/session_manager.h"
 #include <chrono>
-#include <regex>
-#include <algorithm>
 #include <spdlog/spdlog.h>
 
 // 严格对齐 OpenClaw:
@@ -70,19 +68,20 @@ AbortCutoff resolve_abort_cutoff_from_context(
     const std::optional<std::string>& message_sid,
     std::optional<int64_t> timestamp_ms
 ) {
-    AbortCutoff cutoff;
-    cutoff.message_sid = normalize_optional_string(message_sid);
+    // 对齐 OC: normalizeOptionalString(ctx.MessageSidFull) ?? normalizeOptionalString(ctx.MessageSid)
+    auto normalized_sid = normalize_optional_string(message_sid);
 
+    // 对齐 OC: typeof ctx.Timestamp === "number" && Number.isFinite(ctx.Timestamp) ? ctx.Timestamp : undefined
+    std::optional<int64_t> ts;
     if (timestamp_ms.has_value() && *timestamp_ms > 0) {
-        cutoff.timestamp_ms = timestamp_ms;
-    } else {
-        // 对齐 OC: 如果没有提供 timestamp，使用当前时间
-        cutoff.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()
-        ).count();
+        ts = timestamp_ms;
     }
 
-    // 对齐 OC: 如果 messageSid 和 timestamp 都为空，返回空但仍有效的 cutoff
+    // 对齐 OC: if (!messageSid && timestamp === undefined) return undefined;
+    // HC: 返回空 cutoff（调用方通过 has_value() 判断是否有效）
+    AbortCutoff cutoff;
+    cutoff.message_sid = normalized_sid;
+    cutoff.timestamp_ms = ts;
     return cutoff;
 }
 

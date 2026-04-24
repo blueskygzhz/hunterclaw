@@ -248,11 +248,11 @@ std::optional<TaskRecord> TaskRegistry::find_task_by_run_id(const std::string& r
     std::lock_guard<std::mutex> lock(mutex_);
     auto matches = get_tasks_by_run_id_unlocked(run_id);
     if (matches.empty()) return std::nullopt;
-    // Prefer CLI runtime, then oldest
+    // 对齐 OC: pickPreferredRunIdTask — CLI runtime has higher priority (1 > 0), then oldest first
     std::sort(matches.begin(), matches.end(), [](const TaskRecord& a, const TaskRecord& b) {
         int pa = (a.runtime == TaskRuntime::CLI) ? 1 : 0;
         int pb = (b.runtime == TaskRuntime::CLI) ? 1 : 0;
-        if (pa != pb) return pa < pb;
+        if (pa != pb) return pa > pb;  // higher priority first
         return a.created_at < b.created_at;
     });
     return matches[0];
@@ -346,8 +346,16 @@ std::optional<TaskRecord> TaskRegistry::mark_task_terminal_by_id(
 
 std::optional<TaskRecord> TaskRegistry::mark_task_lost_by_id(
     const std::string& task_id, int64_t ended_at,
-    const std::optional<std::string>& error) {
-    return mark_task_terminal_by_id(task_id, TaskStatus::LOST, ended_at, error);
+    const std::optional<std::string>& error,
+    const std::optional<int64_t>& cleanup_after) {
+    // 对齐 OC: markTaskLostById — supports explicit cleanupAfter
+    TaskRecord patch;
+    patch.status = TaskStatus::LOST;
+    patch.ended_at = ended_at;
+    patch.last_event_at = ended_at;
+    if (error) patch.error = error;
+    if (cleanup_after) patch.cleanup_after = cleanup_after;
+    return update_task(task_id, patch);
 }
 
 std::optional<TaskRecord> TaskRegistry::set_task_progress_by_id(
@@ -377,7 +385,9 @@ std::vector<TaskRecord> TaskRegistry::mark_task_running_by_run_id(const std::str
 
 std::vector<TaskRecord> TaskRegistry::mark_task_terminal_by_run_id(
     const std::string& run_id, TaskStatus status, int64_t ended_at,
-    const std::optional<std::string>& error) {
+    const std::optional<std::string>& error,
+    const std::optional<std::string>& terminal_summary,
+    const std::optional<TaskTerminalOutcome>& terminal_outcome) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto matches = get_tasks_by_run_id_unlocked(run_id);
     std::vector<TaskRecord> updated;
@@ -388,6 +398,8 @@ std::vector<TaskRecord> TaskRegistry::mark_task_terminal_by_run_id(
         task.ended_at = ended_at;
         task.last_event_at = ended_at;
         if (error) task.error = error;
+        if (terminal_summary) task.terminal_summary = terminal_summary;
+        if (terminal_outcome) task.terminal_outcome = terminal_outcome;
         if (!task.cleanup_after) {
             task.cleanup_after = ended_at + DEFAULT_TASK_RETENTION_MS;
         }

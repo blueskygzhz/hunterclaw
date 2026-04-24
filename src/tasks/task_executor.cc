@@ -127,9 +127,10 @@ std::vector<TaskRecord> TaskExecutor::complete_task_run_by_run_id(
     const std::string& run_id, int64_t ended_at,
     const std::optional<std::string>& terminal_summary,
     const std::optional<TaskTerminalOutcome>& terminal_outcome) {
-    (void)terminal_summary;
-    (void)terminal_outcome;
-    return registry_->mark_task_terminal_by_run_id(run_id, TaskStatus::SUCCEEDED, ended_at);
+    // 对齐 OC: markTaskTerminalByRunId — pass terminal_summary and terminal_outcome through
+    return registry_->mark_task_terminal_by_run_id(
+        run_id, TaskStatus::SUCCEEDED, ended_at,
+        std::nullopt, terminal_summary, terminal_outcome);
 }
 
 std::vector<TaskRecord> TaskExecutor::fail_task_run_by_run_id(
@@ -152,17 +153,14 @@ TaskRegistry::CancelResult TaskExecutor::cancel_task_by_id(const std::string& ta
 std::vector<TaskRecord> TaskExecutor::record_task_progress_by_run_id(
     const std::string& run_id,
     const std::optional<std::string>& progress_summary) {
-    auto tasks = registry_->list_task_records();
-    std::vector<TaskRecord> updated;
-    for (const auto& task : tasks) {
-        if (task.run_id && trim(*task.run_id) == trim(run_id) && !is_terminal_task_status(task.status)) {
-            auto result = registry_->set_task_progress_by_id(task.task_id, progress_summary);
-            if (result) updated.push_back(*result);
-        }
-    }
-    return updated;
+    // 对齐 OC: recordTaskProgressByRunId — only update active (non-terminal) tasks
+    // Use find_task_by_run_id to locate the task, then update progress
+    auto task = registry_->find_task_by_run_id(run_id);
+    if (!task || is_active_task_status(task->status) == false) return {};
+    auto result = registry_->set_task_progress_by_id(task->task_id, progress_summary);
+    if (result) return {*result};
+    return {};
 }
-
 // ============================================================================
 // Task Status Snapshot
 // ============================================================================

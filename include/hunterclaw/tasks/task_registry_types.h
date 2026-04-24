@@ -103,7 +103,9 @@ inline std::string task_delivery_status_string(TaskDeliveryStatus s) {
 inline std::optional<TaskDeliveryStatus> task_delivery_status_from_string(const std::string& s) {
     if (s == "pending") return TaskDeliveryStatus::PENDING;
     if (s == "delivered") return TaskDeliveryStatus::DELIVERED;
+    if (s == "session_queued") return TaskDeliveryStatus::SESSION_QUEUED;
     if (s == "failed") return TaskDeliveryStatus::FAILED;
+    if (s == "parent_missing") return TaskDeliveryStatus::PARENT_MISSING;
     if (s == "not_applicable") return TaskDeliveryStatus::NOT_APPLICABLE;
     return std::nullopt;
 }

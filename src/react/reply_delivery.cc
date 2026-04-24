@@ -277,19 +277,22 @@ bool should_suppress_messaging_tool_replies(
 }
 
 // ============================================================================
-// 对齐 session-run-accounting.ts: deriveSessionTotalTokens
+// 对齐 agents/usage.ts:196-234: deriveSessionTotalTokens
+// OC: SessionEntry.totalTokens 是 prompt/context 快照，只含 input tokens
+// 不含 output tokens，不做 contextTokens 截断
 // ============================================================================
 std::optional<int64_t> derive_session_total_tokens(
     int64_t input_tokens,
     int64_t output_tokens,
     std::optional<int> context_tokens
 ) {
-    int64_t total = input_tokens + output_tokens;
-    if (context_tokens.has_value() && *context_tokens > 0) {
-        // Use context_tokens as the ceiling
-        total = std::min(total, static_cast<int64_t>(*context_tokens));
-    }
-    return total > 0 ? std::optional<int64_t>(total) : std::nullopt;
+    // 对齐 OC: derivePromptTokens = input + cacheRead + cacheWrite
+    // HC 没有 cacheRead/cacheWrite 分离，input_tokens 已包含 cache tokens
+    // output_tokens 不计入 totalTokens（OC 明确排除 completion tokens）
+    (void)output_tokens;
+    (void)context_tokens;  // OC: "Keep this value unclamped; display layers are responsible"
+    if (input_tokens <= 0) return std::nullopt;
+    return input_tokens;
 }
 
 } // namespace react

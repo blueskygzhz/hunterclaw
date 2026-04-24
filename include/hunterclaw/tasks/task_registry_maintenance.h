@@ -37,6 +37,7 @@ constexpr int64_t TASK_FLOW_RETENTION_MS = 7LL * 24 * 60 * 60 * 1000;  // 7 day 
 
 struct TaskRegistryMaintenanceSummary {
     int reconciled = 0;     // tasks marked as lost
+    int recovered = 0;      // tasks recovered before being marked lost (对齐 OC)
     int cleanup_stamped = 0; // terminal tasks given cleanupAfter timestamp
     int pruned = 0;          // expired tasks deleted
 };

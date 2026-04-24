@@ -96,7 +96,8 @@ public:
     /// Mark task lost by id (对齐 OC: markTaskLostById)
     std::optional<TaskRecord> mark_task_lost_by_id(
         const std::string& task_id, int64_t ended_at,
-        const std::optional<std::string>& error = std::nullopt);
+        const std::optional<std::string>& error = std::nullopt,
+        const std::optional<int64_t>& cleanup_after = std::nullopt);
 
     /// Set progress by id (对齐 OC: setTaskProgressById)
     std::optional<TaskRecord> set_task_progress_by_id(
@@ -109,7 +110,9 @@ public:
     /// Mark terminal by run id (对齐 OC: markTaskTerminalByRunId)
     std::vector<TaskRecord> mark_task_terminal_by_run_id(
         const std::string& run_id, TaskStatus status, int64_t ended_at,
-        const std::optional<std::string>& error = std::nullopt);
+        const std::optional<std::string>& error = std::nullopt,
+        const std::optional<std::string>& terminal_summary = std::nullopt,
+        const std::optional<TaskTerminalOutcome>& terminal_outcome = std::nullopt);
 
     // ──── Snapshot ────
 

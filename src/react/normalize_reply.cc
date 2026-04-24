@@ -92,7 +92,8 @@ std::optional<ReplyPayload> normalize_reply_payload(
         text = "";
     }
 
-    // 对齐 L85-96: heartbeat strip
+    // 对齐 L85-96: heartbeat strip (对齐 OC: shouldStripHeartbeat = opts.stripHeartbeat ?? true)
+    // HC: strip_heartbeat 默认值 true 已在 NormalizeReplyOptions 中设置，对齐 OC 默认行为
     if (opts.strip_heartbeat && !text.empty() && text.find("HEARTBEAT_OK") != std::string::npos) {
         auto stripped = strip_heartbeat_token(text);
         if (stripped.did_strip && opts.on_heartbeat_strip) {

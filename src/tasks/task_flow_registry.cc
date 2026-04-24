@@ -110,16 +110,22 @@ TaskFlowUpdateResult TaskFlowRegistry::update_flow_record_by_id_expected_revisio
         return {false, "revision_conflict", std::nullopt, it->second};
     }
     auto& current = it->second;
+    // 对齐 OC: applyFlowPatch — apply non-default fields; for nullable fields always apply
     if (patch.status != TaskFlowStatus::QUEUED) current.status = patch.status;
-    if (patch.current_step) current.current_step = patch.current_step;
-    if (patch.wait_json) current.wait_json = patch.wait_json;
-    if (patch.state_json) current.state_json = patch.state_json;
-    if (patch.blocked_task_id) current.blocked_task_id = patch.blocked_task_id;
-    if (patch.blocked_summary) current.blocked_summary = patch.blocked_summary;
+    if (patch.notify_policy != TaskNotifyPolicy::DONE_ONLY) current.notify_policy = patch.notify_policy;
+    if (!patch.goal.empty()) current.goal = patch.goal;
+    // Nullable fields: always apply from patch (supports explicit null/clear)
+    current.current_step = patch.current_step;
+    current.blocked_task_id = patch.blocked_task_id;
+    current.blocked_summary = patch.blocked_summary;
+    current.wait_json = patch.wait_json;
+    current.state_json = patch.state_json;
+    current.ended_at = patch.ended_at;
     if (patch.cancel_requested_at) current.cancel_requested_at = patch.cancel_requested_at;
-    if (patch.ended_at) current.ended_at = patch.ended_at;
+    if (patch.controller_id) current.controller_id = patch.controller_id;
     current.revision++;
-    current.updated_at = now_ms();
+    current.updated_at = patch.updated_at > 0 ? patch.updated_at : now_ms();
+    persist_upsert(current);
     return {true, std::nullopt, current};
 }
 
@@ -195,7 +201,10 @@ std::vector<TaskFlowRecord> TaskFlowRegistry::list_task_flows_for_owner_key(cons
 
 bool TaskFlowRegistry::delete_task_flow_record_by_id(const std::string& flow_id) {
     std::lock_guard<std::mutex> lock(mutex_);
-    return flows_.erase(flow_id) > 0;
+    if (flows_.erase(flow_id) == 0) return false;
+    // 对齐 OC: persistFlowDelete after erase
+    persist_delete(flow_id);
+    return true;
 }
 
 std::optional<TaskFlowRecord> TaskFlowRegistry::sync_flow_from_task(const TaskRecord& task) {
@@ -205,14 +214,34 @@ std::optional<TaskFlowRecord> TaskFlowRegistry::sync_flow_from_task(const TaskRe
     if (it == flows_.end()) return std::nullopt;
     auto& flow = it->second;
     if (flow.sync_mode != TaskFlowSyncMode::TASK_MIRRORED) return flow;
-    flow.status = derive_task_flow_status_from_task(task);
+    auto new_status = derive_task_flow_status_from_task(task);
+    flow.status = new_status;
     flow.goal = trim(task.label.value_or(trim(task.task)));
     if (flow.goal.empty()) flow.goal = "Background task";
     flow.updated_at = task.last_event_at.value_or(now_ms());
     flow.revision++;
+    // 对齐 OC: syncFlowFromTask — update blocked_task_id/blocked_summary and clear waitJson
+    if (new_status == TaskFlowStatus::BLOCKED) {
+        flow.blocked_task_id = task.task_id;
+        // resolve blocked_summary from terminal_summary or progress_summary
+        if (task.terminal_summary && !task.terminal_summary->empty()) {
+            flow.blocked_summary = task.terminal_summary;
+        } else if (task.progress_summary && !task.progress_summary->empty()) {
+            flow.blocked_summary = task.progress_summary;
+        } else {
+            flow.blocked_summary = std::nullopt;
+        }
+    } else {
+        flow.blocked_task_id = std::nullopt;
+        flow.blocked_summary = std::nullopt;
+    }
+    flow.wait_json = std::nullopt;  // 对齐 OC: waitJson: null
     if (is_terminal_flow_status(flow.status)) {
         flow.ended_at = task.ended_at.value_or(flow.updated_at);
+    } else {
+        flow.ended_at = std::nullopt;  // 对齐 OC: endedAt: null for non-terminal
     }
+    persist_upsert(flow);
     return flow;
 }
 
@@ -241,7 +270,11 @@ std::vector<TaskAuditFinding> list_task_audit_findings(
         if (task.delivery_status == TaskDeliveryStatus::FAILED && task.notify_policy != TaskNotifyPolicy::SILENT) {
             findings.push_back({TaskAuditSeverity::WARN, TaskAuditCode::DELIVERY_FAILED, task, age, "terminal update delivery failed"});
         }
-        if (is_terminal_task_status(task.status) && !task.cleanup_after) {
+        // 对齐 OC: missing_cleanup excludes queued/running/lost
+        if (task.status != TaskStatus::LOST &&
+            task.status != TaskStatus::QUEUED &&
+            task.status != TaskStatus::RUNNING &&
+            !task.cleanup_after) {
             findings.push_back({TaskAuditSeverity::WARN, TaskAuditCode::MISSING_CLEANUP, task, age, "terminal task is missing cleanupAfter"});
         }
     }

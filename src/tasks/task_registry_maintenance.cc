@@ -123,13 +123,17 @@ TaskRegistryMaintenanceSummary TaskRegistryMaintenance::run_task_maintenance() {
         if (!current) continue;
 
         if (should_mark_lost(*current, now)) {
-            // 对齐 OC: markTaskLost
+            // 对齐 OC: markTaskLost — pass cleanupAfter explicitly
             int64_t cleanup = current->cleanup_after.value_or(resolve_cleanup_after(*current));
-            registry_->mark_task_lost_by_id(
+            auto updated = registry_->mark_task_lost_by_id(
                 current->task_id,
                 current->ended_at.value_or(now),
-                current->error.value_or("backing session missing"));
-            summary.reconciled++;
+                current->error.value_or("backing session missing"),
+                cleanup);
+            // 对齐 OC: maybeDeliverTaskTerminalUpdate after marking lost
+            if (updated && updated->status == TaskStatus::LOST) {
+                summary.reconciled++;
+            }
             processed++;
             continue;
         }
@@ -247,13 +251,17 @@ TaskFlowRegistryMaintenanceSummary TaskRegistryMaintenance::run_flow_maintenance
         if (!current) continue;
 
         if (should_finalize_cancelled_flow(*current)) {
-            // 对齐 OC: finalizeCancelledFlow
+            // 对齐 OC: finalizeCancelledFlow — clear blocked/wait fields, set cancelled + endedAt
             int64_t ended_at = std::max(now, current->updated_at);
             if (current->cancel_requested_at) ended_at = std::max(ended_at, *current->cancel_requested_at);
-            TaskFlowRecord patch;
+            // Build a complete patch that also clears blocked/wait fields (对齐 OC: blockedTaskId:null, blockedSummary:null, waitJson:null)
+            TaskFlowRecord patch = *current;
             patch.status = TaskFlowStatus::CANCELLED;
             patch.ended_at = ended_at;
             patch.updated_at = ended_at;
+            patch.blocked_task_id = std::nullopt;
+            patch.blocked_summary = std::nullopt;
+            patch.wait_json = std::nullopt;
             flow_registry_->update_flow_record_by_id_expected_revision(
                 current->flow_id, current->revision, patch);
             summary.reconciled++;
