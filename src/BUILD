@@ -534,6 +534,52 @@ cc_library(
 )
 
 # ============================================================================
+# Hooks Library - Hook Registry, Hook Events (独立库，无循环依赖)
+# ============================================================================
+cc_library(
+    name = "hunterclaw_hooks",
+    srcs = glob(["hooks/*.cc"]),
+    deps = [
+        "//:hunterclaw_headers",
+        "@nlohmann_json//:json",
+    ],
+    copts = [
+        "-std=c++17",
+        "-Wall",
+        "-Wextra",
+        "-I/usr/include/spdlog",
+    ],
+    linkopts = [
+        "-lpthread",
+    ],
+    linkstatic = False,
+    visibility = ["//visibility:public"],
+)
+
+# ============================================================================
+# Routing Library - Agent Routing, Session Key Resolution (独立库，无循环依赖)
+# ============================================================================
+cc_library(
+    name = "hunterclaw_routing",
+    srcs = glob(["routing/*.cc"]),
+    deps = [
+        "//:hunterclaw_headers",
+        "@nlohmann_json//:json",
+    ],
+    copts = [
+        "-std=c++17",
+        "-Wall",
+        "-Wextra",
+        "-I/usr/include/spdlog",
+    ],
+    linkopts = [
+        "-lpthread",
+    ],
+    linkstatic = False,
+    visibility = ["//visibility:public"],
+)
+
+# ============================================================================
 # ACP Library - ACP Control Plane (对齐 OpenClaw acp/ control-plane/)
 # ============================================================================
 cc_library(
@@ -586,7 +632,7 @@ cc_library(
 # ============================================================================
 cc_library(
     name = "hunterclaw_agents",
-    srcs = glob(["agents/*.cc"]),
+    srcs = glob(["agents/*.cc"]) + glob(["auto_reply/*.cc"]),  # ✅ auto_reply 合并入 agents，避免循环依赖
     deps = [
         "//:hunterclaw_headers",
         ":hunterclaw_memory",
@@ -596,6 +642,9 @@ cc_library(
         ":hunterclaw_tools",   # ✅ 添加 tools 依赖 (ToolManager::create)
         ":hunterclaw_react",   # ✅ 添加 react 依赖 (ReactEngine::create)
         ":hunterclaw_mcp",     # ✅ 添加 mcp 依赖 (AgentInstance 自动启用 MCP)
+        ":hunterclaw_hooks",   # ✅ 添加 hooks 依赖 (auto_reply/message_dispatcher.cc)
+        ":hunterclaw_routing", # ✅ 添加 routing 依赖 (auto_reply/message_dispatcher.cc)
+        ":hunterclaw_acp",     # ✅ 添加 acp 依赖 (auto_reply/message_dispatcher.cc)
         "@ixwebsocket//:ixwebsocket",  # ✅ acp_spawn.cc 需要 gateway/client.h
         "@nlohmann_json//:json",
         "@com_google_absl//absl/status",
@@ -628,6 +677,7 @@ cc_library(
     deps = [
         "//:hunterclaw_headers",
         ":hunterclaw_observability",
+        ":hunterclaw_hooks",   # ✅ 添加 hooks 依赖 (deliver.cc)
         "@nlohmann_json//:json",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -659,12 +709,12 @@ cc_library(
         "context/*.cc",
         "plugins/*.cc",
         "process/*.cc",
-        "hooks/*.cc",
-        "routing/*.cc",
+        # ✅ hooks/*.cc 已移至独立的 hunterclaw_hooks 库
+        # ✅ routing/*.cc 已移至独立的 hunterclaw_routing 库
         "pairing/*.cc",
         "security/*.cc",
         "secrets/*.cc",
-        "auto_reply/*.cc",
+        # ✅ auto_reply/*.cc 已移至 hunterclaw_agents 的 srcs（避免循环依赖）
         # ✅ 移除 observability/*.cc - 已移至独立的 hunterclaw_observability 库
         # ✅ 移除 infra/*.cc - 已移至独立的 hunterclaw_infra 库
         "markdown/*.cc",
@@ -674,14 +724,17 @@ cc_library(
         "main.cc",
         # ✅ context/context_pruning.cc 已挪至 hunterclaw_react 以避免循环依赖
         "context/context_pruning.cc",
+        # ✅ auto_reply/*.cc 已全部移至 hunterclaw_agents
+        "auto_reply/session_lifecycle_supplement.cc",
     ]),
     deps = [
         ":hunterclaw_core_base",  # ✅ 依赖 core_base (core/*.cc)
         ":hunterclaw_logging",   # ✅ 添加 logging 依赖 (create_subsystem_logger)
         ":hunterclaw_acp",       # ✅ 添加 ACP 控制平面依赖
         ":hunterclaw_agents",    # ✅ 添加 agents 依赖
-        ":hunterclaw_cron",      # ✅ 添加 cron 依赖
-        ":hunterclaw_infra",     # ✅ 添加 infra 依赖 (heartbeat_runner 等)
+        ":hunterclaw_hooks",   # ✅ 添加 hooks 依赖
+        ":hunterclaw_routing", # ✅ 添加 routing 依赖
+        ":hunterclaw_cron",        ":hunterclaw_infra",     # ✅ 添加 infra 依赖 (heartbeat_runner 等)
         ":hunterclaw_gateway",   # ✅ 添加 gateway 依赖
         ":hunterclaw_memory",
         ":hunterclaw_llm",
@@ -694,7 +747,7 @@ cc_library(
         ":hunterclaw_observability",  # ✅ 添加 observability 依赖
         ":hunterclaw_outbound",  # ✅ 添加 outbound 依赖 (deliver_outbound_payloads)
         ":hunterclaw_queue",     # ✅ 添加 queue 依赖 (CommandQueue)
-        ":hunterclaw_tasks",     # ✅ 添加 tasks 依赖 (auto_reply/commands_tasks.cc)
+        ":hunterclaw_tasks",     # ✅ 添加 tasks 依赖
         "@ixwebsocket//:ixwebsocket",  # ✅ 添加 ixwebsocket 依赖
         "//:hunterclaw_headers",
         "//third_party:httplib",

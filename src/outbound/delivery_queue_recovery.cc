@@ -249,7 +249,7 @@ RecoverySummary drain_pending_deliveries(
     std::function<PendingDeliveryDrainDecision(const DrainEntryInfo& entry)> matcher,
     DrainDeliverFn deliver_fn
 ) {
-    queue::RecoverySummary summary;
+    RecoverySummary summary;
     auto now = now_ms();
 
     // Prevent concurrent drains for the same drain_key (对齐 OC: drainInProgress Map)
