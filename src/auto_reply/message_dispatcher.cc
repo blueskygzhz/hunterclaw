@@ -607,7 +607,7 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
     // ── Step 6: ACP dispatch ─────────────────────────────────────────────────
     // Aligned with openclaw: tryDispatchAcpReply (bypassForCommand passed through)
     if (config.dispatch.enable_acp) {
-        auto acp_result = try_dispatch_acp_reply(message, delivery_to);
+        auto acp_result = try_dispatch_acp_reply(message, delivery_to, bypass_acp_for_command);
         if (acp_result.handled) {
             result.success = true;
             log()->info("dispatch_reply_from_config: handled by ACP");
@@ -2339,18 +2339,22 @@ MessageDispatcher::FastAbortResult MessageDispatcher::try_fast_abort_from_messag
 
 MessageDispatcher::AcpDispatchResult MessageDispatcher::try_dispatch_acp_reply(
     const channels::InboundMessage& message,
-    const std::string& delivery_to
+    const std::string& delivery_to,
+    bool bypass_for_command
 ) {
     AcpDispatchResult result;
 
     const std::string& session_key = message.session_key;
-    if (session_key.empty()) {
+
+    // ── Guard: empty session key or command bypass ────────────────────────
+    // Aligned with openclaw: if (!sessionKey || params.bypassForCommand) return null
+    if (session_key.empty() || bypass_for_command) {
         return result;
     }
 
     // ── Step 1: acpManager.resolveSession ────────────────────────────────
     // Aligned with openclaw: acpManager.resolveSession({ cfg, sessionKey })
-    // 三态解析: none → fall through, stale → error, ready → run turn
+    // 三态解析: none → fall through, stale → deliver error + handled, ready → run turn
     acp::AcpSessionResolution resolution;
     try {
         resolution = acp::get_acp_session_manager().resolve_session(session_key);
@@ -2363,25 +2367,9 @@ MessageDispatcher::AcpDispatchResult MessageDispatcher::try_dispatch_acp_reply(
     if (resolution.kind == acp::AcpSessionResolution::Kind::None) {
         return result;  // Not an ACP session → fall through to normal dispatch
     }
-    if (resolution.kind == acp::AcpSessionResolution::Kind::Stale) {
-        log()->warn("try_dispatch_acp_reply: stale ACP session: session={} error={}",
-                    session_key, resolution.error ? resolution.error->what() : "unknown");
-        return result;  // Stale → fall through (OpenClaw throws, we're lenient)
-    }
 
-    // kind == Ready
-    const auto& acp_meta = *resolution.meta;
-    const std::string prompt_text = message.text;
-    if (prompt_text.empty()) {
-        log()->debug("try_dispatch_acp_reply: empty prompt for session={}", session_key);
-        return result;
-    }
-
-    log()->info("try_dispatch_acp_reply: routing to ACP session={} agent={}",
-                session_key, acp_meta.agent);
-
-    // ── Step 2: Build deliver function (channel → delivery queue) ────────
-    // Aligned with openclaw: delivery.deliver("block", payload) → channel.send()
+    // ── Build deliver_to_channel helper (shared by stale + ready paths) ──
+    // Aligned with openclaw: delivery.deliver("final", payload) → channel.send()
     auto captured_delivery_queue = delivery_queue_;
     auto captured_channel = message.channel;
     auto captured_to = delivery_to.empty() ? message.sender_id : delivery_to;
@@ -2418,6 +2406,38 @@ MessageDispatcher::AcpDispatchResult MessageDispatcher::try_dispatch_acp_reply(
         }
     };
 
+    // ── Stale path ────────────────────────────────────────────────────────
+    // Aligned with openclaw: acpResolution.kind === "stale" → deliver error text, markIdle
+    if (resolution.kind == acp::AcpSessionResolution::Kind::Stale) {
+        const auto& stale_error = resolution.error.value_or(
+            acp::AcpRuntimeError(acp::AcpErrorCode::ACP_SESSION_INIT_FAILED, "ACP session is stale")
+        );
+        log()->warn("try_dispatch_acp_reply: stale ACP session: session={} code={} error={}",
+                    session_key, stale_error.code_string(), stale_error.what());
+        // Aligned with openclaw: deliver error text to user
+        deliver_to_channel(acp::format_acp_runtime_error_text(stale_error));
+        // Aligned with openclaw: markIdle("message_completed") — log state transition
+        log()->debug("try_dispatch_acp_reply: markIdle session={} reason=message_completed (stale)",
+                     session_key);
+        result.handled = true;
+        return result;
+    }
+
+    // ── kind == Ready ─────────────────────────────────────────────────────
+    const auto& acp_meta = *resolution.meta;
+    const std::string prompt_text = message.text;
+    if (prompt_text.empty()) {
+        // Aligned with openclaw: empty prompt → recordProcessed("completed", "acp_empty_prompt") + markIdle
+        log()->debug("try_dispatch_acp_reply: empty prompt for session={}", session_key);
+        log()->debug("try_dispatch_acp_reply: markIdle session={} reason=message_completed (empty_prompt)",
+                     session_key);
+        result.handled = true;
+        return result;
+    }
+
+    log()->info("try_dispatch_acp_reply: routing to ACP session={} agent={}",
+                session_key, acp_meta.agent);
+
     // ── Step 3: Create AcpReplyProjector ─────────────────────────────────
     // Aligned with openclaw: createAcpReplyProjector (acp-projector.ts)
     acp::AcpReplyProjector::Config projector_config;
@@ -2440,17 +2460,26 @@ MessageDispatcher::AcpDispatchResult MessageDispatcher::try_dispatch_acp_reply(
     std::string captured_session_key = session_key;
     auto captured_projector = projector;
 
-    std::thread([captured_session_key, prompt_text, captured_projector, this]() mutable {
+    std::thread([captured_session_key, prompt_text, captured_projector,
+                 deliver_to_channel, this]() mutable {
+        const int64_t started_at = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count();
+
+        // Aligned with openclaw: markIdle("message_completed") — log state transition
+        // Note: ACP session state (idle/running) is managed internally by run_turn.
+        // markIdle here mirrors openclaw's logSessionStateChange call only.
+        auto mark_idle = [&](const std::string& reason) {
+            log()->debug("try_dispatch_acp_reply: markIdle session={} reason={}",
+                         captured_session_key, reason);
+        };
+
         try {
             acp::AcpRunTurnInput turn_input;
             turn_input.session_key = captured_session_key;
             turn_input.text = prompt_text;
             turn_input.mode = acp::AcpRuntimePromptMode::Prompt;
-            turn_input.request_id = captured_session_key + ":" + std::to_string(
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()
-                ).count()
-            );
+            turn_input.request_id = captured_session_key + ":" + std::to_string(started_at);
             // Aligned with openclaw: onEvent: projector.onEvent
             turn_input.on_event = [captured_projector](const acp::AcpRuntimeEvent& event) {
                 captured_projector->on_event(event);
@@ -2461,16 +2490,37 @@ MessageDispatcher::AcpDispatchResult MessageDispatcher::try_dispatch_acp_reply(
             // Aligned with openclaw: await projector.flush(true)
             captured_projector->flush(true);
 
-            log()->info("try_dispatch_acp_reply: ACP turn completed: session={}",
-                        captured_session_key);
+            const int64_t latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()
+            ).count() - started_at;
+            log()->info("try_dispatch_acp_reply: ACP turn completed: session={} latencyMs={}",
+                        captured_session_key, latency_ms);
+
+            // Aligned with openclaw: markIdle("message_completed")
+            mark_idle("message_completed");
         } catch (const acp::AcpRuntimeError& e) {
+            // Aligned with openclaw: catch → projector.flush(true) + deliver error text + markIdle
+            captured_projector->flush(true);
             log()->error("try_dispatch_acp_reply: ACP turn failed: session={} code={} error={}",
                          captured_session_key, e.code_string(), e.what());
-            captured_projector->flush(true);
+            deliver_to_channel(acp::format_acp_runtime_error_text(e));
+            mark_idle("message_completed");
         } catch (const std::exception& e) {
+            captured_projector->flush(true);
             log()->error("try_dispatch_acp_reply: ACP turn exception: session={} error={}",
                          captured_session_key, e.what());
+            // Wrap as ACP_TURN_FAILED and deliver to user
+            acp::AcpRuntimeError acp_err(acp::AcpErrorCode::ACP_TURN_FAILED, e.what());
+            deliver_to_channel(acp::format_acp_runtime_error_text(acp_err));
+            mark_idle("message_completed");
+        } catch (...) {
             captured_projector->flush(true);
+            log()->error("try_dispatch_acp_reply: ACP turn unknown exception: session={}",
+                         captured_session_key);
+            acp::AcpRuntimeError acp_err(acp::AcpErrorCode::ACP_TURN_FAILED,
+                                         "ACP turn failed before completion.");
+            deliver_to_channel(acp::format_acp_runtime_error_text(acp_err));
+            mark_idle("message_completed");
         }
     }).detach();
 

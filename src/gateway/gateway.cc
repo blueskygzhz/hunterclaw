@@ -27,6 +27,7 @@
 #include "hunterclaw/acp/acp_server.h"                       // ✅ ACP Server (对齐 OC: serveAcpGateway)
 #include "hunterclaw/acp/acp_translator.h"                   // ✅ AcpGatewayAgent (对齐 OC: translator.ts)
 #include "hunterclaw/acp/acp_persistent_bindings.h"          // ✅ ACP persistent bindings reconcile
+#include "hunterclaw/acp/acp_session_manager.h"              // ✅ AcpSessionManager singleton init
 #include <websocketpp/config/asio_no_tls.hpp>
 #include <websocketpp/server.hpp>
 #include <nlohmann/json.hpp>
@@ -2757,6 +2758,50 @@ core::Result<bool> GatewayServer::start() {
 
         if (acp_enabled) {
             try {
+                // Step 0: 初始化 AcpSessionManager singleton
+                // ✅ 严格对齐 OpenClaw: AcpSessionManager 是全局单例，在 gateway 启动时初始化。
+                // OpenClaw: getAcpSessionManager() 通过 module-level singleton 访问，
+                //   read_meta / write_meta 桥接到 session store 的 acp 字段。
+                // HunterClaw: 用 in-memory map 实现（对齐 OC: AcpSessionManager 内部也是内存状态）。
+                // 注意: 必须在 Step 7b (initialize_acp_spawn_runtime) 之前完成，
+                //       否则 acp_spawn.cc 调用 get_acp_session_manager() 会抛异常。
+                {
+                    // Shared in-memory ACP meta store (session_key → AcpSessionMeta)
+                    // Aligned with openclaw: AcpSessionManager stores meta in-process.
+                    auto acp_meta_store = std::make_shared<std::map<std::string, acp::AcpSessionMeta>>();
+                    auto acp_meta_mutex = std::make_shared<std::mutex>();
+
+                    acp::ReadSessionMetaFn read_meta = [acp_meta_store, acp_meta_mutex](
+                        const std::string& session_key
+                    ) -> std::optional<acp::AcpSessionMeta> {
+                        std::lock_guard<std::mutex> lock(*acp_meta_mutex);
+                        auto it = acp_meta_store->find(session_key);
+                        if (it == acp_meta_store->end()) return std::nullopt;
+                        return it->second;
+                    };
+
+                    acp::WriteSessionMetaFn write_meta = [acp_meta_store, acp_meta_mutex](
+                        const std::string& session_key,
+                        const std::optional<acp::AcpSessionMeta>& meta
+                    ) {
+                        std::lock_guard<std::mutex> lock(*acp_meta_mutex);
+                        if (meta.has_value()) {
+                            (*acp_meta_store)[session_key] = *meta;
+                        } else {
+                            acp_meta_store->erase(session_key);
+                        }
+                    };
+
+                    auto acp_mgr = std::make_shared<acp::AcpSessionManager>(
+                        std::move(read_meta),
+                        std::move(write_meta)
+                    );
+                    acp::AcpSessionManager::set_instance(acp_mgr);
+
+                    auto log = spdlog::get("default");
+                    if (log) log->info("[gateway] AcpSessionManager initialized");
+                }
+
                 // Step 1: 创建 InMemorySessionStore
                 // 对齐 OC: const store = createDefaultAcpSessionStore(opts)
                 int max_sessions = 5000;
@@ -2932,6 +2977,8 @@ core::Result<bool> GatewayServer::stop() {
     }
     // ✅ Aligned with openclaw: release ACP server resources on close
     // 对齐 OC server-close.ts: AcpGatewayAgent / AcpSessionStore 在 gateway 关停时释放
+    // 同时清理 AcpSessionManager singleton，避免悬空引用
+    acp::AcpSessionManager::set_instance(nullptr);
     impl_->acp_gateway_agent.reset();
     impl_->acp_session_store.reset();
     auto result = impl_->server_impl->stop();

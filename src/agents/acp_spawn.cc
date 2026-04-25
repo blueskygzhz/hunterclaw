@@ -260,12 +260,9 @@ AcpSpawnParentRelayHandle start_acp_spawn_parent_stream_relay(
     auto emit_start_notice_fn = [state, relay_label, context_prefix, child_session_key,
                                   run_id, emit]() {
         if (state->disposed.load()) return;
-    // Aligned with openclaw: recordTaskRunProgressByRunId({ runId, runtime:"acp", sessionKey, lastEventAt, eventSummary:"Started." })
-        // Note: tasks::record_task_run_progress_by_run_id is a best-effort call;
-        // if the tasks module is not yet initialized, this is silently ignored.
+        // Aligned with openclaw: recordTaskRunProgressByRunId({ runId, runtime:"acp", sessionKey, lastEventAt, eventSummary:"Started." })
         try {
-            // tasks::record_task_run_progress_by_run_id(run_id, "acp", child_session_key, ..., "Started.");
-            // TODO: wire up when tasks module is available
+            tasks::get_task_executor().record_task_progress_by_run_id(run_id, "Started.");
         } catch (...) {}
         emit(
             "Started " + relay_label + " session " + child_session_key +
@@ -316,7 +313,7 @@ AcpSpawnParentRelayHandle start_acp_spawn_parent_stream_relay(
             // Reset stall notifier
             if (state->stall_notified.exchange(false)) {
                 // Aligned with openclaw: recordTaskRunProgressByRunId + emit "resumed output"
-                // tasks::record_task_run_progress_by_run_id(run_id, "acp", child_session_key, ..., "Resumed output.");
+                try { tasks::get_task_executor().record_task_progress_by_run_id(run_id, relay_label + " resumed output."); } catch (...) {}
                 emit(relay_label + " resumed output.", context_prefix + ":resumed");
             }
 
@@ -373,7 +370,7 @@ AcpSpawnParentRelayHandle start_acp_spawn_parent_stream_relay(
                 done_text = relay_label + " run completed.";
             }
             // Aligned with openclaw: recordTaskRunProgressByRunId on end
-            // tasks::record_task_run_progress_by_run_id(run_id, "acp", child_session_key, ..., done_text);
+            try { tasks::get_task_executor().record_task_progress_by_run_id(run_id, done_text); } catch (...) {}
             emit(done_text, context_prefix + ":done");
             state->disposed.store(true);
             return;
@@ -394,7 +391,7 @@ AcpSpawnParentRelayHandle start_acp_spawn_parent_stream_relay(
                 ? (relay_label + " run failed.")
                 : (relay_label + " run failed: " + error_text);
             // Aligned with openclaw: recordTaskRunProgressByRunId on error
-            // tasks::record_task_run_progress_by_run_id(run_id, "acp", child_session_key, ..., fail_text);
+            try { tasks::get_task_executor().record_task_progress_by_run_id(run_id, fail_text); } catch (...) {}
             emit(fail_text, context_prefix + ":error");
             state->disposed.store(true);
         }
@@ -460,7 +457,7 @@ AcpSpawnParentRelayHandle start_acp_spawn_parent_stream_relay(
                     std::string stall_text = relay_label + " has produced no output for " +
                          std::to_string(secs) + "s. It may be waiting for interactive input.";
                     // Aligned with openclaw: recordTaskRunProgressByRunId on stall
-                    // tasks::record_task_run_progress_by_run_id(run_id, "acp", child_session_key, now, ...);
+                    try { tasks::get_task_executor().record_task_progress_by_run_id(run_id, stall_text); } catch (...) {}
                     emit(stall_text, context_prefix + ":stall");
                 }
             }
@@ -819,8 +816,23 @@ SpawnAcpResult spawn_acp_direct(
         // For now, use params.cwd directly (explicit cwd takes priority).
         std::optional<std::string> resolved_cwd = params.cwd;
         if (!resolved_cwd.has_value() || resolved_cwd->empty()) {
-            // TODO: inherit cwd from parent session via infra::resolve_spawned_workspace_inheritance
-            // resolved_cwd = infra::resolve_spawned_workspace_inheritance(target_agent_id, parent_session_key, params.cwd, cfg);
+            // Aligned with openclaw: resolveSpawnedWorkspaceInheritance
+            // Inherit cwd from parent ACP session meta if available.
+            if (!parent_session_key.empty()) {
+                try {
+                    auto parent_res = acp::get_acp_session_manager().resolve_session(parent_session_key);
+                    if (parent_res.kind == acp::AcpSessionResolution::Kind::Ready && parent_res.meta) {
+                        if (parent_res.meta->cwd.has_value() && !parent_res.meta->cwd->empty()) {
+                            resolved_cwd = parent_res.meta->cwd;
+                        } else if (parent_res.meta->runtime_options.cwd.has_value() &&
+                                   !parent_res.meta->runtime_options.cwd->empty()) {
+                            resolved_cwd = parent_res.meta->runtime_options.cwd;
+                        }
+                    }
+                } catch (...) {
+                    // AcpSessionManager not initialized or parent not an ACP session — skip
+                }
+            }
         }
         if (resolved_cwd.has_value() && !resolved_cwd->empty()) {
             if (params.cwd.has_value() && !params.cwd->empty()) {
@@ -925,18 +937,50 @@ SpawnAcpResult spawn_acp_direct(
     // Aligned with openclaw: resolveAcpSpawnStreamLogPath({ childSessionKey })
     std::optional<std::string> stream_log_path;
     if (effective_stream_to_parent && !parent_session_key.empty()) {
-        // Note: infra::resolve_acp_spawn_stream_log_path reads ACP session entry to find log path.
-        // TODO: wire up when ACP session store is available.
-        // stream_log_path = infra::resolve_acp_spawn_stream_log_path(session_key);
+        // Aligned with openclaw: resolveAcpSpawnStreamLogPath reads ACP session meta to find cwd,
+        // then builds: <cwd>/.hunterclaw/acp-spawn-logs/<session_key_hash>.jsonl
+        try {
+            auto child_res = acp::get_acp_session_manager().resolve_session(session_key);
+            std::string log_cwd;
+            if (child_res.kind == acp::AcpSessionResolution::Kind::Ready && child_res.meta) {
+                if (child_res.meta->cwd.has_value() && !child_res.meta->cwd->empty()) {
+                    log_cwd = *child_res.meta->cwd;
+                }
+            }
+            if (log_cwd.empty() && runtime_cwd.has_value()) {
+                log_cwd = *runtime_cwd;
+            }
+            if (!log_cwd.empty()) {
+                // Build log path: <cwd>/.hunterclaw/acp-spawn-logs/<session_key>.jsonl
+                // Sanitize session_key for use as filename (replace ':' with '_')
+                std::string safe_key = session_key;
+                std::replace(safe_key.begin(), safe_key.end(), ':', '_');
+                stream_log_path = log_cwd + "/.hunterclaw/acp-spawn-logs/" + safe_key + ".jsonl";
+            }
+        } catch (...) {}
     }
 
     // Aligned with openclaw: deliveryContextFromSession(parentEntry)
     // Routes system events to the correct thread/topic of the parent session.
     std::optional<json> parent_delivery_ctx;
     if (effective_stream_to_parent && !parent_session_key.empty()) {
-        // Note: delivery context is resolved from the parent session store entry.
-        // TODO: wire up when session store is available.
-        // parent_delivery_ctx = infra::delivery_context_from_session(parent_session_key, cfg);
+        // Aligned with openclaw: deliveryContextFromSession — build delivery context from
+        // the parent session's last known channel/to/accountId/threadId.
+        // In HunterClaw, this is available via the SpawnAcpContext (ctx) which carries
+        // the agent's current delivery context.
+        if (ctx.agent_channel.has_value() && !ctx.agent_channel->empty() &&
+            ctx.agent_to.has_value() && !ctx.agent_to->empty()) {
+            json dctx;
+            dctx["channel"] = *ctx.agent_channel;
+            dctx["to"] = *ctx.agent_to;
+            if (ctx.agent_account_id.has_value() && !ctx.agent_account_id->empty()) {
+                dctx["accountId"] = *ctx.agent_account_id;
+            }
+            if (ctx.agent_thread_id.has_value() && !ctx.agent_thread_id->empty()) {
+                dctx["threadId"] = *ctx.agent_thread_id;
+            }
+            parent_delivery_ctx = dctx;
+        }
     }
 
     AcpSpawnParentRelayHandle parent_relay;

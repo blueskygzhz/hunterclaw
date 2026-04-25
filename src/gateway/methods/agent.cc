@@ -10,6 +10,9 @@
 #include "hunterclaw/queue/delivery_queue.h"   // ✅ DeliveryQueue (deliver 函数)
 #include "hunterclaw/outbound/deliver.h"        // ✅ deliver_outbound_payloads
 #include "hunterclaw/tasks/task_executor.h"     // ✅ 对齐 OC: createRunningTaskRun for agent run tracking
+#include "hunterclaw/acp/acp_session_manager.h" // ✅ AcpSessionManager::run_turn (ACP subagent path)
+#include "hunterclaw/acp/acp_reply_projector.h" // ✅ AcpReplyProjector (event → channel delivery)
+#include "hunterclaw/acp/runtime_errors.h"      // ✅ AcpRuntimeError, format_acp_runtime_error_text
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 #include <thread>
@@ -224,6 +227,145 @@ core::Result<json> method_agent(
 
     auto agent = agent_pool->get_agent(session_key);
     if (!agent) {
+        // ── ACP Session Fast Path ─────────────────────────────────────────────
+        // Aligned with openclaw: dispatchAgentRunFromGateway → dispatch_reply_from_config
+        //   → Step 6: tryDispatchAcpReply → acpManager.runTurn
+        //
+        // When the remote Gateway receives an "agent" request from an ACP subagent,
+        // the session_key is of the form "agent:{target}:acp:{uuid}".
+        // There is NO AgentInstance in the local agent_pool for this session —
+        // the session lives in AcpSessionManager (initialized by acp_spawn.cc on the
+        // calling side, or by initialize_acp_spawn_runtime on the receiving side).
+        //
+        // Correct path: resolve_session → run_turn (bypasses ReactEngine entirely,
+        // because inference is handled by the remote ACP backend, e.g. Cursor/Zed).
+        try {
+            auto resolution = acp::get_acp_session_manager().resolve_session(session_key);
+            if (resolution.kind != acp::AcpSessionResolution::Kind::None) {
+                // This IS an ACP session (Ready or Stale) — handle it directly.
+                spdlog::get("default")->info(
+                    "[method_agent] ACP session fast path: session={} kind={}",
+                    session_key,
+                    resolution.kind == acp::AcpSessionResolution::Kind::Ready ? "ready" : "stale"
+                );
+
+                if (resolution.kind == acp::AcpSessionResolution::Kind::Stale) {
+                    // Stale: deliver error and return accepted (fire-and-forget semantics preserved)
+                    const auto& stale_err = resolution.error.value_or(
+                        acp::AcpRuntimeError(acp::AcpErrorCode::ACP_SESSION_INIT_FAILED,
+                                             "ACP session is stale"));
+                    spdlog::get("default")->warn(
+                        "[method_agent] Stale ACP session: session={} error={}",
+                        session_key, stale_err.what());
+                    // Return accepted — the error is surfaced via the ACP event stream,
+                    // not as a gateway-level failure (aligned with openclaw fire-and-forget).
+                    json accepted;
+                    accepted["run_id"] = idem;
+                    accepted["status"] = "accepted";
+                    accepted["acp_stale"] = true;
+                    return core::Result<json>::Ok(accepted);
+                }
+
+                // Ready: fire run_turn in background thread (aligned with openclaw async dispatch)
+                const std::string run_id = idem;
+                const std::string captured_session_key = session_key;
+                const std::string captured_message = message;
+                const std::string captured_run_id = run_id;
+                const std::string captured_deliver_channel = get_str("deliverChannel", "deliver_channel");
+                const std::string captured_deliver_to = get_str("deliverTo", "deliver_to");
+                const std::string captured_deliver_account_id = get_str("deliverAccountId", "deliver_account_id");
+                const std::string captured_deliver_thread_id = get_str("deliverThreadId", "deliver_thread_id");
+                const std::string captured_deliver_reply_to_id = get_str("deliverReplyToId", "deliver_reply_to_id");
+                auto captured_delivery_queue = server->delivery_queue();
+
+                // Build deliver_to_channel (same pattern as try_dispatch_acp_reply)
+                auto deliver_to_channel = [captured_delivery_queue,
+                                           captured_deliver_channel,
+                                           captured_deliver_to,
+                                           captured_deliver_account_id,
+                                           captured_deliver_thread_id,
+                                           captured_deliver_reply_to_id](const std::string& text) {
+                    if (!captured_delivery_queue || text.empty() ||
+                        captured_deliver_channel.empty() || captured_deliver_to.empty()) return;
+                    ::hunterclaw::queue::MessagePayload payload;
+                    payload.text = text;
+                    ::hunterclaw::outbound::DeliverOutboundPayloadsParams p;
+                    p.channel      = captured_deliver_channel;
+                    p.to           = captured_deliver_to;
+                    p.payloads     = {payload};
+                    p.delivery_queue = captured_delivery_queue;
+                    p.skip_queue   = false;
+                    p.best_effort  = true;
+                    p.silent       = false;
+                    if (!captured_deliver_account_id.empty()) p.account_id = captured_deliver_account_id;
+                    if (!captured_deliver_thread_id.empty())  p.thread_id  = captured_deliver_thread_id;
+                    if (!captured_deliver_reply_to_id.empty()) p.reply_to_id = captured_deliver_reply_to_id;
+                    (void)::hunterclaw::outbound::deliver_outbound_payloads(p);
+                };
+
+                std::thread([captured_session_key, captured_message, captured_run_id,
+                             deliver_to_channel]() mutable {
+                    const int64_t started_at = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+
+                    // Build projector (aligned with try_dispatch_acp_reply)
+                    acp::AcpReplyProjector::Config proj_cfg;
+                    proj_cfg.delivery_mode = acp::AcpDeliveryMode::Block;
+                    proj_cfg.should_send_tool_summaries = true;
+                    auto projector = std::make_shared<acp::AcpReplyProjector>(
+                        proj_cfg,
+                        [deliver_to_channel](const std::string&, const std::string& text,
+                                             const std::optional<acp::AcpProjectedDeliveryMeta>&) {
+                            deliver_to_channel(text);
+                        }
+                    );
+
+                    try {
+                        acp::AcpRunTurnInput turn_input;
+                        turn_input.session_key = captured_session_key;
+                        turn_input.text        = captured_message;
+                        turn_input.mode        = acp::AcpRuntimePromptMode::Prompt;
+                        turn_input.request_id  = captured_session_key + ":" + std::to_string(started_at);
+                        turn_input.on_event = [projector](const acp::AcpRuntimeEvent& ev) {
+                            projector->on_event(ev);
+                        };
+
+                        acp::get_acp_session_manager().run_turn(turn_input);
+                        projector->flush(true);
+
+                        const int64_t latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count() - started_at;
+                        spdlog::get("default")->info(
+                            "[method_agent] ACP turn completed: session={} latencyMs={}",
+                            captured_session_key, latency_ms);
+                    } catch (const acp::AcpRuntimeError& e) {
+                        projector->flush(true);
+                        spdlog::get("default")->error(
+                            "[method_agent] ACP turn failed: session={} code={} error={}",
+                            captured_session_key, e.code_string(), e.what());
+                        deliver_to_channel(acp::format_acp_runtime_error_text(e));
+                    } catch (const std::exception& e) {
+                        projector->flush(true);
+                        spdlog::get("default")->error(
+                            "[method_agent] ACP turn exception: session={} error={}",
+                            captured_session_key, e.what());
+                        acp::AcpRuntimeError acp_err(acp::AcpErrorCode::ACP_TURN_FAILED, e.what());
+                        deliver_to_channel(acp::format_acp_runtime_error_text(acp_err));
+                    }
+                }).detach();
+
+                json accepted;
+                accepted["run_id"] = run_id;
+                accepted["status"] = "accepted";
+                accepted["accepted_at"] = static_cast<int64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count());
+                return core::Result<json>::Ok(accepted);
+            }
+        } catch (...) {
+            // AcpSessionManager not initialized — fall through to normal error
+        }
+
         return core::Result<json>::Err("Agent not found for session: " + session_key);
     }
 
