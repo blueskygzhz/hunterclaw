@@ -3,6 +3,7 @@
 #include "hunterclaw/memory/memory_index_manager.h"  // MemoryIndexManager (openclaw manager.ts)
 #include "hunterclaw/core/utils.h"
 #include "hunterclaw/core/logging.h"
+#include "hunterclaw/infra/agent_events.h"  // ✅ 对齐 OpenClaw: infra/agent-events.ts
 #include "hunterclaw/react/react_engine.h"  // ✅ ReactEngine
 #include "hunterclaw/context/context_pruning.h"  // ✅ 对齐 OC: pi-hooks/context-pruning
 #include "hunterclaw/llm/llm_client.h"       // ✅ LLMClient
@@ -886,7 +887,34 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
         data["success"] = result.success;
         emit_lifecycle_event(AgentLifecyclePhase::ToolExecution, data);
     };
-    
+
+    // ✅ 严格对齐 OpenClaw: 桥接 ReactEngine 局部事件 → 全局 infra::AgentEvent 总线
+    // 参考: openclaw-analysis/src/infra/agent-events.ts: emitAgentEvent
+    //
+    // OpenClaw 链路:
+    //   ReactEngine delta → callbacks.on_agent_event → emitAgentEvent(runId, stream, data)
+    //   → 全局总线广播 → ParentStreamRelay::on_agent_event 触发
+    //   → flush_pending() → enqueue_system_event → 父 Agent 心跳唤醒
+    //
+    // 没有此桥接时:
+    //   - callbacks.on_agent_event 为 nullptr，ReactEngine 内部跳过
+    //   - infra::emit_agent_event 从未被调用
+    //   - ParentStreamRelay 订阅了全局总线但永远收不到事件
+    //   - ACP 父 Agent 无法感知子 Agent 进度，60s stall 检测触发告警
+    {
+        std::string current_run_id = ctx_.current_run_id.value_or("");
+        callbacks.on_agent_event = [current_run_id](const react::StreamCallbacks::AgentEvent& event) {
+            if (current_run_id.empty()) return;
+            infra::AgentEvent global_event;
+            global_event.run_id = current_run_id;
+            global_event.stream = event.stream;
+            // 将 core::JsonValue 转换为 nlohmann::json
+            global_event.data = nlohmann::json::parse(
+                event.data.dump(), nullptr, /*allow_exceptions=*/false);
+            infra::emit_agent_event(global_event);
+        };
+    }
+
     // ✅ 严格对齐 OpenClaw: 计算 transcript 路径
     // OpenClaw: transcriptIO.load(sessionKey) 在每次 run 前加载历史
     // workspace_dir = {base}/{agent_id}/sessions/{session_id}

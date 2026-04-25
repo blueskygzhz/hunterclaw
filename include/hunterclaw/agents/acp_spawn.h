@@ -42,6 +42,13 @@ struct AcpSpawnConfig {
     std::string acp_default_agent;              // acp.defaultAgent
     std::vector<std::string> acp_allowed_agents; // acp.allowedAgents
     int acp_max_concurrent_sessions = 10;       // acp.maxConcurrentSessions
+
+    // 🎯 对齐 OpenClaw: 跨进程 ACP 路由配置
+    // 当 acp_gateway_url 非空时，使用真正的 WebSocket GatewayClient 连接到远端 Gateway
+    // 当为空时，回退到同进程内 method_handler 调用（向后兼容）
+    std::string acp_gateway_url;                // e.g. "ws://127.0.0.1:18789"
+    std::string acp_gateway_token;              // auth token for remote gateway
+    std::string acp_gateway_instance_id;        // instance id for remote gateway
 };
 
 // ============================================================================

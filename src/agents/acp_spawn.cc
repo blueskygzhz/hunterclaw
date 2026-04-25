@@ -539,7 +539,71 @@ SpawnAcpResult spawn_acp_direct(
     // Aligned with openclaw: `agent:${targetAgentId}:acp:${crypto.randomUUID()}`
     const std::string session_key = "agent:" + target_agent_id + ":acp:" + generate_uuid();
 
-    if (!gw) {
+    // ── Step 6b: Resolve effective Gateway client ─────────────────────────
+    // 🎯 对齐 OpenClaw: 真正的跨进程 ACP 路由
+    //
+    // OpenClaw 设计:
+    //   callGateway("agent", params) 通过 WebSocket 连接发到另一个 Gateway 实例。
+    //   targetAgentId 决定路由到哪个远端 Gateway（不同进程/机器）。
+    //
+    // HunterClaw 实现:
+    //   - 如果 cfg.acp_gateway_url 非空: 创建真正的 WebSocket GatewayClient 连接到远端
+    //   - 否则: 使用传入的 gw（同进程内 method_handler，向后兼容）
+    //
+    // 注意: 远端 GatewayClient 在 spawn 完成后会被 stop()，因为 ACP 是 fire-and-forget。
+    // 父子通信通过 ParentStreamRelay（进程内事件总线）或 subagent announce（跨进程消息）完成。
+    std::shared_ptr<gateway::GatewayClient> effective_gw = gw;
+    std::shared_ptr<gateway::GatewayClient> remote_gw;  // owned by this spawn call
+
+    if (!cfg.acp_gateway_url.empty()) {
+        // 🎯 对齐 OC: 创建真正的 WebSocket GatewayClient 连接到远端 Gateway
+        gateway::GatewayClientOptions gw_opts;
+        gw_opts.url = cfg.acp_gateway_url;
+        gw_opts.client_name = "hunterclaw-acp-spawn";
+        gw_opts.client_version = "1.0.0";
+        gw_opts.mode = "headless";
+        gw_opts.role = "operator";
+        gw_opts.scopes = {"admin"};
+        if (!cfg.acp_gateway_token.empty()) {
+            gw_opts.token = cfg.acp_gateway_token;
+        }
+        if (!cfg.acp_gateway_instance_id.empty()) {
+            gw_opts.instance_id = cfg.acp_gateway_instance_id;
+        }
+        // 短超时的 tick watch（spawn 完成后立即 stop）
+        gw_opts.tick_watch_min_interval_ms = 60000;
+
+        auto gw_result = gateway::create_gateway_client(gw_opts);
+        if (!gw_result.is_ok()) {
+            return make_failure("error", "spawn_failed",
+                "Failed to create remote gateway client: " + gw_result.error,
+                session_key, spawn_mode);
+        }
+        remote_gw = gw_result.get();
+        remote_gw->start();
+
+        // Wait for connection (up to 10s)
+        // 🎯 对齐 OC: GatewayClient 连接是异步的，需要等待 hello.ok
+        constexpr int CONNECT_TIMEOUT_MS = 10000;
+        constexpr int POLL_INTERVAL_MS = 50;
+        int waited_ms = 0;
+        while (!remote_gw->is_connected() && waited_ms < CONNECT_TIMEOUT_MS) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(POLL_INTERVAL_MS));
+            waited_ms += POLL_INTERVAL_MS;
+        }
+        if (!remote_gw->is_connected()) {
+            remote_gw->stop();
+            return make_failure("error", "spawn_failed",
+                "Timeout connecting to remote gateway: " + cfg.acp_gateway_url,
+                session_key, spawn_mode);
+        }
+
+        effective_gw = remote_gw;
+        log()->info("spawn_acp_direct: using remote gateway {} for agent {}",
+            cfg.acp_gateway_url, target_agent_id);
+    }
+
+    if (!effective_gw) {
         return make_failure("error", "spawn_failed", "Gateway not available", session_key, spawn_mode);
     }
 

@@ -66,12 +66,10 @@ struct GatewayClientOptions {
     std::function<void(int64_t expected, int64_t received)> on_gap;
 };
 
-/// Pending RPC 请求
+/// Pending RPC 请求 (tracking only — actual delivery via response_callbacks_)
 struct PendingRequest {
     std::string id;
-    std::promise<nlohmann::json> promise;
-    bool expect_final = false;  // 对于流式响应
-    int64_t sent_at;
+    int64_t sent_at = 0;
 };
 
 /// Gateway 客户端 (100% 对齐 OpenClaw)
@@ -130,7 +128,6 @@ private:
     void handle_response(const ResponseFrame& res);
     
     // 连接管理 (100% 对齐 OpenClaw)
-    void schedule_reconnect();
     void send_connect();
     
     // 心跳监控 (100% 对齐 OpenClaw)
@@ -166,9 +163,14 @@ private:
     std::thread tick_watch_thread_;
     std::atomic<bool> tick_watch_running_{false};
     
-    // Pending 请求
+    // Pending 请求 (对齐 OC: waitForResponse map)
     mutable std::mutex pending_mutex_;
     std::map<std::string, std::shared_ptr<PendingRequest>> pending_;
+
+    // 🎯 对齐 OC: response callbacks — 真正的 WebSocket RPC 响应路由
+    // key = request id, value = callback(Result<json>)
+    mutable std::mutex response_callbacks_mutex_;
+    std::map<std::string, std::function<void(core::Result<nlohmann::json>)>> response_callbacks_;
     
     // 序列号追踪 (gap detection)
     std::optional<int64_t> last_seq_;
