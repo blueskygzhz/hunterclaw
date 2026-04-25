@@ -215,9 +215,11 @@ private:
         bool handled = false;
         std::string response;
     };
+    // Aligned with openclaw: bypassForCommand — commands skip ACP dispatch entirely
     AcpDispatchResult try_dispatch_acp_reply(
         const channels::InboundMessage& message,
-        const std::string& delivery_to = ""
+        const std::string& delivery_to = "",
+        bool bypass_for_command = false
     );
     // Legacy fallback when AcpSessionManager not initialized
     AcpDispatchResult try_dispatch_acp_reply_legacy(
