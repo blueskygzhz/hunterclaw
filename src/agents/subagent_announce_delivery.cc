@@ -89,7 +89,7 @@ bool is_cron_session_key(const std::string& session_key) {
     if (session_key.empty()) return false;
     auto parsed = AgentScopeManager::parse_agent_session_key(session_key);
     if (!parsed.has_value()) return false;
-    std::string rest = parsed->rest;
+    std::string rest = parsed->session_name;
     // lowercase
     std::transform(rest.begin(), rest.end(), rest.begin(),
         [](unsigned char c) { return std::tolower(c); });

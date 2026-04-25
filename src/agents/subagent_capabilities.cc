@@ -78,7 +78,7 @@ bool is_subagent_session_key(const std::string& key) {
     // Check rest after "agent:<id>:"
     auto parsed = AgentScopeManager::parse_agent_session_key(raw);
     if (!parsed.has_value()) return false;
-    std::string rest = normalize_optional_lowercase(parsed->rest);
+    std::string rest = normalize_optional_lowercase(parsed->session_name);
     return rest.find("subagent:") == 0;
 }
 
@@ -93,7 +93,7 @@ bool is_acp_session_key(const std::string& key) {
     if (lower.find("acp:") == 0) return true;
     auto parsed = AgentScopeManager::parse_agent_session_key(raw);
     if (!parsed.has_value()) return false;
-    std::string rest = normalize_optional_lowercase(parsed->rest);
+    std::string rest = normalize_optional_lowercase(parsed->session_name);
     return rest.find("acp:") == 0;
 }
 

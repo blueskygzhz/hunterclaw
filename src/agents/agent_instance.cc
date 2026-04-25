@@ -908,9 +908,7 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
             infra::AgentEvent global_event;
             global_event.run_id = current_run_id;
             global_event.stream = event.stream;
-            // 将 core::JsonValue 转换为 nlohmann::json
-            global_event.data = nlohmann::json::parse(
-                event.data.dump(), nullptr, /*allow_exceptions=*/false);
+            global_event.data = event.data.to_json();
             infra::emit_agent_event(global_event);
         };
     }
