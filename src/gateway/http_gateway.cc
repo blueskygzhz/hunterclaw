@@ -1,5 +1,7 @@
 #include "hunterclaw/gateway/http_gateway.h"
 #include "hunterclaw/gateway/http/openai_compat.h"
+#include "hunterclaw/acp/acp_translator.h"   // ✅ AcpGatewayAgent (ACP Server 路由)
+#include "hunterclaw/acp/runtime_errors.h"   // ✅ AcpRuntimeError
 #include "hunterclaw/gateway/session_device_id.h"  // ✅ Device ID 工具
 #include "hunterclaw/security/timing_safe.h"       // 🎯 OpenClaw 对齐: 常量时间比较
 #include "hunterclaw/core/utils.h"
@@ -539,6 +541,309 @@ void HttpGateway::setup_routes() {
         register_route("GET", "/v1/models", [this](const auto& req, auto& res) {
             handle_list_models(req, res);
         });
+    }
+
+    // ========== ACP Server Endpoints (🎯 OpenClaw 对齐) ==========
+    // 对齐 OC: src/acp/server.ts serveAcpGateway → HTTP POST /acp/:method
+    // 当 config.acp.enabled=true 且 AcpGatewayAgent 已初始化时，注册 ACP 路由
+    // ACP 客户端（Cursor/Zed 等 IDE）通过这些端点与 HunterClaw 通信
+    //
+    // 路由映射（对齐 OC translator.ts handle* 方法）:
+    //   POST /acp/initialize          → AcpGatewayAgent::handle_initialize
+    //   POST /acp/authenticate        → AcpGatewayAgent::handle_authenticate
+    //   POST /acp/new_session         → AcpGatewayAgent::handle_new_session
+    //   POST /acp/list_sessions       → AcpGatewayAgent::handle_list_sessions
+    //   POST /acp/load_session        → AcpGatewayAgent::handle_load_session
+    //   POST /acp/prompt              → AcpGatewayAgent::handle_prompt (SSE streaming)
+    //   POST /acp/set_session_mode    → AcpGatewayAgent::handle_set_session_mode
+    //   POST /acp/set_session_config_option → AcpGatewayAgent::handle_set_session_config_option
+    if (gateway_server_ && gateway_server_->acp_gateway_agent()) {
+        http_server_->Post("/acp/(.+)", [this](const auto& req, auto& res) {
+            handle_acp_request(req, res);
+        });
+        log_info("[HTTP Gateway] ACP server routes registered at /acp/*");
+    }
+}
+
+// ========== ACP Server Endpoint Implementation (🎯 OpenClaw 对齐) ==========
+// 对齐 OC: src/acp/server.ts serveAcpGateway HTTP handler
+// 所有 ACP 请求通过 POST /acp/:method 路由，body 为 JSON
+
+void HttpGateway::handle_acp_request(const httplib::Request& req, httplib::Response& res) {
+    auto acp_agent = gateway_server_ ? gateway_server_->acp_gateway_agent() : nullptr;
+    if (!acp_agent) {
+        res.status = 503;
+        res.set_header("Content-Type", "application/json; charset=utf-8");
+        res.set_content(R"({"error":"ACP server not enabled"})", "application/json");
+        return;
+    }
+
+    // 解析 method 路径参数
+    std::string method = req.matches.size() > 1 ? req.matches[1].str() : "";
+    if (method.empty()) {
+        res.status = 400;
+        res.set_header("Content-Type", "application/json; charset=utf-8");
+        res.set_content(R"({"error":"Missing ACP method"})", "application/json");
+        return;
+    }
+
+    // 解析请求 body
+    json body;
+    try {
+        if (!req.body.empty()) {
+            body = json::parse(req.body);
+        } else {
+            body = json::object();
+        }
+    } catch (const std::exception& e) {
+        res.status = 400;
+        res.set_header("Content-Type", "application/json; charset=utf-8");
+        json err = {{"error", std::string("Invalid JSON: ") + e.what()}};
+        res.set_content(err.dump(), "application/json");
+        return;
+    }
+
+    // 分发到对应的 AcpGatewayAgent 处理函数
+    // 对齐 OC: translator.ts 各 handle* 方法
+    try {
+        json response;
+
+        if (method == "initialize") {
+            // 对齐 OC: handleInitialize(req) → { protocolVersion, agentInfo, agentCapabilities, authMethods }
+            acp::InitializeRequest init_req;
+            init_req.client_name = body.value("clientName", "");
+            init_req.client_version = body.value("clientVersion", "");
+            auto r = acp_agent->handle_initialize(init_req);
+            response = {
+                {"protocolVersion", r.protocol_version},
+                {"agentInfo", {
+                    {"name", r.agent.name},
+                    {"title", r.agent.title},
+                    {"version", r.agent.version}
+                }},
+                {"agentCapabilities", {
+                    {"loadSession", r.agent_capabilities.load_session},
+                    {"promptCapabilities", {
+                        {"image", r.agent_capabilities.prompt_image},
+                        {"audio", r.agent_capabilities.prompt_audio},
+                        {"embeddedContext", r.agent_capabilities.prompt_embedded_context}
+                    }},
+                    {"mcpCapabilities", {
+                        {"http", r.agent_capabilities.mcp_http},
+                        {"sse", r.agent_capabilities.mcp_sse}
+                    }},
+                    {"sessionCapabilities", {
+                        {"list", json::object()}
+                    }}
+                }},
+                {"authMethods", r.auth_methods},
+                {"commands", r.commands}
+            };
+
+        } else if (method == "authenticate") {
+            // 对齐 OC: handleAuthenticate(req) → { authenticated }
+            acp::AuthenticateRequest auth_req;
+            auth_req.token = body.value("token", "");
+            auto r = acp_agent->handle_authenticate(auth_req);
+            response = {{"authenticated", r.authenticated}};
+
+        } else if (method == "new_session") {
+            // 对齐 OC: handleNewSession(req) → { sessionId, configOptions, modes }
+            acp::NewSessionRequest ns_req;
+            ns_req.cwd = body.value("cwd", ".");
+            ns_req.meta = body.value("meta", json::object());
+            auto r = acp_agent->handle_new_session(ns_req);
+            json config_opts = json::array();
+            for (const auto& opt : r.config_options) {
+                json o = {{"type", opt.type}, {"id", opt.id}, {"name", opt.name},
+                          {"category", opt.category}, {"description", opt.description},
+                          {"currentValue", opt.current_value}};
+                json opts_arr = json::array();
+                for (const auto& v : opt.options) opts_arr.push_back({{"value", v.value}, {"name", v.name}});
+                o["options"] = opts_arr;
+                config_opts.push_back(o);
+            }
+            json modes_arr = json::array();
+            for (const auto& m : r.modes.available_modes) {
+                modes_arr.push_back({{"id", m.id}, {"name", m.name}, {"description", m.description}});
+            }
+            response = {
+                {"sessionId", r.session_id},
+                {"configOptions", config_opts},
+                {"modes", {{"currentModeId", r.modes.current_mode_id}, {"availableModes", modes_arr}}}
+            };
+
+        } else if (method == "list_sessions") {
+            // 对齐 OC: handleListSessions(req) → { sessions }
+            acp::ListSessionsRequest ls_req;
+            ls_req.limit = body.value("limit", 50);
+            auto r = acp_agent->handle_list_sessions(ls_req);
+            json sessions_arr = json::array();
+            for (const auto& s : r.sessions) {
+                sessions_arr.push_back({{"sessionId", s.session_id}, {"title", s.title}, {"updatedAt", s.updated_at}});
+            }
+            response = {{"sessions", sessions_arr}};
+
+        } else if (method == "load_session") {
+            // 对齐 OC: handleLoadSession(req) → { sessionId, configOptions, modes, replayChunks }
+            acp::LoadSessionRequest load_req;
+            load_req.session_id = body.value("sessionId", "");
+            load_req.replay = body.value("replay", false);
+            auto r = acp_agent->handle_load_session(load_req);
+            json config_opts = json::array();
+            for (const auto& opt : r.config_options) {
+                json o = {{"type", opt.type}, {"id", opt.id}, {"name", opt.name},
+                          {"category", opt.category}, {"description", opt.description},
+                          {"currentValue", opt.current_value}};
+                json opts_arr = json::array();
+                for (const auto& v : opt.options) opts_arr.push_back({{"value", v.value}, {"name", v.name}});
+                o["options"] = opts_arr;
+                config_opts.push_back(o);
+            }
+            json modes_arr = json::array();
+            for (const auto& m : r.modes.available_modes) {
+                modes_arr.push_back({{"id", m.id}, {"name", m.name}, {"description", m.description}});
+            }
+            json replay_arr = json::array();
+            for (const auto& chunk : r.replay_chunks) {
+                replay_arr.push_back({{"sessionUpdate", chunk.session_update}, {"text", chunk.text}});
+            }
+            response = {
+                {"sessionId", r.session_id},
+                {"configOptions", config_opts},
+                {"modes", {{"currentModeId", r.modes.current_mode_id}, {"availableModes", modes_arr}}},
+                {"replayChunks", replay_arr}
+            };
+
+        } else if (method == "prompt") {
+            // 对齐 OC: handlePrompt(req) → SSE stream or { stopReason, text }
+            // 检查是否请求 SSE 流式响应
+            bool wants_sse = false;
+            auto accept_it = req.headers.find("Accept");
+            if (accept_it != req.headers.end()) {
+                wants_sse = accept_it->second.find("text/event-stream") != std::string::npos;
+            }
+
+            acp::PromptRequest prompt_req;
+            prompt_req.session_id = body.value("sessionId", "");
+            prompt_req.text = body.value("text", "");
+            prompt_req.idempotency_key = body.value("idempotencyKey", "");
+            if (body.contains("attachments") && body["attachments"].is_array()) {
+                for (const auto& att : body["attachments"]) {
+                    acp::PromptAttachment a;
+                    a.type = att.value("type", "");
+                    a.mime_type = att.value("mimeType", "");
+                    a.content = att.value("content", "");
+                    prompt_req.attachments.push_back(std::move(a));
+                }
+            }
+
+            if (wants_sse) {
+                // SSE 流式响应
+                // 对齐 OC: translator.ts handlePrompt → streamPromptResponse
+                res.set_header("Content-Type", "text/event-stream; charset=utf-8");
+                res.set_header("Cache-Control", "no-cache");
+                res.set_header("Connection", "keep-alive");
+                res.set_header("X-Accel-Buffering", "no");
+
+                std::string sse_body;
+                acp::PromptStreamCallback stream_cb = [&sse_body](const std::string& event, const std::string& data) {
+                    sse_body += "event: " + event + "\ndata: " + data + "\n\n";
+                };
+
+                auto r = acp_agent->handle_prompt(prompt_req, stream_cb);
+                // 发送最终 done 事件
+                json done_evt = {{"stopReason", r.stop_reason}, {"text", r.text}};
+                sse_body += "event: done\ndata: " + done_evt.dump() + "\n\n";
+                res.status = 200;
+                res.set_content(sse_body, "text/event-stream");
+            } else {
+                // 非流式响应
+                auto r = acp_agent->handle_prompt(prompt_req);
+                response = {{"stopReason", r.stop_reason}, {"text", r.text}};
+                res.status = 200;
+                res.set_header("Content-Type", "application/json; charset=utf-8");
+                res.set_content(response.dump(), "application/json");
+            }
+            return;  // prompt 路径已直接设置响应，提前返回
+
+        } else if (method == "set_session_mode") {
+            // 对齐 OC: handleSetSessionMode(req) → { modes, configOptions }
+            acp::SetSessionModeRequest mode_req;
+            mode_req.session_id = body.value("sessionId", "");
+            mode_req.mode_id = body.value("modeId", "");
+            auto r = acp_agent->handle_set_session_mode(mode_req);
+            json config_opts = json::array();
+            for (const auto& opt : r.config_options) {
+                json o = {{"type", opt.type}, {"id", opt.id}, {"name", opt.name},
+                          {"category", opt.category}, {"description", opt.description},
+                          {"currentValue", opt.current_value}};
+                json opts_arr = json::array();
+                for (const auto& v : opt.options) opts_arr.push_back({{"value", v.value}, {"name", v.name}});
+                o["options"] = opts_arr;
+                config_opts.push_back(o);
+            }
+            json modes_arr = json::array();
+            for (const auto& m : r.modes.available_modes) {
+                modes_arr.push_back({{"id", m.id}, {"name", m.name}, {"description", m.description}});
+            }
+            response = {
+                {"modes", {{"currentModeId", r.modes.current_mode_id}, {"availableModes", modes_arr}}},
+                {"configOptions", config_opts}
+            };
+
+        } else if (method == "set_session_config_option") {
+            // 对齐 OC: handleSetSessionConfigOption(req) → { configOptions, modes }
+            acp::SetSessionConfigOptionRequest cfg_req;
+            cfg_req.session_id = body.value("sessionId", "");
+            cfg_req.option_id = body.value("optionId", "");
+            cfg_req.value = body.value("value", "");
+            auto r = acp_agent->handle_set_session_config_option(cfg_req);
+            json config_opts = json::array();
+            for (const auto& opt : r.config_options) {
+                json o = {{"type", opt.type}, {"id", opt.id}, {"name", opt.name},
+                          {"category", opt.category}, {"description", opt.description},
+                          {"currentValue", opt.current_value}};
+                json opts_arr = json::array();
+                for (const auto& v : opt.options) opts_arr.push_back({{"value", v.value}, {"name", v.name}});
+                o["options"] = opts_arr;
+                config_opts.push_back(o);
+            }
+            json modes_arr = json::array();
+            for (const auto& m : r.modes.available_modes) {
+                modes_arr.push_back({{"id", m.id}, {"name", m.name}, {"description", m.description}});
+            }
+            response = {
+                {"configOptions", config_opts},
+                {"modes", {{"currentModeId", r.modes.current_mode_id}, {"availableModes", modes_arr}}}
+            };
+
+        } else {
+            // 未知 ACP 方法
+            res.status = 404;
+            res.set_header("Content-Type", "application/json; charset=utf-8");
+            json err = {{"error", "Unknown ACP method: " + method}};
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+
+        res.status = 200;
+        res.set_header("Content-Type", "application/json; charset=utf-8");
+        res.set_content(response.dump(), "application/json");
+
+    } catch (const acp::AcpRuntimeError& e) {
+        // 对齐 OC: ACP 协议错误 → 4xx/5xx with { error, code }
+        int status = 400;
+        if (e.code == acp::AcpErrorCode::ACP_SESSION_INIT_FAILED) status = 404;
+        res.status = status;
+        res.set_header("Content-Type", "application/json; charset=utf-8");
+        json err = {{"error", e.what()}, {"code", e.code_string()}};
+        res.set_content(err.dump(), "application/json");
+    } catch (const std::exception& e) {
+        res.status = 500;
+        res.set_header("Content-Type", "application/json; charset=utf-8");
+        json err = {{"error", e.what()}};
+        res.set_content(err.dump(), "application/json");
     }
 }
 

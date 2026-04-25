@@ -30,6 +30,13 @@ class AgentPool;
 }
 
 namespace hunterclaw {
+namespace acp {
+class AcpGatewayAgent;
+class AcpSessionStore;
+}
+}
+
+namespace hunterclaw {
 namespace auto_reply {
 class MessageDispatcher;
 }
@@ -440,6 +447,12 @@ public:
     // exec.approval.request/waitDecision/resolve 通过此访问器获取 manager
     // 对应 OpenClaw: createExecApprovalHandlers(manager, { forwarder })
     std::shared_ptr<ExecApprovalManager> exec_approval_manager() const;
+
+    // ✅ ACP Server access (对齐 OpenClaw: serveAcpGateway / AcpGatewayAgent)
+    // 当 config.acp.enabled=true 时，在 start() 中初始化
+    // 对应 OpenClaw: gateway.cc → serveAcpGateway({ gateway, store, opts })
+    std::shared_ptr<acp::AcpGatewayAgent> acp_gateway_agent() const;
+    std::shared_ptr<acp::AcpSessionStore> acp_session_store() const;
 
 private:
     struct Impl;

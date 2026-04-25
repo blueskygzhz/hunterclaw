@@ -237,6 +237,11 @@ private:
     
     /// POST /hooks/:mapping - Webhook hook endpoint
     void handle_webhook_hook(const httplib::Request& req, httplib::Response& res);
+
+    // ========== ACP Server Endpoints (🎯 OpenClaw 对齐) ==========
+
+    /// POST /acp/:method - ACP protocol handler (对齐 OC: serveAcpGateway)
+    void handle_acp_request(const httplib::Request& req, httplib::Response& res);
     
     // ========== Helper Methods ==========
     

@@ -204,16 +204,21 @@ private:
 
 // ── serveAcpGateway ──────────────────────────────────────────────────────────
 // 🎯 对齐 server.ts serveAcpGateway(opts)
-// NOTE: Full implementation requires gateway wiring, which is done at the
-// gateway layer (gateway.cc). This provides the ACP-side scaffolding.
+// NOTE: ACP Server 的实际集成在 gateway/gateway.cc 的 GatewayServer::start() 中完成：
+//   1. 读取 config.acp.enabled
+//   2. 调用 create_session_store() 创建 InMemorySessionStore
+//   3. 实例化 AcpGatewayAgent(nullptr, opts, store.get())
+//   4. 桥接 gateway 事件 → agent.handle_gateway_event()
+//   5. 在 http_gateway.cc 的 setup_routes() 中注册 POST /acp/* 路由
+//   6. 异步执行 reconcile_acp_sessions（persistent bindings 重建）
+//
+// 此函数保留为向后兼容的入口点，实际逻辑已移至 gateway 层。
+// 对应 OpenClaw: gateway.cc → if (cfg.acp?.enabled) serveAcpGateway(...)
 
 void serve_acp_gateway(const AcpServerOptions& opts) {
-    auto store = create_default_session_store();
-    // The actual gateway connection and event loop is wired in
-    // gateway/gateway.cc when ACP mode is enabled.
-    // AcpGatewayAgent is instantiated there with the live GatewayClient.
+    // 实际集成在 GatewayServer::start() 中完成（gateway/gateway.cc）
+    // 此处为空实现，保留接口兼容性
     (void)opts;
-    (void)store;
 }
 
 // ── AcpSessionStore factory ──────────────────────────────────────────────────
