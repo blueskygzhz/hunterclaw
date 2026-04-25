@@ -83,18 +83,20 @@ void safe_finalize_subagent_task_run(
     int64_t ended_at
 ) {
     try {
-        // 获取 gateway server 的 task_executor（通过全局 gateway 引用）
-        // 简化方式：直接通过 gateway::GatewayServer 静态获取（如果可用）
-        // 注意：这里使用 try/catch 容错，task 失败不应影响 subagent 生命周期
-        // 对齐 OC: completeTaskRunByRunId / failTaskRunByRunId 是 module-level 函数
-        // HC 中 TaskExecutor 需要通过 gateway server 获取
-        // TODO: 当 HC 有全局 task_executor 单例时，可简化此调用
-        (void)run_id;
-        (void)child_session_key;
-        (void)has_error;
-        (void)error_message;
-        (void)ended_at;
-        // 当前通过 SubagentRegistry 的 task_executor_ 成员实现（见下方 set_task_executor）
+        // Aligned with openclaw: safeFinalizeSubagentTaskRun
+        //   → completeTaskRunByRunId / failTaskRunByRunId
+        auto& executor = tasks::get_task_executor();
+        if (has_error) {
+            // Aligned with openclaw: failTaskRunByRunId(runId, endedAt, error)
+            executor.fail_task_run_by_run_id(
+                run_id, ended_at,
+                error_message.empty() ? std::nullopt : std::make_optional(error_message)
+            );
+        } else {
+            // Aligned with openclaw: completeTaskRunByRunId(runId, endedAt)
+            executor.complete_task_run_by_run_id(run_id, ended_at);
+        }
+        (void)child_session_key;  // used for logging in openclaw, not needed here
     } catch (...) {
         // Task record 更新失败不应阻止 subagent 生命周期
     }
@@ -1390,81 +1392,21 @@ core::Result<std::string> SubagentSpawner::spawn(
     if (subagent_instance) {
         // 构建子 Agent 的任务消息
         // ✅ 对齐 OpenClaw: buildSubagentSystemPrompt
-        // 严格对齐 openclaw subagent-announce.ts:buildSubagentSystemPrompt
-        // 包含: # Subagent Context, ## Your Role, ## Rules, ## Output Format,
-        //       ## What You DON'T Do, ## Sub-Agent Spawning (if canSpawn), ## Session Context
-        bool can_spawn = child_depth.can_spawn_child();
-        std::string parent_label = child_depth.depth >= 2 ? "parent orchestrator" : "main agent";
-        std::string task_text = options.prompt.empty() ? "{{TASK_DESCRIPTION}}" : options.prompt;
-        // trim task_text
-        {
-            auto s = task_text.find_first_not_of(" \t\n\r");
-            auto e = task_text.find_last_not_of(" \t\n\r");
-            if (s != std::string::npos) task_text = task_text.substr(s, e - s + 1);
-        }
-        // replace multiple spaces with single space
-        {
-            std::string tmp;
-            bool prev_space = false;
-            for (char c : task_text) {
-                if (c == ' ' || c == '\t') {
-                    if (!prev_space) tmp += ' ';
-                    prev_space = true;
-                } else {
-                    tmp += c;
-                    prev_space = false;
-                }
-            }
-            task_text = tmp;
-        }
+        // 调用 subagent_system_prompt.cc 中的标准实现，严格对齐 openclaw subagent-system-prompt.ts
+        constexpr int DEFAULT_MAX_SPAWN_DEPTH = 5;
+        std::string system_prompt = build_subagent_system_prompt(
+            requester_run_id,
+            subagent_run_id,
+            options.label.empty() ? std::nullopt : std::make_optional(options.label),
+            options.prompt.empty() ? std::nullopt : std::make_optional(options.prompt),
+            child_depth.depth,
+            DEFAULT_MAX_SPAWN_DEPTH,
+            /*acp_enabled=*/false  // subagent spawner does not enable ACP by default
+        );
 
-        std::string child_task_message =
-            "# Subagent Context\n\n"
-            "You are a **subagent** spawned by the " + parent_label + " for a specific task.\n\n"
-            "## Your Role\n"
-            "- You were created to handle: " + task_text + "\n"
-            "- Complete this task. That's your entire purpose.\n"
-            "- You are NOT the " + parent_label + ". Don't try to be.\n\n"
-            "## Rules\n"
-            "1. **Stay focused** - Do your assigned task, nothing else\n"
-            "2. **Complete the task** - Your final message will be automatically reported to the " + parent_label + "\n"
-            "3. **Don't initiate** - No heartbeats, no proactive actions, no side quests\n"
-            "4. **Be ephemeral** - You may be terminated after task completion. That's fine.\n"
-            "5. **Trust push-based completion** - Descendant results are auto-announced back to you; do not busy-poll for status.\n"
-            "6. **Recover from compacted/truncated tool output** - If you see `[compacted: tool output removed to free context]` or `[truncated: output exceeded context limit]`, assume prior output was reduced. Re-read only what you need using smaller chunks (`read` with offset/limit, or targeted `rg`/`head`/`tail`) instead of full-file `cat`.\n\n"
-            "## Output Format\n"
-            "When complete, your final response should include:\n"
-            "- What you accomplished or found\n"
-            "- Any relevant details the " + parent_label + " should know\n"
-            "- Keep it concise but informative\n\n"
-            "## What You DON'T Do\n"
-            "- NO user conversations (that's " + parent_label + "'s job)\n"
-            "- NO external messages (email, tweets, etc.) unless explicitly tasked with a specific recipient/channel\n"
-            "- NO cron jobs or persistent state\n"
-            "- NO pretending to be the " + parent_label + "\n"
-            "- Only use the `message` tool when explicitly instructed to contact a specific external recipient; otherwise return plain text and let the " + parent_label + " deliver it\n\n" +
-            (can_spawn ?
-                "## Sub-Agent Spawning\n"
-                "You CAN spawn your own sub-agents for parallel or complex work using `sessions_spawn`.\n"
-                "Use the `subagents` tool to steer, kill, or do an on-demand status check for your spawned sub-agents.\n"
-                "Your sub-agents will announce their results back to you automatically (not to the main agent).\n"
-                "Default workflow: spawn work, continue orchestrating, and wait for auto-announced completions.\n"
-                "Auto-announce is push-based. After spawning children, do NOT call sessions_list, sessions_history, exec sleep, or any polling tool.\n"
-                "Wait for completion events to arrive as user messages.\n"
-                "Track expected child session keys and only send your final answer after completion events for ALL expected children arrive.\n"
-                "If a child completion event arrives AFTER you already sent your final answer, reply ONLY with NO_REPLY.\n"
-                "Do NOT repeatedly poll `subagents list` in a loop unless you are actively debugging or intervening.\n"
-                "Coordinate their work and synthesize results before reporting back.\n\n"
-                :
-                "## Sub-Agent Spawning\n"
-                "You are a leaf worker and CANNOT spawn further sub-agents. Focus on your assigned task.\n\n"
-            ) +
-            "## Session Context\n" +
-            (!options.label.empty() ? "- Label: " + options.label + "\n" : "") +
-            "- Requester session: " + requester_run_id + ".\n"
-            "- Your session: " + subagent_run_id + ".\n"
-            "\n"
-            "[Subagent Task]: " + options.prompt;
+        // Append the actual task at the end (aligned with openclaw: "[Subagent Task]: ...")
+        std::string child_task_message = system_prompt +
+            "\n[Subagent Task]: " + options.prompt;
         
         // 准备运行选项
         // 对齐 OpenClaw: { sessionKey, deliver: false, lane: AGENT_LANE_SUBAGENT }

@@ -56,11 +56,15 @@ static int64_t now_ms() {
 }
 
 // ============================================================================
-// 🎯 对齐 OpenClaw: isSubagentSessionKey
+// 🎯 对齐 OpenClaw: isSubagentSessionKey(sessionKey)
+// Aligned with openclaw: key.startsWith("agent:") && key.includes(":sub:")
 // ============================================================================
 
 bool is_subagent_key(const std::string& key) {
-    return key.find("sub:") != std::string::npos;
+    // Aligned with openclaw: isSubagentSessionKey
+    // Format: "agent:{agentId}:sub:{uuid}" or "agent:{agentId}:sub:{parentRunId}:{uuid}"
+    if (key.rfind("agent:", 0) != 0) return false;
+    return key.find(":sub:") != std::string::npos;
 }
 
 } // anonymous namespace

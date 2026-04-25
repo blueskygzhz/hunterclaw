@@ -4,12 +4,14 @@
 //   src/agents/acp-spawn-parent-stream.ts (startAcpSpawnParentStreamRelay)
 
 #include "hunterclaw/agents/acp_spawn.h"
+#include "hunterclaw/agents/subagent.h"
 #include "hunterclaw/acp/acp_session_manager.h"
 #include "hunterclaw/gateway/client.h"
 #include "hunterclaw/infra/agent_events.h"
 #include "hunterclaw/infra/system_events.h"
 #include "hunterclaw/infra/heartbeat_wake.h"
 #include "hunterclaw/core/types.h"
+#include "hunterclaw/tasks/task_executor.h"
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
 #include <thread>
@@ -708,12 +710,31 @@ SpawnAcpResult spawn_acp_direct(
     // Aligned with openclaw: resolveAcpSubagentEnvelopeState
     //   → maxSpawnDepth / maxChildrenPerAgent / requireAgentId / allowAgents
     //   → errorCode: "subagent_policy"
-    // Note: infra::is_subagent_envelope_session / infra::resolve_acp_subagent_envelope_error
-    // are implemented in the infra/agents module. If not yet available, this check is skipped.
-    {
-        // TODO: wire up infra::is_subagent_envelope_session and infra::resolve_acp_subagent_envelope_error
-        // when the subagent capabilities module is available.
-        // For now, subagent_policy checks are deferred to the gateway layer.
+    if (!parent_session_key.empty() && is_subagent_envelope_session(parent_session_key)) {
+        // Resolve capabilities for the parent session to check spawn limits
+        SubagentCapabilities parent_caps = resolve_stored_subagent_capabilities(parent_session_key);
+
+        // Aligned with openclaw: requireAgentId — if parent is a subagent envelope, agentId must be explicit
+        if (!params.agent_id.has_value() || params.agent_id->empty()) {
+            return make_failure("forbidden", "subagent_policy",
+                "sessions_spawn from a subagent session requires an explicit agentId.");
+        }
+
+        // Aligned with openclaw: maxSpawnDepth check
+        // Default max depth = 3 (main → orchestrator → leaf)
+        constexpr int DEFAULT_MAX_SPAWN_DEPTH = 3;
+        if (parent_caps.depth >= DEFAULT_MAX_SPAWN_DEPTH) {
+            return make_failure("forbidden", "subagent_policy",
+                "Maximum ACP spawn depth (" + std::to_string(DEFAULT_MAX_SPAWN_DEPTH) +
+                ") reached. Cannot spawn further nested subagents.");
+        }
+
+        // Aligned with openclaw: can_spawn check (leaf role cannot spawn)
+        if (!parent_caps.can_spawn) {
+            return make_failure("forbidden", "subagent_policy",
+                "This subagent session (role=\"" + parent_caps.role +
+                "\") is not permitted to spawn child agents.");
+        }
     }
 
     // ── Step 6: Generate child session key ───────────────────────────────────
@@ -835,10 +856,17 @@ SpawnAcpResult spawn_acp_direct(
         }
         // Aligned with openclaw: subagentEnvelopeState.childSessionPatch
         // (spawnDepth, subagentRole, subagentControlScope)
-        // Note: infra::resolve_subagent_child_session_patch is implemented in the agents module.
-        // TODO: wire up when subagent capabilities module is available.
-        // auto child_patch = infra::resolve_subagent_child_session_patch(parent_session_key, cfg);
-        // if (child_patch.has_value()) { ... }
+        // Resolve child capabilities from parent session to set correct depth/role/controlScope
+        if (!parent_session_key.empty()) {
+            SubagentCapabilities parent_caps = resolve_stored_subagent_capabilities(parent_session_key);
+            int child_depth = parent_caps.depth + 1;
+            // Aligned with openclaw: resolveSubagentRoleForDepth
+            SubagentCapabilities child_caps = resolve_subagent_capabilities_for_depth(child_depth);
+            // Inject subagentEnvelopePatch fields into sessions.patch
+            patch["spawnDepth"] = child_depth;
+            if (!child_caps.role.empty()) patch["subagentRole"] = child_caps.role;
+            if (!child_caps.control_scope.empty()) patch["subagentControlScope"] = child_caps.control_scope;
+        }
         auto patch_result = effective_gw->request("sessions.patch", patch);
         if (!patch_result.is_ok()) {
             if (remote_gw) remote_gw->stop();
@@ -1017,11 +1045,28 @@ SpawnAcpResult spawn_acp_direct(
     // ── Step 11: Register background task run ────────────────────────────────
     // Aligned with openclaw: createRunningTaskRun({ runtime: "acp", sourceId, ownerKey, ... })
     // Used for sessions_list display and task lifecycle tracking.
-    // Note: tasks::create_running_task_run is implemented in the tasks module.
-    // TODO: wire up when tasks module is available.
-    // try {
-    //     tasks::create_running_task_run({ "acp", child_run_id, requester_internal_key, ... });
-    // } catch (...) {}
+    try {
+        auto& task_exec = tasks::get_task_executor();
+        tasks::TaskRecord task_params;
+        task_params.runtime = tasks::TaskRuntime::ACP;
+        task_params.run_id = child_run_id;
+        task_params.source_id = child_idem;  // idempotency key as source
+        task_params.requester_session_key = parent_session_key.empty() ? session_key : parent_session_key;
+        task_params.owner_key = requester_internal_key;
+        task_params.child_session_key = session_key;
+        task_params.agent_id = target_agent_id;
+        task_params.label = params.label;
+        task_params.task = params.task.substr(0, 200);  // truncate for display
+        task_params.status = tasks::TaskStatus::RUNNING;
+        task_params.scope_kind = tasks::TaskScopeKind::SESSION;
+        task_params.notify_policy = tasks::TaskNotifyPolicy::DONE_ONLY;
+        task_params.created_at = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        task_params.started_at = task_params.created_at;
+        task_exec.create_running_task_run(task_params);
+    } catch (...) {
+        // Best-effort: task tracking failure must not abort spawn
+    }
 
     // ── Step 12: Return result ────────────────────────────────────────────
     // 🎯 对齐 OC: fire-and-forget — spawn 完成后 stop 远端 gw（连接不再需要）

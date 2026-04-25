@@ -111,5 +111,18 @@ std::optional<std::string> format_task_status_detail(const TaskRecord& task);
 /// Sanitize task status text (对齐 OC: sanitizeTaskStatusText)
 std::string sanitize_task_status_text(const std::string& value, int max_chars = 0);
 
+// ============================================================================
+// Global TaskExecutor singleton accessor
+// Aligned with openclaw: getTaskExecutor() — returns the process-wide TaskExecutor
+// Must be initialized via set_task_executor() before use.
+// ============================================================================
+
+/// Set the global TaskExecutor instance (called during gateway initialization)
+void set_task_executor(std::shared_ptr<TaskExecutor> executor);
+
+/// Get the global TaskExecutor instance
+/// Throws std::runtime_error if not initialized.
+TaskExecutor& get_task_executor();
+
 } // namespace tasks
 } // namespace hunterclaw

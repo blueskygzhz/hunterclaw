@@ -1,6 +1,8 @@
 #include "hunterclaw/tasks/task_executor.h"
 #include <algorithm>
 #include <chrono>
+#include <mutex>
+#include <stdexcept>
 
 namespace hunterclaw {
 namespace tasks {
@@ -241,6 +243,30 @@ TaskStatusSnapshot build_task_status_snapshot(
     }
 
     return snap;
+}
+
+// ============================================================================
+// Global TaskExecutor singleton
+// Aligned with openclaw: getTaskExecutor() process-wide singleton
+// ============================================================================
+
+namespace {
+    std::shared_ptr<TaskExecutor> g_task_executor;
+    std::mutex g_task_executor_mutex;
+} // namespace
+
+void set_task_executor(std::shared_ptr<TaskExecutor> executor) {
+    std::lock_guard<std::mutex> lock(g_task_executor_mutex);
+    g_task_executor = std::move(executor);
+}
+
+TaskExecutor& get_task_executor() {
+    std::lock_guard<std::mutex> lock(g_task_executor_mutex);
+    if (!g_task_executor) {
+        throw std::runtime_error(
+            "TaskExecutor is not initialized. Call set_task_executor() during gateway startup.");
+    }
+    return *g_task_executor;
 }
 
 } // namespace tasks

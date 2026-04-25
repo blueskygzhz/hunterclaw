@@ -49,6 +49,15 @@ struct AgentEvent {
             return data["text"].get<std::string>();
         return "";
     }
+    // Aligned with openclaw: assistantPhase — "commentary" | "main" | "" (empty = main)
+    // Used by parent stream relay to skip commentary-phase deltas from relay
+    std::string assistant_phase() const {
+        if (data.contains("assistantPhase") && data["assistantPhase"].is_string())
+            return data["assistantPhase"].get<std::string>();
+        if (data.contains("assistant_phase") && data["assistant_phase"].is_string())
+            return data["assistant_phase"].get<std::string>();
+        return "";
+    }
 };
 
 // ============================================================================

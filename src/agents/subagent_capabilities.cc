@@ -468,5 +468,29 @@ SubagentCapabilities resolve_stored_subagent_capabilities(
     return caps;
 }
 
+// ============================================================================
+// 🎯 Public wrapper: is_subagent_envelope_session(sessionKey, cfg)
+// Aligned with openclaw: isSubagentEnvelopeSession(sessionKey, { cfg })
+// Exposed in subagent.h for use by acp_spawn.cc and other modules.
+// ============================================================================
+
+bool is_subagent_envelope_session(
+    const std::string& session_key,
+    const core::Config* cfg
+) {
+    return is_subagent_envelope_session(session_key, cfg, nullptr, nullptr);
+}
+
+// ============================================================================
+// 🎯 Public wrapper: resolve_subagent_capabilities_for_depth(depth)
+// Aligned with openclaw: resolveSubagentCapabilities({ depth }) — convenience overload
+// Used by acp_spawn.cc to compute child capabilities from a given depth.
+// ============================================================================
+
+SubagentCapabilities resolve_subagent_capabilities_for_depth(int depth) {
+    constexpr int DEFAULT_MAX_SPAWN_DEPTH = 5;
+    return resolve_subagent_capabilities(depth, DEFAULT_MAX_SPAWN_DEPTH);
+}
+
 } // namespace agents
 } // namespace hunterclaw

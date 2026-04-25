@@ -560,8 +560,20 @@ std::string resolve_subagent_control_scope_for_role(const std::string& role);
 /// 🎯 对齐 OpenClaw: resolveSubagentCapabilities({ depth, maxSpawnDepth })
 SubagentCapabilities resolve_subagent_capabilities(int depth, int max_spawn_depth = 5);
 
+/// 🎯 对齐 OpenClaw: resolveSubagentCapabilities({ depth }) — convenience overload using default maxSpawnDepth
+/// Used by acp_spawn.cc to compute child capabilities from a given depth.
+SubagentCapabilities resolve_subagent_capabilities_for_depth(int depth);
+
 /// 🎯 对齐 OpenClaw: resolveStoredSubagentCapabilities(sessionKey, opts)
 SubagentCapabilities resolve_stored_subagent_capabilities(
+    const std::string& session_key,
+    const core::Config* cfg = nullptr
+);
+
+/// 🎯 对齐 OpenClaw: isSubagentEnvelopeSession(sessionKey, opts)
+/// Returns true if the session is a subagent envelope (direct subagent key or ACP session
+/// spawned as a subagent envelope, determined by walking the spawnedBy chain).
+bool is_subagent_envelope_session(
     const std::string& session_key,
     const core::Config* cfg = nullptr
 );
