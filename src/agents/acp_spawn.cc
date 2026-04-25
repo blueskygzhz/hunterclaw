@@ -4,10 +4,13 @@
 //   src/agents/acp-spawn-parent-stream.ts (startAcpSpawnParentStreamRelay)
 
 #include "hunterclaw/agents/acp_spawn.h"
+#include "hunterclaw/acp/acp_session_manager.h"
 #include "hunterclaw/gateway/client.h"
 #include "hunterclaw/infra/agent_events.h"
 #include "hunterclaw/infra/system_events.h"
 #include "hunterclaw/infra/heartbeat_wake.h"
+#include "hunterclaw/infra/session_binding_service.h"
+#include "hunterclaw/tasks/detached_task_runtime.h"
 #include "hunterclaw/core/types.h"
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
@@ -414,6 +417,99 @@ AcpSpawnParentRelayHandle start_acp_spawn_parent_stream_relay(
 }
 
 // ============================================================================
+// cleanup_failed_acp_spawn
+// Aligned with openclaw: cleanupFailedAcpSpawn (control-plane/spawn.ts)
+// ============================================================================
+
+void cleanup_failed_acp_spawn(
+    const std::string& session_key,
+    bool should_delete_session,
+    bool delete_transcript,
+    std::shared_ptr<gateway::GatewayClient> gw,
+    const AcpSpawnRuntimeCloseHandle* runtime_close_handle
+) {
+    // Step 1: Close the ACP runtime handle via AcpSessionManager
+    // Aligned with openclaw: acpManager.closeSession({ reason: "spawn-failed", allowBackendUnavailable: true, requireAcpSession: false })
+    try {
+        acp::get_acp_session_manager().close_session(
+            session_key,
+            "spawn-failed",
+            /*clear_meta=*/false,
+            /*allow_backend_unavailable=*/true,
+            /*require_acp_session=*/false
+        );
+    } catch (...) {
+        log()->debug("acp-spawn: manager cleanup close failed for {}", session_key);
+    }
+
+    // Step 2: Unbind any thread binding (best-effort)
+    // Aligned with openclaw: getSessionBindingService().unbind({ targetSessionKey, reason: "spawn-failed" })
+    try {
+        infra::get_session_binding_service().unbind(session_key, "spawn-failed");
+    } catch (...) {
+        log()->debug("acp-spawn: binding cleanup unbind failed for {}", session_key);
+    }
+
+    // Step 3: Delete the Gateway session record (best-effort)
+    // Aligned with openclaw: callGateway("sessions.delete", { key, deleteTranscript, emitLifecycleHooks: false })
+    if (!should_delete_session || !gw) return;
+    try {
+        gw->request("sessions.delete", json{
+            {"key", session_key},
+            {"deleteTranscript", delete_transcript},
+            {"emitLifecycleHooks", false}
+        });
+    } catch (...) {
+        // Best-effort cleanup only
+    }
+}
+
+// ============================================================================
+// initialize_acp_spawn_runtime (internal helper)
+// Aligned with openclaw: initializeAcpSpawnRuntime (agents/acp-spawn.ts)
+// ============================================================================
+
+struct AcpSpawnInitializedRuntime {
+    acp::AcpSessionMeta meta;
+    AcpSpawnRuntimeCloseHandle close_handle;
+};
+
+static std::optional<AcpSpawnInitializedRuntime> initialize_acp_spawn_runtime(
+    const std::string& session_key,
+    const std::string& target_agent_id,
+    acp::AcpRuntimeSessionMode runtime_mode,
+    const std::optional<std::string>& cwd,
+    const std::optional<std::string>& backend_id,
+    const std::optional<std::string>& resume_session_id,
+    std::string& out_error
+) {
+    try {
+        // Aligned with openclaw: getAcpSessionManager().initializeSession({ sessionKey, agent, mode, resumeSessionId, cwd, backendId })
+        auto meta = acp::get_acp_session_manager().initialize_session(
+            session_key,
+            target_agent_id,
+            runtime_mode,
+            cwd,
+            backend_id,
+            resume_session_id
+        );
+
+        AcpSpawnRuntimeCloseHandle close_handle;
+        close_handle.session_key = session_key;
+        close_handle.backend = meta.backend;
+        close_handle.runtime_session_name = meta.runtime_session_name;
+
+        return AcpSpawnInitializedRuntime{ std::move(meta), std::move(close_handle) };
+    } catch (const acp::AcpRuntimeError& e) {
+        out_error = e.what();
+        return std::nullopt;
+    } catch (const std::exception& e) {
+        out_error = e.what();
+        return std::nullopt;
+    }
+}
+
+// ============================================================================
 // spawn_acp_direct
 // Aligned with openclaw: spawnAcpDirect
 // ============================================================================
@@ -529,16 +625,56 @@ SpawnAcpResult spawn_acp_direct(
         requester_internal_key = "agent:" + target_agent_id + ":main";
     }
 
-    // ── Step 5: implicitStreamToParent ────────────────────────────────────
-    // Aligned with openclaw: implicitStreamToParent logic
-    // For simplicity in HunterClaw: only explicit streamTo="parent" is supported
-    // (the implicit logic requires heartbeat config inspection which is complex)
-    const bool effective_stream_to_parent = stream_to_parent_requested;
+    // ── Step 5: implicitStreamToParent ────────────────────────────────────────
+    // Aligned with openclaw: resolveAcpSpawnStreamPlan
+    //
+    // implicitStreamToParent = !streamToParentRequested
+    //   && spawnMode == "run"
+    //   && !requestThreadBinding
+    //   && requester.isSubagentSession
+    //   && !requester.hasActiveSubagentBinding
+    //   && !requester.hasThreadContext
+    //   && requester.heartbeatEnabled
+    //   && requester.heartbeatRelayRouteUsable
+    //
+    // HunterClaw: 通过 infra::resolve_acp_spawn_stream_plan() 完成，
+    // 该函数封装了 heartbeat config 检查逻辑（对齐 OC isHeartbeatEnabledForSessionAgent
+    // + hasSessionLocalHeartbeatRelayRoute）。
+    bool implicit_stream_to_parent = false;
+    if (!stream_to_parent_requested && spawn_mode == "run" && !request_thread_binding
+        && !parent_session_key.empty()) {
+        // Aligned with openclaw: resolveAcpSpawnStreamPlan
+        // Delegate to infra helper which checks heartbeat config
+        implicit_stream_to_parent = infra::resolve_implicit_stream_to_parent(
+            parent_session_key, cfg
+        );
+    }
+    const bool effective_stream_to_parent = stream_to_parent_requested || implicit_stream_to_parent;
+    // ── Step 5b: subagentEnvelopeState check ─────────────────────────────────
+    // Aligned with openclaw: resolveAcpSubagentEnvelopeState
+    //   → maxSpawnDepth / maxChildrenPerAgent / requireAgentId / allowAgents
+    //   → errorCode: "subagent_policy"
+    {
+        std::string subagent_error;
+        bool is_subagent_envelope = infra::is_subagent_envelope_session(
+            parent_session_key, cfg
+        );
+        if (is_subagent_envelope && !parent_session_key.empty()) {
+            subagent_error = infra::resolve_acp_subagent_envelope_error(
+                parent_session_key,
+                target_agent_id,
+                params.agent_id.value_or(""),
+                cfg
+            );
+        }
+        if (!subagent_error.empty()) {
+            return make_failure("forbidden", "subagent_policy", subagent_error);
+        }
+    }
 
-    // ── Step 6: Generate child session key ───────────────────────────────
+    // ── Step 6: Generate child session key ───────────────────────────────────
     // Aligned with openclaw: `agent:${targetAgentId}:acp:${crypto.randomUUID()}`
     const std::string session_key = "agent:" + target_agent_id + ":acp:" + generate_uuid();
-
     // ── Step 6b: Resolve effective Gateway client ─────────────────────────
     // 🎯 对齐 OpenClaw: 真正的跨进程 ACP 路由
     //
@@ -607,9 +743,48 @@ SpawnAcpResult spawn_acp_direct(
         return make_failure("error", "spawn_failed", "Gateway not available", session_key, spawn_mode);
     }
 
+    // ── Step 6b: Resolve runtime cwd (with filesystem validation) ───────────
+    // Aligned with openclaw: resolveSpawnedWorkspaceInheritance + resolveRuntimeCwdForAcpSpawn
+    //   → if cwd path does not exist (ENOENT), silently drop it (return undefined)
+    //   → if other error, return errorCode: "cwd_resolution_failed"
+    std::optional<std::string> runtime_cwd;
+    {
+        // resolveSpawnedWorkspaceInheritance: inherit cwd from parent session if not explicit
+        std::optional<std::string> resolved_cwd = infra::resolve_spawned_workspace_inheritance(
+            target_agent_id,
+            parent_session_key,
+            params.cwd,
+            cfg
+        );
+        if (resolved_cwd.has_value() && !resolved_cwd->empty()) {
+            // resolveRuntimeCwdForAcpSpawn: validate path exists
+            // If explicit cwd was given, trust it directly.
+            // If inherited, check existence; ENOENT → silently drop.
+            if (params.cwd.has_value() && !params.cwd->empty()) {
+                // Explicit cwd: use as-is (aligned with OC: explicitCwd present → return resolvedCwd)
+                runtime_cwd = resolved_cwd;
+            } else {
+                // Inherited cwd: validate existence
+                std::error_code ec;
+                bool exists = std::filesystem::exists(*resolved_cwd, ec);
+                if (ec) {
+                    // Non-ENOENT error → cwd_resolution_failed
+                    if (remote_gw) remote_gw->stop();
+                    return make_failure("error", "cwd_resolution_failed",
+                        "Failed to resolve cwd: " + ec.message());
+                }
+                if (exists) {
+                    runtime_cwd = resolved_cwd;
+                }
+                // else: ENOENT → silently drop (aligned with OC: return undefined)
+            }
+        }
+    }
+
     // ── Step 7: Create Gateway session (sessions.patch) ──────────────────
-    // 🎯 对齐 OpenClaw: callGateway("sessions.patch", { key, spawnedBy, label })
+    // 🎯 对齐 OpenClaw: callGateway("sessions.patch", { key, spawnedBy, ...subagentEnvelopePatch, label })
     // 使用 effective_gw（可能是远端 WebSocket 客户端）
+    bool session_created = false;
     {
         json patch = {
             {"key", session_key},
@@ -618,12 +793,67 @@ SpawnAcpResult spawn_acp_direct(
         if (params.label.has_value() && !params.label->empty()) {
             patch["label"] = *params.label;
         }
+        // Aligned with openclaw: subagentEnvelopeState.childSessionPatch
+        // (spawnDepth, subagentRole, subagentControlScope)
+        auto child_patch = infra::resolve_subagent_child_session_patch(
+            parent_session_key, cfg
+        );
+        if (child_patch.has_value()) {
+            if (child_patch->spawn_depth > 0)
+                patch["spawnDepth"] = child_patch->spawn_depth;
+            if (!child_patch->subagent_role.empty())
+                patch["subagentRole"] = child_patch->subagent_role;
+            if (!child_patch->subagent_control_scope.empty())
+                patch["subagentControlScope"] = child_patch->subagent_control_scope;
+        }
         auto patch_result = effective_gw->request("sessions.patch", patch);
         if (!patch_result.is_ok()) {
             if (remote_gw) remote_gw->stop();
             return make_failure("error", "spawn_failed",
                                 patch_result.error, session_key, spawn_mode);
         }
+        session_created = true;
+    }
+
+    // ── Step 7b: Initialize ACP runtime via AcpSessionManager ────────────
+    // 🎯 对齐 OpenClaw: initializeAcpSpawnRuntime()
+    //   → getAcpSessionManager().initializeSession({ sessionKey, agent, mode, cwd, backendId })
+    //   → 持久化 session meta（acp 字段）到 session store
+    //   → 缓存 runtime handle（供后续 runTurn 复用）
+    //
+    // 这是 HunterClaw 与 OpenClaw 对齐的关键步骤：
+    //   - OpenClaw: agents/acp-spawn.ts → initializeAcpSpawnRuntime() → AcpSessionManager.initializeSession()
+    //   - HunterClaw: 同样通过 acp::get_acp_session_manager().initialize_session() 完成
+    //
+    // 注意: AcpSessionManager 需要已通过 AcpSessionManager::set_instance() 初始化。
+    // 如果未初始化（singleton 未设置），initialize_acp_spawn_runtime 会捕获异常并返回 nullopt。
+    std::optional<AcpSpawnRuntimeCloseHandle> initialized_runtime_handle;
+    {
+        // Resolve runtime mode: "run" → oneshot, "session" → persistent
+        acp::AcpRuntimeSessionMode runtime_mode =
+            (spawn_mode == "session")
+                ? acp::AcpRuntimeSessionMode::Persistent
+                : acp::AcpRuntimeSessionMode::Oneshot;
+
+        std::string init_error;
+        auto initialized = initialize_acp_spawn_runtime(
+            session_key,
+            target_agent_id,
+            runtime_mode,
+            runtime_cwd,  // validated cwd (may be nullopt if path not found)
+            std::nullopt,  // backend_id: use default from AcpSessionManager
+            params.resume_session_id,
+            init_error
+        );
+
+        if (!initialized.has_value()) {
+            // Aligned with openclaw: cleanupFailedAcpSpawn on initializeAcpSpawnRuntime failure
+            cleanup_failed_acp_spawn(session_key, session_created, true, effective_gw, nullptr);
+            if (remote_gw) remote_gw->stop();
+            return make_failure("error", "spawn_failed", init_error, session_key, spawn_mode);
+        }
+
+        initialized_runtime_handle = std::move(initialized->close_handle);
     }
 
     // ── Step 8: Start parent stream relay (before dispatch) ──────────────
@@ -676,16 +906,13 @@ SpawnAcpResult spawn_acp_direct(
         auto response = effective_gw->request<json>("agent", agent_params);
         if (!response.is_ok()) {
             if (parent_relay.dispose) parent_relay.dispose();
-            // Cleanup: delete session
-            try {
-                effective_gw->request("sessions.delete", json{
-                    {"key", session_key},
-                    {"deleteTranscript", true},
-                    {"emitLifecycleHooks", false}
-                });
-            } catch (...) {}
+            // Aligned with openclaw: cleanupFailedAcpSpawn on dispatch failure
+            cleanup_failed_acp_spawn(
+                session_key, /*should_delete_session=*/true, /*delete_transcript=*/true,
+                effective_gw, initialized_runtime_handle ? &*initialized_runtime_handle : nullptr
+            );
             if (remote_gw) remote_gw->stop();
-            return make_failure("error", "spawn_failed",
+            return make_failure("error", "dispatch_failed",
                                 response.error, session_key, spawn_mode);
         }
         const auto& resp = response.get();
@@ -705,15 +932,13 @@ SpawnAcpResult spawn_acp_direct(
         }
     } catch (const std::exception& e) {
         if (parent_relay.dispose) parent_relay.dispose();
-        try {
-            effective_gw->request("sessions.delete", json{
-                {"key", session_key},
-                {"deleteTranscript", true},
-                {"emitLifecycleHooks", false}
-            });
-        } catch (...) {}
+        // Aligned with openclaw: cleanupFailedAcpSpawn on dispatch exception
+        cleanup_failed_acp_spawn(
+            session_key, /*should_delete_session=*/true, /*delete_transcript=*/true,
+            effective_gw, initialized_runtime_handle ? &*initialized_runtime_handle : nullptr
+        );
         if (remote_gw) remote_gw->stop();
-        return make_failure("error", "spawn_failed",
+        return make_failure("error", "dispatch_failed",
                             std::string(e.what()), session_key, spawn_mode);
     }
 
@@ -736,9 +961,31 @@ SpawnAcpResult spawn_acp_direct(
         if (parent_relay.notify_started) parent_relay.notify_started();
     }
 
-    // ── Step 11: Return result ────────────────────────────────────────────
+    // ── Step 11: Register background task run ────────────────────────────────
+    // Aligned with openclaw: createRunningTaskRun({ runtime: "acp", sourceId, ownerKey, ... })
+    // Used for sessions_list display and task lifecycle tracking.
+    try {
+        tasks::create_running_task_run({
+            /*runtime=*/"acp",
+            /*source_id=*/child_run_id,
+            /*owner_key=*/requester_internal_key,
+            /*scope_kind=*/"session",
+            /*child_session_key=*/session_key,
+            /*run_id=*/child_run_id,
+            /*label=*/params.label.value_or(""),
+            /*task=*/params.task,
+            /*delivery_status=*/requester_internal_key.empty() ? "parent_missing" : "pending",
+            /*started_at=*/std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count()
+        });
+    } catch (...) {
+        log()->warn("acp-spawn: failed to create background task for session {}, run {}",
+            session_key, child_run_id);
+    }
+
+    // ── Step 12: Return result ────────────────────────────────────────────
     // 🎯 对齐 OC: fire-and-forget — spawn 完成后 stop 远端 gw（连接不再需要）
-    // 父子通信通过 ParentStreamRelay（进程内事件总线）或 subagent announce 完成
+    // 父子通信通过 ParentStreamRelay（进程内事件总线）或 subagent announce（跨进程消息）完成
     if (remote_gw) {
         // 异步 stop，避免阻塞 spawn 返回
         auto gw_to_stop = remote_gw;
@@ -763,6 +1010,5 @@ SpawnAcpResult spawn_acp_direct(
     ok.error_code = std::nullopt;
     return ok;
 }
-
 } // namespace agents
 } // namespace hunterclaw
