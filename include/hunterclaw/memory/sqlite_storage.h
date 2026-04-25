@@ -24,6 +24,7 @@ public:
         bool enable_fts = true;
         bool enable_vector = true;
         std::optional<std::string> vec_extension_path;
+        std::string fts_tokenizer = "unicode61";  // 对齐 OC: store.fts.tokenizer ("unicode61" | "trigram")
     };
     
     static core::Result<std::shared_ptr<SQLiteVectorStorage>> create(const Config& config);

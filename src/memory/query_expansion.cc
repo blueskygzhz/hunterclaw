@@ -353,8 +353,12 @@ static bool is_segment_separator(char32_t c) {
     return false;
 }
 
-std::vector<std::string> tokenize_query(const std::string& text) {
+std::vector<std::string> tokenize_query(const std::string& text, const std::string& fts_tokenizer) {
     // 对齐 openclaw query-expansion.ts:tokenize
+    // fts_tokenizer: "unicode61" (default) or "trigram"
+    // In trigram mode, CJK chars are kept as contiguous blocks (not unigrams+bigrams)
+    const bool use_trigram = (fts_tokenizer == "trigram");
+
     // 1. normalized = text.toLowerCase().trim()
     // 2. segments = normalized.split(/[\s\p{P}]+/u).filter(Boolean)
     // 3. For each segment: detect script and process accordingly
@@ -408,18 +412,21 @@ std::vector<std::string> tokenize_query(const std::string& text) {
             auto flush_jp = [&]() {
                 if (jp_current.empty()) return;
                 std::string part = utf32_to_utf8(jp_current);
-                // For CJK (kanji) parts: add unigrams + bigrams
+                // For CJK (kanji) parts: add unigrams + bigrams (or just block in trigram mode)
+                // 对齐 OC: if (!useTrigram) { for bigrams }
                 bool all_kanji = true;
                 for (char32_t c : jp_current) {
                     if (!is_cjk(c)) { all_kanji = false; break; }
                 }
                 if (all_kanji && jp_current.size() >= 1) {
                     tokens.push_back(part);
-                    for (size_t i = 0; i + 1 < jp_current.size(); ++i) {
-                        std::u32string bigram;
-                        bigram.push_back(jp_current[i]);
-                        bigram.push_back(jp_current[i+1]);
-                        tokens.push_back(utf32_to_utf8(bigram));
+                    if (!use_trigram) {
+                        for (size_t i = 0; i + 1 < jp_current.size(); ++i) {
+                            std::u32string bigram;
+                            bigram.push_back(jp_current[i]);
+                            bigram.push_back(jp_current[i+1]);
+                            tokens.push_back(utf32_to_utf8(bigram));
+                        }
                     }
                 } else {
                     tokens.push_back(part);
@@ -451,21 +458,31 @@ std::vector<std::string> tokenize_query(const std::string& text) {
             }
             flush_jp();
 
-        } else if (has_cjk) {
-            // 对齐 openclaw: Chinese - unigrams + bigrams
+            } else if (has_cjk) {
+            // 对齐 openclaw: Chinese - unigrams + bigrams (or block in trigram mode)
             std::vector<char32_t> chars;
             for (char32_t c : seg) {
                 if (is_cjk(c)) chars.push_back(c);
             }
-            for (char32_t c : chars) {
-                std::u32string s(1, c);
-                tokens.push_back(utf32_to_utf8(s));
-            }
-            for (size_t i = 0; i + 1 < chars.size(); ++i) {
-                std::u32string bigram;
-                bigram.push_back(chars[i]);
-                bigram.push_back(chars[i+1]);
-                tokens.push_back(utf32_to_utf8(bigram));
+            if (use_trigram) {
+                // 对齐 OC trigram mode: push the whole contiguous CJK block
+                // SQLite's trigram FTS requires at least 3 characters per query term
+                std::u32string block(chars.begin(), chars.end());
+                if (!block.empty()) {
+                    tokens.push_back(utf32_to_utf8(block));
+                }
+            } else {
+                // 对齐 OC default mode: unigrams + bigrams for phrase matching
+                for (char32_t c : chars) {
+                    std::u32string s(1, c);
+                    tokens.push_back(utf32_to_utf8(s));
+                }
+                for (size_t i = 0; i + 1 < chars.size(); ++i) {
+                    std::u32string bigram;
+                    bigram.push_back(chars[i]);
+                    bigram.push_back(chars[i+1]);
+                    tokens.push_back(utf32_to_utf8(bigram));
+                }
             }
 
         } else if (has_hangul) {
@@ -490,8 +507,8 @@ std::vector<std::string> tokenize_query(const std::string& text) {
     return tokens;
 }
 
-std::vector<std::string> extract_keywords(const std::string& query) {
-    auto tokens = tokenize_query(query);
+std::vector<std::string> extract_keywords(const std::string& query, const std::string& fts_tokenizer) {
+    auto tokens = tokenize_query(query, fts_tokenizer);
     std::vector<std::string> keywords;
     std::unordered_set<std::string> seen;
     

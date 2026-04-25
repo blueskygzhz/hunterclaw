@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <optional>
+#include <functional>
 
 // 严格对齐 OpenClaw src/memory/manager-search.ts
 

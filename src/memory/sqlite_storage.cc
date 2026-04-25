@@ -200,7 +200,16 @@ core::Result<bool> SQLiteVectorStorage::ensure_schema() {
     // FTS5 table (对齐 openclaw: chunks_fts)
     if (config_.enable_fts) {
         std::string fts_error;
-        bool fts_ok = ::hunterclaw::memory::exec_sql(db_, R"(
+        // 对齐 OC: ftsTokenizer 决定 FTS5 tokenizer 配置
+        // unicode61 (default): tokenize="unicode61 remove_diacritics 1"
+        // trigram: tokenize="trigram"
+        std::string tokenizer_clause;
+        if (config_.fts_tokenizer == "trigram") {
+            tokenizer_clause = ", tokenize=\"trigram\"";
+        } else {
+            tokenizer_clause = ", tokenize=\"unicode61 remove_diacritics 1\"";
+        }
+        std::string fts_sql = R"(
             CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
                 text,
                 id UNINDEXED,
@@ -208,9 +217,10 @@ core::Result<bool> SQLiteVectorStorage::ensure_schema() {
                 source UNINDEXED,
                 model UNINDEXED,
                 start_line UNINDEXED,
-                end_line UNINDEXED
+                end_line UNINDEXED)" + tokenizer_clause + R"(
             );
-        )", &fts_error);
+        )";
+        bool fts_ok = ::hunterclaw::memory::exec_sql(db_, fts_sql, &fts_error);
         if (fts_ok) {
             fts_available_ = true;
         } else {

@@ -65,6 +65,8 @@ std::shared_ptr<SQLiteVectorStorage> MemoryManagerSyncOps::open_database_at_path
     if (vector_.extension_path) {
         cfg.vec_extension_path = vector_.extension_path;
     }
+    // 对齐 OC: ftsTokenizer = this.settings.store.fts.tokenizer
+    cfg.fts_tokenizer = settings_.fts.tokenizer;
 
     auto result = SQLiteVectorStorage::create(cfg);
     if (!result.is_ok()) {
@@ -1207,6 +1209,7 @@ core::Result<void> MemoryManagerSyncOps::run_safe_reindex(const SyncParams& para
         next_meta.scope_hash = resolve_configured_scope_hash();
         next_meta.chunk_tokens = settings_.chunking.tokens;
         next_meta.chunk_overlap = settings_.chunking.overlap;
+        next_meta.fts_tokenizer = settings_.fts.tokenizer;  // 对齐 OC: meta.ftsTokenizer
         if (vector_.available && *vector_.available && vector_.dims) {
             next_meta.vector_dims = vector_.dims;
         }
@@ -1276,6 +1279,7 @@ core::Result<void> MemoryManagerSyncOps::run_unsafe_reindex(const SyncParams& pa
     meta.scope_hash = resolve_configured_scope_hash();
     meta.chunk_tokens = settings_.chunking.tokens;
     meta.chunk_overlap = settings_.chunking.overlap;
+    meta.fts_tokenizer = settings_.fts.tokenizer;  // 对齐 OC: meta.ftsTokenizer
     if (vector_.available && *vector_.available && vector_.dims) {
         meta.vector_dims = vector_.dims;
     }
@@ -1336,7 +1340,9 @@ core::Result<void> MemoryManagerSyncOps::run_sync(const SyncParams& params) {
         meta->scope_hash != configured_scope_hash ||
         meta->chunk_tokens != settings_.chunking.tokens ||
         meta->chunk_overlap != settings_.chunking.overlap ||
-        (vector_ready && !meta->vector_dims);
+        (vector_ready && !meta->vector_dims) ||
+        // 对齐 OC: (meta.ftsTokenizer ?? "unicode61") !== params.ftsTokenizer
+        (meta->fts_tokenizer.empty() ? "unicode61" : meta->fts_tokenizer) != settings_.fts.tokenizer;
 
     try {
         if (needs_full_reindex) {
