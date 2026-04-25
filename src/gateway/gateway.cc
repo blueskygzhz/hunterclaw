@@ -2580,22 +2580,26 @@ core::Result<bool> GatewayServer::start() {
             auto heartbeat_reply_fn = [agent_pool_weak, cfg_weak](
                 const hunterclaw::infra::HeartbeatReplyRequest& req
             ) -> hunterclaw::infra::HeartbeatReplyResult {
-                // Aligned with openclaw: getReplyFromConfig(ctx, replyOpts, cfg)
-                // ctx.Body = prompt, ctx.SessionKey = session_key, ctx.Provider = provider
+                // ✅ Aligned with openclaw: enqueueCommandInLane(`session:${sessionKey}`, ...)
+                //
+                // CRITICAL: Do NOT call agent->process_message() directly here.
+                // Normal business requests are enqueued into "session:<key>" dynamic lane
+                // (maxConcurrent=1, serial). If heartbeat calls process_message() directly
+                // from its own thread, it races with the business lane thread → data race → core.
+                //
+                // Fix: enqueue heartbeat into the same "session:<key>" lane so it is
+                // serialized with all other requests for this agent. This is exactly what
+                // openclaw does: replyFn enqueues into the session lane and awaits the result.
                 auto agent_pool = agent_pool_weak.lock();
                 if (!agent_pool) {
                     return {};  // no-op: pool gone
                 }
                 const std::string& session_key = req.session_key;
                 const std::string& agent_id    = req.agent_id;
-                // Get or create agent for this session
-                auto agent = agent_pool->get_or_create_agent(
-                    session_key.empty() ? agent_id : session_key,
-                    agent_id.empty() ? std::optional<std::string>{} : agent_id
-                );
-                if (!agent) {
-                    return {};
-                }
+                const std::string lane_key = session_key.empty() ? agent_id : session_key;
+                // "session:<key>" — same lane used by normal business requests
+                const std::string session_lane = "session:" + lane_key;
+
                 // Build options for process_message
                 std::map<std::string, std::string> opts;
                 opts["is_heartbeat"] = "true";
@@ -2606,7 +2610,6 @@ core::Result<bool> GatewayServer::start() {
                     opts["bootstrap_context_mode"] = "lightweight";
                 if (req.suppress_tool_error_warnings)
                     opts["suppress_tool_error_warnings"] = "true";
-                // Delivery target hints (for channel plugins)
                 if (req.originating_channel.has_value())
                     opts["originating_channel"] = req.originating_channel.value();
                 if (req.originating_to.has_value())
@@ -2616,23 +2619,54 @@ core::Result<bool> GatewayServer::start() {
                 if (req.thread_id.has_value())
                     opts["thread_id"] = req.thread_id.value();
 
-                // Invoke the agent
-                auto result = agent->process_message(req.prompt, opts);
+                // Capture everything needed inside the lambda (agent_pool may be gone by the
+                // time the queued task runs, so capture by value).
+                const std::string prompt_copy = req.prompt;
+                const std::string agent_id_copy = agent_id;
+                const std::string lane_key_copy = lane_key;
+                const std::optional<std::string> originating_channel = req.originating_channel;
+                const std::optional<std::string> originating_to = req.originating_to;
 
-                hunterclaw::infra::HeartbeatReplyResult reply;
-                if (result.is_ok()) {
-                    reply.text       = result.get();
-                    reply.has_target = true;
-                    // Delivery target: use originating channel/to if available
-                    if (req.originating_channel.has_value())
-                        reply.channel = req.originating_channel;
-                    if (req.originating_to.has_value())
-                        reply.to = req.originating_to;
-                } else {
-                    // Propagate error as exception so run_heartbeat_once emits "failed"
-                    throw std::runtime_error(result.error);
-                }
-                return reply;
+                // Enqueue into the session lane — serialized with normal business requests.
+                // Block the heartbeat thread until the task completes (same as openclaw await).
+                auto future = hunterclaw::queue::CommandQueue::Instance()
+                    .enqueue_command_in_lane(
+                        session_lane,
+                        [agent_pool, lane_key_copy, agent_id_copy,
+                         prompt_copy, opts_copy = opts,
+                         originating_channel, originating_to]()
+                            -> hunterclaw::infra::HeartbeatReplyResult
+                        {
+                            auto agent = agent_pool->get_or_create_agent(
+                                lane_key_copy,
+                                agent_id_copy.empty()
+                                    ? std::optional<std::string>{}
+                                    : agent_id_copy
+                            );
+                            if (!agent) {
+                                return {};
+                            }
+                            auto result = agent->process_message(prompt_copy, opts_copy);
+                            hunterclaw::infra::HeartbeatReplyResult reply;
+                            if (result.is_ok()) {
+                                reply.text       = result.get();
+                                reply.has_target = true;
+                                reply.channel    = originating_channel;
+                                reply.to         = originating_to;
+                            } else {
+                                throw std::runtime_error(result.error);
+                            }
+                            return reply;
+                        },
+                        hunterclaw::queue::EnqueueOptions{
+                            .label = "heartbeat:" + lane_key_copy,
+                        }
+                    );
+
+                // Block until the enqueued task finishes (openclaw: await the promise).
+                // Exceptions thrown inside the task propagate here and are caught by
+                // run_heartbeat_once → emits "failed".
+                return future.get();
             };
 
             // Build run_once_fn: wraps run_heartbeat_once with injected deps
@@ -2647,11 +2681,21 @@ core::Result<bool> GatewayServer::start() {
                     opts.reply_fn = heartbeat_reply_fn;
                 }
                 // Inject get_queue_size (aligned with openclaw: deps.getQueueSize)
+                // ✅ Aligned with openclaw: getQueueSize(resolveSessionLane(sessionKey))
+                // OpenClaw checks the *session* dynamic lane, NOT the global Main lane.
+                // Normal business traffic (method_agent) is enqueued into "session:<key>"
+                // dynamic lanes. Main lane is always empty for user messages, so checking
+                // Main would make this guard a no-op.
+                // Fix: check the dynamic session lane for the agent being heartbeated.
                 if (!opts.get_queue_size) {
-                    opts.get_queue_size = [](const std::string& /*lane*/) -> int {
+                    opts.get_queue_size = [agent_id = agent.agent_id](const std::string& lane) -> int {
+                        // lane param from run_heartbeat_once is always "main" (openclaw compat).
+                        // We resolve the actual session lane for this agent instead.
+                        const std::string session_lane =
+                            hunterclaw::queue::ResolveSessionLane(lane == "main" ? agent_id : lane);
                         return static_cast<int>(
                             hunterclaw::queue::CommandQueue::Instance()
-                                .get_queue_size(hunterclaw::queue::CommandLane::Main)
+                                .get_queue_size(session_lane)  // string overload → dynamic lane
                         );
                     };
                 }

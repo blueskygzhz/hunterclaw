@@ -501,6 +501,7 @@ public:
         : run_once_fn_(std::move(run_once_fn))
         , stopped_(false)
         , initialized_(false)
+        , running_(false)
     {}
 
     ~HeartbeatRunnerImpl() {
@@ -567,6 +568,20 @@ public:
         if (!are_heartbeats_enabled()) {
             return {HeartbeatRunResult::Status::Skipped, std::nullopt, "disabled"};
         }
+
+        // ✅ Aligned with openclaw: state.running CAS guard
+        // if (state.running) return skipped/requests-in-flight
+        // Prevents concurrent heartbeat executions (e.g. timer fires while
+        // a wake/exec-event heartbeat is still running).
+        bool expected = false;
+        if (!running_.compare_exchange_strong(expected, true)) {
+            return {HeartbeatRunResult::Status::Skipped, std::nullopt, "requests-in-flight"};
+        }
+        // RAII guard: always clear running_ when this function returns
+        struct RunningGuard {
+            std::atomic<bool>& flag;
+            ~RunningGuard() { flag.store(false); }
+        } running_guard{running_};
 
         std::unique_lock<std::mutex> lock(mutex_);
         if (agents_.empty()) {
@@ -720,6 +735,8 @@ private:
     RunOnceFn run_once_fn_;
     std::atomic<bool> stopped_;
     bool initialized_;
+    // ✅ Aligned with openclaw: state.running — prevents concurrent heartbeat runs
+    std::atomic<bool> running_;
     std::mutex mutex_;
     std::mutex timer_mutex_;
     std::condition_variable timer_cv_;

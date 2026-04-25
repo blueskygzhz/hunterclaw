@@ -252,7 +252,10 @@ public:
     size_t GetQueueSize(CommandLane lane) const {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = lanes_.find(lane);
-        return (it != lanes_.end()) ? it->second.queue.size() : 0;
+        // ✅ Aligned with openclaw: getQueueSize returns pending + active
+        // so heartbeat's requests-in-flight check correctly detects an actively
+        // running task (active=1, queue=0) and skips the heartbeat.
+        return (it != lanes_.end()) ? it->second.queue.size() + it->second.active_tasks : 0;
     }
 
     size_t GetDynamicQueueSize(const std::string& lane_name) const {
