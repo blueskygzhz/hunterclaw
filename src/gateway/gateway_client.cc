@@ -438,7 +438,8 @@ void GatewayClient::send_frame(const json& frame) {
     if (!ws_) throw std::runtime_error("websocket not initialized");
     auto result = ws_->send(frame.dump());
     if (!result.success) {
-        throw std::runtime_error("websocket send failed: " + result.errorMsg);
+        throw std::runtime_error("websocket send failed"
+            + (result.compressionError ? " (compression error)" : ""));
     }
 }
 

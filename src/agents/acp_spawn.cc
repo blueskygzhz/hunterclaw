@@ -608,7 +608,8 @@ SpawnAcpResult spawn_acp_direct(
     }
 
     // ── Step 7: Create Gateway session (sessions.patch) ──────────────────
-    // Aligned with openclaw: callGateway("sessions.patch", { key: sessionKey, spawnedBy: requesterInternalKey, label })
+    // 🎯 对齐 OpenClaw: callGateway("sessions.patch", { key, spawnedBy, label })
+    // 使用 effective_gw（可能是远端 WebSocket 客户端）
     {
         json patch = {
             {"key", session_key},
@@ -617,8 +618,9 @@ SpawnAcpResult spawn_acp_direct(
         if (params.label.has_value() && !params.label->empty()) {
             patch["label"] = *params.label;
         }
-        auto patch_result = gw->request("sessions.patch", patch);
+        auto patch_result = effective_gw->request("sessions.patch", patch);
         if (!patch_result.is_ok()) {
+            if (remote_gw) remote_gw->stop();
             return make_failure("error", "spawn_failed",
                                 patch_result.error, session_key, spawn_mode);
         }
@@ -669,17 +671,20 @@ SpawnAcpResult spawn_acp_direct(
             if (ctx.agent_thread_id.has_value()) agent_params["threadId"] = *ctx.agent_thread_id;
         }
 
-        auto response = gw->request<json>("agent", agent_params);
+        // 🎯 对齐 OpenClaw: callGateway("agent", params) — 通过 effective_gw 发到目标 Gateway
+        // 如果 effective_gw 是远端 WebSocket 客户端，这里就是真正的跨进程 ACP 调用
+        auto response = effective_gw->request<json>("agent", agent_params);
         if (!response.is_ok()) {
             if (parent_relay.dispose) parent_relay.dispose();
             // Cleanup: delete session
             try {
-                gw->request("sessions.delete", json{
+                effective_gw->request("sessions.delete", json{
                     {"key", session_key},
                     {"deleteTranscript", true},
                     {"emitLifecycleHooks", false}
                 });
             } catch (...) {}
+            if (remote_gw) remote_gw->stop();
             return make_failure("error", "spawn_failed",
                                 response.error, session_key, spawn_mode);
         }
@@ -701,12 +706,13 @@ SpawnAcpResult spawn_acp_direct(
     } catch (const std::exception& e) {
         if (parent_relay.dispose) parent_relay.dispose();
         try {
-            gw->request("sessions.delete", json{
+            effective_gw->request("sessions.delete", json{
                 {"key", session_key},
                 {"deleteTranscript", true},
                 {"emitLifecycleHooks", false}
             });
         } catch (...) {}
+        if (remote_gw) remote_gw->stop();
         return make_failure("error", "spawn_failed",
                             std::string(e.what()), session_key, spawn_mode);
     }
@@ -731,6 +737,17 @@ SpawnAcpResult spawn_acp_direct(
     }
 
     // ── Step 11: Return result ────────────────────────────────────────────
+    // 🎯 对齐 OC: fire-and-forget — spawn 完成后 stop 远端 gw（连接不再需要）
+    // 父子通信通过 ParentStreamRelay（进程内事件总线）或 subagent announce 完成
+    if (remote_gw) {
+        // 异步 stop，避免阻塞 spawn 返回
+        auto gw_to_stop = remote_gw;
+        std::thread([gw_to_stop]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            gw_to_stop->stop();
+        }).detach();
+    }
+
     std::string note = (spawn_mode == "session")
         ? ACP_SPAWN_SESSION_ACCEPTED_NOTE
         : ACP_SPAWN_ACCEPTED_NOTE;
