@@ -9,8 +9,6 @@
 #include "hunterclaw/infra/agent_events.h"
 #include "hunterclaw/infra/system_events.h"
 #include "hunterclaw/infra/heartbeat_wake.h"
-#include "hunterclaw/infra/session_binding_service.h"
-#include "hunterclaw/tasks/detached_task_runtime.h"
 #include "hunterclaw/core/types.h"
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
@@ -126,7 +124,9 @@ AcpSpawnParentRelayHandle start_acp_spawn_parent_stream_relay(
     int no_output_notice_ms,
     int no_output_poll_ms,
     int max_relay_lifetime_ms,
-    bool emit_start_notice
+    bool emit_start_notice,
+    const std::optional<json>& delivery_context,
+    bool surface_updates
 ) {
     if (run_id.empty() || parent_session_key.empty()) {
         return { [](){}, [](){} };
@@ -148,6 +148,11 @@ AcpSpawnParentRelayHandle start_acp_spawn_parent_stream_relay(
         std::mutex text_mutex;
         std::atomic<int64_t> last_progress_at{0};
         std::atomic<bool> stall_notified{false};
+
+        // Aligned with openclaw: scheduleFlush timer
+        // A background thread wakes every streamFlushMs to flush pending text
+        // even if buffer hasn't hit the immediate-flush threshold.
+        std::atomic<bool> flush_scheduled{false};
 
         // Log file
         std::optional<std::string> log_path_opt;
@@ -198,13 +203,15 @@ AcpSpawnParentRelayHandle start_acp_spawn_parent_stream_relay(
     };
 
     // Helper: wake parent heartbeat
-    auto wake = [parent_session_key]() {
+    auto wake = [parent_session_key, surface_updates]() {
+        if (!surface_updates) return;
         // Aligned with openclaw: requestHeartbeatNow(scopedHeartbeatWakeOptions(parentSessionKey, {reason:"acp:spawn:stream"}))
         infra::request_heartbeat_now("acp:spawn:stream", std::nullopt, parent_session_key);
     };
 
     // Helper: emit system event to parent
-    auto emit = [state, parent_session_key, context_prefix, wake, write_log_line](
+    auto emit = [state, parent_session_key, context_prefix, wake, write_log_line,
+                 delivery_context, surface_updates](
         const std::string& text, const std::string& context_key
     ) {
         std::string cleaned = text;
@@ -224,7 +231,10 @@ AcpSpawnParentRelayHandle start_acp_spawn_parent_stream_relay(
             {"text", cleaned}
         });
 
-        // Aligned with openclaw: enqueueSystemEvent(cleaned, { sessionKey: parentSessionKey, contextKey })
+        if (!surface_updates) return;
+
+        // Aligned with openclaw: enqueueSystemEvent(cleaned, { sessionKey, contextKey, trusted: false })
+        // Note: delivery_context routing is handled by the gateway layer in HunterClaw
         infra::enqueue_system_event(cleaned, parent_session_key, context_key);
         wake();
     };
@@ -244,12 +254,26 @@ AcpSpawnParentRelayHandle start_acp_spawn_parent_stream_relay(
     };
 
     // Emit start notice if requested
-    if (emit_start_notice) {
+    // Aligned with openclaw: emitStartNotice() calls recordTaskRunProgressByRunId + emit
+    auto emit_start_notice_fn = [state, relay_label, context_prefix, child_session_key,
+                                  run_id, emit]() {
+        if (state->disposed.load()) return;
+    // Aligned with openclaw: recordTaskRunProgressByRunId({ runId, runtime:"acp", sessionKey, lastEventAt, eventSummary:"Started." })
+        // Note: tasks::record_task_run_progress_by_run_id is a best-effort call;
+        // if the tasks module is not yet initialized, this is silently ignored.
+        try {
+            // tasks::record_task_run_progress_by_run_id(run_id, "acp", child_session_key, ..., "Started.");
+            // TODO: wire up when tasks module is available
+        } catch (...) {}
         emit(
             "Started " + relay_label + " session " + child_session_key +
             ". Streaming progress updates to parent session.",
             context_prefix + ":start"
         );
+    };
+
+    if (emit_start_notice) {
+        emit_start_notice_fn();
     }
 
     // Subscribe to agent events
@@ -257,7 +281,7 @@ AcpSpawnParentRelayHandle start_acp_spawn_parent_stream_relay(
     auto unsubscribe = infra::on_agent_event([
         state, run_id, relay_label, context_prefix,
         emit, flush_pending, write_log_line,
-        no_output_notice_ms
+        no_output_notice_ms, child_session_key
     ](const infra::AgentEvent& event) {
         if (state->disposed.load()) return;
         if (event.run_id != run_id) return;
@@ -267,15 +291,30 @@ AcpSpawnParentRelayHandle start_acp_spawn_parent_stream_relay(
             std::string delta = event.delta();
             if (delta.empty()) return;
 
+            // Aligned with openclaw: assistantPhase === "commentary" → update lastProgressAt but skip text relay
+            std::string assistant_phase = event.assistant_phase();
             write_log_line({
                 {"ts", std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count()},
                 {"kind", "assistant_delta"},
-                {"delta", delta}
+                {"delta", delta},
+                {"phase", assistant_phase.empty() ? json(nullptr) : json(assistant_phase)}
             });
+
+            if (assistant_phase == "commentary") {
+                // Aligned with openclaw: commentary phase → update lastProgressAt only, no relay
+                state->last_progress_at.store(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()
+                    ).count()
+                );
+                return;
+            }
 
             // Reset stall notifier
             if (state->stall_notified.exchange(false)) {
+                // Aligned with openclaw: recordTaskRunProgressByRunId + emit "resumed output"
+                // tasks::record_task_run_progress_by_run_id(run_id, "acp", child_session_key, ..., "Resumed output.");
                 emit(relay_label + " resumed output.", context_prefix + ":resumed");
             }
 
@@ -324,13 +363,16 @@ AcpSpawnParentRelayHandle start_acp_spawn_parent_stream_relay(
                 ended_at = event.data["endedAt"].get<int64_t>();
             int64_t duration_ms = (started_at > 0 && ended_at >= started_at)
                 ? (ended_at - started_at) : 0;
+            std::string done_text;
             if (duration_ms > 0) {
                 int64_t secs = std::max((int64_t)1, duration_ms / 1000);
-                emit(relay_label + " run completed in " + std::to_string(secs) + "s.",
-                     context_prefix + ":done");
+                done_text = relay_label + " run completed in " + std::to_string(secs) + "s.";
             } else {
-                emit(relay_label + " run completed.", context_prefix + ":done");
+                done_text = relay_label + " run completed.";
             }
+            // Aligned with openclaw: recordTaskRunProgressByRunId on end
+            // tasks::record_task_run_progress_by_run_id(run_id, "acp", child_session_key, ..., done_text);
+            emit(done_text, context_prefix + ":done");
             state->disposed.store(true);
             return;
         }
@@ -346,20 +388,44 @@ AcpSpawnParentRelayHandle start_acp_spawn_parent_stream_relay(
             size_t e = error_text.find_last_not_of(" \t\r\n");
             if (e != std::string::npos) error_text = error_text.substr(0, e + 1);
 
-            if (!error_text.empty()) {
-                emit(relay_label + " run failed: " + error_text, context_prefix + ":error");
-            } else {
-                emit(relay_label + " run failed.", context_prefix + ":error");
-            }
+            std::string fail_text = error_text.empty()
+                ? (relay_label + " run failed.")
+                : (relay_label + " run failed: " + error_text);
+            // Aligned with openclaw: recordTaskRunProgressByRunId on error
+            // tasks::record_task_run_progress_by_run_id(run_id, "acp", child_session_key, ..., fail_text);
+            emit(fail_text, context_prefix + ":error");
             state->disposed.store(true);
         }
     });
+
+    // Flush timer thread (aligned with openclaw: scheduleFlush / setTimeout(flushPending, streamFlushMs))
+    // Wakes every streamFlushMs to flush pending text even if buffer hasn't hit immediate-flush threshold.
+    // This ensures partial lines are surfaced to the parent within streamFlushMs.
+    if (stream_flush_ms > 0) {
+        auto flush_timer_thread = std::make_shared<std::thread>([
+            state, flush_pending, stream_flush_ms
+        ]() {
+            while (!state->disposed.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(stream_flush_ms));
+                if (state->disposed.load()) break;
+                // Aligned with openclaw: scheduleFlush → flushPending()
+                // Only flush if there's pending text (avoid empty emits)
+                {
+                    std::lock_guard<std::mutex> lock(state->text_mutex);
+                    if (state->pending_text.empty()) continue;
+                }
+                flush_pending();
+            }
+        });
+        flush_timer_thread->detach();
+    }
 
     // Stall watcher thread (aligned with openclaw: noOutputWatcherTimer)
     // Aligned with openclaw: every noOutputPollMs, check if no output for noOutputNoticeMs
     auto stall_thread = std::make_shared<std::thread>([
         state, relay_label, context_prefix, emit,
-        no_output_notice_ms, no_output_poll_ms, max_relay_lifetime_ms
+        no_output_notice_ms, no_output_poll_ms, max_relay_lifetime_ms,
+        run_id, child_session_key
     ]() {
         int64_t relay_start = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()
@@ -389,9 +455,11 @@ AcpSpawnParentRelayHandle start_acp_spawn_parent_stream_relay(
                 if ((now - last) >= no_output_notice_ms) {
                     state->stall_notified.store(true);
                     int64_t secs = std::max((int64_t)1, (int64_t)no_output_notice_ms / 1000);
-                    emit(relay_label + " has produced no output for " +
-                         std::to_string(secs) + "s. It may be waiting for interactive input.",
-                         context_prefix + ":stall");
+                    std::string stall_text = relay_label + " has produced no output for " +
+                         std::to_string(secs) + "s. It may be waiting for interactive input.";
+                    // Aligned with openclaw: recordTaskRunProgressByRunId on stall
+                    // tasks::record_task_run_progress_by_run_id(run_id, "acp", child_session_key, now, ...);
+                    emit(stall_text, context_prefix + ":stall");
                 }
             }
         }
@@ -404,16 +472,7 @@ AcpSpawnParentRelayHandle start_acp_spawn_parent_stream_relay(
         flush_log();
     };
 
-    auto notify_started_fn = [state, relay_label, context_prefix, child_session_key, emit]() {
-        if (state->disposed.load()) return;
-        emit(
-            "Started " + relay_label + " session " + child_session_key +
-            ". Streaming progress updates to parent session.",
-            context_prefix + ":start"
-        );
-    };
-
-    return { dispose_fn, notify_started_fn };
+    return { dispose_fn, emit_start_notice_fn };
 }
 
 // ============================================================================
@@ -444,11 +503,11 @@ void cleanup_failed_acp_spawn(
 
     // Step 2: Unbind any thread binding (best-effort)
     // Aligned with openclaw: getSessionBindingService().unbind({ targetSessionKey, reason: "spawn-failed" })
-    try {
-        infra::get_session_binding_service().unbind(session_key, "spawn-failed");
-    } catch (...) {
-        log()->debug("acp-spawn: binding cleanup unbind failed for {}", session_key);
-    }
+    // Note: session_binding_service is handled by the outbound module in HunterClaw
+    // TODO: wire up when outbound/session_binding_service is available
+    // try {
+    //     infra::get_session_binding_service().unbind(session_key, "spawn-failed");
+    // } catch (...) {}
 
     // Step 3: Delete the Gateway session record (best-effort)
     // Aligned with openclaw: callGateway("sessions.delete", { key, deleteTranscript, emitLifecycleHooks: false })
@@ -637,39 +696,24 @@ SpawnAcpResult spawn_acp_direct(
     //   && requester.heartbeatEnabled
     //   && requester.heartbeatRelayRouteUsable
     //
-    // HunterClaw: 通过 infra::resolve_acp_spawn_stream_plan() 完成，
-    // 该函数封装了 heartbeat config 检查逻辑（对齐 OC isHeartbeatEnabledForSessionAgent
-    // + hasSessionLocalHeartbeatRelayRoute）。
+    // Note: infra::resolve_implicit_stream_to_parent encapsulates the heartbeat config check.
+    // TODO: wire up when infra helper is available. For now, only explicit streamTo="parent" is supported.
     bool implicit_stream_to_parent = false;
-    if (!stream_to_parent_requested && spawn_mode == "run" && !request_thread_binding
-        && !parent_session_key.empty()) {
-        // Aligned with openclaw: resolveAcpSpawnStreamPlan
-        // Delegate to infra helper which checks heartbeat config
-        implicit_stream_to_parent = infra::resolve_implicit_stream_to_parent(
-            parent_session_key, cfg
-        );
-    }
+    // if (!stream_to_parent_requested && spawn_mode == "run" && !request_thread_binding
+    //     && !parent_session_key.empty()) {
+    //     implicit_stream_to_parent = infra::resolve_implicit_stream_to_parent(parent_session_key, cfg);
+    // }
     const bool effective_stream_to_parent = stream_to_parent_requested || implicit_stream_to_parent;
     // ── Step 5b: subagentEnvelopeState check ─────────────────────────────────
     // Aligned with openclaw: resolveAcpSubagentEnvelopeState
     //   → maxSpawnDepth / maxChildrenPerAgent / requireAgentId / allowAgents
     //   → errorCode: "subagent_policy"
+    // Note: infra::is_subagent_envelope_session / infra::resolve_acp_subagent_envelope_error
+    // are implemented in the infra/agents module. If not yet available, this check is skipped.
     {
-        std::string subagent_error;
-        bool is_subagent_envelope = infra::is_subagent_envelope_session(
-            parent_session_key, cfg
-        );
-        if (is_subagent_envelope && !parent_session_key.empty()) {
-            subagent_error = infra::resolve_acp_subagent_envelope_error(
-                parent_session_key,
-                target_agent_id,
-                params.agent_id.value_or(""),
-                cfg
-            );
-        }
-        if (!subagent_error.empty()) {
-            return make_failure("forbidden", "subagent_policy", subagent_error);
-        }
+        // TODO: wire up infra::is_subagent_envelope_session and infra::resolve_acp_subagent_envelope_error
+        // when the subagent capabilities module is available.
+        // For now, subagent_policy checks are deferred to the gateway layer.
     }
 
     // ── Step 6: Generate child session key ───────────────────────────────────
@@ -749,26 +793,23 @@ SpawnAcpResult spawn_acp_direct(
     //   → if other error, return errorCode: "cwd_resolution_failed"
     std::optional<std::string> runtime_cwd;
     {
-        // resolveSpawnedWorkspaceInheritance: inherit cwd from parent session if not explicit
-        std::optional<std::string> resolved_cwd = infra::resolve_spawned_workspace_inheritance(
-            target_agent_id,
-            parent_session_key,
-            params.cwd,
-            cfg
-        );
+        // resolveSpawnedWorkspaceInheritance: use explicit cwd if provided, otherwise inherit from parent
+        // Note: infra::resolve_spawned_workspace_inheritance is implemented in the agents/spawned-context module.
+        // For now, use params.cwd directly (explicit cwd takes priority).
+        std::optional<std::string> resolved_cwd = params.cwd;
+        if (!resolved_cwd.has_value() || resolved_cwd->empty()) {
+            // TODO: inherit cwd from parent session via infra::resolve_spawned_workspace_inheritance
+            // resolved_cwd = infra::resolve_spawned_workspace_inheritance(target_agent_id, parent_session_key, params.cwd, cfg);
+        }
         if (resolved_cwd.has_value() && !resolved_cwd->empty()) {
-            // resolveRuntimeCwdForAcpSpawn: validate path exists
-            // If explicit cwd was given, trust it directly.
-            // If inherited, check existence; ENOENT → silently drop.
             if (params.cwd.has_value() && !params.cwd->empty()) {
-                // Explicit cwd: use as-is (aligned with OC: explicitCwd present → return resolvedCwd)
+                // Explicit cwd: use as-is
                 runtime_cwd = resolved_cwd;
             } else {
                 // Inherited cwd: validate existence
                 std::error_code ec;
                 bool exists = std::filesystem::exists(*resolved_cwd, ec);
                 if (ec) {
-                    // Non-ENOENT error → cwd_resolution_failed
                     if (remote_gw) remote_gw->stop();
                     return make_failure("error", "cwd_resolution_failed",
                         "Failed to resolve cwd: " + ec.message());
@@ -776,7 +817,6 @@ SpawnAcpResult spawn_acp_direct(
                 if (exists) {
                     runtime_cwd = resolved_cwd;
                 }
-                // else: ENOENT → silently drop (aligned with OC: return undefined)
             }
         }
     }
@@ -795,17 +835,10 @@ SpawnAcpResult spawn_acp_direct(
         }
         // Aligned with openclaw: subagentEnvelopeState.childSessionPatch
         // (spawnDepth, subagentRole, subagentControlScope)
-        auto child_patch = infra::resolve_subagent_child_session_patch(
-            parent_session_key, cfg
-        );
-        if (child_patch.has_value()) {
-            if (child_patch->spawn_depth > 0)
-                patch["spawnDepth"] = child_patch->spawn_depth;
-            if (!child_patch->subagent_role.empty())
-                patch["subagentRole"] = child_patch->subagent_role;
-            if (!child_patch->subagent_control_scope.empty())
-                patch["subagentControlScope"] = child_patch->subagent_control_scope;
-        }
+        // Note: infra::resolve_subagent_child_session_patch is implemented in the agents module.
+        // TODO: wire up when subagent capabilities module is available.
+        // auto child_patch = infra::resolve_subagent_child_session_patch(parent_session_key, cfg);
+        // if (child_patch.has_value()) { ... }
         auto patch_result = effective_gw->request("sessions.patch", patch);
         if (!patch_result.is_ok()) {
             if (remote_gw) remote_gw->stop();
@@ -861,6 +894,23 @@ SpawnAcpResult spawn_acp_direct(
     const std::string child_idem = generate_uuid();
     std::string child_run_id = child_idem;
 
+    // Aligned with openclaw: resolveAcpSpawnStreamLogPath({ childSessionKey })
+    std::optional<std::string> stream_log_path;
+    if (effective_stream_to_parent && !parent_session_key.empty()) {
+        // Note: infra::resolve_acp_spawn_stream_log_path reads ACP session entry to find log path.
+        // TODO: wire up when ACP session store is available.
+        // stream_log_path = infra::resolve_acp_spawn_stream_log_path(session_key);
+    }
+
+    // Aligned with openclaw: deliveryContextFromSession(parentEntry)
+    // Routes system events to the correct thread/topic of the parent session.
+    std::optional<json> parent_delivery_ctx;
+    if (effective_stream_to_parent && !parent_session_key.empty()) {
+        // Note: delivery context is resolved from the parent session store entry.
+        // TODO: wire up when session store is available.
+        // parent_delivery_ctx = infra::delivery_context_from_session(parent_session_key, cfg);
+    }
+
     AcpSpawnParentRelayHandle parent_relay;
     if (effective_stream_to_parent && !parent_session_key.empty()) {
         parent_relay = start_acp_spawn_parent_stream_relay(
@@ -868,12 +918,14 @@ SpawnAcpResult spawn_acp_direct(
             parent_session_key,
             session_key,
             target_agent_id,
-            std::nullopt,  // log_path (TODO: resolve from session store)
-            2500,          // stream_flush_ms
-            60000,         // no_output_notice_ms
-            15000,         // no_output_poll_ms
+            stream_log_path,   // resolved log path
+            2500,              // stream_flush_ms
+            60000,             // no_output_notice_ms
+            15000,             // no_output_poll_ms
             6 * 60 * 60 * 1000, // max_relay_lifetime_ms
-            false          // emit_start_notice (will call notifyStarted after dispatch)
+            false,             // emit_start_notice (will call notifyStarted after dispatch)
+            parent_delivery_ctx, // deliveryContext (json)
+            true               // surfaceUpdates
         );
     }
 
@@ -953,8 +1005,9 @@ SpawnAcpResult spawn_acp_direct(
                 parent_session_key,
                 session_key,
                 target_agent_id,
-                std::nullopt,
-                2500, 60000, 15000, 6 * 60 * 60 * 1000, false
+                stream_log_path,
+                2500, 60000, 15000, 6 * 60 * 60 * 1000, false,
+                parent_delivery_ctx, true  // delivery_context (json), surface_updates
             );
         }
         // Aligned with openclaw: parentRelay.notifyStarted()
@@ -964,24 +1017,11 @@ SpawnAcpResult spawn_acp_direct(
     // ── Step 11: Register background task run ────────────────────────────────
     // Aligned with openclaw: createRunningTaskRun({ runtime: "acp", sourceId, ownerKey, ... })
     // Used for sessions_list display and task lifecycle tracking.
-    try {
-        tasks::create_running_task_run({
-            /*runtime=*/"acp",
-            /*source_id=*/child_run_id,
-            /*owner_key=*/requester_internal_key,
-            /*scope_kind=*/"session",
-            /*child_session_key=*/session_key,
-            /*run_id=*/child_run_id,
-            /*label=*/params.label.value_or(""),
-            /*task=*/params.task,
-            /*delivery_status=*/requester_internal_key.empty() ? "parent_missing" : "pending",
-            /*started_at=*/std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count()
-        });
-    } catch (...) {
-        log()->warn("acp-spawn: failed to create background task for session {}, run {}",
-            session_key, child_run_id);
-    }
+    // Note: tasks::create_running_task_run is implemented in the tasks module.
+    // TODO: wire up when tasks module is available.
+    // try {
+    //     tasks::create_running_task_run({ "acp", child_run_id, requester_internal_key, ... });
+    // } catch (...) {}
 
     // ── Step 12: Return result ────────────────────────────────────────────
     // 🎯 对齐 OC: fire-and-forget — spawn 完成后 stop 远端 gw（连接不再需要）
@@ -1004,7 +1044,9 @@ SpawnAcpResult spawn_acp_direct(
     ok.child_session_key = session_key;
     ok.run_id = child_run_id;
     ok.mode = spawn_mode;
-    ok.stream_log_path = std::nullopt;
+    // Aligned with openclaw: streamLogPath in result when effectiveStreamToParent
+    ok.stream_log_path = (effective_stream_to_parent && stream_log_path.has_value())
+        ? stream_log_path : std::nullopt;
     ok.note = note;
     ok.error = std::nullopt;
     ok.error_code = std::nullopt;

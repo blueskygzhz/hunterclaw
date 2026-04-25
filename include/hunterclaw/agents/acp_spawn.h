@@ -24,6 +24,7 @@
 #include <functional>
 #include <memory>
 #include <vector>
+#include <nlohmann/json.hpp>
 
 // Forward declaration to avoid pulling in ixwebsocket headers
 namespace hunterclaw {
@@ -189,7 +190,12 @@ AcpSpawnParentRelayHandle start_acp_spawn_parent_stream_relay(
     int no_output_notice_ms = 60000,
     int no_output_poll_ms = 15000,
     int max_relay_lifetime_ms = 6 * 60 * 60 * 1000,
-    bool emit_start_notice = false
+    bool emit_start_notice = false,
+    /// Aligned with openclaw: deliveryContext — routes system events to the correct thread/topic
+    /// Represented as JSON object (channel/to/threadId/accountId fields)
+    const std::optional<nlohmann::json>& delivery_context = std::nullopt,
+    /// Aligned with openclaw: surfaceUpdates — if false, log only (no system events / heartbeat wake)
+    bool surface_updates = true
 );
 
 // ============================================================================
