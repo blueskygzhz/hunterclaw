@@ -228,8 +228,8 @@ std::vector<MemorySearchResult> MemoryIndexManager::search(
             return {};
         }
 
-        // 对齐 manager.ts: extractKeywords(cleaned)
-        auto keywords = extract_keywords(cleaned);
+        // 对齐 manager.ts: extractKeywords(cleaned, { ftsTokenizer: this.settings.store.fts.tokenizer })
+        auto keywords = extract_keywords(cleaned, settings_.fts.tokenizer);
         std::vector<std::string> search_terms;
         if (!keywords.empty()) {
             search_terms = keywords;
@@ -246,7 +246,9 @@ std::vector<MemorySearchResult> MemoryIndexManager::search(
                 term,
                 candidate_limit,
                 SNIPPET_MAX_CHARS,
-                {}
+                {},
+                settings_.fts.tokenizer,  // 对齐 OC: ftsTokenizer
+                true                      // 对齐 OC: boostFallbackRanking: true
             );
             if (kr.is_err()) continue;
             for (const auto& r : kr.get()) {
@@ -294,7 +296,9 @@ std::vector<MemorySearchResult> MemoryIndexManager::search(
             cleaned,
             candidate_limit,
             SNIPPET_MAX_CHARS,
-            {}
+            {},
+            settings_.fts.tokenizer  // 对齐 OC: ftsTokenizer
+            // boost_fallback_ranking defaults to false for hybrid mode
         );
         if (kr.is_ok()) {
             for (const auto& r : kr.get()) {

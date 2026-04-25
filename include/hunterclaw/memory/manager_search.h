@@ -74,6 +74,31 @@ core::Result<std::vector<SearchRowResult>> search_vector_impl(
 );
 
 // ============================================================================
+// scoreFallbackKeywordResult (对齐 manager-search.ts:scoreFallbackKeywordResult)
+// Boost FTS-only ranking with lexical overlap signal.
+// ============================================================================
+double score_fallback_keyword_result(
+    const std::string& query,
+    const std::string& path,
+    const std::string& text,
+    double fts_score
+);
+
+// ============================================================================
+// KeywordSearchPlan (对齐 manager-search.ts:planKeywordSearch)
+// ============================================================================
+struct KeywordSearchPlan {
+    std::optional<std::string> match_query;   // FTS MATCH query (may be null for trigram substring-only)
+    std::vector<std::string> substring_terms; // CJK short terms for LIKE fallback (trigram mode)
+};
+
+KeywordSearchPlan plan_keyword_search(
+    const std::string& query,
+    const std::string& fts_tokenizer,  // "unicode61" | "trigram"
+    std::function<std::optional<std::string>(const std::string&)> build_fts_query
+);
+
+// ============================================================================
 // searchKeyword (对齐 manager-search.ts:searchKeyword)
 // ============================================================================
 core::Result<std::vector<KeywordSearchResultWithScore>> search_keyword_impl(
@@ -83,7 +108,9 @@ core::Result<std::vector<KeywordSearchResultWithScore>> search_keyword_impl(
     const std::string& query,
     int limit,
     int snippet_max_chars,
-    const std::vector<MemorySource>& source_filter_list
+    const std::vector<MemorySource>& source_filter_list,
+    const std::string& fts_tokenizer = "unicode61",  // 对齐 OC: ftsTokenizer
+    bool boost_fallback_ranking = false               // 对齐 OC: boostFallbackRanking
 );
 
 // ============================================================================

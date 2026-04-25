@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <sstream>
 #include <cmath>
+#include <set>
+#include <functional>
 #include <sqlite3.h>
 
 // 严格对齐 OpenClaw src/memory/manager-search.ts
@@ -234,6 +236,181 @@ core::Result<std::vector<SearchRowResult>> search_vector_impl(
 }
 
 // ============================================================================
+// scoreFallbackKeywordResult (对齐 manager-search.ts:scoreFallbackKeywordResult)
+// Boost FTS-only ranking with lexical overlap signal.
+// ============================================================================
+double score_fallback_keyword_result(
+    const std::string& query,
+    const std::string& path,
+    const std::string& text,
+    double fts_score
+) {
+    // 对齐 OC: normalizeSearchTokens
+    auto normalize_tokens = [](const std::string& s) -> std::vector<std::string> {
+        std::vector<std::string> tokens;
+        std::string current;
+        const unsigned char* p = reinterpret_cast<const unsigned char*>(s.data());
+        const unsigned char* end = p + s.size();
+        while (p < end) {
+            unsigned char c = *p;
+            if (c < 0x80) {
+                if (std::isalnum(c) || c == '_') {
+                    current.push_back(static_cast<char>(std::tolower(c)));
+                } else {
+                    if (!current.empty()) { tokens.push_back(current); current.clear(); }
+                }
+                ++p;
+            } else {
+                // multi-byte UTF-8: treat as word char
+                int len = 1;
+                if ((c & 0xE0) == 0xC0) len = 2;
+                else if ((c & 0xF0) == 0xE0) len = 3;
+                else if ((c & 0xF8) == 0xF0) len = 4;
+                for (int i = 0; i < len && p < end; ++i, ++p)
+                    current.push_back(static_cast<char>(*p));
+            }
+        }
+        if (!current.empty()) tokens.push_back(current);
+        return tokens;
+    };
+
+    auto query_tokens_vec = normalize_tokens(query);
+    // 对齐 OC: [...new Set(queryTokens)]
+    std::vector<std::string> query_tokens;
+    std::set<std::string> query_set;
+    for (const auto& t : query_tokens_vec) {
+        if (query_set.insert(t).second) query_tokens.push_back(t);
+    }
+    if (query_tokens.empty()) return fts_score;
+
+    auto text_tokens_vec = normalize_tokens(text);
+    std::set<std::string> text_token_set(text_tokens_vec.begin(), text_tokens_vec.end());
+
+    std::string path_lower = path;
+    std::transform(path_lower.begin(), path_lower.end(), path_lower.begin(), ::tolower);
+
+    // 对齐 OC: overlap = queryTokens.filter(t => textTokenSet.has(t)).length
+    int overlap = 0;
+    for (const auto& t : query_tokens) {
+        if (text_token_set.count(t)) ++overlap;
+    }
+    double unique_query_overlap = static_cast<double>(overlap) /
+        std::max(static_cast<int>(query_set.size()), 1);
+    double density = static_cast<double>(overlap) /
+        std::max(static_cast<int>(text_token_set.size()), 1);
+
+    // 对齐 OC: pathBoost
+    double path_boost = 0.0;
+    for (const auto& t : query_tokens) {
+        if (path_lower.find(t) != std::string::npos) path_boost += 0.18;
+    }
+    // 对齐 OC: textLengthBoost = Math.min(text.length / 160, 0.18)
+    double text_length_boost = std::min(static_cast<double>(text.size()) / 160.0, 0.18);
+
+    // 对齐 OC: lexicalBoost = uniqueQueryOverlap * 0.45 + density * 0.2 + pathBoost + textLengthBoost
+    double lexical_boost = unique_query_overlap * 0.45 + density * 0.2 + path_boost + text_length_boost;
+    return std::min(1.0, fts_score + lexical_boost);
+}
+
+// ============================================================================
+// plan_keyword_search (对齐 manager-search.ts:planKeywordSearch)
+// ============================================================================
+KeywordSearchPlan plan_keyword_search(
+    const std::string& query,
+    const std::string& fts_tokenizer,
+    std::function<std::optional<std::string>(const std::string&)> build_fts_query_fn
+) {
+    KeywordSearchPlan plan;
+
+    if (fts_tokenizer != "trigram") {
+        // 对齐 OC: non-trigram path — just call buildFtsQuery
+        plan.match_query = build_fts_query_fn(query);
+        return plan;
+    }
+
+    // 对齐 OC: trigram path — split tokens, separate short CJK (< 3 chars) as substring terms
+    // SHORT_CJK_TRIGRAM_RE = /[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af\u3131-\u3163]/u
+    auto is_short_cjk_trigram = [](const std::string& token) -> bool {
+        // Check if token contains CJK characters and has fewer than 3 Unicode codepoints
+        const unsigned char* p = reinterpret_cast<const unsigned char*>(token.data());
+        const unsigned char* end = p + token.size();
+        int codepoint_count = 0;
+        bool has_cjk = false;
+        while (p < end) {
+            unsigned char c = *p;
+            uint32_t cp = 0;
+            int len = 1;
+            if (c < 0x80) { cp = c; len = 1; }
+            else if ((c & 0xE0) == 0xC0 && end - p >= 2) { cp = ((c & 0x1F) << 6) | (p[1] & 0x3F); len = 2; }
+            else if ((c & 0xF0) == 0xE0 && end - p >= 3) { cp = ((c & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F); len = 3; }
+            else if ((c & 0xF8) == 0xF0 && end - p >= 4) { cp = ((c & 0x07) << 18) | ((p[1] & 0x3F) << 12) | ((p[2] & 0x3F) << 6) | (p[3] & 0x3F); len = 4; }
+            // Check CJK ranges: \u3040-\u30ff, \u3400-\u9fff, \uac00-\ud7af, \u3131-\u3163
+            if ((cp >= 0x3040 && cp <= 0x30FF) ||
+                (cp >= 0x3400 && cp <= 0x9FFF) ||
+                (cp >= 0xAC00 && cp <= 0xD7AF) ||
+                (cp >= 0x3131 && cp <= 0x3163)) {
+                has_cjk = true;
+            }
+            codepoint_count++;
+            p += len;
+        }
+        return has_cjk && codepoint_count < 3;
+    };
+
+    // 对齐 OC: FTS_QUERY_TOKEN_RE = /[\p{L}\p{N}_]+/gu
+    // Extract tokens (same as build_fts_query tokenization)
+    std::vector<std::string> tokens;
+    std::string current;
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(query.data());
+    const unsigned char* end = p + query.size();
+    while (p < end) {
+        unsigned char c = *p;
+        if (c < 0x80) {
+            if (std::isalnum(c) || c == '_') {
+                current.push_back(static_cast<char>(c));
+            } else {
+                if (!current.empty()) { tokens.push_back(current); current.clear(); }
+            }
+            ++p;
+        } else {
+            int len = 1;
+            if ((c & 0xE0) == 0xC0) len = 2;
+            else if ((c & 0xF0) == 0xE0) len = 3;
+            else if ((c & 0xF8) == 0xF0) len = 4;
+            for (int i = 0; i < len && p < end; ++i, ++p)
+                current.push_back(static_cast<char>(*p));
+        }
+    }
+    if (!current.empty()) tokens.push_back(current);
+
+    if (tokens.empty()) return plan;  // match_query = nullopt, substring_terms = []
+
+    // 对齐 OC: separate matchTerms vs substringTerms
+    std::vector<std::string> match_terms;
+    for (const auto& token : tokens) {
+        if (is_short_cjk_trigram(token)) {
+            plan.substring_terms.push_back(token);
+        } else {
+            match_terms.push_back(token);
+        }
+    }
+
+    // 对齐 OC: buildMatchQueryFromTerms
+    if (!match_terms.empty()) {
+        std::string mq;
+        for (size_t i = 0; i < match_terms.size(); ++i) {
+            if (i > 0) mq += " AND ";
+            std::string t = match_terms[i];
+            t.erase(std::remove(t.begin(), t.end(), '"'), t.end());
+            if (!t.empty()) mq += '"' + t + '"';
+        }
+        if (!mq.empty()) plan.match_query = mq;
+    }
+
+    return plan;
+}
+
+// ============================================================================
 // searchKeyword (对齐 manager-search.ts:searchKeyword)
 // ============================================================================
 core::Result<std::vector<KeywordSearchResultWithScore>> search_keyword_impl(
@@ -243,37 +420,76 @@ core::Result<std::vector<KeywordSearchResultWithScore>> search_keyword_impl(
     const std::string& query,
     int limit,
     int snippet_max_chars,
-    const std::vector<MemorySource>& source_filter_list
+    const std::vector<MemorySource>& source_filter_list,
+    const std::string& fts_tokenizer,
+    bool boost_fallback_ranking
 ) {
     if (limit <= 0) {
         return core::Result<std::vector<KeywordSearchResultWithScore>>::Ok({});
     }
 
-    // 对齐 openclaw: buildFtsQuery
-    std::string fts_query = build_fts_query(query);
-    if (fts_query.empty()) {
+    // 对齐 OC: planKeywordSearch
+    auto plan = plan_keyword_search(
+        query,
+        fts_tokenizer,
+        [](const std::string& raw) -> std::optional<std::string> {
+            std::string q = build_fts_query(raw);
+            return q.empty() ? std::nullopt : std::make_optional(q);
+        }
+    );
+
+    // 对齐 OC: if (!plan.matchQuery && plan.substringTerms.length === 0) return []
+    if (!plan.match_query && plan.substring_terms.empty()) {
         return core::Result<std::vector<KeywordSearchResultWithScore>>::Ok({});
     }
 
     auto source_filter = build_source_filter(source_filter_list);
 
-    // 对齐 openclaw: When providerModel is undefined (FTS-only mode), search all models
-    std::string model_clause  = provider_model ? " AND model = ?" : "";
+    // 对齐 OC: When providerModel is undefined (FTS-only mode), search all models
+    std::string model_clause = provider_model ? " AND model = ?" : "";
     std::vector<std::string> model_params;
     if (provider_model) model_params.push_back(*provider_model);
 
-    // 对齐 openclaw SQL:
+    // 对齐 OC: substringClause = substringTerms.map(() => " AND text LIKE ? ESCAPE '\\'").join("")
+    std::string substring_clause;
+    std::vector<std::string> substring_params;
+    for (const auto& term : plan.substring_terms) {
+        substring_clause += " AND text LIKE ? ESCAPE '\\'";
+        // 对齐 OC: escapeLikePattern(term) → `%${escaped}%`
+        std::string escaped = term;
+        // escape \, %, _
+        std::string esc_term;
+        for (char c : escaped) {
+            if (c == '\\' || c == '%' || c == '_') esc_term += '\\';
+            esc_term += c;
+        }
+        substring_params.push_back("%" + esc_term + "%");
+    }
+
+    // 对齐 OC: whereClause
+    std::string where_clause;
+    if (plan.match_query) {
+        where_clause = fts_table + " MATCH ?" + substring_clause + model_clause + source_filter.sql;
+    } else {
+        // substring-only (all terms were short CJK)
+        where_clause = "1=1" + substring_clause + model_clause + source_filter.sql;
+    }
+
+    // 对齐 OC: rankExpression = plan.matchQuery ? `bm25(${ftsTable})` : "0"
+    std::string rank_expression = plan.match_query ? ("bm25(" + fts_table + ")") : "0";
+
+    // 对齐 OC SQL:
     // SELECT id, path, source, start_line, end_line, text,
-    //        bm25({ftsTable}) AS rank
+    //        {rankExpression} AS rank
     //   FROM {ftsTable}
-    //  WHERE {ftsTable} MATCH ? {modelClause} {sourceFilter}
+    //  WHERE {whereClause}
     //  ORDER BY rank ASC
     //  LIMIT ?
     std::string sql =
         "SELECT id, path, source, start_line, end_line, text,"
-        "       bm25(" + fts_table + ") AS rank"
+        "       " + rank_expression + " AS rank"
         "  FROM " + fts_table +
-        " WHERE " + fts_table + " MATCH ?" + model_clause + source_filter.sql +
+        " WHERE " + where_clause +
         " ORDER BY rank ASC"
         " LIMIT ?";
 
@@ -284,7 +500,13 @@ core::Result<std::vector<KeywordSearchResultWithScore>> search_keyword_impl(
 
     sqlite3_stmt* stmt = stmt_result.get();
     int param_idx = 1;
-    sqlite3_bind_text(stmt, param_idx++, fts_query.c_str(), -1, SQLITE_TRANSIENT);
+    // 对齐 OC: queryParams = [...(matchQuery ? [matchQuery] : []), ...substringParams, ...modelParams, ...sourceFilter.params, limit]
+    if (plan.match_query) {
+        sqlite3_bind_text(stmt, param_idx++, plan.match_query->c_str(), -1, SQLITE_TRANSIENT);
+    }
+    for (const auto& p : substring_params) {
+        sqlite3_bind_text(stmt, param_idx++, p.c_str(), -1, SQLITE_TRANSIENT);
+    }
     for (const auto& p : model_params) {
         sqlite3_bind_text(stmt, param_idx++, p.c_str(), -1, SQLITE_TRANSIENT);
     }
@@ -305,10 +527,16 @@ core::Result<std::vector<KeywordSearchResultWithScore>> search_keyword_impl(
         std::string text = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5));
         double rank    = sqlite3_column_double(stmt, 6);
 
-        // 对齐 openclaw: bm25RankToScore
-        double text_score = bm25_rank_to_score(rank);
+        // 对齐 OC: textScore = plan.matchQuery ? bm25RankToScore(rank) : 1
+        double text_score = plan.match_query ? bm25_rank_to_score(rank) : 1.0;
+
+        // 对齐 OC: score = boostFallbackRanking ? scoreFallbackKeywordResult(...) : textScore
+        double score = boost_fallback_ranking
+            ? score_fallback_keyword_result(query, row.path, text, text_score)
+            : text_score;
+
         row.text_score = text_score;
-        row.score      = text_score;
+        row.score      = score;
         row.snippet    = truncate_utf8_safe(text, snippet_max_chars);
         row.text       = std::move(text);
         results.push_back(std::move(row));

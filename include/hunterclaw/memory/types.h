@@ -315,6 +315,7 @@ struct ResolvedMemorySearchConfig {
     
     struct FtsConfig {
         bool enabled = true;
+        std::string tokenizer = "unicode61";  // 对齐 OC: store.fts.tokenizer ("unicode61" | "trigram")
     } fts;
     
     struct OpenAIConfig {

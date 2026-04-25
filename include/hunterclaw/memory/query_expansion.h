@@ -32,10 +32,20 @@ bool is_useful_korean_stem(const std::u32string& stem);
 
 // Tokenize text into keywords (handles EN/ZH/JA/KO/AR/ES/PT)
 // (对齐 query-expansion.ts:tokenize)
-std::vector<std::string> tokenize_query(const std::string& text);
+// fts_tokenizer: "unicode61" (default) or "trigram" — in trigram mode, CJK chars
+// are kept as contiguous blocks instead of unigrams+bigrams.
+std::vector<std::string> tokenize_query(
+    const std::string& text,
+    const std::string& fts_tokenizer = "unicode61"
+);
 
 // Extract keywords from conversational query
-std::vector<std::string> extract_keywords(const std::string& query);
+// (对齐 query-expansion.ts:extractKeywords)
+// fts_tokenizer: passed through to tokenize_query
+std::vector<std::string> extract_keywords(
+    const std::string& query,
+    const std::string& fts_tokenizer = "unicode61"
+);
 
 /**
  * Expand query result structure
