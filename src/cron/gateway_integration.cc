@@ -79,8 +79,22 @@ nlohmann::json GatewayCronIntegration::handle_wake(const nlohmann::json& params)
         // ✅ Aligned with openclaw: inject get_queue_size (deps.getQueueSize)
         // Aligned with openclaw: queueSize > 0 → skipped/requests-in-flight
         // Without this, the lane check is silently skipped.
+        //
+        // CRITICAL: heartbeat_runner.cc calls get_queue_size("main"), but business
+        // requests are enqueued into "session:<key>" dynamic lanes — NOT the global
+        // Main lane. We must resolve the actual session lane for this agent so the
+        // guard is meaningful. Capture agent_id by value for the lambda.
         if (get_queue_size_fn_) {
-            opts.get_queue_size = get_queue_size_fn_;
+            const std::string agent_id_for_lane = agent_id.empty() ? session_key : agent_id;
+            auto get_queue_size_fn_copy = get_queue_size_fn_;
+            opts.get_queue_size = [get_queue_size_fn_copy, agent_id_for_lane](
+                const std::string& lane) -> int {
+                // lane is always "main" from heartbeat_runner.cc — remap to session lane.
+                const std::string resolved = (lane == "main" && !agent_id_for_lane.empty())
+                    ? agent_id_for_lane
+                    : lane;
+                return get_queue_size_fn_copy(resolved);
+            };
         }
         // If not injected, get_queue_size remains null → lane check skipped (safe fallback)
 
