@@ -32,6 +32,10 @@ namespace infra {
 
 namespace acp {
 
+// Forward declaration: stdio JSON-RPC 连接（session/update notification 回推 +
+// session/request_permission server→client request）。定义见 acp_stdio_transport.h。
+class AcpStdioConnection;
+
 // ── ACP Protocol version ─────────────────────────────────────────────────────
 // ✅ 对齐 OC: src/acp/translator.ts 引用 @agentclientprotocol/sdk 的 PROTOCOL_VERSION
 // 根据 ACP schema (uint16 integer): "Only bumped for breaking changes.
@@ -302,27 +306,56 @@ struct ChatResult {
 
 using PromptStreamCallback = std::function<void(const std::string&, const std::string&)>;
 
+// 🎯 prompt 派发回调（注入式，避免 acp 库直接依赖 gateway，防循环依赖）。
+// 由 server 装配层提供：把一次 ACP prompt 派发到 gateway 的 chat 流程，
+// 返回 { run_id, stop_reason, text }。派发期间的流式事件仍通过
+// handle_gateway_event 回流到 translator 并转成 session/update。
+// 入参：session_key, prompt_text, attachments(json array), idempotency_key。
+using PromptDispatchFn = std::function<ChatResult(
+    const std::string& session_key,
+    const std::string& prompt_text,
+    const nlohmann::json& attachments,
+    const std::string& idempotency_key)>;
+
+// 🎯 cancel 派发回调（注入式）：abort 指定 session_key/run_id 上的运行。
+using CancelDispatchFn = std::function<void(
+    const std::string& session_key, const std::string& run_id)>;
+
 // ── AcpGatewayAgent ──────────────────────────────────────────────────────────
 
 class AcpGatewayAgent {
 public:
     AcpGatewayAgent(gateway::GatewayClient* gw, const AcpServerOptions& opts,
-                     AcpSessionStore* store);
+          AcpSessionStore* store);
     ~AcpGatewayAgent();
+
+    // 🎯 对齐 OC: AgentSideConnection 注入。用于:
+    //   - session/update notification 回推（agent_message_chunk / tool_call / ...）
+    //   - session/request_permission server→client request（权限链路）
+    // 由 server 装配层在构造后注入。
+    void set_connection(AcpStdioConnection* conn);
+
+    // 🎯 注入 prompt / cancel 派发回调（由 server 装配层提供，接 gateway）。
+    void set_prompt_dispatch(PromptDispatchFn fn);
+ void set_cancel_dispatch(CancelDispatchFn fn);
 
     InitializeResponse handle_initialize(const InitializeRequest& req);
     AuthenticateResponse handle_authenticate(const AuthenticateRequest& req);
-    NewSessionResponse handle_new_session(const NewSessionRequest& req);
+  NewSessionResponse handle_new_session(const NewSessionRequest& req);
     ListSessionsResponse handle_list_sessions(const ListSessionsRequest& req);
     LoadSessionResponse handle_load_session(const LoadSessionRequest& req);
-    PromptResponse handle_prompt(const PromptRequest& req, PromptStreamCallback stream_cb = {});
+ PromptResponse handle_prompt(const PromptRequest& req, PromptStreamCallback stream_cb = {});
     SetSessionModeResponse handle_set_session_mode(const SetSessionModeRequest& req);
     SetSessionConfigOptionResponse handle_set_session_config_option(
         const SetSessionConfigOptionRequest& req);
 
-    void handle_gateway_event(const nlohmann::json& evt);
+    // 🎯 对齐 OC: cancel(params) — session/cancel notification。
+    // abort 指定 session 上正在进行的 run。
+    void handle_cancel(const std::string& session_id);
+
+  void handle_gateway_event(const nlohmann::json& evt);
     void handle_gateway_reconnect();
-    void handle_gateway_disconnect(const std::string& reason);
+void handle_gateway_disconnect(const std::string& reason);
 
 private:
     struct Impl;
@@ -339,6 +372,10 @@ private:
     std::string map_stop_reason(const std::string& gateway_reason);
     std::vector<ReplayChunk> extract_replay_chunks(const TranscriptMessage& msg);
     AcpSessionMeta_Request parse_session_meta(const nlohmann::json& meta);
+
+    // 🎯 对齐 OC: sessionUpdates.emit({ sessionId, update })。
+    // 通过注入的 connection 向 client 发 session/update notification。
+    void emit_session_update(const std::string& session_id, const nlohmann::json& update);
 };
 
 // ── Available Commands ───────────────────────────────────────────────────────

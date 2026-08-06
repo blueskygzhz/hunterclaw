@@ -6,6 +6,7 @@
 
 #include "hunterclaw/acp/acp_translator.h"
 #include "hunterclaw/acp/acp_event_mapper.h"
+#include "hunterclaw/acp/acp_stdio_transport.h"
 #include "hunterclaw/acp/runtime_errors.h"
 #include <algorithm>
 #include <chrono>
@@ -71,11 +72,16 @@ struct AcpGatewayAgent::Impl {
     bool gw_connected = false;
     std::unique_ptr<SimpleRateLimiter> rate_limiter;
     AcpAgentInfo info{"hunterclaw-acp", "HunterClaw ACP Gateway", HUNTERCLAW_VERSION};
+    // 🎯 stdio 连接（session/update 回推 + request_permission）
+AcpStdioConnection* connection = nullptr;
+    // 🎯 注入的派发回调（接 gateway，避免循环依赖）
+    PromptDispatchFn prompt_dispatch;
+    CancelDispatchFn cancel_dispatch;
 };
 
 AcpGatewayAgent::AcpGatewayAgent(gateway::GatewayClient* /*gw*/,
-                                   const AcpServerOptions& opts,
-                                   AcpSessionStore* store)
+   const AcpServerOptions& opts,
+      AcpSessionStore* store)
     : impl_(std::make_unique<Impl>()) {
     impl_->opts = opts;
     impl_->session_store = store;
@@ -87,6 +93,36 @@ AcpGatewayAgent::AcpGatewayAgent(gateway::GatewayClient* /*gw*/,
 }
 
 AcpGatewayAgent::~AcpGatewayAgent() = default;
+
+void AcpGatewayAgent::set_connection(AcpStdioConnection* conn) {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    impl_->connection = conn;
+}
+
+void AcpGatewayAgent::set_prompt_dispatch(PromptDispatchFn fn) {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    impl_->prompt_dispatch = std::move(fn);
+}
+
+void AcpGatewayAgent::set_cancel_dispatch(CancelDispatchFn fn) {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    impl_->cancel_dispatch = std::move(fn);
+}
+
+// 🎯 对齐 OC: sessionUpdates.emit — 发 session/update notification
+void AcpGatewayAgent::emit_session_update(const std::string& session_id,
+ const nlohmann::json& update) {
+    AcpStdioConnection* conn = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(impl_->mu);
+      conn = impl_->connection;
+    }
+    if (!conn) return;
+    conn->send_notification("session/update", nlohmann::json{
+        {"sessionId", session_id},
+        {"update", update},
+    });
+}
 
 // ── handleInitialize ─────────────────────────────────────────────────────────
 // ✅ 严格对齐 OC translator.ts:503-524 initialize response
@@ -149,7 +185,7 @@ LoadSessionResponse AcpGatewayAgent::handle_load_session(const LoadSessionReques
 
 // ── handlePrompt ─────────────────────────────────────────────────────────────
 PromptResponse AcpGatewayAgent::handle_prompt(const PromptRequest& req,
-                                                PromptStreamCallback /*cb*/) {
+  PromptStreamCallback cb) {
     size_t bytes = req.text.size();
     for (auto& a : req.attachments) bytes += a.content.size();
     if (bytes > MAX_PROMPT_BYTES)
@@ -161,63 +197,152 @@ PromptResponse AcpGatewayAgent::handle_prompt(const PromptRequest& req,
         throw AcpRuntimeError(AcpErrorCode::ACP_SESSION_INIT_FAILED,
                               "Session not found: " + req.session_id);
 
-    // Register pending
+  // Register pending
+    PromptDispatchFn dispatch;
     {
-        std::lock_guard<std::mutex> lk(impl_->mu);
-        PendingPromptEntry pe;
+  std::lock_guard<std::mutex> lk(impl_->mu);
+     PendingPromptEntry pe;
         pe.session_id = req.session_id;
         pe.session_key = session->session_key;
         pe.idempotency_key = req.idempotency_key;
         impl_->pending[req.session_id] = std::move(pe);
+        dispatch = impl_->prompt_dispatch;
     }
 
-    // NOTE: actual gateway chat dispatch is wired at runtime (gateway layer).
-    // This translation layer prepares the request; the response arrives via
-    // handle_gateway_event() callbacks.
+    nlohmann::json atts = nlohmann::json::array();
+    for (auto& a : req.attachments)
+        atts.push_back({{"type", a.type}, {"mimeType", a.mime_type}, {"content", a.content}});
 
-    // ✅ 严格对齐 OC translator.ts:957-971 finishPrompt stopReason:
-    //   state=="final"        → "end_turn" (或 "max_tokens" if rawStopReason)
-    //   state=="aborted"      → "cancelled"
-    //   state=="error" refusal→ "refusal"
-    //   其他                   → "end_turn"
-    // ACP spec StopReason 枚举是 snake_case: "end_turn" | "max_tokens" | "cancelled" | "refusal"
-    // 旧实现返回 "endTurn"（camelCase）→ Cursor/Zed 等 ACP 客户端会拒绝
+    if (!dispatch) {
+        std::lock_guard<std::mutex> lk(impl_->mu);
+        impl_->pending.erase(req.session_id);
+        PromptResponse r0;
+        r0.stop_reason = "end_turn";
+        return r0;
+    }
+
+    ChatResult cr;
+    try {
+        cr = dispatch(session->session_key, req.text, atts, req.idempotency_key);
+    } catch (const std::exception& e) {
+        {
+            std::lock_guard<std::mutex> lk(impl_->mu);
+   impl_->pending.erase(req.session_id);
+        }
+        throw AcpRuntimeError(AcpErrorCode::ACP_TURN_FAILED,
+       std::string("prompt dispatch failed: ") + e.what());
+    }
+
+ if (!cr.run_id.empty())
+        impl_->session_store->set_active_run(req.session_id, cr.run_id);
+    if (cb && !cr.text.empty()) cb("agent_message_chunk", cr.text);
+ {
+        std::lock_guard<std::mutex> lk(impl_->mu);
+        impl_->pending.erase(req.session_id);
+    }
+    impl_->session_store->clear_active_run(req.session_id);
+
     PromptResponse r;
-    r.stop_reason = "end_turn";
+    r.stop_reason = map_stop_reason(cr.stop_reason.empty() ? "end_turn" : cr.stop_reason);
+    r.text = cr.text;
     return r;
+}
+
+// ── handleCancel (session/cancel notification, 对齐 OC cancel) ────────────────
+void AcpGatewayAgent::handle_cancel(const std::string& session_id) {
+    auto session = impl_->session_store->get_session(session_id);
+    if (!session) return;
+CancelDispatchFn cancel;
+ std::string run_id;
+    {
+ std::lock_guard<std::mutex> lk(impl_->mu);
+   cancel = impl_->cancel_dispatch;
+        run_id = session->active_run_id;
+    }
+    impl_->session_store->cancel_active_run(session_id);
+    if (cancel) {
+        try { cancel(session->session_key, run_id); } catch (...) {}
+    }
 }
 
 // ── handleGatewayEvent ───────────────────────────────────────────────────────
 void AcpGatewayAgent::handle_gateway_event(const nlohmann::json& evt) {
-    std::lock_guard<std::mutex> lk(impl_->mu);
     std::string sk = evt.value("sessionKey", "");
     std::string type = evt.value("type", "");
 
-    for (auto& [sid, pe] : impl_->pending) {
-        if (pe.session_key != sk) continue;
-        if (type == "agent_text") {
-            pe.sent_text += evt.value("text", "");
-        } else if (type == "agent_thought") {
-            pe.sent_thought += evt.value("text", "");
-        } else if (type == "tool_call_start") {
-            PendingToolCallEntry tc;
-            std::string tn = evt.value("toolName", "");
-            tc.kind = infer_tool_kind(tn);
-            tc.raw_input = evt.value("toolInput", nlohmann::json{});
-            tc.title = format_tool_title(tn, tc.raw_input);
-            tc.locations = extract_tool_call_locations(tc.raw_input);
-            pe.tool_calls[evt.value("toolCallId", "")] = std::move(tc);
-        } else if (type == "tool_call_end") {
-            std::string tcid = evt.value("toolCallId", "");
-            if (auto it = pe.tool_calls.find(tcid); it != pe.tool_calls.end()) {
-                auto locs = extract_tool_call_locations_from_result(
-                    evt.value("toolResult", ""));
-                for (auto& l : locs) it->second.locations.push_back(std::move(l));
-            }
-        } else if (type == "run_accepted") {
-            pe.send_accepted = true;
+    // 找到匹配的 pending session（避免持锁期间回调 connection 造成死锁：
+    // 先在锁内更新累积状态并收集要 emit 的 update，再解锁后发送）。
+    std::string target_sid;
+    std::vector<nlohmann::json> updates;  // 待发送的 session/update.update
+    {
+        std::lock_guard<std::mutex> lk(impl_->mu);
+        for (auto& [sid, pe] : impl_->pending) {
+ if (pe.session_key != sk) continue;
+        target_sid = sid;
+            if (type == "agent_text") {
+ std::string t = evt.value("text", "");
+     pe.sent_text += t;
+                if (!t.empty())
+     updates.push_back({{"sessionUpdate", "agent_message_chunk"},
+      {"content", {{"type", "text"}, {"text", t}}}});
+       } else if (type == "agent_thought") {
+  std::string t = evt.value("text", "");
+      pe.sent_thought += t;
+ if (!t.empty())
+    updates.push_back({{"sessionUpdate", "agent_thought_chunk"},
+    {"content", {{"type", "text"}, {"text", t}}}});
+     } else if (type == "tool_call_start") {
+      PendingToolCallEntry tc;
+   std::string tn = evt.value("toolName", "");
+        std::string tcid = evt.value("toolCallId", "");
+    tc.kind = infer_tool_kind(tn);
+      tc.raw_input = evt.value("toolInput", nlohmann::json{});
+   tc.title = format_tool_title(tn, tc.raw_input);
+   tc.locations = extract_tool_call_locations(tc.raw_input);
+   // 🎯 对齐 OC: sessionUpdate=tool_call, status=in_progress
+    nlohmann::json locs = nlohmann::json::array();
+     for (auto& l : tc.locations) {
+        nlohmann::json lj{{"path", l.path}};
+     if (l.line > 0) lj["line"] = l.line;
+      locs.push_back(std::move(lj));
         }
-        break;
+     nlohmann::json u{{"sessionUpdate", "tool_call"},
+       {"toolCallId", tcid},
+ {"title", tc.title},
+        {"kind", tc.kind},
+             {"status", "in_progress"},
+   {"rawInput", tc.raw_input}};
+      if (!locs.empty()) u["locations"] = locs;
+      updates.push_back(std::move(u));
+     pe.tool_calls[tcid] = std::move(tc);
+      } else if (type == "tool_call_end") {
+ std::string tcid = evt.value("toolCallId", "");
+      std::string result = evt.value("toolResult", "");
+     bool is_error = evt.value("isError", false);
+       if (auto it = pe.tool_calls.find(tcid); it != pe.tool_calls.end()) {
+      auto rlocs = extract_tool_call_locations_from_result(result);
+         for (auto& l : rlocs) it->second.locations.push_back(std::move(l));
+     }
+   // 🎯 对齐 OC: sessionUpdate=tool_call_update, status=completed|failed
+          nlohmann::json u{{"sessionUpdate", "tool_call_update"},
+              {"toolCallId", tcid},
+   {"status", is_error ? "failed" : "completed"},
+    {"rawOutput", result}};
+   if (!result.empty())
+          u["content"] = nlohmann::json::array({
+        nlohmann::json{{"type", "content"},
+ {"content", {{"type", "text"}, {"text", result}}}}});
+  updates.push_back(std::move(u));
+  } else if (type == "run_accepted") {
+       pe.send_accepted = true;
+      }
+   break;
+        }
+    }
+
+    // 解锁后发送 session/update notification（避免死锁）。
+    if (!target_sid.empty()) {
+        for (auto& u : updates) emit_session_update(target_sid, u);
     }
 }
 

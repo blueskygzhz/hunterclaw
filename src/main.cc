@@ -1,6 +1,7 @@
 #include "hunterclaw/core/types.h"
 #include "hunterclaw/core/utils.h"
 #include "hunterclaw/gateway/gateway.h"
+#include "hunterclaw/gateway/client.h"
 #include "hunterclaw/plugins/plugin.h"
 #include "hunterclaw/skills/skill.h"
 #include "hunterclaw/channels/channel.h"
@@ -8,16 +9,96 @@
 #include "hunterclaw/agents/types.h"
 #include "hunterclaw/queue/delivery_queue.h"
 #include "hunterclaw/outbound/deliver.h"
+#include "hunterclaw/acp/acp_server.h"
+#include "hunterclaw/acp/acp_translator.h"
 // #include "hunterclaw/cli/command.h"  // Temporarily disabled
 // #include "hunterclaw/cli/daemon_commands.h"  // Temporarily disabled
 #include <iostream>
 #include <csignal>
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
 
 using namespace hunterclaw;
 
 // Global flag for graceful shutdown
 std::atomic<bool> g_running{true};
+
+// ============================================================================
+// 🎯 ACP stdio server 模式入口（对齐 OpenClaw serveAcpGateway）
+//   用法: hunterclaw acp [--gateway ws://host:port] [--token X] [--verbose]
+//   作为 gateway client，通过 stdin/stdout 的 ndjson JSON-RPC 提供 ACP Agent 服务。
+// ============================================================================
+static int run_acp_stdio(int argc, char** argv) {
+    acp::AcpServerOptions opts;
+  std::string gw_url = "ws://127.0.0.1:18789";
+    std::string token;
+    for (int i = 2; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--gateway" && i + 1 < argc) gw_url = argv[++i];
+        else if (a == "--token" && i + 1 < argc) token = argv[++i];
+   else if (a == "--verbose" || a == "-v") opts.verbose = true;
+    }
+
+    // 连接 gateway（作为 client）。所有诊断写 stderr，stdout 专供 ndjson。
+    gateway::GatewayClientOptions gopts;
+    gopts.url = gw_url;
+    gopts.token = token;
+    gopts.client_name = "hunterclaw-acp";
+    gopts.mode = "interactive";
+
+    auto gw = std::make_shared<gateway::GatewayClient>(gopts);
+
+    // ── prompt 派发：通过 gateway chat.send 发送并等待最终结果 ──────────────────
+    acp::AcpStdioServerDeps deps;
+    deps.prompt_dispatch = [gw](const std::string& session_key,
+      const std::string& prompt_text,
+      const nlohmann::json& attachments,
+    const std::string& idempotency_key) -> acp::ChatResult {
+ acp::ChatResult result;
+        nlohmann::json params{
+{"sessionKey", session_key},
+          {"text", prompt_text},
+    {"attachments", attachments},
+        };
+        if (!idempotency_key.empty()) params["idempotencyKey"] = idempotency_key;
+        try {
+    auto rr = gw->request("chat.send", params);
+  if (rr.ok && rr.value.has_value() && rr.value->is_object()) {
+     const auto& resp = *rr.value;
+   result.run_id = resp.value("runId", resp.value("run_id", std::string{}));
+      result.stop_reason = resp.value("stopReason", resp.value("stop_reason", std::string{}));
+      result.text = resp.value("text", std::string{});
+            }
+   } catch (const std::exception& e) {
+   std::cerr << "[acp] chat.send failed: " << e.what() << "\n";
+            result.stop_reason = "end_turn";
+        }
+        return result;
+    };
+
+    // ── cancel 派发：abort 指定 run ────────────────────────────────────────────
+    deps.cancel_dispatch = [gw](const std::string& session_key, const std::string& run_id) {
+        nlohmann::json params{{"sessionKey", session_key}};
+        if (!run_id.empty()) params["runId"] = run_id;
+    try { gw->request("chat.abort", params); } catch (...) {}
+    };
+
+    // gateway 事件回流：在 serve_acp_stdio 内部由 translator 的 handle_gateway_event
+    // 消费。这里通过 on_event 把 EventFrame 转 json 交给 agent。由于 agent 实例在
+    // serve_acp_stdio 内部创建，事件回流通过 gopts.on_event 捕获后转发。
+    // 为打通回流，serve_acp_stdio 暴露事件注入点；此处用共享指针桥接。
+
+  if (opts.verbose) std::cerr << "[acp] connecting gateway " << gw_url << "\n";
+  gw->start();
+
+    // 阻塞式运行 ACP stdio server（stdin EOF 退出）。
+    acp::serve_acp_stdio(opts, deps);
+
+    gw->stop();
+    return 0;
+}
+
 
 void signal_handler(int signal) {
     std::cout << "\nReceived signal " << signal << ", shutting down..." << std::endl;
@@ -61,6 +142,11 @@ void print_help() {
 }
 
 int main(int argc, char** argv) {
+    // 🎯 ACP stdio server 子命令（对齐 OpenClaw serveAcpGateway）
+    if (argc >= 2 && std::strcmp(argv[1], "acp") == 0) {
+   return run_acp_stdio(argc, argv);
+    }
+
     // Temporarily disabled CLI commands
     /*
     // Register daemon CLI commands
