@@ -27,6 +27,16 @@ void serve_acp_gateway(const AcpServerOptions& opts);
 struct AcpStdioServerDeps {
     PromptDispatchFn prompt_dispatch;   // 必填：把 prompt 派发到 gateway chat
     CancelDispatchFn cancel_dispatch;   // 可选：abort run
+    // 🎯 approval 中继（session/request_permission 反向权限链路，对齐 OC）。
+    ApprovalDetailsFn approval_details; // 可选：exec.approval.get
+    ApprovalResolveFn approval_resolve; // 可选：exec.approval.resolve
+
+    // 🎯 gateway 事件回流出参：serve_acp_stdio 在内部创建 agent 后，
+    //   会把一个"事件转发器"写入该 shared_ptr，供调用方在 gateway on_event
+    //   回调中调用，从而把 chat 流 / approval 事件回流到 translator，
+    //   驱动 session/update 与 session/request_permission。
+ // 调用方应在 serve 之前把该指针指向一个可写的 std::function 容器。
+    std::shared_ptr<std::function<void(const nlohmann::json&)>> event_forwarder;
 };
 
 // 阻塞式运行；返回时表示连接已关闭（stdin EOF 或错误）。

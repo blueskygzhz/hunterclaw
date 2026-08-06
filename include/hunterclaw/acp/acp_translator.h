@@ -161,8 +161,11 @@ struct AcpAgentCapabilities {
     // mcpCapabilities
     bool mcp_http = false;
     bool mcp_sse = false;
-    // sessionCapabilities.list (empty object = supported)
+    // sessionCapabilities: { list, resume, close } (empty object = supported)
+    // 🎯 对齐 OC: sessionCapabilities = { list:{}, resume:{}, close:{} }
     bool session_list_supported = true;
+  bool session_resume_supported = true;
+    bool session_close_supported = true;
 };
 
 struct InitializeResponse {
@@ -277,6 +280,31 @@ struct SetSessionConfigOptionResponse {
     SessionModeState modes;
 };
 
+// 🎯 对齐 OC resumeSession（translator.ts）: 与 loadSession 类似，
+//   请求携带 sessionId/cwd/mcpServers/_meta，返回 { configOptions, modes }，
+//   replay 通过 session/update 推送。
+struct ResumeSessionRequest {
+    std::string session_id;
+    std::string cwd;
+    nlohmann::json meta;
+    bool replay = true;
+};
+
+struct ResumeSessionResponse {
+    std::vector<SessionConfigOption> config_options;
+    SessionModeState modes;
+};
+
+// 🎯 对齐 OC closeSession（translator.ts）: 请求携带 sessionId，
+//   cancel 正在进行的 run 并释放 session，返回 {}。
+struct CloseSessionRequest {
+    std::string session_id;
+};
+
+struct CloseSessionResponse {
+    // OC 返回 {}；此处保留空结构以对齐。
+};
+
 struct GatewaySessionRow {
     std::string session_id;
     std::string label;
@@ -321,6 +349,24 @@ using PromptDispatchFn = std::function<ChatResult(
 using CancelDispatchFn = std::function<void(
     const std::string& session_key, const std::string& run_id)>;
 
+// 🎯 对齐 OC GatewayExecApprovalEvent（permission-relay.ts:11-17）。
+struct GatewayApprovalEvent {
+    std::string approval_id;
+    std::string command;       // 可空
+    std::string host;     // 可空
+    std::string title;         // 可空
+ std::string tool_call_id;  // 可空
+};
+
+// 🎯 approval 详情查询回调（注入式）：对齐 OC gateway.request("exec.approval.get")。
+//   入参 approval_id，返回 { commandText?, commandPreview?, host?, allowedDecisions?[] } json。
+using ApprovalDetailsFn = std::function<nlohmann::json(const std::string& approval_id)>;
+
+// 🎯 approval 解决回调（注入式）：对齐 OC gateway.request("exec.approval.resolve")。
+//   入参 approval_id + decision（"allow-once"|"allow-always"|"deny"），返回 true 表示成功。
+using ApprovalResolveFn = std::function<bool(
+    const std::string& approval_id, const std::string& decision)>;
+
 // ── AcpGatewayAgent ──────────────────────────────────────────────────────────
 
 class AcpGatewayAgent {
@@ -339,11 +385,19 @@ public:
     void set_prompt_dispatch(PromptDispatchFn fn);
  void set_cancel_dispatch(CancelDispatchFn fn);
 
+    // 🎯 注入 approval 详情/解决回调（接 gateway 的 exec.approval.get/resolve）。
+    // 用于 session/request_permission 反向权限链路。
+    void set_approval_details(ApprovalDetailsFn fn);
+void set_approval_resolve(ApprovalResolveFn fn);
+
     InitializeResponse handle_initialize(const InitializeRequest& req);
     AuthenticateResponse handle_authenticate(const AuthenticateRequest& req);
   NewSessionResponse handle_new_session(const NewSessionRequest& req);
     ListSessionsResponse handle_list_sessions(const ListSessionsRequest& req);
     LoadSessionResponse handle_load_session(const LoadSessionRequest& req);
+ // 🎯 对齐 OC resumeSession / closeSession。
+    ResumeSessionResponse handle_resume_session(const ResumeSessionRequest& req);
+    CloseSessionResponse handle_close_session(const CloseSessionRequest& req);
  PromptResponse handle_prompt(const PromptRequest& req, PromptStreamCallback stream_cb = {});
     SetSessionModeResponse handle_set_session_mode(const SetSessionModeRequest& req);
     SetSessionConfigOptionResponse handle_set_session_config_option(
@@ -376,6 +430,19 @@ private:
     // 🎯 对齐 OC: sessionUpdates.emit({ sessionId, update })。
     // 通过注入的 connection 向 client 发 session/update notification。
     void emit_session_update(const std::string& session_id, const nlohmann::json& update);
+
+    // 🎯 对齐 OC: sendAvailableCommands — 在 new/load/resume 后发
+    // available_commands_update 通知。
+    void emit_available_commands(const std::string& session_id);
+
+    // 🎯 对齐 OC: startApprovalRelay + runApprovalRelay — 处理 Gateway exec approval，
+    //   通过 session/request_permission 向 client 请求决策并回写 Gateway。
+    void start_approval_relay(const std::string& session_key,
+ const std::string& run_id,
+        const GatewayApprovalEvent& event);
+    void run_approval_relay(const std::string& session_id,
+   const std::string& approval_id,
+   const GatewayApprovalEvent& event);
 };
 
 // ── Available Commands ───────────────────────────────────────────────────────

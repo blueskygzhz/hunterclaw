@@ -65,8 +65,11 @@ nlohmann::json agent_capabilities_to_json(const AcpAgentCapabilities& c) {
    {"http", c.mcp_http},
     {"sse", c.mcp_sse},
     };
+    // 🎯 对齐 OC: sessionCapabilities = { list:{}, resume:{}, close:{} }
     nlohmann::json session_caps = nlohmann::json::object();
     if (c.session_list_supported) session_caps["list"] = nlohmann::json::object();
+    if (c.session_resume_supported) session_caps["resume"] = nlohmann::json::object();
+ if (c.session_close_supported) session_caps["close"] = nlohmann::json::object();
     return nlohmann::json{
         {"loadSession", c.load_session},
         {"promptCapabilities", prompt_caps},
@@ -114,8 +117,18 @@ void serve_acp_stdio(const AcpServerOptions& opts, const AcpStdioServerDeps& dep
  agent->set_connection(&conn);
     if (deps.prompt_dispatch) agent->set_prompt_dispatch(deps.prompt_dispatch);
  if (deps.cancel_dispatch) agent->set_cancel_dispatch(deps.cancel_dispatch);
+  if (deps.approval_details) agent->set_approval_details(deps.approval_details);
+    if (deps.approval_resolve) agent->set_approval_resolve(deps.approval_resolve);
 
     AcpGatewayAgent* ag = agent.get();
+
+    // 🎯 gateway 事件回流：把 agent->handle_gateway_event 暴露给调用方，
+ //   调用方在 gateway on_event 中调用它，驱动 session/update 与权限中继。
+    if (deps.event_forwarder) {
+     *deps.event_forwarder = [ag](const nlohmann::json& evt) {
+     try { ag->handle_gateway_event(evt); } catch (...) {}
+        };
+    }
 
     // ── initialize ────────────────────────────────────────────────────────────
     conn.register_method("initialize", [ag](const AcpRequestContext& ctx) -> nlohmann::json {
@@ -162,22 +175,48 @@ void serve_acp_stdio(const AcpServerOptions& opts, const AcpStdioServerDeps& dep
     });
 
     // ── session/load ────────────────────────────────────────────────────────────
+    // 🎯 对齐 OC loadSession: 返回 { configOptions, modes }（无 sessionId/replayChunks），
+    //   replay 通过 session/update 推送。
     conn.register_method("session/load", [ag](const AcpRequestContext& ctx) -> nlohmann::json {
         LoadSessionRequest req;
         req.session_id = ctx.params.value("sessionId", "");
  req.replay = ctx.params.value("replay", true);
       try {
             auto r = ag->handle_load_session(req);
-            nlohmann::json replay = nlohmann::json::array();
-            for (auto& c : r.replay_chunks)
- replay.push_back({{"sessionUpdate", c.session_update}, {"text", c.text}});
   return nlohmann::json{
-   {"sessionId", r.session_id},
       {"configOptions", config_options_to_json(r.config_options)},
-    {"modes", modes_to_json(r.modes)},
-     {"replayChunks", replay},
-            };
+ {"modes", modes_to_json(r.modes)},
+   };
   } catch (const AcpRuntimeError& e) { rethrow_as_rpc(e); }
+});
+
+    // ── session/resume ────────────────────────────────────────────────────────────
+    // 🎯 对齐 OC resumeSession: 返回 { configOptions, modes }，replay 通过 session/update 推送。
+    conn.register_method("session/resume", [ag](const AcpRequestContext& ctx) -> nlohmann::json {
+   ResumeSessionRequest req;
+     req.session_id = ctx.params.value("sessionId", "");
+   req.cwd = ctx.params.value("cwd", "");
+     req.meta = ctx.params.contains("_meta") ? ctx.params["_meta"]
+      : ctx.params.value("meta", nlohmann::json::object());
+        req.replay = ctx.params.value("replay", true);
+    try {
+     auto r = ag->handle_resume_session(req);
+   return nlohmann::json{
+     {"configOptions", config_options_to_json(r.config_options)},
+  {"modes", modes_to_json(r.modes)},
+   };
+        } catch (const AcpRuntimeError& e) { rethrow_as_rpc(e); }
+    });
+
+    // ── session/close ────────────────────────────────────────────────────────────
+    // 🎯 对齐 OC closeSession: cancel run + 释放 session，返回 {}。
+    conn.register_method("session/close", [ag](const AcpRequestContext& ctx) -> nlohmann::json {
+   CloseSessionRequest req;
+   req.session_id = ctx.params.value("sessionId", "");
+        try {
+        ag->handle_close_session(req);
+       return nlohmann::json::object();
+     } catch (const AcpRuntimeError& e) { rethrow_as_rpc(e); }
     });
 
     // ── session/list ────────────────────────────────────────────────────────────
@@ -234,9 +273,9 @@ void serve_acp_stdio(const AcpServerOptions& opts, const AcpStdioServerDeps& dep
         req.value = ctx.params.value("value", "");
    try {
   auto r = ag->handle_set_session_config_option(req);
-    return nlohmann::json{
-                {"configOptions", config_options_to_json(r.config_options)},
- {"modes", modes_to_json(r.modes)},
+     // 🎯 对齐 OC setSessionConfigOption: 仅返回 { configOptions }。
+     return nlohmann::json{
+   {"configOptions", config_options_to_json(r.config_options)},
      };
         } catch (const AcpRuntimeError& e) { rethrow_as_rpc(e); }
     });

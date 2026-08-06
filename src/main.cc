@@ -40,12 +40,24 @@ static int run_acp_stdio(int argc, char** argv) {
    else if (a == "--verbose" || a == "-v") opts.verbose = true;
     }
 
+    // 🎯 gateway 事件回流转发器：serve_acp_stdio 内部创建 agent 后写入，
+    //   gateway on_event 通过它把 chat 流 / approval 事件回流到 translator。
+    auto event_forwarder = std::make_shared<std::function<void(const nlohmann::json&)>>();
+
     // 连接 gateway（作为 client）。所有诊断写 stderr，stdout 专供 ndjson。
     gateway::GatewayClientOptions gopts;
     gopts.url = gw_url;
     gopts.token = token;
     gopts.client_name = "hunterclaw-acp";
     gopts.mode = "interactive";
+    // 🎯 on_event: 把 gateway 事件回流到 ACP translator（驱动 session/update
+    //   与 session/request_permission 权限中继）。
+    gopts.on_event = [event_forwarder](const gateway::EventFrame& ev) {
+        if (event_forwarder && *event_forwarder) {
+   nlohmann::json j = ev.to_json();
+     try { (*event_forwarder)(j); } catch (...) {}
+   }
+    };
 
     auto gw = std::make_shared<gateway::GatewayClient>(gopts);
 
@@ -79,15 +91,33 @@ static int run_acp_stdio(int argc, char** argv) {
 
     // ── cancel 派发：abort 指定 run ────────────────────────────────────────────
     deps.cancel_dispatch = [gw](const std::string& session_key, const std::string& run_id) {
-        nlohmann::json params{{"sessionKey", session_key}};
+   nlohmann::json params{{"sessionKey", session_key}};
         if (!run_id.empty()) params["runId"] = run_id;
     try { gw->request("chat.abort", params); } catch (...) {}
     };
 
-    // gateway 事件回流：在 serve_acp_stdio 内部由 translator 的 handle_gateway_event
-    // 消费。这里通过 on_event 把 EventFrame 转 json 交给 agent。由于 agent 实例在
-    // serve_acp_stdio 内部创建，事件回流通过 gopts.on_event 捕获后转发。
-    // 为打通回流，serve_acp_stdio 暴露事件注入点；此处用共享指针桥接。
+  // ── approval 详情查询：对齐 OC exec.approval.get ─────────────────────────────
+    deps.approval_details = [gw](const std::string& approval_id) -> nlohmann::json {
+ try {
+   auto rr = gw->request("exec.approval.get", nlohmann::json{{"id", approval_id}});
+     if (rr.ok && rr.value.has_value() && rr.value->is_object()) return *rr.value;
+        } catch (...) {}
+        return nlohmann::json::object();
+    };
+
+    // ── approval 解决：对齐 OC exec.approval.resolve ─────────────────────────────
+    deps.approval_resolve = [gw](const std::string& approval_id,
+     const std::string& decision) -> bool {
+        try {
+     auto rr = gw->request("exec.approval.resolve",
+   nlohmann::json{{"id", approval_id}, {"decision", decision}});
+   return rr.ok;
+   } catch (...) { return false; }
+  };
+
+    // 🎯 gateway 事件回流出参：serve_acp_stdio 内部创建 agent 后写入 forwarder，
+    //   gopts.on_event 通过 event_forwarder 把事件回流到 translator。
+    deps.event_forwarder = event_forwarder;
 
   if (opts.verbose) std::cerr << "[acp] connecting gateway " << gw_url << "\n";
   gw->start();
