@@ -66,6 +66,7 @@ std::string plugin_hook_name_to_string(PluginHookName name) {
         case PluginHookName::BEFORE_MODEL_RESOLVE:       return "before_model_resolve";
         case PluginHookName::BEFORE_PROMPT_BUILD:        return "before_prompt_build";
         case PluginHookName::BEFORE_AGENT_START:         return "before_agent_start";
+        case PluginHookName::BEFORE_AGENT_REPLY:         return "before_agent_reply";
         case PluginHookName::LLM_INPUT:                  return "llm_input";
         case PluginHookName::LLM_OUTPUT:                 return "llm_output";
         case PluginHookName::AGENT_END:                  return "agent_end";
@@ -110,6 +111,7 @@ void ToolHookManager::method_name(                                             \
 IMPL_REGISTER(register_before_model_resolve, before_model_resolve_hooks_, BeforeModelResolveEntry, BeforeModelResolveHandler)
 IMPL_REGISTER(register_before_prompt_build,  before_prompt_build_hooks_,  BeforePromptBuildEntry,  BeforePromptBuildHandler)
 IMPL_REGISTER(register_before_agent_start,   before_agent_start_hooks_,   BeforeAgentStartEntry,   BeforeAgentStartHandler)
+IMPL_REGISTER(register_before_agent_reply,   before_agent_reply_hooks_,   BeforeAgentReplyEntry,   BeforeAgentReplyHandler)
 IMPL_REGISTER(register_llm_input,            llm_input_hooks_,            LlmInputEntry,           LlmInputHandler)
 IMPL_REGISTER(register_llm_output,           llm_output_hooks_,           LlmOutputEntry,          LlmOutputHandler)
 IMPL_REGISTER(register_agent_end,            agent_end_hooks_,            AgentEndEntry,           AgentEndHandler)
@@ -324,6 +326,24 @@ std::optional<PluginHookBeforePromptBuildResult> ToolHookManager::run_before_pro
                 accumulated->prepend_context        = concat_optional(accumulated->prepend_context,        result->prepend_context);
                 accumulated->prepend_system_context = concat_optional(accumulated->prepend_system_context, result->prepend_system_context);
                 accumulated->append_system_context  = concat_optional(accumulated->append_system_context,  result->append_system_context);
+                accumulated->append_context         = concat_optional(accumulated->append_context,         result->append_context);
+                // toolsAllow: intersect across hooks (OpenClaw mergeBeforePromptBuild
+                // narrows the allowed set; presence of any list constrains the run).
+                if (result->tools_allow) {
+                    if (!accumulated->tools_allow) {
+                        accumulated->tools_allow = result->tools_allow;
+                    } else {
+                        std::vector<std::string> intersection;
+                        for (const auto& name : *accumulated->tools_allow) {
+                            if (std::find(result->tools_allow->begin(),
+                                          result->tools_allow->end(),
+                                          name) != result->tools_allow->end()) {
+                                intersection.push_back(name);
+                            }
+                        }
+                        accumulated->tools_allow = std::move(intersection);
+                    }
+                }
             }
         } catch (const std::exception& e) {
             log()->error("[hooks] before_prompt_build handler from '{}' failed: {}",
@@ -378,6 +398,43 @@ std::optional<PluginHookBeforeAgentStartResult> ToolHookManager::run_before_agen
         }
     }
     return accumulated;
+}
+
+// ============================================================================
+// run_before_agent_reply (claiming hook)
+//
+// Aligned with OpenClaw runBeforeAgentReply = runClaimingHook:
+//   Iterate handlers in registration/priority order. The FIRST handler that
+//   returns { handled: true } claims the turn; its result is returned and no
+//   further handlers run. Handlers returning nullopt or handled==false are
+//   skipped. Handler exceptions are logged and skipped (never claim on throw).
+// ============================================================================
+
+std::optional<PluginHookBeforeAgentReplyResult> ToolHookManager::run_before_agent_reply(
+    const PluginHookBeforeAgentReplyEvent& event,
+    const PluginHookAgentContext& ctx)
+{
+    std::vector<BeforeAgentReplyEntry> hooks;
+    { std::lock_guard<std::mutex> lock(mutex_); hooks = before_agent_reply_hooks_; }
+    if (hooks.empty()) return std::nullopt;
+
+    log()->debug("[hooks] running before_agent_reply ({} handlers, claiming)", hooks.size());
+
+    for (const auto& entry : hooks) {
+        try {
+            auto result = entry.handler(event, ctx);
+            if (result && result->handled) {
+                log()->info("[hooks] before_agent_reply claimed by '{}'{}",
+                    entry.plugin_id,
+                    result->reason ? (" reason=" + *result->reason) : std::string{});
+                return result;  // first claim wins — short-circuit
+            }
+        } catch (const std::exception& e) {
+            log()->error("[hooks] before_agent_reply handler from '{}' failed: {}",
+                entry.plugin_id, e.what());
+        }
+    }
+    return std::nullopt;  // no handler claimed the turn
 }
 
 // ============================================================================
@@ -670,6 +727,7 @@ bool ToolHookManager::has_hooks(PluginHookName name) const {
         case PluginHookName::BEFORE_MODEL_RESOLVE:     return !before_model_resolve_hooks_.empty();
         case PluginHookName::BEFORE_PROMPT_BUILD:      return !before_prompt_build_hooks_.empty();
         case PluginHookName::BEFORE_AGENT_START:       return !before_agent_start_hooks_.empty();
+        case PluginHookName::BEFORE_AGENT_REPLY:       return !before_agent_reply_hooks_.empty();
         case PluginHookName::LLM_INPUT:                return !llm_input_hooks_.empty();
         case PluginHookName::LLM_OUTPUT:               return !llm_output_hooks_.empty();
         case PluginHookName::AGENT_END:                return !agent_end_hooks_.empty();
@@ -701,6 +759,7 @@ size_t ToolHookManager::hook_count(PluginHookName name) const {
         case PluginHookName::BEFORE_MODEL_RESOLVE:     return before_model_resolve_hooks_.size();
         case PluginHookName::BEFORE_PROMPT_BUILD:      return before_prompt_build_hooks_.size();
         case PluginHookName::BEFORE_AGENT_START:       return before_agent_start_hooks_.size();
+        case PluginHookName::BEFORE_AGENT_REPLY:       return before_agent_reply_hooks_.size();
         case PluginHookName::LLM_INPUT:                return llm_input_hooks_.size();
         case PluginHookName::LLM_OUTPUT:               return llm_output_hooks_.size();
         case PluginHookName::AGENT_END:                return agent_end_hooks_.size();

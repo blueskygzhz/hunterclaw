@@ -59,6 +59,12 @@ struct ReactResult {
     std::vector<ReactStep> steps;             // 执行步骤
     std::string error;                        // 错误信息
 
+    // 🎯 对齐 OpenClaw before_agent_reply (runClaimingHook): 当某个插件 hook
+    // 在 LLM 调用前 claim 了本回合 (handled==true)，此处为 true，LLM 未被调用，
+    // final_response 直接来自 hook 返回的 ReplyPayload。
+    bool handled_by_hook = false;
+    std::optional<std::string> handled_reason;
+
     // 🎯 对齐 OpenClaw: assistantTexts — all text chunks emitted during the run
     // Mirrors subscribeEmbeddedPiSession().assistantTexts
     std::vector<std::string> assistant_texts;
@@ -506,6 +512,9 @@ private:
         std::string code_fence_marker;  // stores the opening fence marker for matching close
         // 🎯 对齐 OpenClaw: reasoningStreamOpen
         bool reasoning_stream_open = false;
+        // 🎯 对齐 OpenClaw chunk 级 abort: 一旦本run/session 被 abort，
+        // 置true 后流式回调停止 emit 后续 token（掐断正在吐的流）。
+        bool stream_aborted = false;
         // 🎯 对齐 OpenClaw: emittedAssistantUpdate
         bool emitted_assistant_update = false;
         // 🎯 对齐 OpenClaw: lastStreamedAssistant / lastStreamedAssistantCleaned
@@ -566,6 +575,7 @@ private:
             last_block_reply_text.clear();
             suppress_block_chunks = false;
             reasoning_stream_open = false;
+            stream_aborted = false;
             emitted_assistant_update = false;
             last_streamed_assistant.clear();
             last_streamed_assistant_cleaned.clear();
@@ -661,6 +671,12 @@ private:
     //   - 与 system_prompt 无关 (OC 的工具声明严格走 API 参数通道)
     //   - 与 skills 不冲突 (skills 走 system_prompt 的 <available_skills> 块)
     std::vector<llm::ToolDefinition> build_tool_definitions() const;
+
+    // 🎯 对齐 OpenClaw before_prompt_build.toolsAllow: 按回合收窄工具集。
+    // tools_allow == nullopt 时不施加约束；present 时仅保留其中列出的工具
+    // (空 vector 则禁用所有可选工具)。
+    std::vector<llm::ToolDefinition> build_tool_definitions(
+        const std::optional<std::vector<std::string>>& tools_allow) const;
 
 public:
     // ✅ 新增: 设置 CompactionManager (从 AgentInstance 调用)

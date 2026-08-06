@@ -422,6 +422,52 @@ ReactResult ReactEngine::execute_loop(
     loop_detection_state_ = LoopDetectionState::create(config_.loop_detection);
 
     // =========================================================================
+    // Hook: before_agent_reply (claiming) — 严格对齐 OpenClaw runBeforeAgentReply
+    // Runs BEFORE the LLM is resolved/invoked. If a plugin claims the turn
+    // (handled==true), short-circuit the entire run and return itsReplyPayload.
+    // first-claim-wins. (plugins/hooks.ts: runClaimingHook)
+    // =========================================================================
+    {
+        auto* claim_mgr = tools::get_global_hook_manager();
+        if (claim_mgr && claim_mgr->has_hooks(plugins::PluginHookName::BEFORE_AGENT_REPLY)) {
+            tools::PluginHookBeforeAgentReplyEvent bar_event;
+            bar_event.cleaned_body = user_input;  // 对齐 OC: cleanedBody
+            tools::PluginHookAgentContext bar_ctx;
+            bar_ctx.session_id = callbacks.session_id.empty()
+                ? std::nullopt : std::make_optional(callbacks.session_id);
+            try {
+                auto claim = claim_mgr->run_before_agent_reply(bar_event, bar_ctx);
+                if (claim && claim->handled) {
+                    result.success = true;
+                    result.handled_by_hook = true;
+                    result.handled_reason = claim->reason;
+                    // 从ReplyPayload JSON 中取 text（对齐 OC 直接投递 reply）
+                    std::string reply_text;
+                    if (claim->reply_json) {
+                        auto parsed = core::JsonValue::parse(*claim->reply_json);
+                        if (parsed.ok && parsed.value && parsed.value->is_object() &&
+                            parsed.value->contains("text") &&
+                            (*parsed.value)["text"].is_string()) {
+                            reply_text = (*parsed.value)["text"].as_string();
+                        }
+                    }
+                    result.final_response = reply_text;
+                    if (!reply_text.empty()) {
+                        result.assistant_texts.push_back(reply_text);
+                        if (callbacks.on_assistant_delta) callbacks.on_assistant_delta(reply_text);
+                        if (callbacks.on_block_reply) callbacks.on_block_reply(reply_text);
+                    }
+                    log()->info("[hooks] before_agent_reply short-circuited the run{}",
+                        claim->reason ? (" (" + *claim->reason + ")") : std::string{});
+                    return result;  // ← 跳过 LLM 调用
+                }
+            } catch (const std::exception& e) {
+                log()->warn("before_agent_reply hook failed: {}", e.what());
+            }
+        }
+    }
+
+    // =========================================================================
     // Hook: before_model_resolve
     // Aligned with OpenClaw run.ts:329 — runs before resolveModel()
     // Allows plugins to override provider/model for this run.
@@ -461,6 +507,8 @@ ReactResult ReactEngine::execute_loop(
     std::optional<std::string> hook_prepend_context;
     std::optional<std::string> hook_prepend_system_context;
     std::optional<std::string> hook_append_system_context;
+    std::optional<std::string> hook_append_context;              // 对齐 OC appendContext
+    std::optional<std::vector<std::string>> hook_tools_allow;    // 对齐 OC toolsAllow
 
     if (hook_mgr) {
         tools::PluginHookAgentContext hook_ctx;
@@ -502,6 +550,8 @@ ReactResult ReactEngine::execute_loop(
                     if (bpb_result->prepend_context)        hook_prepend_context        = bpb_result->prepend_context;
                     if (bpb_result->prepend_system_context) hook_prepend_system_context = bpb_result->prepend_system_context;
                     if (bpb_result->append_system_context)  hook_append_system_context  = bpb_result->append_system_context;
+                    if (bpb_result->append_context)hook_append_context         = bpb_result->append_context;
+                    if (bpb_result->tools_allow)            hook_tools_allow            = bpb_result->tools_allow;
                 }
             } catch (const std::exception& e) {
                 log()->warn("before_prompt_build hook failed: {}", e.what());
@@ -578,6 +628,10 @@ ReactResult ReactEngine::execute_loop(
     llm::LLMMessage user_msg;
     user_msg.role = llm::LLMMessageRole::User;
     user_msg.content = user_input;
+    // 🎯 对齐 OC before_prompt_build.appendContext: 追加到用户 prompt 尾部
+    if (hook_append_context.has_value() && !hook_append_context->empty()) {
+        user_msg.content = user_msg.content + "\n\n" + *hook_append_context;
+    }
     messages.push_back(user_msg);
 
     // 🎯 对齐 OpenClaw run.ts:97-109: scrubAnthropicRefusalMagic
@@ -853,8 +907,9 @@ ReactResult ReactEngine::execute_loop(
         (void)maybe_prune_context(messages);
 
         // 🎯 对齐 OC tools-payload.ts: 每次 LLM 调用前打包工具 schema
-        // (内置 + MCP + sandbox, 统一走 API 原生 tools 参数)
-        auto tool_defs = build_tool_definitions();
+        // (内置 + MCP + sandbox, 统一走API 原生 tools 参数)
+        // 应用 before_prompt_build.toolsAllow 收窄本回合工具集
+        auto tool_defs = build_tool_definitions(hook_tools_allow);
 
         // 步骤 1: Reason (推理)
         auto llm_response = call_llm(messages, callbacks, tool_defs);
@@ -882,8 +937,8 @@ ReactResult ReactEngine::execute_loop(
                     static_cast<int>(assistant_texts.size()));
                 // 🎯 对齐 OC: compaction 之后 retry 前再次 prune (对齐 extension.ts 每次 on("context"))
                 (void)maybe_prune_context(messages);
-                // 🎯 对齐 OC: compaction 后重建 tool_defs (工具集可能未变，但保持一致性)
-                auto retry_tool_defs = build_tool_definitions();
+                // 🎯 对齐 OC: compaction 后重建 tool_defs (保持 toolsAllow 约束一致)
+                auto retry_tool_defs = build_tool_definitions(hook_tools_allow);
                 llm_response = call_llm(messages, callbacks, retry_tool_defs);
             }
         }
@@ -1538,6 +1593,16 @@ ReactEngine::LLMResponseData ReactEngine::call_llm(
     // text_end monotonicity is handled by the LLM client layer (or approximated below).
     auto stream_callback = [&](const std::string& delta) {
         if (delta.empty()) return;
+
+        // 🎯 对齐 OpenClaw chunk 级 abort: signal.aborted 在流式回调内逐 chunk 检查。
+        // 一旦本run 或 session 被 abort，立即停止累积/emit 后续 token（掐断正在吐的流），
+        // 不再把在飞的 chunk 送到 channel。step 级 break 之外的第二道闸。
+        if (cancelled_ ||
+            (callbacks.abort_signal && callbacks.abort_signal->load())) {
+            streaming_state_.stream_aborted = true;
+            return;
+        }
+        if (streaming_state_.stream_aborted) return;
 
         // 🎯 对齐 OpenClaw: deltaBuffer accumulation (text_delta path)
         streaming_state_.delta_buffer += delta;
@@ -2797,6 +2862,11 @@ bool ReactEngine::maybe_prune_context(std::vector<LLMMessage>& messages) {
 //   - 这与 skills 元信息 (走 system_prompt 的 <available_skills> 块) 互补
 // ═══════════════════════════════════════════════════════════════════════════
 std::vector<llm::ToolDefinition> ReactEngine::build_tool_definitions() const {
+    return build_tool_definitions(std::nullopt);
+}
+
+std::vector<llm::ToolDefinition> ReactEngine::build_tool_definitions(
+    const std::optional<std::vector<std::string>>& tools_allow) const {
     std::vector<llm::ToolDefinition> defs;
     if (!tool_manager_) return defs;
 
@@ -2804,6 +2874,13 @@ std::vector<llm::ToolDefinition> ReactEngine::build_tool_definitions() const {
     defs.reserve(names.size());
 
     for (const auto& name : names) {
+        // 🎯 对齐 OC before_prompt_build.toolsAllow: 收窄工具集
+        if (tools_allow.has_value()) {
+            if (std::find(tools_allow->begin(), tools_allow->end(), name)
+                == tools_allow->end()) {
+                continue;  // 不在允许列表 → 本回合跳过该工具
+            }
+        }
         auto tool = tool_manager_->get_tool(name);
         if (!tool) continue;
 

@@ -57,6 +57,8 @@ using plugins::PluginHookBeforePromptBuildEvent;
 using plugins::PluginHookBeforePromptBuildResult;
 using plugins::PluginHookBeforeAgentStartEvent;
 using plugins::PluginHookBeforeAgentStartResult;
+using plugins::PluginHookBeforeAgentReplyEvent;
+using plugins::PluginHookBeforeAgentReplyResult;
 using plugins::PluginHookLlmInputEvent;
 using plugins::PluginHookLlmOutputEvent;
 using plugins::PluginHookLlmOutputUsage;
@@ -124,6 +126,13 @@ using BeforePromptBuildHandler = std::function<
 using BeforeAgentStartHandler = std::function<
     std::optional<PluginHookBeforeAgentStartResult>(
         const PluginHookBeforeAgentStartEvent& event,
+        const PluginHookAgentContext& ctx)>;
+
+/// Claiming hook (first {handled:true} wins). Aligned with
+/// PluginHookHandlerMap["before_agent_reply"].
+using BeforeAgentReplyHandler = std::function<
+    std::optional<PluginHookBeforeAgentReplyResult>(
+        const PluginHookBeforeAgentReplyEvent& event,
         const PluginHookAgentContext& ctx)>;
 
 using LlmInputHandler = std::function<
@@ -249,6 +258,7 @@ public:
     void register_before_model_resolve(const std::string& plugin_id, BeforeModelResolveHandler handler, int priority = 0);
     void register_before_prompt_build(const std::string& plugin_id, BeforePromptBuildHandler handler, int priority = 0);
     void register_before_agent_start(const std::string& plugin_id, BeforeAgentStartHandler handler, int priority = 0);
+    void register_before_agent_reply(const std::string& plugin_id, BeforeAgentReplyHandler handler, int priority = 0);
     void register_llm_input(const std::string& plugin_id, LlmInputHandler handler, int priority = 0);
     void register_llm_output(const std::string& plugin_id, LlmOutputHandler handler, int priority = 0);
     void register_agent_end(const std::string& plugin_id, AgentEndHandler handler, int priority = 0);
@@ -315,6 +325,13 @@ public:
     /// Legacy compatibility: combines model resolve + prompt build phases
     std::optional<PluginHookBeforeAgentStartResult> run_before_agent_start(
         const PluginHookBeforeAgentStartEvent& event,
+        const PluginHookAgentContext& ctx);
+
+    /// Run before_agent_reply hooks (claiming: first {handled:true} wins).
+    /// Aligned with: runBeforeAgentReply() = runClaimingHook in plugins/hooks.ts
+    /// Returns the claiming result, or nullopt when no handler claimed the turn.
+    std::optional<PluginHookBeforeAgentReplyResult> run_before_agent_reply(
+        const PluginHookBeforeAgentReplyEvent& event,
         const PluginHookAgentContext& ctx);
 
     /// Run llm_input hooks (void, sequential)
@@ -434,6 +451,7 @@ private:
     struct BeforeModelResolveEntry  { std::string plugin_id; BeforeModelResolveHandler  handler; int priority = 0; };
     struct BeforePromptBuildEntry   { std::string plugin_id; BeforePromptBuildHandler   handler; int priority = 0; };
     struct BeforeAgentStartEntry    { std::string plugin_id; BeforeAgentStartHandler    handler; int priority = 0; };
+    struct BeforeAgentReplyEntry    { std::string plugin_id; BeforeAgentReplyHandler    handler; int priority = 0; };
     struct LlmInputEntry            { std::string plugin_id; LlmInputHandler            handler; int priority = 0; };
     struct LlmOutputEntry           { std::string plugin_id; LlmOutputHandler           handler; int priority = 0; };
     struct AgentEndEntry            { std::string plugin_id; AgentEndHandler            handler; int priority = 0; };
@@ -467,6 +485,7 @@ private:
     std::vector<BeforeModelResolveEntry>     before_model_resolve_hooks_;
     std::vector<BeforePromptBuildEntry>      before_prompt_build_hooks_;
     std::vector<BeforeAgentStartEntry>       before_agent_start_hooks_;
+    std::vector<BeforeAgentReplyEntry>       before_agent_reply_hooks_;
     std::vector<LlmInputEntry>               llm_input_hooks_;
     std::vector<LlmOutputEntry>              llm_output_hooks_;
     std::vector<AgentEndEntry>               agent_end_hooks_;

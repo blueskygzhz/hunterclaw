@@ -561,6 +561,7 @@ std::string plugin_hook_name_to_string(PluginHookName hook) {
     case PluginHookName::BEFORE_MODEL_RESOLVE: return "before_model_resolve";
     case PluginHookName::BEFORE_PROMPT_BUILD: return "before_prompt_build";
     case PluginHookName::BEFORE_AGENT_START: return "before_agent_start";
+    case PluginHookName::BEFORE_AGENT_REPLY: return "before_agent_reply";
     case PluginHookName::LLM_INPUT: return "llm_input";
     case PluginHookName::LLM_OUTPUT: return "llm_output";
     case PluginHookName::AGENT_END: return "agent_end";
@@ -632,6 +633,7 @@ std::optional<PluginHookName> string_to_plugin_hook_name(const std::string& str)
   if (str == "before_model_resolve") return PluginHookName::BEFORE_MODEL_RESOLVE;
   if (str == "before_prompt_build") return PluginHookName::BEFORE_PROMPT_BUILD;
   if (str == "before_agent_start") return PluginHookName::BEFORE_AGENT_START;
+  if (str == "before_agent_reply") return PluginHookName::BEFORE_AGENT_REPLY;
   if (str == "llm_input") return PluginHookName::LLM_INPUT;
   if (str == "llm_output") return PluginHookName::LLM_OUTPUT;
   if (str == "agent_end") return PluginHookName::AGENT_END;

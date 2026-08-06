@@ -44,6 +44,7 @@ enum class PluginHookName {
   BEFORE_MODEL_RESOLVE,
   BEFORE_PROMPT_BUILD,
   BEFORE_AGENT_START,
+  BEFORE_AGENT_REPLY,
   LLM_INPUT,
   LLM_OUTPUT,
   AGENT_END,
@@ -178,6 +179,12 @@ struct PluginHookAgentContext {
 struct PluginHookBeforeModelResolveEvent {
   /** User prompt for this run. No session messages are available yet in this phase. */
   std::string prompt;
+  /**
+   * Attachment metadata for this run (JSON array string of {mime,kind,size,...}).
+   * Aligned with OpenClaw PluginHookBeforeModelResolveEvent.attachments — enables
+   * file-aware model routing (e.g. route image attachments to a vision model).
+   */
+  std::optional<std::string> attachments_json;
 };
 
 struct PluginHookBeforeModelResolveResult {
@@ -210,6 +217,19 @@ struct PluginHookBeforePromptBuildResult {
    * Use for static plugin guidance instead of prepend_context.
    */
   std::optional<std::string> append_system_context;
+  /**
+   * Appended to the user-facing prompt context (tail). Aligned with OpenClaw
+   * PluginHookBeforePromptBuildResult.appendContext.
+   */
+  std::optional<std::string> append_context;
+  /**
+   * Narrow the tool set available for THIS run. Aligned with OpenClaw
+   * PluginHookBeforePromptBuildResult.toolsAllow. Semantics:
+   *   - std::nullopt        : no constraint from this hook
+   *   - present (may empty)  : allowed tool names; multiple hooks intersect.
+   * An empty vector disables all optional tools for the run.
+   */
+  std::optional<std::vector<std::string>> tools_allow;
 };
 
 // ============================================================================
@@ -231,6 +251,33 @@ struct PluginHookBeforeAgentStartResult {
   // From PluginHookBeforeModelResolveResult
   std::optional<std::string> model_override;
   std::optional<std::string> provider_override;
+};
+
+// ============================================================================
+// Plugin Hook — before_agent_reply (claiming hook: short-circuit the reply)
+//
+// Aligned with OpenClaw:
+//   PluginHookBeforeAgentReplyEvent  { cleanedBody }
+//   PluginHookBeforeAgentReplyResult { handled, reply?, reason? }
+//   runBeforeAgentReply = runClaimingHook (first {handled:true} wins)
+//
+// Runs BEFORE the LLM is invoked. If a handler returns handled==true, the
+// entire agent turn is short-circuited and `reply_json` (a serialized
+// ReplyPayload) is returned directly to the user; the LLM is never called.
+// ============================================================================
+
+struct PluginHookBeforeAgentReplyEvent {
+  /** Cleaned inbound user text for this run (commands/markers stripped). */
+  std::string cleaned_body;
+};
+
+struct PluginHookBeforeAgentReplyResult {
+  /** When true, the turn is claimed and the LLM call is skipped. */
+  bool handled = false;
+  /** Serialized ReplyPayload (JSON) to deliver directly. Optional. */
+  std::optional<std::string> reply_json;
+  /** Optional human-readable reason for observability. */
+  std::optional<std::string> reason;
 };
 
 // ============================================================================
