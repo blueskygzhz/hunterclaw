@@ -18,6 +18,7 @@
 
 #include "hunterclaw/tools/exec.h"
 #include "hunterclaw/tools/tool_hooks.h"
+#include "hunterclaw/tools/before_tool_call_policy.h"
 #include "hunterclaw/tools/approval.h"
 #include "hunterclaw/tools/tool_manager.h"
 #include "hunterclaw/core/utils.h"
@@ -620,8 +621,10 @@ public:
             if (before_result.has_value()) {
                 if (before_result->block) {
                     std::string reason = before_result->block_reason.value_or("blocked by plugin hook");
-                    log()->warn("exec: blocked by before_tool_call hook: {}", reason);
-                    return tool_result::error("exec blocked: " + reason);
+                    log()->warn("exec: vetoed by before_tool_call hook: {}", reason);
+                    // 对齐 OpenClaw buildBlockedToolResult(): blocked shape
+                    return build_blocked_tool_result(
+                        "exec blocked: " + reason, denied_reason::kPluginBeforeToolCall);
                 }
                 if (before_result->params_json.has_value()) {
                     auto parsed = core::JsonValue::parse(*before_result->params_json);
@@ -642,8 +645,9 @@ public:
                 if (global_result.has_value()) {
                     if (global_result->block) {
                         std::string reason = global_result->block_reason.value_or("blocked by global plugin hook");
-                        log()->warn("exec: blocked by global before_tool_call hook: {}", reason);
-                        return tool_result::error("exec blocked: " + reason);
+                        log()->warn("exec: vetoed by global before_tool_call hook: {}", reason);
+                        return build_blocked_tool_result(
+                            "exec blocked: " + reason, denied_reason::kPluginBeforeToolCall);
                     }
                     if (global_result->params_json.has_value()) {
                         auto parsed = core::JsonValue::parse(*global_result->params_json);

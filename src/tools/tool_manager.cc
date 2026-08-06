@@ -1,6 +1,7 @@
 #include "hunterclaw/tools/tool_manager.h"
 #include "hunterclaw/tools/tool.h"
 #include "hunterclaw/tools/tool_hooks.h"
+#include "hunterclaw/tools/before_tool_call_policy.h"
 #include "hunterclaw/tools/tool_loop_detector.h"
 #include "hunterclaw/tools/tool_policy.h"
 #include "hunterclaw/tools/tool_result_processor.h"
@@ -250,32 +251,38 @@ ToolResult ToolManager::execute_tool(
         }
     }
     
-    // 3. Before Hooks (参数修改和验证)
-    // Aligned with OpenClaw runBeforeToolCall() in plugins/hooks.ts
+    // 3. Before Hooks (参数修改和验证) — 严格对齐 OpenClaw runBeforeToolCallHook()
     core::JsonValue effective_params = params;
     if (hook_manager_) {
-        PluginHookBeforeToolCallEvent before_event;
-        before_event.tool_name = name;
-        before_event.params_json = params.to_string();  // serialize to JSON string
+        BeforeToolCallContext policy_ctx;
+        policy_ctx.tool_name = name;
+        policy_ctx.agent_id = context_.agent_id;
+        policy_ctx.session_key = context_.session_key;
+        policy_ctx.run_id = context_.run_id;
+        policy_ctx.session_id = context_.session_id;
+        policy_ctx.hook_manager = hook_manager_.get();
 
-        PluginHookToolContext tool_ctx;
-        tool_ctx.tool_name = name;
-        tool_ctx.agent_id = context_.agent_id.empty()
-            ? std::nullopt : std::make_optional(context_.agent_id);
-        tool_ctx.session_key = context_.session_key.empty()
-            ? std::nullopt : std::make_optional(context_.session_key);
+        auto outcome = run_before_tool_call_policy(policy_ctx, params);
+        if (outcome.kind == HookOutcomeKind::Veto) {
+            log()->warn("Tool '{}' vetoed by before_tool_call policy: {}",
+                        name, outcome.reason.value_or(""));
+            return build_blocked_tool_result(
+                outcome.reason.value_or("blocked by plugin hook"),
+                outcome.denied_reason.value_or(denied_reason::kPluginBeforeToolCall));
+        }
+        if (outcome.kind == HookOutcomeKind::Failure) {
+            log()->error("Tool '{}' before_tool_call FAILURE ({}): {}",
+                         name, outcome.disposition.value_or(disposition::kError),
+                         outcome.reason.value_or(""));
+            return tool_result::error(outcome.reason.value_or("before_tool_call failed"));
+        }
+        effective_params = std::move(outcome.params);
 
-        auto before_result = hook_manager_->run_before_tool_call(before_event, tool_ctx);
-        if (before_result.has_value()) {
-            if (before_result->block) {
-                std::string reason = before_result->block_reason.value_or("blocked by plugin hook");
-                log()->warn("Tool '{}' blocked by before_tool_call hook: {}", name, reason);
-                return tool_result::error(reason);
-            }
-            if (before_result->params_json.has_value()) {
-                auto parsed = core::JsonValue::parse(*before_result->params_json);
-                if (parsed.ok && parsed.value) effective_params = std::move(*parsed.value);
-            }
+        // 对齐 OpenClaw validateToolExecutionParams(): hook 改写后二次 schema 校验
+        std::string verr = validate_tool_execution_params(*tool, effective_params);
+        if (!verr.empty()) {
+            log()->warn("Tool '{}' params invalid after before_tool_call: {}", name, verr);
+            return tool_result::error("invalid tool params: " + verr);
         }
     }
     

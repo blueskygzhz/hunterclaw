@@ -37,6 +37,7 @@ struct MemoryIndexMeta {
     int chunk_tokens = 0;
     int chunk_overlap = 0;
     std::optional<int> vector_dims;
+    std::string fts_tokenizer = "unicode61";  // 对齐 OC: meta.ftsTokenizer
 };
 
 // ============================================================================

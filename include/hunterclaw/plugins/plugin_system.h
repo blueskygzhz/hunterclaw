@@ -383,10 +383,26 @@ struct PluginHookBeforeToolCallEvent {
   std::optional<std::string> tool_call_id;
 };
 
+// Plugin approval request attached to a before_tool_call result.
+// Aligned with OpenClaw PluginHookBeforeToolCallResult["requireApproval"].
+struct PluginHookApprovalRequest {
+  std::optional<std::string> plugin_id;
+  std::optional<std::string> title;
+  std::optional<std::string> description;
+  std::optional<std::string> severity;                 // "info" | "warning" | "critical"
+  std::vector<std::string> allowed_decisions;          // subset of allow_once/allow_always/deny
+  std::optional<int64_t> timeout_ms;
+  // OpenClaw: when set, a timeout is treated as a veto with this reason instead
+  // of a failure disposition.
+  std::optional<std::string> timeout_reason;
+};
+
 struct PluginHookBeforeToolCallResult {
   std::optional<std::string> params_json;  // Modified params as JSON
   bool block = false;
   std::optional<std::string> block_reason;
+  // Aligned with OpenClaw: plugin may request approval instead of blocking.
+  std::optional<PluginHookApprovalRequest> require_approval;
 };
 
 struct PluginHookAfterToolCallEvent {

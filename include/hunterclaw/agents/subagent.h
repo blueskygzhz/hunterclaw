@@ -14,6 +14,7 @@
 #include <chrono>
 #include <thread>
 #include <atomic>
+#include <optional>
 
 namespace hunterclaw {
 namespace agents {
@@ -722,6 +723,20 @@ void recover_orphaned_subagent_sessions(
     gateway::GatewayClient& gw,
     SubagentRegistry& registry,
     int64_t recovery_delay_ms = 5000
+);
+
+// ============================================================================
+// 🎯 对齐 OpenClaw: subagent-system-prompt.ts (buildSubagentSystemPrompt)
+// 定义位于 subagent_system_prompt.cc
+// ============================================================================
+std::string build_subagent_system_prompt(
+    const std::string& requester_session_key,
+    const std::string& child_session_key,
+    const std::optional<std::string>& label,
+    const std::optional<std::string>& task,
+    int child_depth,
+    int max_spawn_depth,
+    bool acp_enabled
 );
 
 } // namespace agents

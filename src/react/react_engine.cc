@@ -13,6 +13,7 @@
 // preflight_memory — 均在 dispatcher/外层调用
 #include "hunterclaw/tools/tool_manager.h"
 #include "hunterclaw/tools/tool_hooks.h"             // PluginHook* types + get_global_hook_manager()
+#include "hunterclaw/tools/before_tool_call_policy.h" // unified before_tool_call policy chain
 #include "hunterclaw/sessions/transcript_io.h"       // append_tool_result_to_transcript (tool_result_persist)
 #include "hunterclaw/observability/observability.h"  // ✅ Span, Tracer, SpanKind
 #include "hunterclaw/observability/diagnostic_events.h"  // ✅ 可观测性集成
@@ -1944,57 +1945,55 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                     tool_call.name, tool_call.input, tool_call.id);
             }
 
-            // ✅ 对齐 OpenClaw: runBeforeToolCallHook — plugin hook runner (before execute)
-            // pi-tools.before-tool-call.ts:150-193:
-            //   const hookRunner = getGlobalHookRunner();
-            //   if (hookRunner?.hasHooks("before_tool_call")) { ... }
+            // ✅ 严格对齐 OpenClaw runBeforeToolCallHook — 统一 policy 链
+            // (loop 已在上方内联完成，此处 loop_state 传 null避免重复记录)
+            // policy 返回三态 HookOutcome: PASS / VETO / FAILURE
             core::JsonValue effective_params = tool_call.input;
             {
-                auto* hook_mgr = tools::get_global_hook_manager();
-                if (hook_mgr && hook_mgr->has_before_tool_call_hooks()) {
-                    try {
-                        // 构建 event + context (对齐 OpenClaw before-tool-call.ts:156-172)
-                        plugins::PluginHookBeforeToolCallEvent hook_event;
-                        hook_event.tool_name = tool_call.name;
-                        hook_event.params_json = tool_call.input.to_string();
-                        if (!callbacks.run_id.empty()) hook_event.run_id = callbacks.run_id;
-                        hook_event.tool_call_id = tool_call.id;
+                tools::BeforeToolCallContext policy_ctx;
+                policy_ctx.tool_name = tool_call.name;
+                policy_ctx.tool_call_id = tool_call.id;
+                policy_ctx.run_id = callbacks.run_id;
+                policy_ctx.session_id = callbacks.session_id;
+                policy_ctx.aborted = &cancelled_;
+                policy_ctx.loop_state = nullptr;
+                policy_ctx.hook_manager = tools::get_global_hook_manager();
 
-                        plugins::PluginHookToolContext hook_ctx;
-                        hook_ctx.tool_name = tool_call.name;
-                        if (!callbacks.session_id.empty()) hook_ctx.session_id = callbacks.session_id;
-                        if (!callbacks.run_id.empty()) hook_ctx.run_id = callbacks.run_id;
-                        hook_ctx.tool_call_id = tool_call.id;
+                auto outcome = tools::run_before_tool_call_policy(policy_ctx, tool_call.input);
 
-                        auto hook_result = hook_mgr->run_before_tool_call(hook_event, hook_ctx);
-
-                        if (hook_result.has_value()) {
-                            if (hook_result->block) {
-                                std::string reason = hook_result->block_reason.value_or(
-                                    "Tool call blocked by plugin hook");
-                                log()->warn("Plugin hook blocked tool '{}': {}", tool_call.name, reason);
-                                tools::ToolResult blocked_result;
-                                blocked_result.success = false;
-                                blocked_result.error = reason;
-                                results[tool_call.id] = blocked_result;
-                                if (callbacks.on_tool_end) callbacks.on_tool_end(tool_call.name, blocked_result);
-                                continue;
-                            }
-                            // 对齐 OpenClaw: hookResult?.params → 合并参数
-                            if (hook_result->params_json.has_value()) {
-                                auto parsed = core::JsonValue::parse(*hook_result->params_json);
-                                if (parsed.ok && parsed.value) {
-                                    effective_params = std::move(*parsed.value);
-                                }
-                            }
-                        }
-                    } catch (const std::exception& e) {
-                        // 对齐 OpenClaw: hook 异常降级 — 记日志，继续执行
-                        // before-tool-call.ts:188-191: log.warn, continue
-                        log()->warn("before_tool_call hook failed: tool={} error={}",
-                                    tool_call.name, e.what());
-                    }
+                if (outcome.kind == tools::HookOutcomeKind::Veto) {
+                    // 对齐 OpenClaw buildBlockedToolResult(): blocked shape 交给 LLM
+                    auto blocked = tools::build_blocked_tool_result(
+                        outcome.reason.value_or("Tool call blocked"),
+                        outcome.denied_reason.value_or(tools::denied_reason::kPluginBeforeToolCall),
+                        tool_call.id);
+                    log()->warn("Tool '{}' vetoed by before_tool_call policy: {}",
+                                tool_call.name, blocked.error);
+                    results[tool_call.id] = blocked;
+                    if (callbacks.on_tool_end) callbacks.on_tool_end(tool_call.name, blocked);
+                    continue;
                 }
+                if (outcome.kind == tools::HookOutcomeKind::Failure) {
+                    // 对齐 OpenClaw: FAILURE 作为 terminal 事故，携带 disposition
+                    tools::ToolResult err;
+                    err.success = false;
+                    err.error = outcome.reason.value_or("before_tool_call failed");
+                    err.details = core::JsonValue::object();
+                    err.details["status"] = std::string("error");
+                    err.details["disposition"] =
+                        outcome.disposition.value_or(tools::disposition::kError);
+                    err.details["deniedReason"] =
+                        outcome.denied_reason.value_or(tools::denied_reason::kPluginBeforeToolCall);
+                    log()->error("Tool '{}' before_tool_call FAILURE ({}): {}",
+                                 tool_call.name,
+                                 outcome.disposition.value_or(tools::disposition::kError),
+                                 err.error);
+                    results[tool_call.id] = err;
+                    if (callbacks.on_tool_end) callbacks.on_tool_end(tool_call.name, err);
+                    continue;
+                }
+                // PASS: 使用（可能被 hook 改写的）最终参数
+                effective_params = std::move(outcome.params);
             }
 
             // ✅ 对齐 OpenClaw handlers.tools.ts:314 — 记录工具启动时间
@@ -2184,55 +2183,55 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                     tool_call.name, tool_call.input, tool_call.id);
             }
 
-            // ✅ 对齐 OpenClaw: runBeforeToolCallHook — plugin hook runner (并行路径)
+            // ✅ 严格对齐 OpenClaw runBeforeToolCallHook — 统一 policy 链（并行路径）
             // hook 在主线程调用（不在线程池内），避免并发竞争
             core::JsonValue parallel_effective_params = tool_call.input;
             {
-                auto* hook_mgr = tools::get_global_hook_manager();
-                if (hook_mgr && hook_mgr->has_before_tool_call_hooks()) {
-                    try {
-                        plugins::PluginHookBeforeToolCallEvent hook_event;
-                        hook_event.tool_name = tool_call.name;
-                        hook_event.params_json = tool_call.input.to_string();
-                        if (!callbacks.run_id.empty()) hook_event.run_id = callbacks.run_id;
-                        hook_event.tool_call_id = tool_call.id;
+                tools::BeforeToolCallContext policy_ctx;
+                policy_ctx.tool_name = tool_call.name;
+                policy_ctx.tool_call_id = tool_call.id;
+                policy_ctx.run_id = callbacks.run_id;
+                policy_ctx.session_id = callbacks.session_id;
+                policy_ctx.aborted = &cancelled_;
+                policy_ctx.loop_state = nullptr;
+                policy_ctx.hook_manager = tools::get_global_hook_manager();
 
-                        plugins::PluginHookToolContext hook_ctx;
-                        hook_ctx.tool_name = tool_call.name;
-                        if (!callbacks.session_id.empty()) hook_ctx.session_id = callbacks.session_id;
-                        if (!callbacks.run_id.empty()) hook_ctx.run_id = callbacks.run_id;
-                        hook_ctx.tool_call_id = tool_call.id;
+                auto outcome = tools::run_before_tool_call_policy(policy_ctx, tool_call.input);
 
-                        auto hook_result = hook_mgr->run_before_tool_call(hook_event, hook_ctx);
-
-                        if (hook_result.has_value()) {
-                            if (hook_result->block) {
-                                std::string reason = hook_result->block_reason.value_or(
-                                    "Tool call blocked by plugin hook");
-                                log()->warn("Plugin hook blocked tool '{}' (parallel): {}", tool_call.name, reason);
-                                std::string tool_id = tool_call.id;
-                                auto f = std::async(std::launch::deferred,
-                                    [tool_id, reason]() -> ParallelToolResultOuter {
-                                        tools::ToolResult r;
-                                        r.success = false;
-                                        r.error = reason;
-                                        return {tool_id, r, 0.0};
-                                    });
-                                futures.push_back(std::move(f));
-                                continue;
-                            }
-                            if (hook_result->params_json.has_value()) {
-                                auto parsed = core::JsonValue::parse(*hook_result->params_json);
-                                if (parsed.ok && parsed.value) {
-                                    parallel_effective_params = std::move(*parsed.value);
-                                }
-                            }
-                        }
-                    } catch (const std::exception& e) {
-                        log()->warn("before_tool_call hook failed (parallel): tool={} error={}",
-                                    tool_call.name, e.what());
-                    }
+                if (outcome.kind == tools::HookOutcomeKind::Veto ||
+                    outcome.kind == tools::HookOutcomeKind::Failure) {
+                    const bool is_veto = (outcome.kind == tools::HookOutcomeKind::Veto);
+                    tools::ToolResult r =
+                        is_veto
+                            ? tools::build_blocked_tool_result(
+                                  outcome.reason.value_or("Tool call blocked"),
+                                  outcome.denied_reason.value_or(
+                                      tools::denied_reason::kPluginBeforeToolCall),
+                                  tool_call.id)
+                            : [&] {
+                                  tools::ToolResult e;
+                                  e.success = false;
+                                  e.error = outcome.reason.value_or("before_tool_call failed");
+                                  e.details = core::JsonValue::object();
+                                  e.details["status"] = std::string("error");
+                                  e.details["disposition"] =
+                                      outcome.disposition.value_or(tools::disposition::kError);
+                                  e.details["deniedReason"] = outcome.denied_reason.value_or(
+                                      tools::denied_reason::kPluginBeforeToolCall);
+                                  return e;
+                              }();
+                    log()->warn("Tool '{}' blocked by before_tool_call policy (parallel, {}): {}",
+                                tool_call.name, is_veto ? "veto" : "failure", r.error);
+                    std::string tool_id = tool_call.id;
+                    auto f = std::async(std::launch::deferred,
+                        [tool_id, r]() -> ParallelToolResultOuter {
+                            return {tool_id, r, 0.0};
+                        });
+                    futures.push_back(std::move(f));
+                    continue;
                 }
+                // PASS
+                parallel_effective_params = std::move(outcome.params);
             }
             
             // ✅ 提交任务到全局线程池 (避免频繁创建/销毁线程)
