@@ -62,47 +62,78 @@ tools::ToolResult McpToolAdapter::execute(const core::JsonValue& params) {
     }
     
     auto mcp_result = result.get();
-    
-    if (!mcp_result.success) {
-        return tools::tool_result::error(
-            "MCP tool execution failed: " + mcp_result.error
-        );
+
+    // 🎯 严格对齐 OpenClaw toAgentToolResult (agent-bundle-mcp-materialize.ts:90-145)。
+    const std::string& server_name = definition_.server_name;
+    const std::string& tool_name = definition_.tool_name;
+
+    json source_content = JsonConverter::to_nlohmann(mcp_result.content);
+    if (!source_content.is_array()) {
+        source_content = json::array();
     }
-    
-    // 转换结果 (对齐 OpenClaw 的结果处理)
-    tools::ToolResult tool_result;
-    tool_result.success = true;
-    
-    // 使用 JsonConverter 处理结构化内容
-    json structured_json = JsonConverter::to_nlohmann(mcp_result.structured_content);
-    
-    if (!structured_json.is_null() && !structured_json.empty()) {
-        // 如果是对象/数组,返回 JSON
-        if (structured_json.is_object() || structured_json.is_array()) {
-            tools::ToolResultContent content;
-            content.type = tools::ToolResultContent::Type::Json;
-            content.text = JsonConverter::stringify(structured_json, 2);  // 美化输出
-            
-            tool_result.content.push_back(content);
-            tool_result.details = JsonConverter::from_nlohmann(structured_json);
-            
-        } else if (structured_json.is_string()) {
-            // 字符串内容
-            tools::ToolResultContent content;
-            content.type = tools::ToolResultContent::Type::Text;
-            content.text = structured_json.get<std::string>();
-            
-            tool_result.content.push_back(content);
+
+    // 单个 MCP content block → HunterClaw ToolResultContent。
+    auto block_to_content = [](const json& block) -> tools::ToolResultContent {
+        tools::ToolResultContent c;
+        if (block.is_object() && block.value("type", "") == "text" &&
+            block.contains("text") && block["text"].is_string()) {
+            c.type = tools::ToolResultContent::Type::Text;
+            c.text = block["text"].get<std::string>();
+        } else {
+            // 非文本块（image/audio/resource 等）：HunterClaw 无对应富类型，
+            // 以 JSON 文本承载，保留原始结构（对齐 mcpContentBlockToAgentContent 的降级）。
+            c.type = tools::ToolResultContent::Type::Json;
+            c.text = block.dump(2);
         }
-    } else if (!mcp_result.stdout_output.empty()) {
-        // 回退到 stdout
-        tools::ToolResultContent content;
-        content.type = tools::ToolResultContent::Type::Text;
-        content.text = mcp_result.stdout_output;
-        
-        tool_result.content.push_back(content);
+        return c;
+    };
+
+    tools::ToolResult tool_result;
+    tool_result.success = !mcp_result.is_error;
+
+    if (mcp_result.has_structured_content) {
+        // structuredContent 存在：首块为 "structuredContent:\n{pretty}"，
+        // 其后保留原始的非 text 块（图片/资源/音频，JSON 无法镜像）。
+        json structured = JsonConverter::to_nlohmann(mcp_result.structured_content);
+        tools::ToolResultContent head;
+        head.type = tools::ToolResultContent::Type::Text;
+        head.text = "structuredContent:\n" + structured.dump(2);
+        tool_result.content.push_back(std::move(head));
+        for (const auto& block : source_content) {
+            if (!(block.is_object() && block.value("type", "") == "text")) {
+                tool_result.content.push_back(block_to_content(block));
+            }
+        }
+    } else if (!source_content.empty()) {
+        // 无 structured：映射全部原始 content 块。
+        for (const auto& block : source_content) {
+            tool_result.content.push_back(block_to_content(block));
+        }
+    } else {
+        // 无内容：回退到 {status, server, tool} JSON（对齐 OC的兜底块）。
+        json fallback = {
+            {"status", mcp_result.is_error ? "error" : "ok"},
+            {"server", server_name},
+            {"tool", tool_name},
+        };
+        tools::ToolResultContent c;
+        c.type = tools::ToolResultContent::Type::Text;
+        c.text = fallback.dump(2);
+        tool_result.content.push_back(std::move(c));
     }
-    
+
+    // details：mcpServer/mcpTool，有 structured 加 structuredContent，error 加 status。
+    json details = json::object();
+    details["mcpServer"] = server_name;
+    details["mcpTool"] = tool_name;
+    if (mcp_result.has_structured_content) {
+        details["structuredContent"] = JsonConverter::to_nlohmann(mcp_result.structured_content);
+    }
+    if (mcp_result.is_error) {
+        details["status"] = "error";
+    }
+    tool_result.details = JsonConverter::from_nlohmann(details);
+
     return tool_result;
 }
 

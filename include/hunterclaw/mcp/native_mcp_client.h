@@ -233,6 +233,16 @@ public:
     // 列出工具
     core::Result<std::vector<McpToolDefinition>> list_tools();
 
+    // 🎯 对齐 OpenClaw resources/prompts utility tools 的底层 RPC。
+    //   list 操作走 collectMcpPaginatedItems 有界分页，返回聚合后的原始 JSON。
+    core::Result<nlohmann::json> list_resources();               // resources/list
+    core::Result<nlohmann::json> read_resource(                // resources/read
+        const std::string& uri);
+    core::Result<nlohmann::json> list_prompts();                 // prompts/list
+    core::Result<nlohmann::json> get_prompt(                     // prompts/get
+        const std::string& name,
+        const std::map<std::string, std::string>& arguments = {});
+
     // 调用工具
     core::Result<nlohmann::json> call_tool(
         const std::string& tool_name,
@@ -288,6 +298,15 @@ public:
         const std::string& server_and_tool, const core::JsonValue& args) override;
     core::Result<std::vector<McporterResult>> call_tools(
         const std::vector<McporterCallArgs>& calls) override;
+
+    // ========== Resources / Prompts (🎯 对齐 OpenClaw utility tools) ==========
+    core::Result<core::JsonValue> list_resources(const std::string& server_name) override;
+    core::Result<core::JsonValue> read_resource(
+        const std::string& server_name, const std::string& uri) override;
+    core::Result<core::JsonValue> list_prompts(const std::string& server_name) override;
+    core::Result<core::JsonValue> get_prompt(
+        const std::string& server_name, const std::string& name,
+        const std::map<std::string, std::string>& arguments = {}) override;
 
     // ========== 配置管理 ==========
     core::Result<core::JsonValue> get_config() override;

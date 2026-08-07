@@ -21,6 +21,7 @@
 #include "hunterclaw/mcp/native_mcp_client.h"
 #include "hunterclaw/mcp/mcp_transport_config.h"
 #include "hunterclaw/mcp/json_converter.h"
+#include "hunterclaw/mcp/mcp_pagination.h"
 #include "hunterclaw/core/subprocess.h"
 #include <spdlog/spdlog.h>
 #include <algorithm>
@@ -646,20 +647,49 @@ core::Result<std::vector<McpToolDefinition>> McpServerConnection::list_tools() {
         return core::Result<std::vector<McpToolDefinition>>::Err("not connected");
     }
 
-    auto result = transport_->send_request(
-        "tools/list", json::object(), config_.call_timeout_ms);
-    if (result.is_err()) {
-        return core::Result<std::vector<McpToolDefinition>>::Err(result.error);
+    // 🎯 对齐 OpenClaw collectMcpPaginatedItems: 有界分页收集 tools/list。
+    CollectMcpPaginatedItemsParams pg;
+    pg.label = "bundle-mcp tools/list (" + config_.name + ")";
+    pg.item_label = "tools";
+    pg.timeout_ms = config_.call_timeout_ms > 0 ? config_.call_timeout_ms
+                                                : MCP_LIST_DEFAULT_TIMEOUT_MS;
+    pg.max_pages = MCP_LIST_DEFAULT_MAX_PAGES;
+    pg.max_items = MCP_LIST_DEFAULT_MAX_ITEMS;
+    pg.max_bytes = MCP_LIST_DEFAULT_MAX_BYTES;
+    pg.load_page =
+        [this](const McpPaginationRequest& req) -> core::Result<McpPaginationPage> {
+        json params = json::object();
+        if (req.cursor.has_value()) {
+            params["cursor"] = *req.cursor;
+        }
+        auto result = transport_->send_request("tools/list", params, config_.call_timeout_ms);
+        if (result.is_err()) {
+            return core::Result<McpPaginationPage>::Err(result.error);
+        }
+        const auto& response = result.get();
+        McpPaginationPage page;
+        if (response.contains("tools") && response["tools"].is_array()) {
+            for (const auto& tool : response["tools"]) {
+                page.items.push_back(JsonConverter::from_nlohmann(tool));
+            }
+        }
+        // 对齐 nextCursor：仅当为非空字符串时作为续页游标。
+        if (response.contains("nextCursor") && response["nextCursor"].is_string()) {
+            std::string nc = response["nextCursor"].get<std::string>();
+            if (!nc.empty()) page.next_cursor = nc;
+        }
+        page.serialized_value = JsonConverter::from_nlohmann(response);
+        return core::Result<McpPaginationPage>::Ok(std::move(page));
+    };
+
+    auto collected = collect_mcp_paginated_items(pg);
+    if (collected.is_err()) {
+        return core::Result<std::vector<McpToolDefinition>>::Err(collected.error);
     }
 
-    const auto& response = result.get();
     std::vector<McpToolDefinition> tools;
-
-    if (!response.contains("tools") || !response["tools"].is_array()) {
-        return core::Result<std::vector<McpToolDefinition>>::Ok(tools);
-    }
-
-    for (const auto& tool : response["tools"]) {
+    for (const auto& item : collected.get()) {
+        json tool = JsonConverter::to_nlohmann(item);
         McpToolDefinition def;
         def.server_name = config_.name;
         if (tool.contains("name")) def.tool_name = tool["name"].get<std::string>();
@@ -671,7 +701,7 @@ core::Result<std::vector<McpToolDefinition>> McpServerConnection::list_tools() {
         tools.push_back(std::move(def));
     }
 
-    return core::Result<std::vector<McpToolDefinition>>::Ok(tools);
+    return core::Result<std::vector<McpToolDefinition>>::Ok(std::move(tools));
 }
 
 core::Result<json> McpServerConnection::call_tool(
@@ -687,6 +717,94 @@ core::Result<json> McpServerConnection::call_tool(
     };
 
     return transport_->send_request("tools/call", params, config_.call_timeout_ms);
+}
+
+// 🎯 对齐 OpenClaw resources/prompts utility tools 的底层 RPC。
+
+namespace {
+// 通用有界分页 list（resources/list、prompts/list 共用）。
+//   result_key:响应里的数组字段名（"resources" | "prompts"）。
+//   返回 {<result_key>: [...聚合项...] }。
+core::Result<json> paginated_list(
+    McpTransport* transport, int call_timeout_ms,
+    const std::string& server_name, const std::string& method,
+    const std::string& result_key) {
+    CollectMcpPaginatedItemsParams pg;
+    pg.label = "bundle-mcp " + method + " (" + server_name + ")";
+    pg.item_label = result_key;
+    pg.timeout_ms = call_timeout_ms > 0 ? call_timeout_ms : MCP_LIST_DEFAULT_TIMEOUT_MS;
+    pg.max_pages = MCP_LIST_DEFAULT_MAX_PAGES;
+    pg.max_items = MCP_LIST_DEFAULT_MAX_ITEMS;
+    pg.max_bytes = MCP_LIST_DEFAULT_MAX_BYTES;
+    pg.load_page =
+        [transport, call_timeout_ms, method, result_key](
+            const McpPaginationRequest& req) -> core::Result<McpPaginationPage> {
+        json params = json::object();
+        if (req.cursor.has_value()) params["cursor"] = *req.cursor;
+        auto result = transport->send_request(method, params, call_timeout_ms);
+        if (result.is_err()) {
+            return core::Result<McpPaginationPage>::Err(result.error);
+        }
+        const auto& response = result.get();
+        McpPaginationPage page;
+        if (response.contains(result_key) && response[result_key].is_array()) {
+            for (const auto& item : response[result_key]) {
+                page.items.push_back(JsonConverter::from_nlohmann(item));
+            }
+        }
+        if (response.contains("nextCursor") && response["nextCursor"].is_string()) {
+            std::string nc = response["nextCursor"].get<std::string>();
+            if (!nc.empty()) page.next_cursor = nc;
+        }
+        page.serialized_value = JsonConverter::from_nlohmann(response);
+        return core::Result<McpPaginationPage>::Ok(std::move(page));
+    };
+
+    auto collected = collect_mcp_paginated_items(pg);
+    if (collected.is_err()) {
+        return core::Result<json>::Err(collected.error);
+    }
+    json arr = json::array();
+    for (const auto& item : collected.get()) {
+        arr.push_back(JsonConverter::to_nlohmann(item));
+    }
+    json out = json::object();
+    out[result_key] = std::move(arr);
+    return core::Result<json>::Ok(std::move(out));
+}
+} // namespace
+
+core::Result<json> McpServerConnection::list_resources() {
+    if (!is_ready()) return core::Result<json>::Err("not connected");
+    return paginated_list(transport_.get(), config_.call_timeout_ms,
+                          config_.name, "resources/list", "resources");
+}
+
+core::Result<json> McpServerConnection::read_resource(const std::string& uri) {
+    if (!is_ready()) return core::Result<json>::Err("not connected");
+    json params = json::object();
+    params["uri"] = uri;
+    return transport_->send_request("resources/read", params, config_.call_timeout_ms);
+}
+
+core::Result<json> McpServerConnection::list_prompts() {
+    if (!is_ready()) return core::Result<json>::Err("not connected");
+    return paginated_list(transport_.get(), config_.call_timeout_ms,
+                          config_.name, "prompts/list", "prompts");
+}
+
+core::Result<json> McpServerConnection::get_prompt(
+    const std::string& name,
+    const std::map<std::string, std::string>& arguments) {
+    if (!is_ready()) return core::Result<json>::Err("not connected");
+    json params = json::object();
+    params["name"] = name;
+    if (!arguments.empty()) {
+        json args_obj = json::object();
+        for (const auto& [k, v] : arguments) args_obj[k] = v;
+        params["arguments"] = std::move(args_obj);
+    }
+    return transport_->send_request("prompts/get", params, config_.call_timeout_ms);
 }
 
 void McpServerConnection::disconnect() {
@@ -862,6 +980,46 @@ core::Result<std::vector<McpToolDefinition>> NativeMcpClient::list_tools(
     return conn_result.get()->list_tools();
 }
 
+// 🎯 对齐 OpenClaw resources/prompts utility tools：转发到连接层RPC。
+core::Result<core::JsonValue> NativeMcpClient::list_resources(const std::string& server_name) {
+    ensure_daemon_started();
+    auto conn = get_or_connect(server_name);
+    if (conn.is_err()) return core::Result<core::JsonValue>::Err(conn.error);
+    auto r = conn.get()->list_resources();
+    if (r.is_err()) return core::Result<core::JsonValue>::Err(r.error);
+    return core::Result<core::JsonValue>::Ok(JsonConverter::from_nlohmann(r.get()));
+}
+
+core::Result<core::JsonValue> NativeMcpClient::read_resource(
+    const std::string& server_name, const std::string& uri) {
+    ensure_daemon_started();
+    auto conn = get_or_connect(server_name);
+    if (conn.is_err()) return core::Result<core::JsonValue>::Err(conn.error);
+    auto r = conn.get()->read_resource(uri);
+    if (r.is_err()) return core::Result<core::JsonValue>::Err(r.error);
+    return core::Result<core::JsonValue>::Ok(JsonConverter::from_nlohmann(r.get()));
+}
+
+core::Result<core::JsonValue> NativeMcpClient::list_prompts(const std::string& server_name) {
+    ensure_daemon_started();
+    auto conn = get_or_connect(server_name);
+    if (conn.is_err()) return core::Result<core::JsonValue>::Err(conn.error);
+    auto r = conn.get()->list_prompts();
+    if (r.is_err()) return core::Result<core::JsonValue>::Err(r.error);
+    return core::Result<core::JsonValue>::Ok(JsonConverter::from_nlohmann(r.get()));
+}
+
+core::Result<core::JsonValue> NativeMcpClient::get_prompt(
+    const std::string& server_name, const std::string& name,
+    const std::map<std::string, std::string>& arguments) {
+    ensure_daemon_started();
+    auto conn = get_or_connect(server_name);
+    if (conn.is_err()) return core::Result<core::JsonValue>::Err(conn.error);
+    auto r = conn.get()->get_prompt(name, arguments);
+    if (r.is_err()) return core::Result<core::JsonValue>::Err(r.error);
+    return core::Result<core::JsonValue>::Ok(JsonConverter::from_nlohmann(r.get()));
+}
+
 core::Result<std::vector<McpToolDefinition>> NativeMcpClient::discover_all_tools() {
     ensure_daemon_started();
 
@@ -935,9 +1093,15 @@ core::Result<McporterResult> NativeMcpClient::call_tool(
     mcp_result.success = true;
     mcp_result.exit_code = 0;
 
+    //🎯 对齐 OpenClaw CallToolResult: 保留原始 content[] 与 isError。
+    if (response.contains("content") && response["content"].is_array()) {
+        mcp_result.content = JsonConverter::from_nlohmann(response["content"]);
+    }
+
     // MCP tools/call 响应格式: { content: [...], isError: bool }
     if (response.contains("isError") && response["isError"].get<bool>()) {
         mcp_result.success = false;
+        mcp_result.is_error = true;
         if (response.contains("content") && response["content"].is_array() &&
             !response["content"].empty()) {
             const auto& first = response["content"][0];
@@ -947,12 +1111,12 @@ core::Result<McporterResult> NativeMcpClient::call_tool(
         }
     }
 
-    // 优先取 structuredContent，否则取 content
+    // 🎯 对齐 OpenClaw: 仅在真正存在 structuredContent 时保留它（不再把整个
+    //   response 折叠进 structured_content，避免与 content[] 语义混淆）。
     if (response.contains("structuredContent")) {
+        mcp_result.has_structured_content = true;
         mcp_result.structured_content =
             JsonConverter::from_nlohmann(response["structuredContent"]);
-    } else {
-        mcp_result.structured_content = JsonConverter::from_nlohmann(response);
     }
 
     return core::Result<McporterResult>::Ok(mcp_result);

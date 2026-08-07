@@ -4,6 +4,7 @@
 // 🎯 对齐 OpenClaw: config/mcp-config.ts (list/set/unset MCP servers)
 
 #include "hunterclaw/core/result.h"
+#include "hunterclaw/mcp/mcp_tool_filter.h"  // McpServerToolFilterConfig
 #include <string>
 #include <vector>
 #include <map>
@@ -27,6 +28,7 @@ struct McpServerConfig {
     std::optional<std::string> transport;                 // 🎯 "sse" | "streamable-http"
     std::map<std::string, std::string> headers;           // 🎯 HTTP transport: extra headers
     std::optional<int> connection_timeout_ms;             // 🎯 Optional connection timeout
+    std::optional<McpServerToolFilterConfig> tool_filter; // 🎯 对齐 toolFilter (include/exclude)
 
     // Serialize to/from JSON
     nlohmann::json to_json() const;

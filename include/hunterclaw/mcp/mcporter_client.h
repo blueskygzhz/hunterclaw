@@ -51,6 +51,11 @@ struct McporterResult {
     core::JsonValue structured_content;   // 解析后的 JSON
     std::string error;
     int exit_code = -1;
+    // 🎯 对齐 OpenClaw CallToolResult：保留原始 MCP content 数组与 isError，
+    //   供 toAgentToolResult 规范化（结构化优先、保留非文本块、无内容回退）。
+    core::JsonValue content;// MCP content[] 原样（Array<{type,text,...}>）
+    bool is_error = false;                // MCP isError
+    bool has_structured_content = false;  // 区分"无 structuredContent"与"值为 null"
 };
 
 // MCP 工具定义
@@ -122,6 +127,29 @@ public:
     virtual core::Result<std::vector<McporterResult>> call_tools(
         const std::vector<McporterCallArgs>& calls
     ) = 0;
+
+    // ========== Resources / Prompts (🎯 对齐 OpenClaw utility tools) ==========
+    // 默认返回 unsupported，仅 NativeMcpClient 实现（走 MCP resources/*、prompts/*）。
+
+    /// resources/list（有界分页聚合）→ {resources:[...]}
+    virtual core::Result<core::JsonValue> list_resources(const std::string& /*server_name*/) {
+        return core::Result<core::JsonValue>::Err("resources not supported by this client");
+    }
+    /// resources/read →原始结果
+    virtual core::Result<core::JsonValue> read_resource(
+        const std::string& /*server_name*/, const std::string& /*uri*/) {
+        return core::Result<core::JsonValue>::Err("resources not supported by this client");
+    }
+    /// prompts/list（有界分页聚合）→ {prompts:[...]}
+    virtual core::Result<core::JsonValue> list_prompts(const std::string& /*server_name*/) {
+        return core::Result<core::JsonValue>::Err("prompts not supported by this client");
+    }
+    /// prompts/get → 原始结果
+    virtual core::Result<core::JsonValue> get_prompt(
+        const std::string& /*server_name*/, const std::string& /*name*/,
+        const std::map<std::string, std::string>& /*arguments*/ = {}) {
+        return core::Result<core::JsonValue>::Err("prompts not supported by this client");
+    }
 
     // ========== 配置管理 ==========
 

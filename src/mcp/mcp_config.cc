@@ -25,6 +25,13 @@ nlohmann::json McpServerConfig::to_json() const {
     if (transport) j["transport"] = *transport;
     if (!headers.empty()) j["headers"] = headers;
     if (connection_timeout_ms) j["connectionTimeoutMs"] = *connection_timeout_ms;
+    // 🎯 对齐 OpenClaw toolFilter (types.mcp.ts:11-20)
+    if (tool_filter) {
+        nlohmann::json tf = nlohmann::json::object();
+        if (tool_filter->has_include) tf["include"] = tool_filter->include;
+        if (tool_filter->has_exclude) tf["exclude"] = tool_filter->exclude;
+        if (!tf.empty()) j["toolFilter"] = tf;
+    }
     return j;
 }
 
@@ -54,6 +61,24 @@ McpServerConfig McpServerConfig::from_json(const nlohmann::json& j) {
     }
     if (j.contains("connectionTimeoutMs") && j["connectionTimeoutMs"].is_number()) {
         cfg.connection_timeout_ms = j["connectionTimeoutMs"].get<int>();
+    }
+    // 🎯 对齐 OpenClaw toolFilter (types.mcp.ts:11-20)
+    if (j.contains("toolFilter") && j["toolFilter"].is_object()) {
+        const auto& tf = j["toolFilter"];
+        McpServerToolFilterConfig filter;
+        if (tf.contains("include") && tf["include"].is_array()) {
+            filter.has_include = true;
+            for (const auto& p : tf["include"]) {
+                if (p.is_string()) filter.include.push_back(p.get<std::string>());
+            }
+        }
+        if (tf.contains("exclude") && tf["exclude"].is_array()) {
+            filter.has_exclude = true;
+            for (const auto& p : tf["exclude"]) {
+                if (p.is_string()) filter.exclude.push_back(p.get<std::string>());
+            }
+        }
+        cfg.tool_filter = std::move(filter);
     }
     return cfg;
 }
