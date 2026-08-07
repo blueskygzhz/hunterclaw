@@ -2,7 +2,6 @@
 #include "hunterclaw/memory/qmd_manager.h"
 #include "hunterclaw/memory/qmd_scope.h"
 #include "hunterclaw/memory/qmd_process.h"
-#include "hunterclaw/memory/json_parser.h"
 #include "hunterclaw/memory/qmd_query_parser.h"
 #include <stdexcept>
 #include <sstream>

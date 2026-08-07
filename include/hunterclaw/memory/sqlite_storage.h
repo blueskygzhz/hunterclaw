@@ -130,6 +130,10 @@ public:
     
     // 按source统计
     core::Result<std::vector<MemoryProviderStatus::SourceCount>> get_source_counts();
+
+    // 🎯 对齐 OC memory_index_state: 读取当前索引 revision（供缓存失效/增量同步）。
+    //   SELECT revision FROM memory_index_state WHERE id = 1。
+    core::Result<int64_t> get_index_revision();
     
     // ========================================================================
     // 状态查询

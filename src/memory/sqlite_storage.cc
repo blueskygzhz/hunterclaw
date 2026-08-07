@@ -304,9 +304,45 @@ core::Result<bool> SQLiteVectorStorage::ensure_schema() {
         }
     }
 
+    // 🎯 严格对齐 OpenClaw memory-schema.ts:619-649: revision 计数 triggers。
+    //   sources / chunks 各 insert/update/delete → memory_index_state.revision += 1，
+    //   用于外部感知索引变更（缓存失效/增量同步）。无条件建立（非 FTS 依赖）。
+    ::hunterclaw::memory::exec_sql(db_, R"(
+        CREATE TRIGGER IF NOT EXISTS memory_index_sources_revision_after_insert
+        AFTER INSERT ON memory_index_sources
+        BEGIN UPDATE memory_index_state SET revision = revision + 1 WHERE id = 1; END;
+    )");
+    ::hunterclaw::memory::exec_sql(db_, R"(
+        CREATE TRIGGER IF NOT EXISTS memory_index_sources_revision_after_update
+        AFTER UPDATE ON memory_index_sources
+        BEGIN UPDATE memory_index_state SET revision = revision + 1 WHERE id = 1; END;
+    )");
+    ::hunterclaw::memory::exec_sql(db_, R"(
+        CREATE TRIGGER IF NOT EXISTS memory_index_sources_revision_after_delete
+        AFTER DELETE ON memory_index_sources
+        BEGIN UPDATE memory_index_state SET revision = revision + 1 WHERE id = 1; END;
+    )");
+    ::hunterclaw::memory::exec_sql(db_, R"(
+        CREATE TRIGGER IF NOT EXISTS memory_index_chunks_revision_after_insert
+        AFTER INSERT ON memory_index_chunks
+        BEGIN UPDATE memory_index_state SET revision = revision + 1 WHERE id = 1; END;
+    )");
+    ::hunterclaw::memory::exec_sql(db_, R"(
+        CREATE TRIGGER IF NOT EXISTS memory_index_chunks_revision_after_update
+        AFTER UPDATE ON memory_index_chunks
+        BEGIN UPDATE memory_index_state SET revision = revision + 1 WHERE id = 1; END;
+    )");
+    ::hunterclaw::memory::exec_sql(db_, R"(
+        CREATE TRIGGER IF NOT EXISTS memory_index_chunks_revision_after_delete
+        AFTER DELETE ON memory_index_chunks
+        BEGIN UPDATE memory_index_state SET revision = revision + 1 WHERE id = 1; END;
+    )");
+
     // Indices (canonical 表名)
     ::hunterclaw::memory::exec_sql(db_, "CREATE INDEX IF NOT EXISTS idx_chunks_path ON memory_index_chunks(path);");
     ::hunterclaw::memory::exec_sql(db_, "CREATE INDEX IF NOT EXISTS idx_chunks_source ON memory_index_chunks(source);");
+    // 🎯 对齐 OC memory-schema.ts:651: sources.source 索引
+    ::hunterclaw::memory::exec_sql(db_, "CREATE INDEX IF NOT EXISTS idx_memory_index_sources_source ON memory_index_sources(source);");
 
     // sqlite-vec virtual table - only if vec extension loaded
     if (vec_available_) {
@@ -473,6 +509,23 @@ core::Result<std::string> SQLiteVectorStorage::add_chunk(
 
     if (rc != SQLITE_DONE) {
         return core::Result<std::string>::Err("Failed to insert chunk: " + std::string(sqlite3_errmsg(db_)));
+    }
+
+    // 🎯 对齐 OC memory-schema-provenance.ts: 新chunk 默认写 provenance
+    //   (origin_class='untrusted', session_kind='unknown', observed_at=updated_at)。
+    //   与 OC 存量迁移默认值一致；上层若有可信来源可后续upsert 覆盖。
+    {
+        sqlite3_stmt* pstmt = prepare_stmt(db_, R"(
+            INSERT OR IGNORE INTO memory_index_chunk_provenance
+            (chunk_id, origin_class, session_kind, observed_at)
+            VALUES (?, 'untrusted', 'unknown', ?)
+        )");
+        if (pstmt) {
+            sqlite3_bind_text(pstmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(pstmt, 2, updated_at);
+            sqlite3_step(pstmt);
+            sqlite3_finalize(pstmt);
+        }
     }
 
     // vec 表（canonical: 仅 id + embedding），仅在 vec 扩展可用时。
@@ -1078,6 +1131,25 @@ core::Result<std::vector<MemoryProviderStatus::SourceCount>> SQLiteVectorStorage
     sqlite3_finalize(stmt);
     
     return core::Result<std::vector<MemoryProviderStatus::SourceCount>>::Ok(counts);
+}
+
+// 🎯 对齐 OC: 读取索引 revision（memory_index_state.revision, id=1）。
+core::Result<int64_t> SQLiteVectorStorage::get_index_revision() {
+    if (!db_) {
+        return core::Result<int64_t>::Err("Database not open");
+    }
+    std::string error;
+    sqlite3_stmt* stmt = prepare_stmt(db_,
+        "SELECT revision FROM memory_index_state WHERE id = 1", &error);
+    if (!stmt) {
+        return core::Result<int64_t>::Err("Failed to query index revision: " + error);
+    }
+    int64_t revision = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        revision = sqlite3_column_int64(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return core::Result<int64_t>::Ok(revision);
 }
 
 // ============================================================================

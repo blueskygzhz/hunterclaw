@@ -2,6 +2,7 @@
 #include "hunterclaw/sessions/session_paths.h"
 #include <filesystem>
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 
 namespace fs = std::filesystem;
@@ -86,12 +87,26 @@ std::string resolve_store_path(
 }
 
 // 对齐 paths.ts:38-278 (simplified)
+// 🎯 严格对齐 OpenClaw safeTrajectorySessionFileName (trajectory/paths.ts:16-19):
+//   - 非法字符 [^A-Za-z0-9_-] 替换为 '_'（非删除，避免不同 id 折叠冲突）
+//   - 截断至 120 字符
+//   - 若结果不含任何字母数字，fallback 为 "session"
 static std::string sanitize_session_id_for_filename(const std::string& id) {
   std::string safe;
+  safe.reserve(id.size());
   for (char c : id) {
-    if (std::isalnum(c) || c == '-' || c == '_') safe += c;
+    if (std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_') {
+      safe += c;
+    } else {
+      safe += '_';
+    }
   }
-  return safe.empty() ? "unknown" : safe;
+  if (safe.size() > 120) safe = safe.substr(0, 120);
+  bool has_alnum = false;
+  for (char c : safe) {
+    if (std::isalnum(static_cast<unsigned char>(c))) { has_alnum = true; break; }
+  }
+  return has_alnum ? safe : "session";
 }
 
 std::string resolve_session_file_path(

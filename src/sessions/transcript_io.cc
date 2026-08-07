@@ -1,4 +1,5 @@
 #include "hunterclaw/sessions/transcript_io.h"
+#include "hunterclaw/sessions/session_paths.h"
 #include "hunterclaw/tools/tool_hooks.h"   // get_global_hook_manager(), PluginHook* types
 #include "hunterclaw/core/utils.h"
 #include <spdlog/spdlog.h>
@@ -33,14 +34,16 @@ std::string resolve_transcript_path(
     const std::string& agent_id,
     const std::string& sessions_dir
 ) {
-    // 对齐 OpenClaw:
-    // sessions_dir/agent-{agent_id}/session-{session_id}.jsonl
-    
-    std::string agent_folder = "agent-" + agent_id;
-    std::string filename = "session-" + session_id + ".jsonl";
-    
-    fs::path path = fs::path(sessions_dir) / agent_folder / filename;
-    return path.string();
+    // 🎯 严格对齐 OpenClaw (trajectory/cleanup.test.ts 等权威用例):
+    //   session 文件路径为扁平 {sessionsDir}/{sanitizedSessionId}.jsonl，
+    //   无 agent- 子目录、无 session- 前缀。
+    //   委托给 session_paths.cc 的权威实现，消除此前两套路径不一致的 bug
+    //   （旧实现: sessions_dir/agent-{id}/session-{id}.jsonl，与 session_paths
+    //    的 {sessions_dir}/{id}.jsonl 分歧，导致读写落到不同文件）。
+    SessionFilePathOptions opts;
+    opts.agent_id = agent_id;
+    if (!sessions_dir.empty()) opts.sessions_dir = sessions_dir;
+    return resolve_session_transcript_path(session_id, opts);
 }
 
 // ============================================================================
@@ -146,10 +149,16 @@ AppendTranscriptResult append_assistant_message_to_transcript(
                 return { false, "", "Transcript file not found" };
             }
             
-            // 从 transcript_path 提取 session_id (假设格式: session-{id}.jsonl)
+            // 🎯 对齐 OpenClaw 扁平命名: 文件名去掉 .jsonl 后缀即 session_id
+            //   （不再依赖已废弃的 "session-" 前缀 substr 提取，避免截错）。
             fs::path path(transcript_path);
             std::string filename = path.filename().string();
-            std::string session_id = filename.substr(8, filename.size() - 14);  // "session-" + id + ".jsonl"
+            std::string session_id = filename;
+            const std::string kExt = ".jsonl";
+            if (session_id.size() > kExt.size() &&
+                session_id.compare(session_id.size() - kExt.size(), kExt.size(), kExt) == 0) {
+                session_id = session_id.substr(0, session_id.size() - kExt.size());
+            }
             
             auto ensure_result = ensure_transcript_file(transcript_path, session_id);
             if (!ensure_result.ok) {
