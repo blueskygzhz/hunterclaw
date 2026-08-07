@@ -1,6 +1,8 @@
 #include "hunterclaw/react/reply_delivery.h"
 #include "hunterclaw/react/execution_guard.h"
+#include "hunterclaw/tools/tool_hooks.h"
 #include <algorithm>
+#include <nlohmann/json.hpp>
 #include <regex>
 #include <spdlog/spdlog.h>
 
@@ -33,6 +35,35 @@ bool has_media(const ReplyPayload& p) {
 
 bool is_single_use_mode(ReplyToMode mode) {
     return mode == ReplyToMode::First;
+}
+
+// 🎯 reply_payload_sending hook：ReplyPayload ↔ JSON 轻量序列化（核心字段）。
+nlohmann::json reply_payload_to_json(const ReplyPayload& p) {
+    nlohmann::json j;
+    j["text"] = p.text;
+    j["isError"] = p.is_error;
+    j["isReasoning"] = p.is_reasoning;
+    j["isCompactionNotice"] = p.is_compaction_notice;
+    if (p.media_url.has_value()) j["mediaUrl"] = *p.media_url;
+    if (!p.media_urls.empty()) j["mediaUrls"] = p.media_urls;
+    j["audioAsVoice"] = p.audio_as_voice;
+    if (p.reply_to_id.has_value()) j["replyToId"] = *p.reply_to_id;
+    j["replyToCurrent"] = p.reply_to_current;
+    j["interactive"] = p.interactive;
+    return j;
+}
+
+ReplyPayload reply_payload_from_json(const nlohmann::json& j, const ReplyPayload& base) {
+    ReplyPayload p = base;  // 未提供字段沿用原值
+    if (j.contains("text") && j["text"].is_string()) p.text = j["text"].get<std::string>();
+    if (j.contains("isError") && j["isError"].is_boolean()) p.is_error = j["isError"].get<bool>();
+    if (j.contains("mediaUrl") && j["mediaUrl"].is_string()) p.media_url = j["mediaUrl"].get<std::string>();
+    if (j.contains("mediaUrls") && j["mediaUrls"].is_array())
+        p.media_urls = j["mediaUrls"].get<std::vector<std::string>>();
+    if (j.contains("audioAsVoice") && j["audioAsVoice"].is_boolean()) p.audio_as_voice = j["audioAsVoice"].get<bool>();
+    if (j.contains("replyToId") && j["replyToId"].is_string()) p.reply_to_id = j["replyToId"].get<std::string>();
+    if (j.contains("interactive") && j["interactive"].is_boolean()) p.interactive = j["interactive"].get<bool>();
+    return p;
 }
 } // anon
 
@@ -170,6 +201,41 @@ std::function<void(const ReplyPayload&)> create_block_reply_delivery_handler(
         if (block_payload.text.empty() && !has_media(block_payload) &&
             !block_payload.audio_as_voice) return;
         if (normalized.is_silent && !has_media(block_payload)) return;
+
+        // Step 7.5: Plugin hook — reply_payload_sending (modifying, before delivery)
+        // 🎯 对齐 OpenClaw runReplyPayloadSending：投递前顺序修改/取消规范化 payload。
+        {
+            auto* hook_mgr = tools::get_global_hook_manager();
+            if (hook_mgr && hook_mgr->has_hooks(plugins::PluginHookName::REPLY_PAYLOAD_SENDING)) {
+                plugins::PluginHookReplyPayloadSendingEvent rps_event;
+                rps_event.payload_json = reply_payload_to_json(block_payload).dump();
+                rps_event.kind = "block";// block streaming delivery
+                plugins::PluginHookMessageContext rps_ctx;
+                try {
+                    auto rps_result = hook_mgr->run_reply_payload_sending(rps_event, rps_ctx);
+                    if (rps_result) {
+                        if (rps_result->cancel) {
+                            log()->info("[hooks] reply_payload_sending cancelled delivery{}",
+                                rps_result->reason ? (" (" + *rps_result->reason + ")") : std::string{});
+                            return;  // ← 取消投递
+                        }
+                        if (rps_result->payload_json) {
+                            try {
+                                auto parsed = nlohmann::json::parse(*rps_result->payload_json);
+                                block_payload = reply_payload_from_json(parsed, block_payload);
+                            } catch (const std::exception& e) {
+                                log()->warn("reply_payload_sending: invalid payload JSON: {}", e.what());
+                            }
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    log()->warn("reply_payload_sending hook failed: {}", e.what());
+                }
+                // 修改后重新做空检查
+                if (block_payload.text.empty() && !has_media(block_payload) &&
+                    !block_payload.audio_as_voice) return;
+            }
+        }
 
         // Step 8: typing signal
         if (!block_payload.text.empty() && params.signal_text_delta) {

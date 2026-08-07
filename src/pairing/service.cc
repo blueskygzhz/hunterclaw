@@ -2,6 +2,7 @@
 // 严格对齐 OpenClaw pairing/
 
 #include "hunterclaw/pairing/service.h"
+#include "hunterclaw/tools/tool_hooks.h"
 
 #include <algorithm>
 #include <chrono>
@@ -103,6 +104,33 @@ PairingChallengeResult issue_pairing_challenge(const PairingChallengeParams& par
   // Notify callback
   if (params.on_created) {
     params.on_created(code);
+  }
+
+  // ── Plugin hook: channel_pairing_requested (void 观测) ──────────────────────
+  // 🎯 对齐 OpenClaw runChannelPairingRequested：创建 pending pairing 请求时通知
+  //   operator（供审批通知/审计）。metadata 视为不可信。
+  {
+    auto* hook_mgr = tools::get_global_hook_manager();
+    if (hook_mgr && hook_mgr->has_hooks(plugins::PluginHookName::CHANNEL_PAIRING_REQUESTED)) {
+      plugins::PluginHookChannelPairingRequestedEvent cpr_event;
+      cpr_event.channel   = params.channel;
+      cpr_event.sender_id = params.sender_id;
+      cpr_event.code      = code;
+      auto acc_it = params.meta.find("accountId");
+      if (acc_it != params.meta.end()) cpr_event.account_id = acc_it->second;
+      if (!params.meta.empty()) {
+        nlohmann::json meta_json(params.meta);
+        cpr_event.metadata_json = meta_json.dump();
+      }
+      plugins::PluginHookMessageContext cpr_ctx;
+      cpr_ctx.channel_id = params.channel;
+      if (acc_it != params.meta.end()) cpr_ctx.account_id = acc_it->second;
+      try {
+        hook_mgr->run_channel_pairing_requested(cpr_event, cpr_ctx);
+      } catch (const std::exception& e) {
+        // fire-and-forget：不阻断 pairing 流程
+      }
+    }
   }
 
   // Build reply text

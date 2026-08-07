@@ -523,6 +523,76 @@ struct PluginHookMessageReceivedEvent {
   std::optional<std::string> metadata_json;
 };
 
+// ============================================================================
+// Plugin Hook — inbound_claim (claiming)
+//   对齐 OpenClaw PluginHookInboundClaimEvent/Result + Context
+//   (hook-message.types.ts:92 / hook-types.ts:508)。
+//   插件可在 commands/agent dispatch 之前认领入站事件（first-claim-wins）。
+// ============================================================================
+
+struct PluginHookInboundClaimEvent {
+  std::string content;
+  std::optional<std::string> body;
+  std::optional<std::string> body_for_agent;
+  std::optional<std::string> transcript;
+  std::optional<int64_t> timestamp;
+  std::string channel;
+  std::optional<std::string> account_id;
+  std::optional<std::string> conversation_id;
+  std::optional<std::string> parent_conversation_id;
+  std::optional<std::string> sender_id;
+  std::optional<std::string> message_id;
+};
+
+struct PluginHookInboundClaimContext {
+  std::string channel_id;
+  std::optional<std::string> account_id;
+  std::optional<std::string> conversation_id;
+  std::optional<std::string> agent_id;
+  std::optional<std::string> sender_id;
+  std::optional<std::string> message_id;
+};
+
+struct PluginHookInboundClaimResult {
+  bool handled = false;
+  std::optional<std::string> reply_json;  // 序列化 ReplyPayload（可选直接投递）
+};
+
+// ============================================================================
+// Plugin Hook — channel_pairing_requested (void 观测)
+//   对齐 OpenClaw PluginHookChannelPairingRequestedEvent (hook-types.ts:206)。
+//   创建 pending pairing 请求时通知 operator。metadata 视为不可信。
+// ============================================================================
+
+struct PluginHookChannelPairingRequestedEvent {
+  std::string channel;
+  std::optional<std::string> account_id;
+  std::string sender_id;
+  std::string code;
+  std::optional<std::string> metadata_json;
+};
+
+// ============================================================================
+// Plugin Hook — reply_payload_sending (modifying)
+//   对齐 OpenClaw PluginHookReplyPayloadSendingEvent/Result (hook-types.ts:659)。
+//   投递前顺序修改/取消规范化的 reply payload（每个 handler 拿到最新 payload）。
+// ============================================================================
+
+struct PluginHookReplyPayloadSendingEvent {
+  std::string payload_json;              // 序列化 ReplyPayload
+  std::string kind;                      // ReplyDispatchKind
+  std::optional<std::string> channel;
+  std::optional<std::string> session_key;
+  std::optional<std::string> run_id;
+  std::optional<std::string> usage_state_json;
+};
+
+struct PluginHookReplyPayloadSendingResult {
+  std::optional<std::string> payload_json;  // 修改后的 payload
+  bool cancel = false;
+  std::optional<std::string> reason;
+};
+
 struct PluginHookMessageSendingEvent {
   std::string to;
   std::string content;
@@ -539,6 +609,70 @@ struct PluginHookMessageSentEvent {
   std::string content;
   bool success = false;
   std::optional<std::string> error;
+};
+
+// ============================================================================
+// Plugin Hook — before_dispatch (claiming)
+//   对齐 OpenClaw PluginHookBeforeDispatchEvent/Context/Result (hook-types.ts:513)。
+//   model dispatch 之前，插件可检查/接管消息。first-claim-wins（{handled, text?}）。
+// ============================================================================
+
+struct PluginHookBeforeDispatchEvent {
+  std::optional<std::string> message_id;
+  std::string content;
+  std::optional<std::string> body;
+  std::optional<std::string> channel;
+  std::optional<std::string> session_key;
+  std::optional<std::string> sender_id;
+  std::optional<bool> is_group;
+  std::optional<int64_t> timestamp;
+};
+
+struct PluginHookBeforeDispatchContext {
+  std::optional<std::string> message_id;
+  std::optional<std::string> channel_id;
+  std::optional<std::string> account_id;
+  std::optional<std::string> conversation_id;
+  std::optional<std::string> session_key;
+  std::optional<std::string> sender_id;
+};
+
+struct PluginHookBeforeDispatchResult {
+  bool handled = false;
+  std::optional<std::string> text;
+};
+
+// ============================================================================
+// Plugin Hook — reply_dispatch (claiming)
+//   对齐 OpenClaw PluginHookReplyDispatchEvent/Context/Result (hook-types.ts:548)。
+//   默认 model path 之前，插件可接管整个 reply dispatch。first-claim-wins。
+//   event 字段众多，此处传核心可用字段。
+// ============================================================================
+
+struct PluginHookReplyDispatchEvent {
+  std::optional<std::string> run_id;
+  std::optional<std::string> session_key;
+  std::optional<std::vector<std::string>> tools_allow;
+  bool inbound_audio = false;
+  std::optional<std::string> tts_channel;
+  bool should_route_to_originating = false;
+  std::optional<std::string> originating_channel;
+  bool should_send_tool_summaries = false;
+  std::string send_policy;  // "allow" | "deny"
+  std::optional<bool> is_tail_dispatch;
+};
+
+struct PluginHookReplyDispatchContext {
+  std::optional<std::string> channel_id;
+  std::optional<std::string> account_id;
+  std::optional<std::string> conversation_id;
+  std::optional<std::string> session_key;
+};
+
+struct PluginHookReplyDispatchResult {
+  bool handled = false;
+  bool queued_final = false;
+  std::optional<std::string> counts_json;  // Record<ReplyDispatchKind, number>
 };
 
 // ============================================================================

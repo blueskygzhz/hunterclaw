@@ -377,6 +377,41 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
     (void)inbound_audio;
     (void)session_tts_auto;
 
+    // ── Plugin hook: inbound_claim (claiming) ────────────────────────────────
+    // 🎯 对齐 OpenClaw runInboundClaim：在 commands/agent dispatch 之前，允许插件
+    //   认领入站事件（first-claim-wins）。claim 则短路整个 dispatch。
+    {
+        auto* claim_mgr = tools::get_global_hook_manager();
+        if (claim_mgr && claim_mgr->has_hooks(plugins::PluginHookName::INBOUND_CLAIM)) {
+            plugins::PluginHookInboundClaimEvent ic_event;
+            ic_event.content = message.text;
+            ic_event.channel = message.channel;
+            ic_event.account_id = message.account_id;
+            ic_event.sender_id = message.sender_id;
+            if (!message.message_id.empty()) ic_event.message_id = message.message_id;
+            ic_event.conversation_id = message.chat_id.empty()
+                ? std::make_optional(message.sender_id) : std::make_optional(message.chat_id);
+            plugins::PluginHookInboundClaimContext ic_ctx;
+            ic_ctx.channel_id      = message.channel;
+            ic_ctx.account_id      = message.account_id;
+            ic_ctx.conversation_id = ic_event.conversation_id;
+            ic_ctx.sender_id       = message.sender_id;
+            if (!message.message_id.empty()) ic_ctx.message_id = message.message_id;
+            try {
+                auto claim = claim_mgr->run_inbound_claim(ic_event, ic_ctx);
+                if (claim && claim->handled) {
+                    log()->info("dispatch_reply_from_config: inbound_claim claimed msg={}", message_id);
+                    result.skipped = true;
+                    result.skip_reason = "inbound_claim";
+                    result.success = true;
+                    return result;  // ← 插件认领，短路 dispatch
+                }
+            } catch (const std::exception& e) {
+                log()->warn("dispatch_reply_from_config: inbound_claim hook failed: {}", e.what());
+            }
+        }
+    }
+
     // ── Plugin hook: message_received ────────────────────────────────────────
     // 🎯 对齐 OpenClaw: dispatch-from-config.ts L188-195
     //   hookRunner.runMessageReceived(toPluginMessageReceivedEvent(hookContext), toPluginMessageContext(hookContext))
@@ -400,6 +435,41 @@ MessageDispatcher::DispatchResult MessageDispatcher::dispatch_reply_from_config(
                 hook_mgr->run_message_received(mr_event, mr_ctx);
             } catch (const std::exception& e) {
                 log()->warn("dispatch_reply_from_config: message_received hook failed: {}", e.what());
+            }
+        }
+
+        // ── Plugin hook: before_dispatch (claiming) ──────────────────────────
+        // 🎯 对齐 OpenClaw runBeforeDispatch：model dispatch 之前，插件可检查/接管
+        //   消息（first-claim-wins，{handled, text?}）。claim 则短路 model dispatch。
+        {
+            auto* bd_mgr = tools::get_global_hook_manager();
+            if (bd_mgr && bd_mgr->has_hooks(plugins::PluginHookName::BEFORE_DISPATCH)) {
+                plugins::PluginHookBeforeDispatchEvent bd_event;
+                bd_event.content = message.text;
+                bd_event.channel = message.channel;
+                if (!message.message_id.empty()) bd_event.message_id = message.message_id;
+                if (!session_key.empty())        bd_event.session_key = session_key;
+                bd_event.sender_id = message.sender_id;
+                plugins::PluginHookBeforeDispatchContext bd_ctx;
+                bd_ctx.channel_id      = message.channel;
+                bd_ctx.account_id      = message.account_id;
+                bd_ctx.conversation_id = message.chat_id.empty()
+                    ? std::make_optional(message.sender_id) : std::make_optional(message.chat_id);
+                if (!session_key.empty())        bd_ctx.session_key = session_key;
+                bd_ctx.sender_id       = message.sender_id;
+                if (!message.message_id.empty()) bd_ctx.message_id = message.message_id;
+                try {
+                    auto claim = bd_mgr->run_before_dispatch(bd_event, bd_ctx);
+                    if (claim && claim->handled) {
+                        log()->info("dispatch_reply_from_config: before_dispatch claimed msg={}", message_id);
+                        result.skipped = true;
+                        result.skip_reason = "before_dispatch";
+                        result.success = true;
+                        return result;  // ← 插件接管，短路 model dispatch
+                    }
+                } catch (const std::exception& e) {
+                    log()->warn("dispatch_reply_from_config: before_dispatch hook failed: {}", e.what());
+                }
             }
         }
         
@@ -1597,6 +1667,33 @@ MessageDispatcher::DispatchResult MessageDispatcher::run_reply_agent(
 ) {
     const std::string& session_key = params.session_key;
     const QueueSettings& qs = params.queue_settings;
+
+    // ── Plugin hook: reply_dispatch (claiming) ────────────────────────────────
+    // 🎯 对齐 OpenClaw runReplyDispatch：默认 model path 之前，插件可接管整个 reply
+    //   dispatch（first-claim-wins）。claim 则短路默认 agent 运行。
+    {
+        auto* rd_mgr = tools::get_global_hook_manager();
+        if (rd_mgr && rd_mgr->has_hooks(plugins::PluginHookName::REPLY_DISPATCH)) {
+            plugins::PluginHookReplyDispatchEvent rd_event;
+            if (!session_key.empty()) rd_event.session_key = session_key;
+            rd_event.send_policy = "allow";
+            plugins::PluginHookReplyDispatchContext rd_ctx;
+            if (!session_key.empty()) rd_ctx.session_key = session_key;
+            try {
+                auto claim = rd_mgr->run_reply_dispatch(rd_event, rd_ctx);
+                if (claim && claim->handled) {
+                    log()->info("run_reply_agent: reply_dispatch claimed session={}", session_key);
+                    DispatchResult claimed;
+                    claimed.success = true;
+                    claimed.skipped = true;
+                    claimed.skip_reason = "reply_dispatch";
+                    return claimed;  // ← 插件接管，短路默认 model path
+                }
+            } catch (const std::exception& e) {
+                log()->warn("run_reply_agent: reply_dispatch hook failed: {}", e.what());
+            }
+        }
+    }
 
     // ── Check isActive + isStreaming ──────────────────────────────────────────
     // Aligned with openclaw: isEmbeddedPiRunActive / isEmbeddedPiRunStreaming

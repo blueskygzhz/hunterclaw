@@ -138,6 +138,11 @@ IMPL_REGISTER(register_model_call_ended,     model_call_ended_hooks_,     ModelC
 IMPL_REGISTER(register_agent_turn_prepare,   agent_turn_prepare_hooks_,   AgentTurnPrepareEntry,   AgentTurnPrepareHandler)
 IMPL_REGISTER(register_before_agent_finalize,before_agent_finalize_hooks_,BeforeAgentFinalizeEntry,BeforeAgentFinalizeHandler)
 IMPL_REGISTER(register_before_agent_run,     before_agent_run_hooks_,     BeforeAgentRunEntry,     BeforeAgentRunHandler)
+IMPL_REGISTER(register_inbound_claim,        inbound_claim_hooks_,        InboundClaimEntry,       InboundClaimHandler)
+IMPL_REGISTER(register_channel_pairing_requested, channel_pairing_requested_hooks_, ChannelPairingRequestedEntry, ChannelPairingRequestedHandler)
+IMPL_REGISTER(register_reply_payload_sending,reply_payload_sending_hooks_,ReplyPayloadSendingEntry,ReplyPayloadSendingHandler)
+IMPL_REGISTER(register_before_dispatch,      before_dispatch_hooks_,      BeforeDispatchEntry,     BeforeDispatchHandler)
+IMPL_REGISTER(register_reply_dispatch,       reply_dispatch_hooks_,       ReplyDispatchEntry,      ReplyDispatchHandler)
 IMPL_REGISTER(register_llm_output,           llm_output_hooks_,           LlmOutputEntry,          LlmOutputHandler)
 IMPL_REGISTER(register_agent_end,            agent_end_hooks_,            AgentEndEntry,           AgentEndHandler)
 IMPL_REGISTER(register_before_compaction,    before_compaction_hooks_,    BeforeCompactionEntry,   BeforeCompactionHandler)
@@ -254,6 +259,7 @@ IMPL_VOID_HOOK(run_llm_input,          llm_input_hooks_,         PluginHookLlmIn
 IMPL_VOID_HOOK(run_model_call_started, model_call_started_hooks_,PluginHookModelCallStartedEvent, PluginHookAgentContext,   "model_call_started")
 IMPL_VOID_HOOK(run_model_call_ended,   model_call_ended_hooks_,  PluginHookModelCallEndedEvent,   PluginHookAgentContext,   "model_call_ended")
 IMPL_VOID_HOOK(run_llm_output,         llm_output_hooks_,        PluginHookLlmOutputEvent,        PluginHookAgentContext,   "llm_output")
+IMPL_VOID_HOOK(run_channel_pairing_requested, channel_pairing_requested_hooks_, PluginHookChannelPairingRequestedEvent, PluginHookMessageContext, "channel_pairing_requested")
 IMPL_VOID_HOOK(run_agent_end,          agent_end_hooks_,         PluginHookAgentEndEvent,         PluginHookAgentContext,   "agent_end")
 IMPL_VOID_HOOK(run_before_compaction,  before_compaction_hooks_, PluginHookBeforeCompactionEvent, PluginHookAgentContext,   "before_compaction")
 IMPL_VOID_HOOK(run_after_compaction,   after_compaction_hooks_,  PluginHookAfterCompactionEvent,  PluginHookAgentContext,   "after_compaction")
@@ -567,6 +573,134 @@ std::optional<PluginHookBeforeAgentRunResult> ToolHookManager::run_before_agent_
         }
     }
     return std::nullopt;  // 全部 pass
+}
+
+// ============================================================================
+// run_inbound_claim (claiming hook)
+//   对齐 OpenClaw runInboundClaim = runClaimingHook：first-claim-wins。
+//   第一个返回 handled==true 的 handler 认领事件并短路。
+// ============================================================================
+
+std::optional<PluginHookInboundClaimResult> ToolHookManager::run_inbound_claim(
+    const PluginHookInboundClaimEvent& event,
+    const PluginHookInboundClaimContext& ctx)
+{
+    std::vector<InboundClaimEntry> hooks;
+    { std::lock_guard<std::mutex> lock(mutex_); hooks = inbound_claim_hooks_; }
+    if (hooks.empty()) return std::nullopt;
+
+    for (const auto& entry : hooks) {
+        try {
+            auto result = entry.handler(event, ctx);
+            if (result && result->handled) {
+                log()->info("[hooks] inbound_claim claimed by '{}'", entry.plugin_id);
+                return result;  // first claim wins — short-circuit
+            }
+        } catch (const std::exception& e) {
+            log()->error("[hooks] inbound_claim handler from '{}' failed: {}",
+                entry.plugin_id, e.what());
+        }
+    }
+    return std::nullopt;  // no handler claimed
+}
+
+// ============================================================================
+// run_reply_payload_sending (modifying hook, sequential)
+//   对齐 OpenClaw runReplyPayloadSending：顺序执行，每个 handler拿到最新 payload，
+//   可修改 payload 或 cancel（cancel 立即短路）。
+// ============================================================================
+
+std::optional<PluginHookReplyPayloadSendingResult> ToolHookManager::run_reply_payload_sending(
+    const PluginHookReplyPayloadSendingEvent& event,
+    const PluginHookMessageContext& ctx)
+{
+    std::vector<ReplyPayloadSendingEntry> hooks;
+    { std::lock_guard<std::mutex> lock(mutex_); hooks = reply_payload_sending_hooks_; }
+    if (hooks.empty()) return std::nullopt;
+
+    std::string current_payload = event.payload_json;
+    std::optional<PluginHookReplyPayloadSendingResult> result;
+
+    for (const auto& entry : hooks) {
+        try {
+            PluginHookReplyPayloadSendingEvent ev = event;
+            ev.payload_json = current_payload;  // 传入最新 payload
+            auto handler_result = entry.handler(ev, ctx);
+            if (!handler_result) continue;
+            if (handler_result->cancel) {
+                log()->info("[hooks] reply_payload_sending cancelled by '{}'{}",
+                    entry.plugin_id,
+                    handler_result->reason ? (" reason=" + *handler_result->reason) : std::string{});
+                return handler_result;  // cancel 短路
+            }
+            if (handler_result->payload_json) {
+                current_payload = *handler_result->payload_json;  // 累积修改
+            }
+            if (!result) result = PluginHookReplyPayloadSendingResult{};
+            result->payload_json = current_payload;
+        } catch (const std::exception& e) {
+            log()->error("[hooks] reply_payload_sending handler from '{}' failed: {}",
+                entry.plugin_id, e.what());
+        }
+    }
+    return result;
+}
+
+// ============================================================================
+// run_before_dispatch (claiming hook)
+//   对齐 OpenClaw runBeforeDispatch：model dispatch 前，first-claim-wins。
+// ============================================================================
+
+std::optional<PluginHookBeforeDispatchResult> ToolHookManager::run_before_dispatch(
+    const PluginHookBeforeDispatchEvent& event,
+    const PluginHookBeforeDispatchContext& ctx)
+{
+    std::vector<BeforeDispatchEntry> hooks;
+    { std::lock_guard<std::mutex> lock(mutex_); hooks = before_dispatch_hooks_; }
+    if (hooks.empty()) return std::nullopt;
+
+    for (const auto& entry : hooks) {
+        try {
+            auto result = entry.handler(event, ctx);
+            if (result && result->handled) {
+                log()->info("[hooks] before_dispatch claimed by '{}'", entry.plugin_id);
+                return result;  // first claim wins
+            }
+        } catch (const std::exception& e) {
+            log()->error("[hooks] before_dispatch handler from '{}' failed: {}",
+                entry.plugin_id, e.what());
+        }
+    }
+    return std::nullopt;
+}
+
+// ============================================================================
+// run_reply_dispatch (claiming hook)
+//   对齐 OpenClaw runReplyDispatch：默认 model path 前接管 reply dispatch，
+//   first-claim-wins。
+// ============================================================================
+
+std::optional<PluginHookReplyDispatchResult> ToolHookManager::run_reply_dispatch(
+    const PluginHookReplyDispatchEvent& event,
+    const PluginHookReplyDispatchContext& ctx)
+{
+    std::vector<ReplyDispatchEntry> hooks;
+    { std::lock_guard<std::mutex> lock(mutex_); hooks = reply_dispatch_hooks_; }
+    if (hooks.empty()) return std::nullopt;
+
+    for (const auto& entry : hooks) {
+        try {
+            auto result = entry.handler(event, ctx);
+            if (result && result->handled) {
+                log()->info("[hooks] reply_dispatch claimed by '{}'", entry.plugin_id);
+                return result;  // first claim wins
+            }
+        } catch (const std::exception& e) {
+            log()->error("[hooks] reply_dispatch handler from '{}' failed: {}",
+                entry.plugin_id, e.what());
+        }
+    }
+    return std::nullopt;
 }
 
 // ============================================================================
@@ -884,6 +1018,11 @@ bool ToolHookManager::has_hooks(PluginHookName name) const {
         case PluginHookName::AGENT_TURN_PREPARE:       return !agent_turn_prepare_hooks_.empty();
         case PluginHookName::BEFORE_AGENT_FINALIZE:    return !before_agent_finalize_hooks_.empty();
         case PluginHookName::BEFORE_AGENT_RUN:         return !before_agent_run_hooks_.empty();
+        case PluginHookName::INBOUND_CLAIM:            return !inbound_claim_hooks_.empty();
+        case PluginHookName::CHANNEL_PAIRING_REQUESTED: return !channel_pairing_requested_hooks_.empty();
+        case PluginHookName::REPLY_PAYLOAD_SENDING:    return !reply_payload_sending_hooks_.empty();
+        case PluginHookName::BEFORE_DISPATCH:          return !before_dispatch_hooks_.empty();
+        case PluginHookName::REPLY_DISPATCH:           return !reply_dispatch_hooks_.empty();
         case PluginHookName::GATEWAY_START:            return !gateway_start_hooks_.empty();
         case PluginHookName::GATEWAY_STOP:             return !gateway_stop_hooks_.empty();
         default:
@@ -923,6 +1062,11 @@ size_t ToolHookManager::hook_count(PluginHookName name) const {
         case PluginHookName::AGENT_TURN_PREPARE:       return agent_turn_prepare_hooks_.size();
         case PluginHookName::BEFORE_AGENT_FINALIZE:    return before_agent_finalize_hooks_.size();
         case PluginHookName::BEFORE_AGENT_RUN:         return before_agent_run_hooks_.size();
+        case PluginHookName::INBOUND_CLAIM:            return inbound_claim_hooks_.size();
+        case PluginHookName::CHANNEL_PAIRING_REQUESTED: return channel_pairing_requested_hooks_.size();
+        case PluginHookName::REPLY_PAYLOAD_SENDING:    return reply_payload_sending_hooks_.size();
+        case PluginHookName::BEFORE_DISPATCH:          return before_dispatch_hooks_.size();
+        case PluginHookName::REPLY_DISPATCH:           return reply_dispatch_hooks_.size();
         case PluginHookName::GATEWAY_START:            return gateway_start_hooks_.size();
         case PluginHookName::GATEWAY_STOP:             return gateway_stop_hooks_.size();
         default:

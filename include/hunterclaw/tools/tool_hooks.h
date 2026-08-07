@@ -67,6 +67,18 @@ using plugins::PluginHookBeforeAgentFinalizeEvent;
 using plugins::PluginHookBeforeAgentFinalizeResult;
 using plugins::PluginHookBeforeAgentRunEvent;
 using plugins::PluginHookBeforeAgentRunResult;
+using plugins::PluginHookInboundClaimEvent;
+using plugins::PluginHookInboundClaimContext;
+using plugins::PluginHookInboundClaimResult;
+using plugins::PluginHookChannelPairingRequestedEvent;
+using plugins::PluginHookReplyPayloadSendingEvent;
+using plugins::PluginHookReplyPayloadSendingResult;
+using plugins::PluginHookBeforeDispatchEvent;
+using plugins::PluginHookBeforeDispatchContext;
+using plugins::PluginHookBeforeDispatchResult;
+using plugins::PluginHookReplyDispatchEvent;
+using plugins::PluginHookReplyDispatchContext;
+using plugins::PluginHookReplyDispatchResult;
 using plugins::PluginHookLlmInputEvent;
 using plugins::PluginHookLlmOutputEvent;
 using plugins::PluginHookLlmOutputUsage;
@@ -173,6 +185,35 @@ using BeforeAgentRunHandler = std::function<
     std::optional<PluginHookBeforeAgentRunResult>(
         const PluginHookBeforeAgentRunEvent& event,
         const PluginHookAgentContext& ctx)>;
+
+// inbound_claim — claiming hook（first-claim-wins）
+using InboundClaimHandler = std::function<
+    std::optional<PluginHookInboundClaimResult>(
+        const PluginHookInboundClaimEvent& event,
+        const PluginHookInboundClaimContext& ctx)>;
+
+// channel_pairing_requested — void 观测hook
+using ChannelPairingRequestedHandler = std::function<
+    void(const PluginHookChannelPairingRequestedEvent& event,
+         const PluginHookMessageContext& ctx)>;
+
+// reply_payload_sending — modifying hook（sequential，可改payload 或 cancel）
+using ReplyPayloadSendingHandler = std::function<
+    std::optional<PluginHookReplyPayloadSendingResult>(
+        const PluginHookReplyPayloadSendingEvent& event,
+        const PluginHookMessageContext& ctx)>;
+
+// before_dispatch — claiming hook（first-claim-wins，{handled, text?}）
+using BeforeDispatchHandler = std::function<
+    std::optional<PluginHookBeforeDispatchResult>(
+        const PluginHookBeforeDispatchEvent& event,
+        const PluginHookBeforeDispatchContext& ctx)>;
+
+// reply_dispatch — claiming hook（first-claim-wins）
+using ReplyDispatchHandler = std::function<
+    std::optional<PluginHookReplyDispatchResult>(
+        const PluginHookReplyDispatchEvent& event,
+        const PluginHookReplyDispatchContext& ctx)>;
 
 using LlmOutputHandler = std::function<
     void(const PluginHookLlmOutputEvent& event,
@@ -300,6 +341,11 @@ public:
     void register_agent_turn_prepare(const std::string& plugin_id, AgentTurnPrepareHandler handler, int priority = 0);
     void register_before_agent_finalize(const std::string& plugin_id, BeforeAgentFinalizeHandler handler, int priority = 0);
     void register_before_agent_run(const std::string& plugin_id, BeforeAgentRunHandler handler, int priority = 0);
+    void register_inbound_claim(const std::string& plugin_id, InboundClaimHandler handler, int priority = 0);
+    void register_channel_pairing_requested(const std::string& plugin_id, ChannelPairingRequestedHandler handler, int priority = 0);
+    void register_reply_payload_sending(const std::string& plugin_id, ReplyPayloadSendingHandler handler, int priority = 0);
+    void register_before_dispatch(const std::string& plugin_id, BeforeDispatchHandler handler, int priority = 0);
+    void register_reply_dispatch(const std::string& plugin_id, ReplyDispatchHandler handler, int priority = 0);
     void register_llm_output(const std::string& plugin_id, LlmOutputHandler handler, int priority = 0);
     void register_agent_end(const std::string& plugin_id, AgentEndHandler handler, int priority = 0);
     void register_before_compaction(const std::string& plugin_id, BeforeCompactionHandler handler, int priority = 0);
@@ -392,6 +438,26 @@ public:
     /// Run before_agent_run (gate): 返回最严格 pass/block；fail-closed
     std::optional<PluginHookBeforeAgentRunResult> run_before_agent_run(
         const PluginHookBeforeAgentRunEvent& event, const PluginHookAgentContext& ctx);
+
+    /// Run inbound_claim (claiming): first-claim-wins
+    std::optional<PluginHookInboundClaimResult> run_inbound_claim(
+        const PluginHookInboundClaimEvent& event, const PluginHookInboundClaimContext& ctx);
+
+    /// Run channel_pairing_requested (void 观测)
+    void run_channel_pairing_requested(
+        const PluginHookChannelPairingRequestedEvent& event, const PluginHookMessageContext& ctx);
+
+    /// Run reply_payload_sending (modifying): 顺序修改/取消payload
+    std::optional<PluginHookReplyPayloadSendingResult> run_reply_payload_sending(
+        const PluginHookReplyPayloadSendingEvent& event, const PluginHookMessageContext& ctx);
+
+    /// Run before_dispatch (claiming): first-claim-wins
+    std::optional<PluginHookBeforeDispatchResult> run_before_dispatch(
+        const PluginHookBeforeDispatchEvent& event, const PluginHookBeforeDispatchContext& ctx);
+
+    /// Run reply_dispatch (claiming): first-claim-wins
+    std::optional<PluginHookReplyDispatchResult> run_reply_dispatch(
+        const PluginHookReplyDispatchEvent& event, const PluginHookReplyDispatchContext& ctx);
 
     /// Run llm_output hooks (void, sequential)
     void run_llm_output(const PluginHookLlmOutputEvent& event, const PluginHookAgentContext& ctx);
@@ -514,6 +580,11 @@ private:
     struct AgentTurnPrepareEntry    { std::string plugin_id; AgentTurnPrepareHandler    handler; int priority = 0; };
     struct BeforeAgentFinalizeEntry { std::string plugin_id; BeforeAgentFinalizeHandler handler; int priority = 0; };
     struct BeforeAgentRunEntry      { std::string plugin_id; BeforeAgentRunHandler      handler; int priority = 0; };
+    struct InboundClaimEntry        { std::string plugin_id; InboundClaimHandler        handler; int priority = 0; };
+    struct ChannelPairingRequestedEntry { std::string plugin_id; ChannelPairingRequestedHandler handler; int priority = 0; };
+    struct ReplyPayloadSendingEntry { std::string plugin_id; ReplyPayloadSendingHandler handler; int priority = 0; };
+    struct BeforeDispatchEntry      { std::string plugin_id; BeforeDispatchHandler      handler; int priority = 0; };
+    struct ReplyDispatchEntry       { std::string plugin_id; ReplyDispatchHandler       handler; int priority = 0; };
     struct LlmOutputEntry           { std::string plugin_id; LlmOutputHandler           handler; int priority = 0; };
     struct AgentEndEntry            { std::string plugin_id; AgentEndHandler            handler; int priority = 0; };
     struct BeforeCompactionEntry    { std::string plugin_id; BeforeCompactionHandler    handler; int priority = 0; };
@@ -553,6 +624,11 @@ private:
     std::vector<AgentTurnPrepareEntry>       agent_turn_prepare_hooks_;
     std::vector<BeforeAgentFinalizeEntry>    before_agent_finalize_hooks_;
     std::vector<BeforeAgentRunEntry>         before_agent_run_hooks_;
+    std::vector<InboundClaimEntry>           inbound_claim_hooks_;
+    std::vector<ChannelPairingRequestedEntry> channel_pairing_requested_hooks_;
+    std::vector<ReplyPayloadSendingEntry>    reply_payload_sending_hooks_;
+    std::vector<BeforeDispatchEntry>         before_dispatch_hooks_;
+    std::vector<ReplyDispatchEntry>          reply_dispatch_hooks_;
     std::vector<LlmOutputEntry>              llm_output_hooks_;
     std::vector<AgentEndEntry>               agent_end_hooks_;
     std::vector<BeforeCompactionEntry>       before_compaction_hooks_;
