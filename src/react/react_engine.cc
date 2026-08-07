@@ -514,6 +514,13 @@ ReactResult ReactEngine::execute_loop(
         tools::PluginHookAgentContext hook_ctx;
         hook_ctx.session_id = callbacks.session_id.empty()
             ? std::nullopt : std::make_optional(callbacks.session_id);
+        // 🎯 填充 hook 上下文（供 active-memory lane-1 等插件读取 workspace/agent）。
+        hook_ctx.agent_id = callbacks.agent_id.empty()
+            ? std::nullopt : std::make_optional(callbacks.agent_id);
+        hook_ctx.session_key = callbacks.session_key.empty()
+            ? std::nullopt : std::make_optional(callbacks.session_key);
+        hook_ctx.workspace_dir = callbacks.workspace_dir.empty()
+            ? std::nullopt : std::make_optional(callbacks.workspace_dir);
 
         // Legacy: before_agent_start
         if (hook_mgr->has_hooks(plugins::PluginHookName::BEFORE_AGENT_START)) {

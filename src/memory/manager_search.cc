@@ -615,5 +615,58 @@ core::Result<std::vector<ChunkWithEmbedding>> list_chunks_impl(
     return core::Result<std::vector<ChunkWithEmbedding>>::Ok(std::move(chunks));
 }
 
+// ============================================================================
+// 🎯 attach_recall_and_importance — 对齐 OC importance.ts + attachRecallMetadata
+// ============================================================================
+namespace {
+// 对齐 OC importanceMultiplier: null→1；否则 0.75 + clamp(importance,1,10)*0.05
+inline double importance_multiplier(const std::optional<int>& importance) {
+    if (!importance.has_value()) return 1.0;
+    int bounded = *importance;
+    if (bounded < 1) bounded = 1;
+    if (bounded > 10) bounded = 10;
+    return 0.75 + bounded * 0.05;
+}
+} // namespace
+
+void attach_recall_and_importance(
+    SQLiteVectorStorage& db,
+    std::vector<MemorySearchResult>& results) {
+    if (results.empty()) return;
+
+    // 收集有 id 的 chunk（对齐 OC: attachRecallMetadata 需entry.id）
+    std::vector<std::string> ids;
+    ids.reserve(results.size());
+    for (const auto& r : results) {
+        if (!r.id.empty()) ids.push_back(r.id);
+    }
+    if (!ids.empty()) {
+        auto meta_res = db.get_recall_metadata(ids);
+        if (meta_res.is_ok()) {
+            const auto& meta_by_id = meta_res.get();
+            for (auto& r : results) {
+                auto it = meta_by_id.find(r.id);
+                if (it == meta_by_id.end()) continue;
+                r.importance  = it->second.importance;
+                r.triggers    = it->second.triggers;
+                r.project_key = it->second.project_key;
+            }
+        }
+    }
+
+    // 对齐 OC applyImportanceMultiplier: score *= importanceMultiplier(importance)
+    for (auto& r : results) {
+        r.score = r.score * importance_multiplier(r.importance);
+    }
+
+    // 对齐 OC toSorted((l,r)=> r.score-l.score || l.path.localeCompare(r.path) || ...)
+    std::sort(results.begin(), results.end(),
+              [](const MemorySearchResult& a, const MemorySearchResult& b) {
+                  if (a.score != b.score) return a.score > b.score;
+                  if (a.path != b.path) return a.path < b.path;
+                  return a.start_line < b.start_line;
+              });
+}
+
 } // namespace memory
 } // namespace hunterclaw

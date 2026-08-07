@@ -39,6 +39,14 @@ struct MemorySearchResult {
     std::string snippet;                     // 代码片段
     MemorySource source;                     // 来源
     std::optional<std::string> citation;     // 引用格式
+    // 🎯 对齐 OC attachRecallMetadata: chunk id 与召回元数据（用于加权/展示）
+    std::string id;                          // chunk id（关联 recall_metadata）
+    std::optional<int> importance;           // 召回重要度 1-10
+    std::optional<std::string> triggers;     // 触发词
+    std::optional<std::string> project_key;  // 项目键
+    // 🎯 对齐 OC MemorySearchResult.originClass: 来自provenance 的可信来源标记
+    //("owner" | "agent" | "untrusted" | "system")，供 trigger recall 信任判定。
+    std::optional<std::string> origin_class; // 来源可信度
 };
 
 // ============================================================================

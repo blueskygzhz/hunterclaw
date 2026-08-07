@@ -2,6 +2,7 @@
 #include "hunterclaw/cli/command.h"
 #include "hunterclaw/gateway/gateway.h"
 #include "hunterclaw/tools/tool_hooks.h"   // get_global_hook_manager(), PluginHook* types
+#include "hunterclaw/memory/active_memory_hooks.h"  // register_active_memory_hooks_global()
 #include "hunterclaw/infra/http_client.h"
 #include "hunterclaw/core/json.h"
 #include <iostream>
@@ -182,7 +183,18 @@ core::Result<void> GatewayStartCommand::execute(const std::vector<std::string>& 
     if (!gateway) {
         return core::Result<void>::err("Failed to create Gateway");
     }
-    
+
+    // =========================================================================
+    // 装配 active-memory lane-1 hooks（对齐 OpenClaw extensions/active-memory register()）。
+    // 必须在 gateway->start() 之前注册，确保接受请求前 before_prompt_build /
+    // agent_end hook 已就绪。使用进程全局 ToolHookManager。
+    // =========================================================================
+    try {
+        memory::register_active_memory_hooks_global();
+    } catch (const std::exception& e) {
+        std::cerr << "[gateway] failed to register active-memory hooks: " << e.what() << "\n";
+    }
+
     auto start_result = gateway->start();
     if (!start_result.is_ok()) {
         return core::Result<void>::err("Failed to start Gateway: " + start_result.error);

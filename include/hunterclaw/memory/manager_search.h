@@ -62,6 +62,17 @@ struct KeywordSearchResultWithScore {
 };
 
 // ============================================================================
+// 🎯 对齐 OC importance.ts + attachRecallMetadata:
+//   批量给检索结果附加召回元数据（importance/triggers/project_key），
+//   并按 importance 乘子重算score 后重排序。
+//   importanceMultiplier: null→1；否则 0.75 + clamp(importance,1,10)*0.05。
+//   应在裁剪前调用（加权会改变排序）。
+// ============================================================================
+void attach_recall_and_importance(
+    SQLiteVectorStorage& db,
+    std::vector<MemorySearchResult>& results);
+
+// ============================================================================
 // searchVector (对齐 manager-search.ts:searchVector)
 // ============================================================================
 core::Result<std::vector<SearchRowResult>> search_vector_impl(

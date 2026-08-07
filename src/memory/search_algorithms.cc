@@ -369,7 +369,7 @@ std::vector<HybridMergedResult> merge_hybrid_results(
     merged.reserve(by_id.size());
     for (const auto& [id, entry] : by_id) {
         double score = vector_weight * entry.vector_score + text_weight * entry.text_score;
-        merged.push_back({entry.path, entry.start_line, entry.end_line,
+        merged.push_back({entry.id, entry.path, entry.start_line, entry.end_line,
                           score, entry.snippet, entry.source});
     }
 

@@ -45,6 +45,7 @@ struct HybridKeywordResult {
 // HybridMergedResult (对齐 hybrid.ts:mergeHybridResults 返回类型)
 // ============================================================================
 struct HybridMergedResult {
+    std::string id;   // 🎯 对齐 OC: 保留 chunk id 供 attachRecallMetadata
     std::string path;
     int start_line = 0;
     int end_line = 0;

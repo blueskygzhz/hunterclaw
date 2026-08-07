@@ -268,11 +268,12 @@ std::vector<MemorySearchResult> MemoryIndexManager::search(
                       return a.score > b.score;
                   });
 
-        std::vector<MemorySearchResult> results;
+        // 🎯 对齐 OC: 先构建全量结果(含 id) → attachRecallMetadata + importance 加权
+        //   重排 → 再 min_score 过滤 + 裁剪（加权在裁剪前，避免改变 top-N）。
+        std::vector<MemorySearchResult> all_results;
         for (const auto& r : merged_kw) {
-            if (r.score < min_score) continue;
-            if (static_cast<int>(results.size()) >= max_results) break;
             MemorySearchResult res;
+            res.id         = r.id;
             res.path       = r.path;
             res.start_line = r.start_line;
             res.end_line   = r.end_line;
@@ -280,6 +281,13 @@ std::vector<MemorySearchResult> MemoryIndexManager::search(
             res.snippet    = r.snippet;
             res.source     = r.source;  // MemorySource enum，直接赋值
             res.citation   = r.path + ":" + std::to_string(r.start_line) + "-" + std::to_string(r.end_line);
+            all_results.push_back(std::move(res));
+        }
+        if (db_) attach_recall_and_importance(*db_, all_results);
+        std::vector<MemorySearchResult> results;
+        for (auto& res : all_results) {
+            if (res.score < min_score) continue;
+            if (static_cast<int>(results.size()) >= max_results) break;
             results.push_back(std::move(res));
         }
         return results;
@@ -344,11 +352,10 @@ std::vector<MemorySearchResult> MemoryIndexManager::search(
 
     // 5c. 降级为纯向量搜索 (对齐 manager.ts: !hybrid.enabled || !fts.enabled || !fts.available)
     if (!settings_.hybrid.enabled || !fts_.enabled || !fts_.available) {
-        std::vector<MemorySearchResult> results;
+        std::vector<MemorySearchResult> all_results;
         for (const auto& r : vec_results) {
-            if (r.score < min_score) continue;
-            if (static_cast<int>(results.size()) >= max_results) break;
             MemorySearchResult res;
+            res.id         = r.id;
             res.path       = r.path;
             res.start_line = r.start_line;
             res.end_line   = r.end_line;
@@ -356,6 +363,13 @@ std::vector<MemorySearchResult> MemoryIndexManager::search(
             res.snippet    = r.snippet;
             res.source     = (r.source == "sessions") ? MemorySource::Sessions : MemorySource::Memory;
             res.citation   = r.path + ":" + std::to_string(r.start_line) + "-" + std::to_string(r.end_line);
+            all_results.push_back(std::move(res));
+        }
+        if (db_) attach_recall_and_importance(*db_, all_results);
+        std::vector<MemorySearchResult> results;
+        for (auto& res : all_results) {
+            if (res.score < min_score) continue;
+            if (static_cast<int>(results.size()) >= max_results) break;
             results.push_back(std::move(res));
         }
         return results;
@@ -393,11 +407,11 @@ std::vector<MemorySearchResult> MemoryIndexManager::search(
     );
 
     // 5e. strict 过滤 (对齐 manager.ts: merged.filter(entry => entry.score >= minScore))
-    std::vector<MemorySearchResult> strict_results;
+    //🎯 对齐 OC: 先加权重排（含 id/recall），再 min_score 过滤 + 裁剪。
+    std::vector<MemorySearchResult> strict_all;
     for (const auto& item : merged) {
-        if (item.score < min_score) continue;
-        if (static_cast<int>(strict_results.size()) >= max_results) break;
         MemorySearchResult res;
+        res.id         = item.id;
         res.path       = item.path;
         res.start_line = item.start_line;
         res.end_line   = item.end_line;
@@ -405,6 +419,13 @@ std::vector<MemorySearchResult> MemoryIndexManager::search(
         res.snippet    = item.snippet;
         res.source     = (item.source == "sessions") ? MemorySource::Sessions : MemorySource::Memory;
         res.citation   = item.path + ":" + std::to_string(item.start_line) + "-" + std::to_string(item.end_line);
+        strict_all.push_back(std::move(res));
+    }
+    if (db_) attach_recall_and_importance(*db_, strict_all);
+    std::vector<MemorySearchResult> strict_results;
+    for (auto& res : strict_all) {
+        if (res.score < min_score) continue;
+        if (static_cast<int>(strict_results.size()) >= max_results) break;
         strict_results.push_back(std::move(res));
     }
 
@@ -425,14 +446,14 @@ std::vector<MemorySearchResult> MemoryIndexManager::search(
                        std::to_string(r.start_line) + ":" + std::to_string(r.end_line));
     }
 
-    std::vector<MemorySearchResult> relaxed_results;
+    std::vector<MemorySearchResult> relaxed_all;
     for (const auto& item : merged) {
         const std::string key = item.source + ":" + item.path + ":" +
                                 std::to_string(item.start_line) + ":" + std::to_string(item.end_line);
         if (kw_keys.count(key) == 0) continue;
         if (item.score < relaxed_min_score) continue;
-        if (static_cast<int>(relaxed_results.size()) >= max_results) break;
         MemorySearchResult res;
+        res.id         = item.id;
         res.path       = item.path;
         res.start_line = item.start_line;
         res.end_line   = item.end_line;
@@ -440,9 +461,69 @@ std::vector<MemorySearchResult> MemoryIndexManager::search(
         res.snippet    = item.snippet;
         res.source     = (item.source == "sessions") ? MemorySource::Sessions : MemorySource::Memory;
         res.citation   = item.path + ":" + std::to_string(item.start_line) + "-" + std::to_string(item.end_line);
+        relaxed_all.push_back(std::move(res));
+    }
+    if (db_) attach_recall_and_importance(*db_, relaxed_all);
+    std::vector<MemorySearchResult> relaxed_results;
+    for (auto& res : relaxed_all) {
+        if (static_cast<int>(relaxed_results.size()) >= max_results) break;
         relaxed_results.push_back(std::move(res));
     }
     return relaxed_results;
+}
+
+// 🎯 对齐 OC manager.ts:listCuratedMemoryTriggerCandidates + toCuratedMemorySearchResults。
+std::vector<MemorySearchResult> MemoryIndexManager::list_trigger_candidates(
+    int limit,
+    const std::optional<std::vector<std::string>>& active_project_keys) {
+    if (closed_ || !db_) {
+        return {};
+    }
+    // 对齐 OC: limit = max(1, min(512, floor(limit ?? 512)))
+    int clamped = limit;
+    if (clamped < 1) clamped = 1;
+    if (clamped > 512) clamped = 512;
+
+    auto res = db_->list_curated_trigger_candidates(clamped, active_project_keys);
+    if (!res.is_ok()) {
+        return {};
+    }
+    auto rows = res.get();
+    // 对齐 OC: citation 补全（toCuratedMemorySearchResults 不设citation，
+    //   但 HunterClaw 其它检索分支统一补 citation，保持消费端一致）。
+    for (auto& r : rows) {
+        if (!r.citation.has_value()) {
+            r.citation = r.path +":" + std::to_string(r.start_line) + "-" +
+                         std::to_string(r.end_line);
+        }
+    }
+    return rows;
+}
+
+// 🎯 对齐 OC manager.ts:listCuratedProjectCandidates + toCuratedMemorySearchResults。
+std::vector<MemorySearchResult> MemoryIndexManager::list_project_candidates(
+    const std::vector<std::string>& active_project_keys,
+    int limit) {
+    if (closed_ || !db_) {
+        return {};
+    }
+    // 对齐 OC: limit = max(1, min(512, floor(limit ?? 48)))
+    int clamped = limit;
+    if (clamped < 1) clamped = 1;
+    if (clamped > 512) clamped = 512;
+
+    auto res = db_->list_curated_project_candidates(clamped, active_project_keys);
+    if (!res.is_ok()) {
+        return {};
+    }
+    auto rows = res.get();
+    for (auto& r : rows) {
+        if (!r.citation.has_value()) {
+            r.citation = r.path + ":" + std::to_string(r.start_line) + "-" +
+                         std::to_string(r.end_line);
+        }
+    }
+    return rows;
 }
 
 ReadFileResult MemoryIndexManager::read_file(const ReadFileParams& params) {

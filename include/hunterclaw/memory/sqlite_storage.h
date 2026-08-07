@@ -143,9 +143,33 @@ public:
         std::optional<int> importance;
         std::optional<std::string> triggers;
         std::optional<std::string> project_key;
+        // 🎯 对齐 OC: provenance.origin_class (left join)，供 trigger recall 信任判定。
+        std::optional<std::string> origin_class;
     };
     core::Result<std::map<std::string, RecallMetadata>> get_recall_metadata(
         const std::vector<std::string>& chunk_ids);
+
+    // 🎯 对齐 OC readCuratedMemoryTriggerCandidates (memory-recall-metadata.ts):
+    //   拉取所有带 triggers 注解的 curated chunk（source='memory' 且
+    //   path IN('MEMORY.md','USER.md')），按 importance 降序 keyset 分页。
+    //   active_project_keys 提供时做项目资格过滤：
+    //     - 含INVALID_PROJECT_ANNOTATION_KEY 的行剔除；
+    //     - project_key 为空的行保留（trigger 不要求 project）；
+    //     - 否则要求其所有 project_key 均在 active 集合内。
+    //   返回结果已带 id/importance/triggers/project_key/origin_class，供 trigger 匹配。
+    core::Result<std::vector<MemorySearchResult>> list_curated_trigger_candidates(
+        int limit,
+        const std::optional<std::vector<std::string>>& active_project_keys = std::nullopt);
+
+    // 🎯 对齐 OC readCuratedProjectMemoryCandidates (memory-recall-metadata.ts):
+    //   拉取所有带 project_key 注解的 curated chunk（source='memory' 且
+    //   path IN('MEMORY.md','USER.md')），按 importance 降序 keyset 分页。
+    //   与 trigger 版本的区别：requireProject=true、requireTriggers=false，
+    //   且 active_project_keys 为空时直接返回空（对齐 OC 提前 return []）。
+    //   资格过滤同样剔除含 INVALID_PROJECT_ANNOTATION_KEY 的行、要求所有 key active。
+    core::Result<std::vector<MemorySearchResult>> list_curated_project_candidates(
+        int limit,
+        const std::vector<std::string>& active_project_keys);
     
     // ========================================================================
     // 状态查询

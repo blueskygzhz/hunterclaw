@@ -11,6 +11,9 @@
 #include <chrono>
 #include <iomanip>
 #include <regex>
+#include <algorithm>
+#include <set>
+#include <vector>
 
 namespace hunterclaw {
 namespace memory {
@@ -1272,9 +1275,11 @@ SQLiteVectorStorage::get_recall_metadata(const std::vector<std::string>& chunk_i
         placeholders += "?";
     }
     std::string sql =
-        "SELECT chunk.id, metadata.importance, metadata.triggers, metadata.project_key "
+        "SELECT chunk.id, metadata.importance, metadata.triggers, metadata.project_key, "
+        "       prov.origin_class "
         "FROM memory_index_chunks AS chunk "
         "LEFT JOIN memory_index_chunk_recall_metadata AS metadata ON metadata.chunk_id = chunk.id "
+        "LEFT JOIN memory_index_chunk_provenance AS prov ON prov.chunk_id = chunk.id "
         "WHERE chunk.id IN (" + placeholders + ")";
 
     std::string error;
@@ -1300,15 +1305,277 @@ SQLiteVectorStorage::get_recall_metadata(const std::vector<std::string>& chunk_i
             const char* p = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
             if (p) meta.project_key = std::string(p);
         }
+        if (sqlite3_column_type(stmt, 4) != SQLITE_NULL) {
+            const char* o = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
+            if (o) meta.origin_class = std::string(o);
+        }
         result[std::string(cid)] = std::move(meta);
     }
     sqlite3_finalize(stmt);
     return core::Result<std::map<std::string, RecallMetadata>>::Ok(result);
 }
 
-// ============================================================================
-// Transaction Support
-// ============================================================================
+// 🎯 对齐 OC readCuratedMemoryCandidates + readCuratedCandidateBatch
+//   (memory-recall-metadata.ts) 的通用内部实现。keyset 分页拉取curated chunk，
+//   按 require_triggers / require_project 约束 SQL 与资格过滤后填满 limit。
+//   trigger 版：require_triggers=true, require_project=false。
+//   project 版：require_project=true, require_triggers=false。
+static core::Result<std::vector<MemorySearchResult>> list_curated_candidates_impl(
+    sqlite3* db_,
+    int limit,
+    const std::optional<std::vector<std::string>>& active_project_keys,
+    bool require_project,
+    bool require_triggers) {
+    std::vector<MemorySearchResult> results;
+    if (!db_) {
+        return core::Result<std::vector<MemorySearchResult>>::Err("Database not open");
+    }
+    if (limit <= 0) {
+        return core::Result<std::vector<MemorySearchResult>>::Ok(results);
+    }
+
+    // 对齐 OC INVALID_PROJECT_ANNOTATION_KEY (internal.ts)
+    static const std::string kInvalidProjectAnnotationKey = "!invalid-project-annotation";
+
+    // 对齐 OC: active = new Set(keys.trim().filter(Boolean))；未提供时 active=undefined。
+    std::optional<std::set<std::string>> active;
+    if (active_project_keys.has_value()) {
+        std::set<std::string> s;
+        for (const auto& k : *active_project_keys) {
+            std::string t = k;
+            // trim
+            size_t b = t.find_first_not_of(" \t\r\n");
+            size_t e = t.find_last_not_of(" \t\r\n");
+            if (b == std::string::npos) continue;
+            t = t.substr(b, e - b + 1);
+            if (!t.empty()) s.insert(t);
+        }
+        active = std::move(s);
+    }
+
+    // 对齐 OC: batchSize = max(64, limit)
+    const int batch_size = std::max(64, limit);
+
+    // keyset 游标 (对齐 OC cursor: { importance, path, id })
+    bool has_cursor = false;
+    int cursor_importance = 0;  // coalesce(importance,0)
+    std::string cursor_path;
+    std::string cursor_id;
+
+    // 拆分 project_key（";" 分隔、trim、去空）→ vector
+    auto split_project_keys = [](const std::string& raw) -> std::vector<std::string> {
+        std::vector<std::string> keys;
+        std::string cur;
+        for (char c : raw) {
+            if (c == ';') {
+                // trim cur
+                size_t b = cur.find_first_not_of(" \t\r\n");
+                size_t e = cur.find_last_not_of(" \t\r\n");
+                if (b != std::string::npos) keys.push_back(cur.substr(b, e - b + 1));
+                cur.clear();
+            } else {
+                cur.push_back(c);
+            }
+        }
+        size_t b = cur.find_first_not_of(" \t\r\n");
+        size_t e = cur.find_last_not_of(" \t\r\n");
+        if (b != std::string::npos) keys.push_back(cur.substr(b, e - b + 1));
+        return keys;
+    };
+
+    while (static_cast<int>(results.size()) < limit) {
+        // 对齐 OC readCuratedCandidateBatch SQL：
+        //   requireTriggers=true → metadata.triggers IS NOT NULL
+        //   requireProject=false（trigger 路径）
+        //   ORDER BY coalesce(importance,0) DESC, path, id
+        std::string sql =
+            "SELECT chunk.id, chunk.path, chunk.source, chunk.start_line, chunk.end_line, chunk.text, "
+            "       metadata.importance, metadata.triggers, metadata.project_key, prov.origin_class, "
+            "       COALESCE(metadata.importance, 0) AS imp0 "
+            "FROM memory_index_chunks AS chunk "
+            "LEFT JOIN memory_index_chunk_recall_metadata AS metadata ON metadata.chunk_id = chunk.id "
+            "LEFT JOIN memory_index_chunk_provenance AS prov ON prov.chunk_id = chunk.id "
+            "WHERE chunk.source = 'memory' "
+            "  AND chunk.path IN ('MEMORY.md', 'USER.md') ";
+        // 对齐 OC readCuratedCandidateBatch：requireTriggers / requireProject 条件。
+        if (require_triggers) {
+            sql += "  AND metadata.triggers IS NOT NULL ";
+        }
+        if (require_project) {
+            sql += "  AND metadata.project_key IS NOT NULL ";
+        }
+        if (has_cursor) {
+            // 对齐 OC keyset：coalesce(importance,0) < c.imp0
+            //   OR (= c.imp0 AND (path > c.path OR (path = c.path AND id > c.id)))
+            // 注意：WHERE 不能引用 SELECT 列别名，需重复 COALESCE 表达式。
+            sql +=
+                "  AND ( COALESCE(metadata.importance, 0) < ? "
+                "        OR ( COALESCE(metadata.importance, 0) = ? "
+                "             AND ( chunk.path > ? "
+                "                   OR ( chunk.path = ? AND chunk.id > ? ) ) ) ) ";
+        }
+        sql +=
+            "ORDER BY imp0 DESC, chunk.path ASC, chunk.id ASC "
+            "LIMIT ?";
+
+        std::string error;
+        sqlite3_stmt* stmt = prepare_stmt(db_, sql, &error);
+        if (!stmt) {
+            return core::Result<std::vector<MemorySearchResult>>::Err(
+                "Failed to query curated trigger candidates: " + error);
+        }
+        int idx = 1;
+        if (has_cursor) {
+            sqlite3_bind_int(stmt, idx++, cursor_importance);
+            sqlite3_bind_int(stmt, idx++, cursor_importance);
+            sqlite3_bind_text(stmt, idx++, cursor_path.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, idx++, cursor_path.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, idx++, cursor_id.c_str(), -1, SQLITE_TRANSIENT);
+        }
+        sqlite3_bind_int(stmt, idx, batch_size);
+
+        int row_count = 0;
+        std::string last_path, last_id;
+        int last_imp0 = 0;
+        bool reached_limit = false;
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            ++row_count;
+            std::string id   = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+            std::string path = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+            int start_line   = sqlite3_column_int(stmt, 3);
+            int end_line     = sqlite3_column_int(stmt, 4);
+            const char* text_c = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5));
+            std::string text = text_c ? text_c : "";
+
+            std::optional<int> importance;
+            if (sqlite3_column_type(stmt, 6) != SQLITE_NULL)
+                importance = sqlite3_column_int(stmt, 6);
+            std::optional<std::string> triggers;
+            if (sqlite3_column_type(stmt, 7) != SQLITE_NULL) {
+                const char* t = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
+                if (t) triggers = std::string(t);
+            }
+            std::optional<std::string> project_key;
+            if (sqlite3_column_type(stmt, 8) != SQLITE_NULL) {
+                const char* p = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 8));
+                if (p) project_key = std::string(p);
+            }
+            std::optional<std::string> origin_class;
+            if (sqlite3_column_type(stmt, 9) != SQLITE_NULL) {
+                const char* o = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 9));
+                if (o) origin_class = std::string(o);
+            }
+            int imp0 = sqlite3_column_int(stmt, 10);
+
+            // 记录本批最后一行（用于游标推进），必须先于资格过滤 continue。
+            last_path = path;
+            last_id   = id;
+            last_imp0 = imp0;
+
+            // 对齐 OC资格过滤（在keyset 批之上应用）
+            std::vector<std::string> stored_keys;
+            if (project_key.has_value()) {
+                stored_keys = split_project_keys(*project_key);
+            }
+            // 含 INVALID_PROJECT_ANNOTATION_KEY → 剔除
+            if (std::find(stored_keys.begin(), stored_keys.end(),
+                          kInvalidProjectAnnotationKey) != stored_keys.end()) {
+                continue;
+            }
+            // 对齐 OC 条件：
+            //   (active===undefined && !requireProject) ||
+            //   (project_key===null && !requireProject) ||
+            //   (storedKeys.length>0 && storedKeys.every(k => active.has(k)))
+            bool eligible = false;
+            if (!active.has_value() && !require_project) {
+                eligible = true;
+            } else if (!project_key.has_value() && !require_project) {
+                eligible = true;
+            } else if (!stored_keys.empty()) {
+                bool all_in = active.has_value();  // active 为空集则 every→需active 存在
+                if (all_in) {
+                    for (const auto& k : stored_keys) {
+                        if (active->find(k) == active->end()) { all_in = false; break; }
+                    }
+                }
+                eligible = all_in;
+            }
+            if (!eligible) {
+                continue;
+            }
+
+            // 对齐 OC toCuratedMemorySearchResults：score=0, snippet=text, source=memory；
+            //importance/triggers/project_key trim 后写入。
+            MemorySearchResult r;
+            r.path= path;
+            r.start_line = start_line;
+            r.end_line   = end_line;
+            r.score      = 0.0;
+            r.snippet    = text;
+            r.source     = MemorySource::Memory;
+            r.id         = id;
+            if (importance.has_value()) r.importance = importance;
+            if (triggers.has_value()) {
+                std::string t = *triggers;
+                size_t b = t.find_first_not_of(" \t\r\n");
+                size_t e = t.find_last_not_of(" \t\r\n");
+                if (b != std::string::npos) r.triggers = t.substr(b, e - b + 1);
+            }
+            if (project_key.has_value()) {
+                std::string p = *project_key;
+                size_t b = p.find_first_not_of(" \t\r\n");
+                size_t e = p.find_last_not_of(" \t\r\n");
+                if (b != std::string::npos) r.project_key = p.substr(b, e - b + 1);
+            }
+            if (origin_class.has_value()) r.origin_class = origin_class;
+
+            results.push_back(std::move(r));
+            if (static_cast<int>(results.size()) == limit) {
+                reached_limit = true;
+                break;
+            }
+        }
+        sqlite3_finalize(stmt);
+
+        if (reached_limit) break;
+        // 对齐 OC: if (!last || rows.length < batchSize) break;
+        if (row_count == 0 || row_count < batch_size) break;
+        // 推进游标
+        has_cursor = true;
+        cursor_importance = last_imp0;
+        cursor_path = last_path;
+        cursor_id = last_id;
+    }
+
+    return core::Result<std::vector<MemorySearchResult>>::Ok(std::move(results));
+}
+
+//🎯 对齐 OC readCuratedMemoryTriggerCandidates:
+//   requireTriggers=true, requireProject=false。
+core::Result<std::vector<MemorySearchResult>>
+SQLiteVectorStorage::list_curated_trigger_candidates(
+    int limit,
+    const std::optional<std::vector<std::string>>& active_project_keys) {
+    return list_curated_candidates_impl(
+        db_, limit, active_project_keys,
+        /*require_project=*/false, /*require_triggers=*/true);
+}
+
+// 🎯 对齐 OC readCuratedProjectMemoryCandidates:
+//   requireProject=true, requireTriggers=false；active 为空直接返回空。
+core::Result<std::vector<MemorySearchResult>>
+SQLiteVectorStorage::list_curated_project_candidates(
+    int limit,
+    const std::vector<std::string>& active_project_keys) {
+    // 对齐 OC: if (activeProjectKeys.length === 0) return [];
+    if (active_project_keys.empty()) {
+        return core::Result<std::vector<MemorySearchResult>>::Ok({});
+    }
+    return list_curated_candidates_impl(
+        db_, limit, active_project_keys,
+        /*require_project=*/true, /*require_triggers=*/false);
+}
 
 core::Result<bool> SQLiteVectorStorage::begin_transaction() {
     if (!db_) {

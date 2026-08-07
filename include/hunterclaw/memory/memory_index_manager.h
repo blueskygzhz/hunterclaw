@@ -58,6 +58,22 @@ public:
         const SearchOptions& opts = {}
     ) override;
 
+    // 🎯 对齐 OC manager.ts:listCuratedMemoryTriggerCandidates:
+    //   拉取带 triggers 注解的 curated chunk（MEMORY.md/USER.md），供
+    //   active-memory lane-1 的 trigger 匹配召回使用（不参与常规检索排序）。
+    //   limit 默认 512，clamp 到 [1,512]，与 OC 一致。
+    std::vector<MemorySearchResult> list_trigger_candidates(
+        int limit = 512,
+        const std::optional<std::vector<std::string>>& active_project_keys = std::nullopt);
+
+    // 🎯 对齐 OC manager.ts:listCuratedProjectCandidates:
+    //   拉取带 project_key 注解且全部命中 active_project_keys 的 curated chunk，
+    //   供 project-aware 召回使用。limit 默认 48，clamp 到 [1,512]。
+    //   active_project_keys 为空时返回空（对齐 OC）。
+    std::vector<MemorySearchResult> list_project_candidates(
+        const std::vector<std::string>& active_project_keys,
+        int limit = 48);
+
     ReadFileResult read_file(const ReadFileParams& params) override;
 
     MemoryProviderStatus status() override;
