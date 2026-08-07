@@ -82,6 +82,20 @@ using plugins::PluginHookReplyDispatchResult;
 using plugins::PluginHookCronReconciledEvent;
 using plugins::PluginHookCronReconciledContext;
 using plugins::PluginHookCronChangedEvent;
+using plugins::PluginHookSkillContext;
+using plugins::PluginHookSkillChangedEvent;
+using plugins::PluginHookSkillProposalEvaluateEvent;
+using plugins::PluginHookSkillProposalEvaluateResult;
+using plugins::PluginHookSkillProposalChangedEvent;
+using plugins::PluginHookSubagentProgressEvent;
+using plugins::PluginHookBeforeInstallEvent;
+using plugins::PluginHookBeforeInstallContext;
+using plugins::PluginHookBeforeInstallResult;
+using plugins::PluginHookResolveExecEnvEvent;
+using plugins::PluginHookResolveExecEnvResult;
+using plugins::PluginHookDeactivateEvent;
+using plugins::PluginHookHeartbeatPromptContributionEvent;
+using plugins::PluginHookHeartbeatPromptContributionResult;
 using plugins::PluginHookLlmInputEvent;
 using plugins::PluginHookLlmOutputEvent;
 using plugins::PluginHookLlmOutputUsage;
@@ -323,6 +337,41 @@ using CronChangedHandler = std::function<
     void(const PluginHookCronChangedEvent& event,
          const PluginHookGatewayContext& ctx)>;
 
+// skill_changed / skill_proposal_changed — void 观测；skill_proposal_evaluate — 收集 outcome
+using SkillChangedHandler = std::function<
+    void(const PluginHookSkillChangedEvent& event,
+         const PluginHookSkillContext& ctx)>;
+using SkillProposalChangedHandler = std::function<
+    void(const PluginHookSkillProposalChangedEvent& event,
+         const PluginHookSkillContext& ctx)>;
+using SkillProposalEvaluateHandler = std::function<
+    std::optional<PluginHookSkillProposalEvaluateResult>(
+        const PluginHookSkillProposalEvaluateEvent& event,
+        const PluginHookSkillContext& ctx)>;
+
+// subagent_progress / deactivate — void 观测
+using SubagentProgressHandler = std::function<
+    void(const PluginHookSubagentProgressEvent& event,
+         const PluginHookSubagentContext& ctx)>;
+using DeactivateHandler = std::function<
+    void(const PluginHookDeactivateEvent& event,
+         const PluginHookAgentContext& ctx)>;
+// before_install — modifying gate（findings/block）
+using BeforeInstallHandler = std::function<
+    std::optional<PluginHookBeforeInstallResult>(
+        const PluginHookBeforeInstallEvent& event,
+        const PluginHookBeforeInstallContext& ctx)>;
+// resolve_exec_env — modifying（返回 env 变量）
+using ResolveExecEnvHandler = std::function<
+    std::optional<PluginHookResolveExecEnvResult>(
+        const PluginHookResolveExecEnvEvent& event,
+        const PluginHookAgentContext& ctx)>;
+// heartbeat_prompt_contribution — modifying（prepend/append context）
+using HeartbeatPromptContributionHandler = std::function<
+    std::optional<PluginHookHeartbeatPromptContributionResult>(
+        const PluginHookHeartbeatPromptContributionEvent& event,
+        const PluginHookAgentContext& ctx)>;
+
 // ============================================================================
 // ToolHookManager
 //
@@ -393,6 +442,14 @@ public:
     void register_gateway_stop(const std::string& plugin_id, GatewayStopHandler handler, int priority = 0);
     void register_cron_reconciled(const std::string& plugin_id, CronReconciledHandler handler, int priority = 0);
     void register_cron_changed(const std::string& plugin_id, CronChangedHandler handler, int priority = 0);
+    void register_skill_changed(const std::string& plugin_id, SkillChangedHandler handler, int priority = 0);
+    void register_skill_proposal_changed(const std::string& plugin_id, SkillProposalChangedHandler handler, int priority = 0);
+    void register_skill_proposal_evaluate(const std::string& plugin_id, SkillProposalEvaluateHandler handler, int priority = 0);
+    void register_subagent_progress(const std::string& plugin_id, SubagentProgressHandler handler, int priority = 0);
+    void register_deactivate(const std::string& plugin_id, DeactivateHandler handler, int priority = 0);
+    void register_before_install(const std::string& plugin_id, BeforeInstallHandler handler, int priority = 0);
+    void register_resolve_exec_env(const std::string& plugin_id, ResolveExecEnvHandler handler, int priority = 0);
+    void register_heartbeat_prompt_contribution(const std::string& plugin_id, HeartbeatPromptContributionHandler handler, int priority = 0);
 
     // ========== Unregister ==========
 
@@ -569,6 +626,26 @@ public:
     void run_cron_reconciled(const PluginHookCronReconciledEvent& event, const PluginHookCronReconciledContext& ctx);
     void run_cron_changed(const PluginHookCronChangedEvent& event, const PluginHookGatewayContext& ctx);
 
+    /// Run skill_changed / skill_proposal_changed hooks (void, sequential)
+    void run_skill_changed(const PluginHookSkillChangedEvent& event, const PluginHookSkillContext& ctx);
+    void run_skill_proposal_changed(const PluginHookSkillProposalChangedEvent& event, const PluginHookSkillContext& ctx);
+    /// Run skill_proposal_evaluate:收集所有 evaluator 的结果
+    std::vector<PluginHookSkillProposalEvaluateResult> run_skill_proposal_evaluate(
+        const PluginHookSkillProposalEvaluateEvent& event, const PluginHookSkillContext& ctx);
+
+    /// Run subagent_progress / deactivate hooks (void, sequential)
+    void run_subagent_progress(const PluginHookSubagentProgressEvent& event, const PluginHookSubagentContext& ctx);
+    void run_deactivate(const PluginHookDeactivateEvent& event, const PluginHookAgentContext& ctx);
+    /// Run before_install (gate): 返回 findings/block（最严格 block 优先）
+    std::optional<PluginHookBeforeInstallResult> run_before_install(
+        const PluginHookBeforeInstallEvent& event, const PluginHookBeforeInstallContext& ctx);
+    /// Run resolve_exec_env (modifying): 合并所有插件的 env 变量
+    std::optional<PluginHookResolveExecEnvResult> run_resolve_exec_env(
+        const PluginHookResolveExecEnvEvent& event, const PluginHookAgentContext& ctx);
+    /// Run heartbeat_prompt_contribution (modifying): 拼接 prepend/append context
+    std::optional<PluginHookHeartbeatPromptContributionResult> run_heartbeat_prompt_contribution(
+        const PluginHookHeartbeatPromptContributionEvent& event, const PluginHookAgentContext& ctx);
+
     // ========== Query ==========
 
     bool has_hooks(PluginHookName name) const;
@@ -628,6 +705,14 @@ private:
     struct GatewayStopEntry         { std::string plugin_id; GatewayStopHandler         handler; int priority = 0; };
     struct CronReconciledEntry      { std::string plugin_id; CronReconciledHandler      handler; int priority = 0; };
     struct CronChangedEntry         { std::string plugin_id; CronChangedHandler         handler; int priority = 0; };
+    struct SkillChangedEntry        { std::string plugin_id; SkillChangedHandler        handler; int priority = 0; };
+    struct SkillProposalChangedEntry{ std::string plugin_id; SkillProposalChangedHandler handler; int priority = 0; };
+    struct SkillProposalEvaluateEntry { std::string plugin_id; SkillProposalEvaluateHandler handler; int priority = 0; };
+    struct SubagentProgressEntry    { std::string plugin_id; SubagentProgressHandler    handler; int priority = 0; };
+    struct DeactivateEntry          { std::string plugin_id; DeactivateHandler          handler; int priority = 0; };
+    struct BeforeInstallEntry       { std::string plugin_id; BeforeInstallHandler       handler; int priority = 0; };
+    struct ResolveExecEnvEntry      { std::string plugin_id; ResolveExecEnvHandler      handler; int priority = 0; };
+    struct HeartbeatPromptContributionEntry { std::string plugin_id; HeartbeatPromptContributionHandler handler; int priority = 0; };
 
     mutable std::mutex mutex_;
 
@@ -674,6 +759,14 @@ private:
     std::vector<GatewayStopEntry>            gateway_stop_hooks_;
     std::vector<CronReconciledEntry>         cron_reconciled_hooks_;
     std::vector<CronChangedEntry>            cron_changed_hooks_;
+    std::vector<SkillChangedEntry>           skill_changed_hooks_;
+    std::vector<SkillProposalChangedEntry>   skill_proposal_changed_hooks_;
+    std::vector<SkillProposalEvaluateEntry>  skill_proposal_evaluate_hooks_;
+    std::vector<SubagentProgressEntry>       subagent_progress_hooks_;
+    std::vector<DeactivateEntry>             deactivate_hooks_;
+    std::vector<BeforeInstallEntry>          before_install_hooks_;
+    std::vector<ResolveExecEnvEntry>         resolve_exec_env_hooks_;
+    std::vector<HeartbeatPromptContributionEntry> heartbeat_prompt_contribution_hooks_;
 
     // Helper: sort by priority descending (higher first)
     template<typename T>

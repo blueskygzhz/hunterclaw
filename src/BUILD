@@ -377,6 +377,7 @@ cc_library(
     srcs = glob(["skills/*.cc"]),
     deps = [
         "//:hunterclaw_headers",
+        ":hunterclaw_tools",  # ✅ skill_changed hook (get_global_hook_manager)
         "@nlohmann_json//:json",
         "@yaml_cpp//:yaml-cpp",
         "@com_google_absl//absl/status",

@@ -798,6 +798,33 @@ private:
             log()->info("exec: elevated command, routing to gateway");
         }
 
+        // 🎯 Plugin hook: resolve_exec_env (modifying) — 对齐 OpenClaw resolve_exec_env
+        //   host 确定后、命令执行前，插件可注入/覆盖 exec 环境变量（合并进 env）。
+        {
+            auto* hook_mgr = tools::get_global_hook_manager();
+            if (hook_mgr && hook_mgr->has_hooks(plugins::PluginHookName::RESOLVE_EXEC_ENV)) {
+                plugins::PluginHookResolveExecEnvEvent ree_event;
+                ree_event.tool_name = "exec";
+                ree_event.host = render_exec_host_label(host);
+                if (!context_.session_key.empty()) ree_event.session_key = context_.session_key;
+                plugins::PluginHookAgentContext ree_ctx;
+                if (!context_.session_key.empty()) ree_ctx.session_key = context_.session_key;
+                try {
+                    auto ree_result = hook_mgr->run_resolve_exec_env(ree_event, ree_ctx);
+                    if (ree_result && ree_result->env_json) {
+                        auto parsed = core::JsonValue::parse(*ree_result->env_json);
+                        if (parsed.ok && parsed.value && parsed.value->is_object()) {
+                            for (auto it = parsed.value->begin(); it != parsed.value->end(); ++it) {
+                                if (it->second->is_string()) env[it->first] = it->second->as_string();
+                            }
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    log()->warn("resolve_exec_env hook failed: {}", e.what());
+                }
+            }
+        }
+
         // ================================================================
         // STEP 4: Security/ask policy (aligned with OpenClaw minSecurity/maxAsk)
         // ================================================================

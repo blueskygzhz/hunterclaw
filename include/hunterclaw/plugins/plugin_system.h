@@ -911,6 +911,105 @@ struct PluginHookCronChangedEvent {
 };
 
 // ============================================================================
+// Plugin Hook — skill_changed / skill_proposal_evaluate / skill_proposal_changed
+//   对齐 OpenClaw hook-skill.types.ts。skill_changed 观测 skill artifact 增删改；
+//   skill_proposal_* 依赖 Workshop proposal 流水线（HunterClaw暂无该子系统，
+//   分发registry 就绪、埋点待子系统落地）。
+// ============================================================================
+
+struct PluginHookSkillContext {
+  std::string workspace_dir;
+  std::optional<std::string> agent_id;
+};
+
+struct PluginHookSkillChangedEvent {
+  std::string action;      // "created" | "updated" | "removed"
+  std::string source;      // "workshop"|"clawhub"|"source-install"|"upload"
+  std::string occurred_at; // ISO timestamp
+  std::optional<std::string> before_json;  // PluginHookSkillArtifact
+  std::optional<std::string> after_json;
+};
+
+struct PluginHookSkillProposalEvaluateEvent {
+  std::string proposal_json;  // proposal + candidate 快照
+};
+
+struct PluginHookSkillProposalEvaluateResult {
+  std::optional<std::string> summary;
+  std::optional<std::string> findings_json;
+  std::optional<std::string> metrics_json;
+};
+
+struct PluginHookSkillProposalChangedEvent {
+  std::string event_id;
+  int sequence = 0;
+  std::string action;
+  std::string occurred_at;
+  std::optional<std::string> evaluations_json;
+};
+
+// ============================================================================
+// Plugin Hook — subagent_progress / before_install / resolve_exec_env
+//               / deactivate / heartbeat_prompt_contribution
+//   对齐 OpenClaw hook-types.ts:921/1184/1227 + host-hook-turn-types.ts:47。
+// ============================================================================
+
+struct PluginHookSubagentProgressEvent {
+  std::string phase;            // "started" | "ended"
+  std::string run_id;
+  std::string child_session_key;
+  std::optional<std::string> outcome;   // ended 时:ok|error|timeout|killed|unknown
+  std::optional<std::string> requester_json;
+};
+
+struct PluginHookBeforeInstallContext {
+  std::string target_type;      // PluginInstallTargetType
+  std::string request_kind;
+  std::optional<std::string> origin;
+};
+
+struct PluginHookBeforeInstallEvent {
+  std::string target_type;
+  std::string target_name;
+  std::string source_path;
+  std::string source_path_kind;
+  std::optional<std::string> origin;
+};
+
+struct PluginHookBeforeInstallResult {
+  std::optional<std::string> findings_json;
+  bool block = false;
+  std::optional<std::string> block_reason;
+};
+
+struct PluginHookResolveExecEnvEvent {
+  std::optional<std::string> session_key;
+  std::string tool_name = "exec";
+  std::string host;             // "gateway" | "sandbox" | "node"
+};
+
+struct PluginHookResolveExecEnvResult {
+  // 对齐 Record<string,string>：env 变量键值对（序列化 JSON object）。
+  std::optional<std::string> env_json;
+};
+
+struct PluginHookDeactivateEvent {
+  std::optional<std::string> plugin_id;
+  std::optional<std::string> reason;
+};
+
+struct PluginHookHeartbeatPromptContributionEvent {
+  std::optional<std::string> session_key;
+  std::optional<std::string> agent_id;
+  std::optional<std::string> heartbeat_name;
+};
+
+struct PluginHookHeartbeatPromptContributionResult {
+  std::optional<std::string> prepend_context;
+  std::optional<std::string> append_context;
+};
+
+// ============================================================================
 // Plugin Hook Handler & Options
 // ============================================================================
 

@@ -170,6 +170,14 @@ IMPL_REGISTER(register_gateway_start,        gateway_start_hooks_,        Gatewa
 IMPL_REGISTER(register_gateway_stop,         gateway_stop_hooks_,         GatewayStopEntry,        GatewayStopHandler)
 IMPL_REGISTER(register_cron_reconciled,      cron_reconciled_hooks_,      CronReconciledEntry,     CronReconciledHandler)
 IMPL_REGISTER(register_cron_changed,         cron_changed_hooks_,         CronChangedEntry,        CronChangedHandler)
+IMPL_REGISTER(register_skill_changed,        skill_changed_hooks_,        SkillChangedEntry,       SkillChangedHandler)
+IMPL_REGISTER(register_skill_proposal_changed, skill_proposal_changed_hooks_, SkillProposalChangedEntry, SkillProposalChangedHandler)
+IMPL_REGISTER(register_skill_proposal_evaluate, skill_proposal_evaluate_hooks_, SkillProposalEvaluateEntry, SkillProposalEvaluateHandler)
+IMPL_REGISTER(register_subagent_progress,    subagent_progress_hooks_,    SubagentProgressEntry,   SubagentProgressHandler)
+IMPL_REGISTER(register_deactivate,           deactivate_hooks_,           DeactivateEntry,         DeactivateHandler)
+IMPL_REGISTER(register_before_install,       before_install_hooks_,       BeforeInstallEntry,      BeforeInstallHandler)
+IMPL_REGISTER(register_resolve_exec_env,     resolve_exec_env_hooks_,     ResolveExecEnvEntry,     ResolveExecEnvHandler)
+IMPL_REGISTER(register_heartbeat_prompt_contribution, heartbeat_prompt_contribution_hooks_, HeartbeatPromptContributionEntry, HeartbeatPromptContributionHandler)
 
 #undef IMPL_REGISTER
 
@@ -281,6 +289,10 @@ IMPL_VOID_HOOK(run_gateway_start,      gateway_start_hooks_,     PluginHookGatew
 IMPL_VOID_HOOK(run_gateway_stop,       gateway_stop_hooks_,      PluginHookGatewayStopEvent,      PluginHookGatewayContext, "gateway_stop")
 IMPL_VOID_HOOK(run_cron_reconciled,    cron_reconciled_hooks_,   PluginHookCronReconciledEvent,   PluginHookCronReconciledContext, "cron_reconciled")
 IMPL_VOID_HOOK(run_cron_changed,       cron_changed_hooks_,      PluginHookCronChangedEvent,      PluginHookGatewayContext, "cron_changed")
+IMPL_VOID_HOOK(run_skill_changed,      skill_changed_hooks_,     PluginHookSkillChangedEvent,     PluginHookSkillContext, "skill_changed")
+IMPL_VOID_HOOK(run_skill_proposal_changed, skill_proposal_changed_hooks_, PluginHookSkillProposalChangedEvent, PluginHookSkillContext, "skill_proposal_changed")
+IMPL_VOID_HOOK(run_subagent_progress,  subagent_progress_hooks_, PluginHookSubagentProgressEvent, PluginHookSubagentContext, "subagent_progress")
+IMPL_VOID_HOOK(run_deactivate,         deactivate_hooks_,        PluginHookDeactivateEvent,       PluginHookAgentContext, "deactivate")
 
 #undef IMPL_VOID_HOOK
 
@@ -708,9 +720,132 @@ std::optional<PluginHookReplyDispatchResult> ToolHookManager::run_reply_dispatch
 }
 
 // ============================================================================
-// run_message_sending (modifying hook)
-//
-// Aligned with OpenClaw runMessageSending merge:
+// run_skill_proposal_evaluate (collecting hook)
+//   对齐 OpenClaw runSkillProposalEvaluate：收集所有 evaluator 的结果（非短路）。
+//   evaluator 失败作为数据处理（此处简化：失败跳过，不影响其它evaluator）。
+// ============================================================================
+
+std::vector<PluginHookSkillProposalEvaluateResult> ToolHookManager::run_skill_proposal_evaluate(
+    const PluginHookSkillProposalEvaluateEvent& event,
+    const PluginHookSkillContext& ctx)
+{
+    std::vector<SkillProposalEvaluateEntry> hooks;
+    { std::lock_guard<std::mutex> lock(mutex_); hooks = skill_proposal_evaluate_hooks_; }
+    std::vector<PluginHookSkillProposalEvaluateResult> outcomes;
+    if (hooks.empty()) return outcomes;
+
+    for (const auto& entry : hooks) {
+        try {
+            auto result = entry.handler(event, ctx);
+            if (result) outcomes.push_back(*result);
+        } catch (const std::exception& e) {
+            log()->error("[hooks] skill_proposal_evaluate handler from '{}' failed: {}",
+                entry.plugin_id, e.what());
+        }
+    }
+    return outcomes;
+}
+
+// ============================================================================
+// run_before_install (gate hook)
+//   对齐 OpenClaw before_install：安装前收集 findings，任一 block 则整体 block。
+// ============================================================================
+
+std::optional<PluginHookBeforeInstallResult> ToolHookManager::run_before_install(
+    const PluginHookBeforeInstallEvent& event,
+    const PluginHookBeforeInstallContext& ctx)
+{
+    std::vector<BeforeInstallEntry> hooks;
+    { std::lock_guard<std::mutex> lock(mutex_); hooks = before_install_hooks_; }
+    if (hooks.empty()) return std::nullopt;
+
+    std::optional<PluginHookBeforeInstallResult> accumulated;
+    for (const auto& entry : hooks) {
+        try {
+            auto result = entry.handler(event, ctx);
+            if (!result) continue;
+            if (!accumulated) accumulated = PluginHookBeforeInstallResult{};
+            // findings 累积（此处简单拼接 JSON 片段留给宿主，取最后一个非空）。
+            if (result->findings_json) accumulated->findings_json = result->findings_json;
+            if (result->block) {
+                accumulated->block = true;
+                if (result->block_reason) accumulated->block_reason = result->block_reason;
+                log()->warn("[hooks] before_install blocked by '{}'", entry.plugin_id);
+            }
+        } catch (const std::exception& e) {
+            log()->error("[hooks] before_install handler from '{}' failed: {}",
+                entry.plugin_id, e.what());
+        }
+    }
+    return accumulated;
+}
+
+// ============================================================================
+// run_resolve_exec_env (modifying hook)
+//   对齐 OpenClaw resolve_exec_env：合并所有插件贡献的 env 变量（后者覆盖前者）。
+// ============================================================================
+
+std::optional<PluginHookResolveExecEnvResult> ToolHookManager::run_resolve_exec_env(
+    const PluginHookResolveExecEnvEvent& event,
+    const PluginHookAgentContext& ctx)
+{
+    std::vector<ResolveExecEnvEntry> hooks;
+    { std::lock_guard<std::mutex> lock(mutex_); hooks = resolve_exec_env_hooks_; }
+    if (hooks.empty()) return std::nullopt;
+
+    nlohmann::json merged = nlohmann::json::object();
+    bool any = false;
+    for (const auto& entry : hooks) {
+        try {
+            auto result = entry.handler(event, ctx);
+            if (!result || !result->env_json) continue;
+            auto parsed = nlohmann::json::parse(*result->env_json, nullptr, false);
+            if (parsed.is_object()) {
+                for (auto it = parsed.begin(); it != parsed.end(); ++it) {
+                    merged[it.key()] = it.value();  // 后者覆盖前者
+                    any = true;
+                }
+            }
+        } catch (const std::exception& e) {
+            log()->error("[hooks] resolve_exec_env handler from '{}' failed: {}",
+                entry.plugin_id, e.what());
+        }
+    }
+    if (!any) return std::nullopt;
+    PluginHookResolveExecEnvResult out;
+    out.env_json = merged.dump();
+    return out;
+}
+
+// ============================================================================
+// run_heartbeat_prompt_contribution (modifying hook)
+//   对齐 OpenClaw runHeartbeatPromptContribution + mergeAgentTurnPrepare：
+//   拼接所有插件贡献的 prepend/append context。
+// ============================================================================
+
+std::optional<PluginHookHeartbeatPromptContributionResult> ToolHookManager::run_heartbeat_prompt_contribution(
+    const PluginHookHeartbeatPromptContributionEvent& event,
+    const PluginHookAgentContext& ctx)
+{
+    std::vector<HeartbeatPromptContributionEntry> hooks;
+    { std::lock_guard<std::mutex> lock(mutex_); hooks = heartbeat_prompt_contribution_hooks_; }
+    if (hooks.empty()) return std::nullopt;
+
+    std::optional<PluginHookHeartbeatPromptContributionResult> accumulated;
+    for (const auto& entry : hooks) {
+        try {
+            auto result = entry.handler(event, ctx);
+            if (!result) continue;
+            if (!accumulated) accumulated = PluginHookHeartbeatPromptContributionResult{};
+            accumulated->prepend_context = concat_optional(accumulated->prepend_context, result->prepend_context);
+            accumulated->append_context  = concat_optional(accumulated->append_context,  result->append_context);
+        } catch (const std::exception& e) {
+            log()->error("[hooks] heartbeat_prompt_contribution handler from '{}' failed: {}",
+                entry.plugin_id, e.what());
+        }
+    }
+    return accumulated;
+}
 //   content: next.content ?? acc?.content  (last defined wins)
 //   cancel:  next.cancel  ?? acc?.cancel
 // ============================================================================
@@ -1031,6 +1166,14 @@ bool ToolHookManager::has_hooks(PluginHookName name) const {
         case PluginHookName::GATEWAY_STOP:             return !gateway_stop_hooks_.empty();
         case PluginHookName::CRON_RECONCILED:          return !cron_reconciled_hooks_.empty();
         case PluginHookName::CRON_CHANGED:             return !cron_changed_hooks_.empty();
+        case PluginHookName::SKILL_CHANGED:            return !skill_changed_hooks_.empty();
+        case PluginHookName::SKILL_PROPOSAL_CHANGED:   return !skill_proposal_changed_hooks_.empty();
+        case PluginHookName::SKILL_PROPOSAL_EVALUATE:  return !skill_proposal_evaluate_hooks_.empty();
+        case PluginHookName::SUBAGENT_PROGRESS:        return !subagent_progress_hooks_.empty();
+        case PluginHookName::DEACTIVATE:               return !deactivate_hooks_.empty();
+        case PluginHookName::BEFORE_INSTALL:           return !before_install_hooks_.empty();
+        case PluginHookName::RESOLVE_EXEC_ENV:         return !resolve_exec_env_hooks_.empty();
+        case PluginHookName::HEARTBEAT_PROMPT_CONTRIBUTION: return !heartbeat_prompt_contribution_hooks_.empty();
         default:
             // 其余对齐 OpenClaw 的hook 暂未在 tool 层装配 registry（宿主层直接分发）。
             return false;
@@ -1077,6 +1220,14 @@ size_t ToolHookManager::hook_count(PluginHookName name) const {
         case PluginHookName::GATEWAY_STOP:             return gateway_stop_hooks_.size();
         case PluginHookName::CRON_RECONCILED:          return cron_reconciled_hooks_.size();
         case PluginHookName::CRON_CHANGED:             return cron_changed_hooks_.size();
+        case PluginHookName::SKILL_CHANGED:            return skill_changed_hooks_.size();
+        case PluginHookName::SKILL_PROPOSAL_CHANGED:   return skill_proposal_changed_hooks_.size();
+        case PluginHookName::SKILL_PROPOSAL_EVALUATE:  return skill_proposal_evaluate_hooks_.size();
+        case PluginHookName::SUBAGENT_PROGRESS:        return subagent_progress_hooks_.size();
+        case PluginHookName::DEACTIVATE:               return deactivate_hooks_.size();
+        case PluginHookName::BEFORE_INSTALL:           return before_install_hooks_.size();
+        case PluginHookName::RESOLVE_EXEC_ENV:         return resolve_exec_env_hooks_.size();
+        case PluginHookName::HEARTBEAT_PROMPT_CONTRIBUTION: return heartbeat_prompt_contribution_hooks_.size();
         default:
             return 0;
     }

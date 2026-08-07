@@ -2,6 +2,7 @@
 // ClawHub registry: search, install, update skills from remote registry.
 #include "hunterclaw/skills/skill.h"
 #include "hunterclaw/core/utils.h"
+#include "hunterclaw/tools/tool_hooks.h"
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 #include <filesystem>
@@ -163,6 +164,35 @@ InstallClawHubSkillResult ClawHubManager::install(
             return result;
         }
 
+        // 🎯 Plugin hook: before_install (gate) — 对齐 OpenClaw runBeforeInstall
+        //   skill 安装前，插件可扫描并 block（如安全策略）。block则中止安装。
+        {
+            auto* hook_mgr = tools::get_global_hook_manager();
+            if (hook_mgr && hook_mgr->has_hooks(plugins::PluginHookName::BEFORE_INSTALL)) {
+                plugins::PluginHookBeforeInstallEvent bi_event;
+                bi_event.target_type = "skill";
+                bi_event.target_name = slug;
+                bi_event.source_path = url_base;
+                bi_event.source_path_kind = "clawhub";
+                bi_event.origin = url_base;
+                plugins::PluginHookBeforeInstallContext bi_ctx;
+                bi_ctx.target_type = "skill";
+                bi_ctx.request_kind = "install";
+                bi_ctx.origin = url_base;
+                try {
+                    auto gate = hook_mgr->run_before_install(bi_event, bi_ctx);
+                    if (gate && gate->block) {
+                        result.error = "Skill install blocked by plugin: " +
+                            gate->block_reason.value_or("policy");
+                        log()->warn("before_install blocked skill {}", slug);
+                        return result;
+                    }
+                } catch (const std::exception& e) {
+                    log()->warn("before_install hook failed: {}", e.what());
+                }
+            }
+        }
+
         // 3. Download archive
         log()->info("Downloading {}@{} from ClawHub...", slug, resolved_version);
         fs::path tmp_archive = fs::temp_directory_path() / ("clawhub-" + slug + ".tgz");
@@ -208,6 +238,28 @@ InstallClawHubSkillResult ClawHubManager::install(
         result.version = resolved_version;
         result.target_dir = target.string();
         log()->info("Installed {}@{} -> {}", slug, resolved_version, target.string());
+
+        // 🎯 Plugin hook: skill_changed (void 观测) — 对齐 OpenClaw runSkillChanged
+        //   skill artifact 安装完成（action="created", source="clawhub"）通知插件。
+        {
+            auto* hook_mgr = tools::get_global_hook_manager();
+            if (hook_mgr && hook_mgr->has_hooks(plugins::PluginHookName::SKILL_CHANGED)) {
+                plugins::PluginHookSkillChangedEvent sc_event;
+                sc_event.action = "created";
+                sc_event.source = "clawhub";
+                sc_event.occurred_at = std::to_string(origin.installed_at);
+                nlohmann::json after;
+                after["slug"] = slug;
+                after["version"] = resolved_version;
+                after["targetDir"] = target.string();
+                sc_event.after_json = after.dump();
+                plugins::PluginHookSkillContext sc_ctx;
+                sc_ctx.workspace_dir = workspace_dir;
+                try {
+                    hook_mgr->run_skill_changed(sc_event, sc_ctx);
+                } catch (...) { /* fire-and-forget */ }
+            }
+        }
 
     } catch (const std::exception& e) {
         result.error = e.what();
