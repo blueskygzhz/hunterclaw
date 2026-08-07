@@ -10,11 +10,85 @@
 #include <random>
 #include <chrono>
 #include <iomanip>
+#include <regex>
 
 namespace hunterclaw {
 namespace memory {
 
 namespace {
+
+// 🎯 严格对齐 OpenClaw memory 注解 (project-memory-bootstrap: HTML 注释携带):
+//   <!-- importance: 8 -->  <!-- trigger: release helper -->  <!-- project: key -->
+//   从 chunk 文本解析召回元数据，写入 memory_index_chunk_recall_metadata。
+struct RecallAnnotation {
+    std::optional<int> importance;      // 1..10 (超出范围忽略)
+    std::optional<std::string> triggers;
+    std::optional<std::string> project_key;
+    bool any() const { return importance || triggers || project_key; }
+};
+
+inline std::string trim_copy(const std::string& s) {
+    size_t b = s.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return "";
+    size_t e = s.find_last_not_of(" \t\r\n");
+    return s.substr(b, e - b + 1);
+}
+
+RecallAnnotation parse_recall_annotation(const std::string& text) {
+    RecallAnnotation ann;
+    // importance: 捕获 1-2 位数字
+    static const std::regex re_importance(
+        R"(<!--\s*importance\s*:\s*([0-9]{1,2})\s*-->)", std::regex::icase);
+    // trigger(s): 捕获到 --> 前的内容
+    static const std::regex re_trigger(
+        R"(<!--\s*triggers?\s*:\s*(.*?)\s*-->)", std::regex::icase);
+    // project: 捕获到 --> 前的内容（可能多个，用 ; 合并）
+    static const std::regex re_project(
+        R"(<!--\s*project\s*:\s*(.*?)\s*-->)", std::regex::icase);
+
+    std::smatch m;
+    if (std::regex_search(text, m, re_importance) && m.size() > 1) {
+        int v = std::atoi(m[1].str().c_str());
+        if (v >= 1 && v <= 10) ann.importance = v;   // 对齐 CHECK(importance BETWEEN 1 AND 10)
+    }
+    // triggers: 可能多条，用 "; " 连接（对齐 OC 存储为单字符串）
+    {
+        std::vector<std::string> parts;
+        auto begin = std::sregex_iterator(text.begin(), text.end(), re_trigger);
+        auto end = std::sregex_iterator();
+        for (auto it = begin; it != end; ++it) {
+            std::string v = trim_copy((*it)[1].str());
+            if (!v.empty()) parts.push_back(v);
+        }
+        if (!parts.empty()) {
+            std::string joined;
+            for (size_t i = 0; i < parts.size(); ++i) {
+                if (i) joined += "; ";
+                joined += parts[i];
+            }
+            ann.triggers = joined;
+        }
+    }
+    // project keys: 多条用 ";" 连接（对齐 OC project_key split(";")）
+    {
+        std::vector<std::string> keys;
+        auto begin = std::sregex_iterator(text.begin(), text.end(), re_project);
+        auto end = std::sregex_iterator();
+        for (auto it = begin; it != end; ++it) {
+            std::string v = trim_copy((*it)[1].str());
+            if (!v.empty()) keys.push_back(v);
+        }
+        if (!keys.empty()) {
+            std::string joined;
+            for (size_t i = 0; i < keys.size(); ++i) {
+                if (i) joined += ";";
+                joined += keys[i];
+            }
+            ann.project_key = joined;
+        }
+    }
+    return ann;
+}
 
 // Helper: execute SQL without result
 bool exec_sql(sqlite3* db, const std::string& sql, std::string* error = nullptr) {
@@ -525,6 +599,35 @@ core::Result<std::string> SQLiteVectorStorage::add_chunk(
             sqlite3_bind_int64(pstmt, 2, updated_at);
             sqlite3_step(pstmt);
             sqlite3_finalize(pstmt);
+        }
+    }
+
+    // 🎯 严格对齐 OC recall curation: 从 chunk 文本解析 importance/triggers/project
+    //   注解并upsert 到 memory_index_chunk_recall_metadata（懒写：无注解则不写，
+    //   读时返回 null）。对齐 memory-schema-recall.ts 的 ON CONFLICT(chunk_id) upsert。
+    {
+        RecallAnnotation ann = parse_recall_annotation(content);
+        if (ann.any()) {
+            sqlite3_stmt* rstmt = prepare_stmt(db_, R"(
+                INSERT INTO memory_index_chunk_recall_metadata
+                (chunk_id, importance, triggers, project_key)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(chunk_id) DO UPDATE SET
+                    importance = excluded.importance,
+                    triggers = excluded.triggers,
+                    project_key = excluded.project_key
+            )");
+            if (rstmt) {
+                sqlite3_bind_text(rstmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
+                if (ann.importance) sqlite3_bind_int(rstmt, 2, *ann.importance);
+                else sqlite3_bind_null(rstmt, 2);
+                if (ann.triggers) sqlite3_bind_text(rstmt, 3, ann.triggers->c_str(), -1, SQLITE_TRANSIENT);
+                else sqlite3_bind_null(rstmt, 3);
+                if (ann.project_key) sqlite3_bind_text(rstmt, 4, ann.project_key->c_str(), -1, SQLITE_TRANSIENT);
+                else sqlite3_bind_null(rstmt, 4);
+                sqlite3_step(rstmt);
+                sqlite3_finalize(rstmt);
+            }
         }
     }
 
@@ -1150,6 +1253,57 @@ core::Result<int64_t> SQLiteVectorStorage::get_index_revision() {
     }
     sqlite3_finalize(stmt);
     return core::Result<int64_t>::Ok(revision);
+}
+
+// 🎯 对齐 OC readMemoryRecallMetadata: 批量读取 chunk 召回元数据（left join）。
+core::Result<std::map<std::string, SQLiteVectorStorage::RecallMetadata>>
+SQLiteVectorStorage::get_recall_metadata(const std::vector<std::string>& chunk_ids) {
+    std::map<std::string, RecallMetadata> result;
+    if (!db_) {
+        return core::Result<std::map<std::string, RecallMetadata>>::Err("Database not open");
+    }
+    if (chunk_ids.empty()) {
+        return core::Result<std::map<std::string, RecallMetadata>>::Ok(result);
+    }
+    // 构造 IN (?, ?, ...) 占位符
+    std::string placeholders;
+    for (size_t i = 0; i < chunk_ids.size(); ++i) {
+        if (i) placeholders += ",";
+        placeholders += "?";
+    }
+    std::string sql =
+        "SELECT chunk.id, metadata.importance, metadata.triggers, metadata.project_key "
+        "FROM memory_index_chunks AS chunk "
+        "LEFT JOIN memory_index_chunk_recall_metadata AS metadata ON metadata.chunk_id = chunk.id "
+        "WHERE chunk.id IN (" + placeholders + ")";
+
+    std::string error;
+    sqlite3_stmt* stmt = prepare_stmt(db_, sql, &error);
+    if (!stmt) {
+        return core::Result<std::map<std::string, RecallMetadata>>::Err(
+            "Failed to query recall metadata: " + error);
+    }
+    for (size_t i = 0; i < chunk_ids.size(); ++i) {
+        sqlite3_bind_text(stmt, static_cast<int>(i + 1), chunk_ids[i].c_str(), -1, SQLITE_TRANSIENT);
+    }
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char* cid = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        if (!cid) continue;
+        RecallMetadata meta;
+        if (sqlite3_column_type(stmt, 1) != SQLITE_NULL)
+            meta.importance = sqlite3_column_int(stmt, 1);
+        if (sqlite3_column_type(stmt, 2) != SQLITE_NULL) {
+            const char* t = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+            if (t) meta.triggers = std::string(t);
+        }
+        if (sqlite3_column_type(stmt, 3) != SQLITE_NULL) {
+            const char* p = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+            if (p) meta.project_key = std::string(p);
+        }
+        result[std::string(cid)] = std::move(meta);
+    }
+    sqlite3_finalize(stmt);
+    return core::Result<std::map<std::string, RecallMetadata>>::Ok(result);
 }
 
 // ============================================================================

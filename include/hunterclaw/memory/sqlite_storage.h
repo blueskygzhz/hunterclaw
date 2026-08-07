@@ -7,6 +7,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <map>
 
 namespace hunterclaw {
 namespace memory {
@@ -134,6 +135,17 @@ public:
     // 🎯 对齐 OC memory_index_state: 读取当前索引 revision（供缓存失效/增量同步）。
     //   SELECT revision FROM memory_index_state WHERE id = 1。
     core::Result<int64_t> get_index_revision();
+
+    // 🎯 对齐 OC readMemoryRecallMetadata (memory-recall-metadata.ts):
+    //   批量读取 chunk 的召回元数据（importance/triggers/project_key），
+    //   left join，未命中字段为空。供检索加权/触发/项目过滤使用。
+    struct RecallMetadata {
+        std::optional<int> importance;
+        std::optional<std::string> triggers;
+        std::optional<std::string> project_key;
+    };
+    core::Result<std::map<std::string, RecallMetadata>> get_recall_metadata(
+        const std::vector<std::string>& chunk_ids);
     
     // ========================================================================
     // 状态查询
