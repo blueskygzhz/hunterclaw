@@ -884,6 +884,33 @@ struct PluginHookGatewayStopEvent {
 };
 
 // ============================================================================
+// Plugin Hook — cron_reconciled / cron_changed (void 观测)
+//   对齐 OpenClaw PluginHookCronReconciledEvent/Context + CronChangedEvent
+//   (hook-types.ts:969 / 1054)。cron 调度对账+ job 生命周期变更通知。
+// ============================================================================
+
+struct PluginHookCronReconciledEvent {
+  std::string reason;   // "startup" | "reload"
+  bool enabled = false;
+};
+
+struct PluginHookCronReconciledContext {
+  std::optional<int> port;
+  std::optional<std::string> workspace_dir;
+};
+
+struct PluginHookCronChangedEvent {
+  std::string action;   // "added"|"updated"|"removed"|"started"|"finished"|"scheduled"
+  std::string job_id;
+  std::optional<std::string> job_json;
+  std::optional<std::string> session_target;
+  std::optional<std::string> agent_id;
+  std::optional<int64_t> next_run_at_ms;
+  std::optional<std::string> status;    // finished 时: "ok"|"error"|"skipped"
+  std::optional<std::string> error;
+};
+
+// ============================================================================
 // Plugin Hook Handler & Options
 // ============================================================================
 

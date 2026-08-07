@@ -168,6 +168,8 @@ IMPL_REGISTER(register_subagent_ended,       subagent_ended_hooks_,       Subage
 // Gateway hooks
 IMPL_REGISTER(register_gateway_start,        gateway_start_hooks_,        GatewayStartEntry,       GatewayStartHandler)
 IMPL_REGISTER(register_gateway_stop,         gateway_stop_hooks_,         GatewayStopEntry,        GatewayStopHandler)
+IMPL_REGISTER(register_cron_reconciled,      cron_reconciled_hooks_,      CronReconciledEntry,     CronReconciledHandler)
+IMPL_REGISTER(register_cron_changed,         cron_changed_hooks_,         CronChangedEntry,        CronChangedHandler)
 
 #undef IMPL_REGISTER
 
@@ -277,6 +279,8 @@ IMPL_VOID_HOOK(run_subagent_ended,     subagent_ended_hooks_,    PluginHookSubag
 // Gateway void hooks
 IMPL_VOID_HOOK(run_gateway_start,      gateway_start_hooks_,     PluginHookGatewayStartEvent,     PluginHookGatewayContext, "gateway_start")
 IMPL_VOID_HOOK(run_gateway_stop,       gateway_stop_hooks_,      PluginHookGatewayStopEvent,      PluginHookGatewayContext, "gateway_stop")
+IMPL_VOID_HOOK(run_cron_reconciled,    cron_reconciled_hooks_,   PluginHookCronReconciledEvent,   PluginHookCronReconciledContext, "cron_reconciled")
+IMPL_VOID_HOOK(run_cron_changed,       cron_changed_hooks_,      PluginHookCronChangedEvent,      PluginHookGatewayContext, "cron_changed")
 
 #undef IMPL_VOID_HOOK
 
@@ -1025,6 +1029,8 @@ bool ToolHookManager::has_hooks(PluginHookName name) const {
         case PluginHookName::REPLY_DISPATCH:           return !reply_dispatch_hooks_.empty();
         case PluginHookName::GATEWAY_START:            return !gateway_start_hooks_.empty();
         case PluginHookName::GATEWAY_STOP:             return !gateway_stop_hooks_.empty();
+        case PluginHookName::CRON_RECONCILED:          return !cron_reconciled_hooks_.empty();
+        case PluginHookName::CRON_CHANGED:             return !cron_changed_hooks_.empty();
         default:
             // 其余对齐 OpenClaw 的hook 暂未在 tool 层装配 registry（宿主层直接分发）。
             return false;
@@ -1069,6 +1075,8 @@ size_t ToolHookManager::hook_count(PluginHookName name) const {
         case PluginHookName::REPLY_DISPATCH:           return reply_dispatch_hooks_.size();
         case PluginHookName::GATEWAY_START:            return gateway_start_hooks_.size();
         case PluginHookName::GATEWAY_STOP:             return gateway_stop_hooks_.size();
+        case PluginHookName::CRON_RECONCILED:          return cron_reconciled_hooks_.size();
+        case PluginHookName::CRON_CHANGED:             return cron_changed_hooks_.size();
         default:
             return 0;
     }

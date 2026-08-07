@@ -2084,6 +2084,7 @@ core::Result<bool> GatewayServer::start() {
         // Creates CronService with injected deps and starts the scheduler loop.
         {
             cron::CronServiceDeps cron_deps;
+            bool cron_enabled_snapshot = cron_deps.cron_enabled;  // 🎯 供 cron_reconciled hook
 
             // now_ms: default (std::chrono::system_clock)
 
@@ -2094,6 +2095,7 @@ core::Result<bool> GatewayServer::start() {
                     const auto& cron_cfg = data["cron"];
                     if (cron_cfg.contains("enabled") && cron_cfg["enabled"].is_boolean()) {
                         cron_deps.cron_enabled = cron_cfg["enabled"].get<bool>();
+                        cron_enabled_snapshot = cron_deps.cron_enabled;
                     }
                     // CronConfig: maxConcurrentRuns
                     cron::CronConfig cc;
@@ -2403,6 +2405,24 @@ core::Result<bool> GatewayServer::start() {
                     ef.payload = payload;
                     server_impl->broadcast(ef, /*drop_if_slow=*/true, nullptr);
                 }
+                // 🎯 Plugin hook: cron_changed (void观测) — 对齐 OpenClaw runCronChanged
+                //   job 生命周期变更（added/updated/removed/started/finished）通知插件。
+                {
+                    auto* hook_mgr = tools::get_global_hook_manager();
+                    if (hook_mgr && hook_mgr->has_hooks(plugins::PluginHookName::CRON_CHANGED)) {
+                        plugins::PluginHookCronChangedEvent cc_event;
+                        cc_event.action = evt.action;
+                        cc_event.job_id = evt.job_id;
+                        if (evt.next_run_at_ms.has_value()) cc_event.next_run_at_ms = *evt.next_run_at_ms;
+                        if (evt.status.has_value()) cc_event.status = cron::cron_run_status_to_string(*evt.status);
+                        if (evt.error.has_value()) cc_event.error = *evt.error;
+                        if (evt.session_key.has_value()) cc_event.session_target = *evt.session_key;
+                        plugins::PluginHookGatewayContext cc_ctx;
+                        try {
+                            hook_mgr->run_cron_changed(cc_event, cc_ctx);
+                        } catch (...) { /* fire-and-forget */ }
+                    }
+                }
                 // 2. TODO: appendCronRunLog for "finished" events (requires file-backed store)
                 // 3. TODO: webhook POST for "finished" events with delivery.mode=webhook
             };
@@ -2469,6 +2489,21 @@ core::Result<bool> GatewayServer::start() {
             auto cron_store = cron::createMemoryCronStore();
             impl_->cron_service = cron::createCronService(std::move(cron_store), std::move(cron_deps));
             impl_->cron_service->start();
+
+            // 🎯 Plugin hook: cron_reconciled (void 观测) — 对齐 OpenClaw runCronReconciled
+            //   cron 调度启动对账后通知插件（reason="startup"）。
+            {
+                auto* hook_mgr = tools::get_global_hook_manager();
+                if (hook_mgr && hook_mgr->has_hooks(plugins::PluginHookName::CRON_RECONCILED)) {
+                    plugins::PluginHookCronReconciledEvent cr_event;
+                    cr_event.reason = "startup";
+                    cr_event.enabled = cron_enabled_snapshot;
+                    plugins::PluginHookCronReconciledContext cr_ctx;
+                    try {
+                        hook_mgr->run_cron_reconciled(cr_event, cr_ctx);
+                    } catch (...) { /* fire-and-forget */ }
+                }
+            }
 
             // Store run_heartbeat_once_fn pointer so we can patch it after heartbeat_runner is built
             // (heartbeat_runner is built below, after this block)

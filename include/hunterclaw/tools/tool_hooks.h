@@ -79,6 +79,9 @@ using plugins::PluginHookBeforeDispatchResult;
 using plugins::PluginHookReplyDispatchEvent;
 using plugins::PluginHookReplyDispatchContext;
 using plugins::PluginHookReplyDispatchResult;
+using plugins::PluginHookCronReconciledEvent;
+using plugins::PluginHookCronReconciledContext;
+using plugins::PluginHookCronChangedEvent;
 using plugins::PluginHookLlmInputEvent;
 using plugins::PluginHookLlmOutputEvent;
 using plugins::PluginHookLlmOutputUsage;
@@ -308,9 +311,16 @@ using SubagentEndedHandler = std::function<
 using GatewayStartHandler = std::function<
     void(const PluginHookGatewayStartEvent& event,
          const PluginHookGatewayContext& ctx)>;
-
 using GatewayStopHandler = std::function<
     void(const PluginHookGatewayStopEvent& event,
+         const PluginHookGatewayContext& ctx)>;
+
+// cron_reconciled / cron_changed — void 观测 hook
+using CronReconciledHandler = std::function<
+    void(const PluginHookCronReconciledEvent& event,
+         const PluginHookCronReconciledContext& ctx)>;
+using CronChangedHandler = std::function<
+    void(const PluginHookCronChangedEvent& event,
          const PluginHookGatewayContext& ctx)>;
 
 // ============================================================================
@@ -381,6 +391,8 @@ public:
 
     void register_gateway_start(const std::string& plugin_id, GatewayStartHandler handler, int priority = 0);
     void register_gateway_stop(const std::string& plugin_id, GatewayStopHandler handler, int priority = 0);
+    void register_cron_reconciled(const std::string& plugin_id, CronReconciledHandler handler, int priority = 0);
+    void register_cron_changed(const std::string& plugin_id, CronChangedHandler handler, int priority = 0);
 
     // ========== Unregister ==========
 
@@ -553,6 +565,10 @@ public:
     /// Run gateway_stop hooks (void, sequential)
     void run_gateway_stop(const PluginHookGatewayStopEvent& event, const PluginHookGatewayContext& ctx);
 
+    /// Run cron_reconciled / cron_changed hooks (void, sequential)
+    void run_cron_reconciled(const PluginHookCronReconciledEvent& event, const PluginHookCronReconciledContext& ctx);
+    void run_cron_changed(const PluginHookCronChangedEvent& event, const PluginHookGatewayContext& ctx);
+
     // ========== Query ==========
 
     bool has_hooks(PluginHookName name) const;
@@ -610,6 +626,8 @@ private:
     // ---- Gateway hook entries ----
     struct GatewayStartEntry        { std::string plugin_id; GatewayStartHandler        handler; int priority = 0; };
     struct GatewayStopEntry         { std::string plugin_id; GatewayStopHandler         handler; int priority = 0; };
+    struct CronReconciledEntry      { std::string plugin_id; CronReconciledHandler      handler; int priority = 0; };
+    struct CronChangedEntry         { std::string plugin_id; CronChangedHandler         handler; int priority = 0; };
 
     mutable std::mutex mutex_;
 
@@ -654,6 +672,8 @@ private:
     // Gateway hooks
     std::vector<GatewayStartEntry>           gateway_start_hooks_;
     std::vector<GatewayStopEntry>            gateway_stop_hooks_;
+    std::vector<CronReconciledEntry>         cron_reconciled_hooks_;
+    std::vector<CronChangedEntry>            cron_changed_hooks_;
 
     // Helper: sort by priority descending (higher first)
     template<typename T>
