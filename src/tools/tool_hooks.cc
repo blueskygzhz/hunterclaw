@@ -64,17 +64,24 @@ namespace {
 std::string plugin_hook_name_to_string(PluginHookName name) {
     switch (name) {
         case PluginHookName::BEFORE_MODEL_RESOLVE:       return "before_model_resolve";
+        case PluginHookName::AGENT_TURN_PREPARE:         return "agent_turn_prepare";
         case PluginHookName::BEFORE_PROMPT_BUILD:        return "before_prompt_build";
         case PluginHookName::BEFORE_AGENT_START:         return "before_agent_start";
         case PluginHookName::BEFORE_AGENT_REPLY:         return "before_agent_reply";
+        case PluginHookName::MODEL_CALL_STARTED:         return "model_call_started";
+        case PluginHookName::MODEL_CALL_ENDED:           return "model_call_ended";
         case PluginHookName::LLM_INPUT:                  return "llm_input";
         case PluginHookName::LLM_OUTPUT:                 return "llm_output";
+        case PluginHookName::BEFORE_AGENT_FINALIZE:      return "before_agent_finalize";
         case PluginHookName::AGENT_END:                  return "agent_end";
         case PluginHookName::BEFORE_COMPACTION:          return "before_compaction";
         case PluginHookName::AFTER_COMPACTION:           return "after_compaction";
         case PluginHookName::BEFORE_RESET:               return "before_reset";
+        case PluginHookName::INBOUND_CLAIM:              return "inbound_claim";
+        case PluginHookName::CHANNEL_PAIRING_REQUESTED:  return "channel_pairing_requested";
         case PluginHookName::MESSAGE_RECEIVED:           return "message_received";
         case PluginHookName::MESSAGE_SENDING:            return "message_sending";
+        case PluginHookName::REPLY_PAYLOAD_SENDING:      return "reply_payload_sending";
         case PluginHookName::MESSAGE_SENT:               return "message_sent";
         case PluginHookName::BEFORE_TOOL_CALL:           return "before_tool_call";
         case PluginHookName::AFTER_TOOL_CALL:            return "after_tool_call";
@@ -85,9 +92,22 @@ std::string plugin_hook_name_to_string(PluginHookName name) {
         case PluginHookName::SUBAGENT_SPAWNING:          return "subagent_spawning";
         case PluginHookName::SUBAGENT_DELIVERY_TARGET:   return "subagent_delivery_target";
         case PluginHookName::SUBAGENT_SPAWNED:           return "subagent_spawned";
+        case PluginHookName::SUBAGENT_PROGRESS:          return "subagent_progress";
         case PluginHookName::SUBAGENT_ENDED:             return "subagent_ended";
+        case PluginHookName::DEACTIVATE:                 return "deactivate";
         case PluginHookName::GATEWAY_START:              return "gateway_start";
         case PluginHookName::GATEWAY_STOP:               return "gateway_stop";
+        case PluginHookName::HEARTBEAT_PROMPT_CONTRIBUTION: return "heartbeat_prompt_contribution";
+        case PluginHookName::CRON_RECONCILED:            return "cron_reconciled";
+        case PluginHookName::CRON_CHANGED:               return "cron_changed";
+        case PluginHookName::SKILL_PROPOSAL_EVALUATE:    return "skill_proposal_evaluate";
+        case PluginHookName::SKILL_PROPOSAL_CHANGED:     return "skill_proposal_changed";
+        case PluginHookName::SKILL_CHANGED:              return "skill_changed";
+        case PluginHookName::BEFORE_DISPATCH:            return "before_dispatch";
+        case PluginHookName::REPLY_DISPATCH:             return "reply_dispatch";
+        case PluginHookName::BEFORE_INSTALL:             return "before_install";
+        case PluginHookName::BEFORE_AGENT_RUN:           return "before_agent_run";
+        case PluginHookName::RESOLVE_EXEC_ENV:           return "resolve_exec_env";
         default:                                         return "unknown";
     }
 }
@@ -113,6 +133,11 @@ IMPL_REGISTER(register_before_prompt_build,  before_prompt_build_hooks_,  Before
 IMPL_REGISTER(register_before_agent_start,   before_agent_start_hooks_,   BeforeAgentStartEntry,   BeforeAgentStartHandler)
 IMPL_REGISTER(register_before_agent_reply,   before_agent_reply_hooks_,   BeforeAgentReplyEntry,   BeforeAgentReplyHandler)
 IMPL_REGISTER(register_llm_input,            llm_input_hooks_,            LlmInputEntry,           LlmInputHandler)
+IMPL_REGISTER(register_model_call_started,   model_call_started_hooks_,   ModelCallStartedEntry,   ModelCallStartedHandler)
+IMPL_REGISTER(register_model_call_ended,     model_call_ended_hooks_,     ModelCallEndedEntry,     ModelCallEndedHandler)
+IMPL_REGISTER(register_agent_turn_prepare,   agent_turn_prepare_hooks_,   AgentTurnPrepareEntry,   AgentTurnPrepareHandler)
+IMPL_REGISTER(register_before_agent_finalize,before_agent_finalize_hooks_,BeforeAgentFinalizeEntry,BeforeAgentFinalizeHandler)
+IMPL_REGISTER(register_before_agent_run,     before_agent_run_hooks_,     BeforeAgentRunEntry,     BeforeAgentRunHandler)
 IMPL_REGISTER(register_llm_output,           llm_output_hooks_,           LlmOutputEntry,          LlmOutputHandler)
 IMPL_REGISTER(register_agent_end,            agent_end_hooks_,            AgentEndEntry,           AgentEndHandler)
 IMPL_REGISTER(register_before_compaction,    before_compaction_hooks_,    BeforeCompactionEntry,   BeforeCompactionHandler)
@@ -226,6 +251,8 @@ void ToolHookManager::run_method(const EventType& event, const CtxType& ctx)    
 
 // Agent void hooks
 IMPL_VOID_HOOK(run_llm_input,          llm_input_hooks_,         PluginHookLlmInputEvent,         PluginHookAgentContext,   "llm_input")
+IMPL_VOID_HOOK(run_model_call_started, model_call_started_hooks_,PluginHookModelCallStartedEvent, PluginHookAgentContext,   "model_call_started")
+IMPL_VOID_HOOK(run_model_call_ended,   model_call_ended_hooks_,  PluginHookModelCallEndedEvent,   PluginHookAgentContext,   "model_call_ended")
 IMPL_VOID_HOOK(run_llm_output,         llm_output_hooks_,        PluginHookLlmOutputEvent,        PluginHookAgentContext,   "llm_output")
 IMPL_VOID_HOOK(run_agent_end,          agent_end_hooks_,         PluginHookAgentEndEvent,         PluginHookAgentContext,   "agent_end")
 IMPL_VOID_HOOK(run_before_compaction,  before_compaction_hooks_, PluginHookBeforeCompactionEvent, PluginHookAgentContext,   "before_compaction")
@@ -435,6 +462,111 @@ std::optional<PluginHookBeforeAgentReplyResult> ToolHookManager::run_before_agen
         }
     }
     return std::nullopt;  // no handler claimed the turn
+}
+
+// ============================================================================
+// run_agent_turn_prepare (modifying hook)
+//   对齐 OpenClaw runAgentTurnPrepare + mergeAgentTurnPrepare：
+//   顺序执行所有 handler，拼接 prepend/append context。
+// ============================================================================
+
+std::optional<PluginHookAgentTurnPrepareResult> ToolHookManager::run_agent_turn_prepare(
+    const PluginHookAgentTurnPrepareEvent& event,
+    const PluginHookAgentContext& ctx)
+{
+    std::vector<AgentTurnPrepareEntry> hooks;
+    { std::lock_guard<std::mutex> lock(mutex_); hooks = agent_turn_prepare_hooks_; }
+    if (hooks.empty()) return std::nullopt;
+
+    std::optional<PluginHookAgentTurnPrepareResult> accumulated;
+    for (const auto& entry : hooks) {
+        try {
+            auto result = entry.handler(event, ctx);
+            if (!result) continue;
+            if (!accumulated) accumulated = PluginHookAgentTurnPrepareResult{};
+            accumulated->prepend_context = concat_optional(accumulated->prepend_context, result->prepend_context);
+            accumulated->append_context  = concat_optional(accumulated->append_context,  result->append_context);
+        } catch (const std::exception& e) {
+            log()->error("[hooks] agent_turn_prepare handler from '{}' failed: {}",
+                entry.plugin_id, e.what());
+        }
+    }
+    return accumulated;
+}
+
+// ============================================================================
+// run_before_agent_finalize (modifying hook)
+//   对齐 OpenClaw runBeforeAgentFinalize + mergeBeforeAgentFinalize：
+//   revise 优先累积（reason 用空行拼接、retry 取首个有效）；finalize 可强制收尾。
+// ============================================================================
+
+std::optional<PluginHookBeforeAgentFinalizeResult> ToolHookManager::run_before_agent_finalize(
+    const PluginHookBeforeAgentFinalizeEvent& event,
+    const PluginHookAgentContext& ctx)
+{
+    std::vector<BeforeAgentFinalizeEntry> hooks;
+    { std::lock_guard<std::mutex> lock(mutex_); hooks = before_agent_finalize_hooks_; }
+    if (hooks.empty()) return std::nullopt;
+
+    std::optional<PluginHookBeforeAgentFinalizeResult> accumulated;
+    for (const auto& entry : hooks) {
+        try {
+            auto result = entry.handler(event, ctx);
+            if (!result) continue;
+            if (!accumulated) { accumulated = *result; continue; }
+            // finalize 覆盖 revise（强制收尾）；否则 revise 累积。
+            const std::string cur_action = result->action.value_or("continue");
+            const std::string acc_action = accumulated->action.value_or("continue");
+            if (cur_action == "finalize") {
+                accumulated->action = "finalize";
+                if (result->reason) accumulated->reason = result->reason;
+            } else if (cur_action == "revise" && acc_action != "finalize") {
+                accumulated->action = "revise";
+                accumulated->reason = concat_optional(accumulated->reason, result->reason);
+                if (!accumulated->retry && result->retry) accumulated->retry = result->retry;
+            }
+        } catch (const std::exception& e) {
+            log()->error("[hooks] before_agent_finalize handler from '{}' failed: {}",
+                entry.plugin_id, e.what());
+        }
+    }
+    return accumulated;
+}
+
+// ============================================================================
+// run_before_agent_run (gate hook)
+//   对齐 OpenClaw runBeforeAgentRun：返回最严格 pass/block（block 优先，第一个
+//   block 胜出并短路）；handler 返回 nullopt 视为 pass；handler抛异常 → fail-closed
+//   （视为 block，reason="before_agent_run hook failed"）。
+// ============================================================================
+
+std::optional<PluginHookBeforeAgentRunResult> ToolHookManager::run_before_agent_run(
+    const PluginHookBeforeAgentRunEvent& event,
+    const PluginHookAgentContext& ctx)
+{
+    std::vector<BeforeAgentRunEntry> hooks;
+    { std::lock_guard<std::mutex> lock(mutex_); hooks = before_agent_run_hooks_; }
+    if (hooks.empty()) return std::nullopt;
+
+    for (const auto& entry : hooks) {
+        try {
+            auto result = entry.handler(event, ctx);
+            // nullopt / block=false → pass，继续。
+            if (result && result->block) {
+                log()->warn("[hooks] before_agent_run blocked by '{}'", entry.plugin_id);
+                return result;  // 第一个 block 胜出，短路
+            }
+        } catch (const std::exception& e) {
+            // fail-closed：hook 异常直接 block
+            log()->warn("[hooks] before_agent_run handler from '{}' failed; blocking: {}",
+                entry.plugin_id, e.what());
+            PluginHookBeforeAgentRunResult blocked;
+            blocked.block = true;
+            blocked.reason = "before_agent_run hook failed";
+            return blocked;
+        }
+    }
+    return std::nullopt;  // 全部 pass
 }
 
 // ============================================================================
@@ -747,10 +879,17 @@ bool ToolHookManager::has_hooks(PluginHookName name) const {
         case PluginHookName::SUBAGENT_DELIVERY_TARGET: return !subagent_delivery_target_hooks_.empty();
         case PluginHookName::SUBAGENT_SPAWNED:         return !subagent_spawned_hooks_.empty();
         case PluginHookName::SUBAGENT_ENDED:           return !subagent_ended_hooks_.empty();
+        case PluginHookName::MODEL_CALL_STARTED:       return !model_call_started_hooks_.empty();
+        case PluginHookName::MODEL_CALL_ENDED:         return !model_call_ended_hooks_.empty();
+        case PluginHookName::AGENT_TURN_PREPARE:       return !agent_turn_prepare_hooks_.empty();
+        case PluginHookName::BEFORE_AGENT_FINALIZE:    return !before_agent_finalize_hooks_.empty();
+        case PluginHookName::BEFORE_AGENT_RUN:         return !before_agent_run_hooks_.empty();
         case PluginHookName::GATEWAY_START:            return !gateway_start_hooks_.empty();
         case PluginHookName::GATEWAY_STOP:             return !gateway_stop_hooks_.empty();
+        default:
+            // 其余对齐 OpenClaw 的hook 暂未在 tool 层装配 registry（宿主层直接分发）。
+            return false;
     }
-    return false;
 }
 
 size_t ToolHookManager::hook_count(PluginHookName name) const {
@@ -779,10 +918,16 @@ size_t ToolHookManager::hook_count(PluginHookName name) const {
         case PluginHookName::SUBAGENT_DELIVERY_TARGET: return subagent_delivery_target_hooks_.size();
         case PluginHookName::SUBAGENT_SPAWNED:         return subagent_spawned_hooks_.size();
         case PluginHookName::SUBAGENT_ENDED:           return subagent_ended_hooks_.size();
+        case PluginHookName::MODEL_CALL_STARTED:       return model_call_started_hooks_.size();
+        case PluginHookName::MODEL_CALL_ENDED:         return model_call_ended_hooks_.size();
+        case PluginHookName::AGENT_TURN_PREPARE:       return agent_turn_prepare_hooks_.size();
+        case PluginHookName::BEFORE_AGENT_FINALIZE:    return before_agent_finalize_hooks_.size();
+        case PluginHookName::BEFORE_AGENT_RUN:         return before_agent_run_hooks_.size();
         case PluginHookName::GATEWAY_START:            return gateway_start_hooks_.size();
         case PluginHookName::GATEWAY_STOP:             return gateway_stop_hooks_.size();
+        default:
+            return 0;
     }
-    return 0;
 }
 
 bool ToolHookManager::has_before_tool_call_hooks() const {

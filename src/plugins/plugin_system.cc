@@ -559,17 +559,24 @@ std::string plugin_status_to_string(PluginStatus status) {
 std::string plugin_hook_name_to_string(PluginHookName hook) {
   switch (hook) {
     case PluginHookName::BEFORE_MODEL_RESOLVE: return "before_model_resolve";
+    case PluginHookName::AGENT_TURN_PREPARE: return "agent_turn_prepare";
     case PluginHookName::BEFORE_PROMPT_BUILD: return "before_prompt_build";
     case PluginHookName::BEFORE_AGENT_START: return "before_agent_start";
     case PluginHookName::BEFORE_AGENT_REPLY: return "before_agent_reply";
+    case PluginHookName::MODEL_CALL_STARTED: return "model_call_started";
+    case PluginHookName::MODEL_CALL_ENDED: return "model_call_ended";
     case PluginHookName::LLM_INPUT: return "llm_input";
     case PluginHookName::LLM_OUTPUT: return "llm_output";
+    case PluginHookName::BEFORE_AGENT_FINALIZE: return "before_agent_finalize";
     case PluginHookName::AGENT_END: return "agent_end";
     case PluginHookName::BEFORE_COMPACTION: return "before_compaction";
     case PluginHookName::AFTER_COMPACTION: return "after_compaction";
     case PluginHookName::BEFORE_RESET: return "before_reset";
+    case PluginHookName::INBOUND_CLAIM: return "inbound_claim";
+    case PluginHookName::CHANNEL_PAIRING_REQUESTED: return "channel_pairing_requested";
     case PluginHookName::MESSAGE_RECEIVED: return "message_received";
     case PluginHookName::MESSAGE_SENDING: return "message_sending";
+    case PluginHookName::REPLY_PAYLOAD_SENDING: return "reply_payload_sending";
     case PluginHookName::MESSAGE_SENT: return "message_sent";
     case PluginHookName::BEFORE_TOOL_CALL: return "before_tool_call";
     case PluginHookName::AFTER_TOOL_CALL: return "after_tool_call";
@@ -580,9 +587,22 @@ std::string plugin_hook_name_to_string(PluginHookName hook) {
     case PluginHookName::SUBAGENT_SPAWNING: return "subagent_spawning";
     case PluginHookName::SUBAGENT_DELIVERY_TARGET: return "subagent_delivery_target";
     case PluginHookName::SUBAGENT_SPAWNED: return "subagent_spawned";
+    case PluginHookName::SUBAGENT_PROGRESS: return "subagent_progress";
     case PluginHookName::SUBAGENT_ENDED: return "subagent_ended";
+    case PluginHookName::DEACTIVATE: return "deactivate";
     case PluginHookName::GATEWAY_START: return "gateway_start";
     case PluginHookName::GATEWAY_STOP: return "gateway_stop";
+    case PluginHookName::HEARTBEAT_PROMPT_CONTRIBUTION: return "heartbeat_prompt_contribution";
+    case PluginHookName::CRON_RECONCILED: return "cron_reconciled";
+    case PluginHookName::CRON_CHANGED: return "cron_changed";
+    case PluginHookName::SKILL_PROPOSAL_EVALUATE: return "skill_proposal_evaluate";
+    case PluginHookName::SKILL_PROPOSAL_CHANGED: return "skill_proposal_changed";
+    case PluginHookName::SKILL_CHANGED: return "skill_changed";
+    case PluginHookName::BEFORE_DISPATCH: return "before_dispatch";
+    case PluginHookName::REPLY_DISPATCH: return "reply_dispatch";
+    case PluginHookName::BEFORE_INSTALL: return "before_install";
+    case PluginHookName::BEFORE_AGENT_RUN: return "before_agent_run";
+    case PluginHookName::RESOLVE_EXEC_ENV: return "resolve_exec_env";
   }
   return "unknown";
 }

@@ -59,6 +59,14 @@ using plugins::PluginHookBeforeAgentStartEvent;
 using plugins::PluginHookBeforeAgentStartResult;
 using plugins::PluginHookBeforeAgentReplyEvent;
 using plugins::PluginHookBeforeAgentReplyResult;
+using plugins::PluginHookModelCallStartedEvent;
+using plugins::PluginHookModelCallEndedEvent;
+using plugins::PluginHookAgentTurnPrepareEvent;
+using plugins::PluginHookAgentTurnPrepareResult;
+using plugins::PluginHookBeforeAgentFinalizeEvent;
+using plugins::PluginHookBeforeAgentFinalizeResult;
+using plugins::PluginHookBeforeAgentRunEvent;
+using plugins::PluginHookBeforeAgentRunResult;
 using plugins::PluginHookLlmInputEvent;
 using plugins::PluginHookLlmOutputEvent;
 using plugins::PluginHookLlmOutputUsage;
@@ -138,6 +146,33 @@ using BeforeAgentReplyHandler = std::function<
 using LlmInputHandler = std::function<
     void(const PluginHookLlmInputEvent& event,
          const PluginHookAgentContext& ctx)>;
+
+// model_call_started / model_call_ended — void 观测 hook（对齐 OpenClaw）
+using ModelCallStartedHandler = std::function<
+    void(const PluginHookModelCallStartedEvent& event,
+         const PluginHookAgentContext& ctx)>;
+
+using ModelCallEndedHandler = std::function<
+    void(const PluginHookModelCallEndedEvent& event,
+         const PluginHookAgentContext& ctx)>;
+
+// agent_turn_prepare — modifying hook（返回 prepend/append context，拼接合并）
+using AgentTurnPrepareHandler = std::function<
+    std::optional<PluginHookAgentTurnPrepareResult>(
+        const PluginHookAgentTurnPrepareEvent& event,
+        const PluginHookAgentContext& ctx)>;
+
+// before_agent_finalize — modifying hook（可请求 revise/retry）
+using BeforeAgentFinalizeHandler = std::function<
+    std::optional<PluginHookBeforeAgentFinalizeResult>(
+        const PluginHookBeforeAgentFinalizeEvent& event,
+        const PluginHookAgentContext& ctx)>;
+
+// before_agent_run — gate hook（pass/block，最严格优先，void=pass）
+using BeforeAgentRunHandler = std::function<
+    std::optional<PluginHookBeforeAgentRunResult>(
+        const PluginHookBeforeAgentRunEvent& event,
+        const PluginHookAgentContext& ctx)>;
 
 using LlmOutputHandler = std::function<
     void(const PluginHookLlmOutputEvent& event,
@@ -260,6 +295,11 @@ public:
     void register_before_agent_start(const std::string& plugin_id, BeforeAgentStartHandler handler, int priority = 0);
     void register_before_agent_reply(const std::string& plugin_id, BeforeAgentReplyHandler handler, int priority = 0);
     void register_llm_input(const std::string& plugin_id, LlmInputHandler handler, int priority = 0);
+    void register_model_call_started(const std::string& plugin_id, ModelCallStartedHandler handler, int priority = 0);
+    void register_model_call_ended(const std::string& plugin_id, ModelCallEndedHandler handler, int priority = 0);
+    void register_agent_turn_prepare(const std::string& plugin_id, AgentTurnPrepareHandler handler, int priority = 0);
+    void register_before_agent_finalize(const std::string& plugin_id, BeforeAgentFinalizeHandler handler, int priority = 0);
+    void register_before_agent_run(const std::string& plugin_id, BeforeAgentRunHandler handler, int priority = 0);
     void register_llm_output(const std::string& plugin_id, LlmOutputHandler handler, int priority = 0);
     void register_agent_end(const std::string& plugin_id, AgentEndHandler handler, int priority = 0);
     void register_before_compaction(const std::string& plugin_id, BeforeCompactionHandler handler, int priority = 0);
@@ -336,6 +376,22 @@ public:
 
     /// Run llm_input hooks (void, sequential)
     void run_llm_input(const PluginHookLlmInputEvent& event, const PluginHookAgentContext& ctx);
+
+    /// Run model_call_started / model_call_ended hooks (void, sequential)
+    void run_model_call_started(const PluginHookModelCallStartedEvent& event, const PluginHookAgentContext& ctx);
+    void run_model_call_ended(const PluginHookModelCallEndedEvent& event, const PluginHookAgentContext& ctx);
+
+    /// Run agent_turn_prepare (modifying):合并所有插件的 prepend/append context
+    std::optional<PluginHookAgentTurnPrepareResult> run_agent_turn_prepare(
+        const PluginHookAgentTurnPrepareEvent& event, const PluginHookAgentContext& ctx);
+
+    /// Run before_agent_finalize (modifying): 合并 revise/retry 决策
+    std::optional<PluginHookBeforeAgentFinalizeResult> run_before_agent_finalize(
+        const PluginHookBeforeAgentFinalizeEvent& event, const PluginHookAgentContext& ctx);
+
+    /// Run before_agent_run (gate): 返回最严格 pass/block；fail-closed
+    std::optional<PluginHookBeforeAgentRunResult> run_before_agent_run(
+        const PluginHookBeforeAgentRunEvent& event, const PluginHookAgentContext& ctx);
 
     /// Run llm_output hooks (void, sequential)
     void run_llm_output(const PluginHookLlmOutputEvent& event, const PluginHookAgentContext& ctx);
@@ -453,6 +509,11 @@ private:
     struct BeforeAgentStartEntry    { std::string plugin_id; BeforeAgentStartHandler    handler; int priority = 0; };
     struct BeforeAgentReplyEntry    { std::string plugin_id; BeforeAgentReplyHandler    handler; int priority = 0; };
     struct LlmInputEntry            { std::string plugin_id; LlmInputHandler            handler; int priority = 0; };
+    struct ModelCallStartedEntry    { std::string plugin_id; ModelCallStartedHandler    handler; int priority = 0; };
+    struct ModelCallEndedEntry      { std::string plugin_id; ModelCallEndedHandler       handler; int priority = 0; };
+    struct AgentTurnPrepareEntry    { std::string plugin_id; AgentTurnPrepareHandler    handler; int priority = 0; };
+    struct BeforeAgentFinalizeEntry { std::string plugin_id; BeforeAgentFinalizeHandler handler; int priority = 0; };
+    struct BeforeAgentRunEntry      { std::string plugin_id; BeforeAgentRunHandler      handler; int priority = 0; };
     struct LlmOutputEntry           { std::string plugin_id; LlmOutputHandler           handler; int priority = 0; };
     struct AgentEndEntry            { std::string plugin_id; AgentEndHandler            handler; int priority = 0; };
     struct BeforeCompactionEntry    { std::string plugin_id; BeforeCompactionHandler    handler; int priority = 0; };
@@ -487,6 +548,11 @@ private:
     std::vector<BeforeAgentStartEntry>       before_agent_start_hooks_;
     std::vector<BeforeAgentReplyEntry>       before_agent_reply_hooks_;
     std::vector<LlmInputEntry>               llm_input_hooks_;
+    std::vector<ModelCallStartedEntry>       model_call_started_hooks_;
+    std::vector<ModelCallEndedEntry>         model_call_ended_hooks_;
+    std::vector<AgentTurnPrepareEntry>       agent_turn_prepare_hooks_;
+    std::vector<BeforeAgentFinalizeEntry>    before_agent_finalize_hooks_;
+    std::vector<BeforeAgentRunEntry>         before_agent_run_hooks_;
     std::vector<LlmOutputEntry>              llm_output_hooks_;
     std::vector<AgentEndEntry>               agent_end_hooks_;
     std::vector<BeforeCompactionEntry>       before_compaction_hooks_;

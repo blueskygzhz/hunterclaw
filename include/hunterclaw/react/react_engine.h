@@ -429,7 +429,8 @@ public:
     };
     CompactionResult trigger_compaction(
         std::vector<LLMMessage>& messages,
-        const std::string& transcript_path = ""  // 对齐 OC: compaction 后持久化到 transcript
+        const std::string& transcript_path = "",  // 对齐 OC: compaction 后持久化到 transcript
+        const std::string& session_id = ""        // 🎯 对齐 OC: before/after_compaction hook ctx
     );
     
 private:

@@ -872,6 +872,12 @@ core::Result<json> method_session_reset(
             br_event.reason         = reason;
             br_event.old_session_id = had_existing_entry
                 ? std::make_optional(old_entry.session_id) : std::nullopt;
+            // 🎯 对齐 OpenClaw session-reset-service.ts: before_reset 传 sessionFile
+            if (had_existing_entry && !old_entry.session_id.empty()) {
+                std::string sf = sessions::resolve_transcript_path(
+                    old_entry.session_id, old_entry.agent_id, sessions_dir);
+                if (!sf.empty()) br_event.session_file = sf;
+            }
             tools::PluginHookAgentContext br_ctx;
             br_ctx.session_id = had_existing_entry ? old_entry.session_id : key;
             try {

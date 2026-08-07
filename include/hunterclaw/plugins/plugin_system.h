@@ -42,17 +42,24 @@ enum class PluginStatus {
 
 enum class PluginHookName {
   BEFORE_MODEL_RESOLVE,
+  AGENT_TURN_PREPARE,
   BEFORE_PROMPT_BUILD,
   BEFORE_AGENT_START,
   BEFORE_AGENT_REPLY,
+  MODEL_CALL_STARTED,
+  MODEL_CALL_ENDED,
   LLM_INPUT,
   LLM_OUTPUT,
+  BEFORE_AGENT_FINALIZE,
   AGENT_END,
   BEFORE_COMPACTION,
   AFTER_COMPACTION,
   BEFORE_RESET,
+  INBOUND_CLAIM,
+  CHANNEL_PAIRING_REQUESTED,
   MESSAGE_RECEIVED,
   MESSAGE_SENDING,
+  REPLY_PAYLOAD_SENDING,
   MESSAGE_SENT,
   BEFORE_TOOL_CALL,
   AFTER_TOOL_CALL,
@@ -63,9 +70,22 @@ enum class PluginHookName {
   SUBAGENT_SPAWNING,
   SUBAGENT_DELIVERY_TARGET,
   SUBAGENT_SPAWNED,
+  SUBAGENT_PROGRESS,
   SUBAGENT_ENDED,
+  DEACTIVATE,
   GATEWAY_START,
-  GATEWAY_STOP
+  GATEWAY_STOP,
+  HEARTBEAT_PROMPT_CONTRIBUTION,
+  CRON_RECONCILED,
+  CRON_CHANGED,
+  SKILL_PROPOSAL_EVALUATE,
+  SKILL_PROPOSAL_CHANGED,
+  SKILL_CHANGED,
+  BEFORE_DISPATCH,
+  REPLY_DISPATCH,
+  BEFORE_INSTALL,
+  BEFORE_AGENT_RUN,
+  RESOLVE_EXEC_ENV
 };
 
 enum class HttpRouteAuth {
@@ -233,6 +253,80 @@ struct PluginHookBeforePromptBuildResult {
 };
 
 // ============================================================================
+// Plugin Hook — agent_turn_prepare (modifying)
+//   对齐 OpenClaw PluginAgentTurnPrepareEvent/Result (host-hook-turn-types.ts)。
+//   多插件贡献 prepend/append context，按顺序拼接。
+// ============================================================================
+
+struct PluginHookAgentTurnPrepareEvent {
+  std::string prompt;
+  std::optional<std::string> messages_json;
+  std::optional<std::string> queued_injections_json;
+};
+
+struct PluginHookAgentTurnPrepareResult {
+  std::optional<std::string> prepend_context;
+  std::optional<std::string> append_context;
+};
+
+// ============================================================================
+// Plugin Hook — before_agent_finalize (modifying)
+//   对齐 OpenClaw PluginHookBeforeAgentFinalizeEvent/Result (hook-types.ts:456)。
+//   允许插件在自然 final reply 前请求再跑一轮模型（revise/retry）。
+// ============================================================================
+
+struct PluginHookBeforeAgentFinalizeEvent {
+  std::optional<std::string> run_id;
+  std::string session_id;
+  std::optional<std::string> session_key;
+  std::optional<std::string> turn_id;
+  std::optional<std::string> provider;
+  std::optional<std::string> model;
+  std::optional<std::string> cwd;
+  std::optional<std::string> transcript_path;
+  bool stop_hook_active = false;
+  std::optional<std::string> last_assistant_message;
+  std::optional<std::string> messages_json;
+};
+
+struct PluginHookBeforeAgentFinalizeRetry {
+  std::string instruction;
+  std::optional<std::string> idempotency_key;
+};
+
+struct PluginHookBeforeAgentFinalizeResult {
+  // "continue" | "revise" | "finalize"
+  std::optional<std::string> action;
+  std::optional<std::string> reason;
+  std::optional<PluginHookBeforeAgentFinalizeRetry> retry;
+};
+
+// ============================================================================
+// Plugin Hook — before_agent_run (gate)
+//   对齐 OpenClaw PluginHookBeforeAgentRunEvent + InputGateDecision
+//   (hook-types.ts:1206 / hook-decision-types.ts)。会话解析+工作区准备后、
+//   模型推理前触发；返回最严格的 pass/block；void 视为 pass；fail-closed。
+// ============================================================================
+
+struct PluginHookBeforeAgentRunEvent {
+  std::string prompt;
+  std::optional<std::string> messages_json;
+  std::optional<std::string> system_prompt;
+  std::optional<std::string> account_id;
+  std::optional<std::string> channel_id;
+  std::optional<std::string> sender_id;
+  std::optional<bool> sender_is_owner;
+};
+
+struct PluginHookBeforeAgentRunResult {
+  // 对齐 InputGateDecision：默认 pass；block=true 表示拦截。
+  bool block = false;
+  std::optional<std::string> reason;     // 内部原因，勿外泄
+  std::optional<std::string> message;    // 面向用户的可展示信息
+  std::optional<std::string> category;   // 分析用类别
+};
+
+// ============================================================================
 // Plugin Hook — before_agent_start (legacy: combines both phases)
 // ============================================================================
 
@@ -278,6 +372,48 @@ struct PluginHookBeforeAgentReplyResult {
   std::optional<std::string> reply_json;
   /** Optional human-readable reason for observability. */
   std::optional<std::string> reason;
+};
+
+// ============================================================================
+// Plugin Hook — model_call_started / model_call_ended
+//   对齐 OpenClaw PluginHookModelCallStartedEvent / PluginHookModelCallEndedEvent
+//   (hook-types.ts:373-401)。观测型 void hook，包裹单次模型调用。
+// ============================================================================
+
+struct PluginHookModelCallStartedEvent {
+  std::string run_id;
+  std::string call_id;
+  std::optional<std::string> session_key;
+  std::optional<std::string> session_id;
+  std::string provider;
+  std::string model;
+  std::optional<std::string> api;
+  std::optional<std::string> transport;
+  std::optional<int> context_token_budget;
+  std::optional<std::string> context_window_source;
+  std::optional<int> context_window_reference_tokens;
+};
+
+struct PluginHookModelCallEndedEvent {
+  std::string run_id;
+  std::string call_id;
+  std::optional<std::string> session_key;
+  std::optional<std::string> session_id;
+  std::string provider;
+  std::string model;
+  std::optional<std::string> api;
+  std::optional<std::string> transport;
+  std::optional<int> context_token_budget;
+  std::optional<std::string> context_window_source;
+  std::optional<int> context_window_reference_tokens;
+  int duration_ms = 0;
+  std::string outcome;  // "completed" | "error"
+  std::optional<std::string> error_category;
+  std::optional<std::string> failure_kind;  // aborted|connection_closed|connection_reset|terminated|timeout
+  std::optional<int> request_payload_bytes;
+  std::optional<int> response_stream_bytes;
+  std::optional<int> time_to_first_byte_ms;
+  std::optional<std::string> upstream_request_id_hash;
 };
 
 // ============================================================================

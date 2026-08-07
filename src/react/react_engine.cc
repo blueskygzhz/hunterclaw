@@ -260,7 +260,7 @@ ReactResult ReactEngine::run(
                     callbacks.transcript_path, /*limit=*/0);
                 if (!transcript_msgs.empty()) {
                     auto compact_res = trigger_compaction(
-                        transcript_msgs, callbacks.transcript_path);
+                        transcript_msgs, callbacks.transcript_path, callbacks.session_id);
                     if (compact_res.compacted) {
                         log()->info(
                             "[ReactEngine] preflight compaction: session={} "
@@ -468,6 +468,42 @@ ReactResult ReactEngine::execute_loop(
     }
 
     // =========================================================================
+    // Hook: before_agent_run (gate) — 严格对齐 OpenClaw runBeforeAgentRun
+    // 会话解析 + 工作区准备之后、模型推理之前触发。返回最严格 pass/block
+    // （block 优先短路），void=pass，fail-closed（hook 异常 → block）。
+    // block 时中止本次 run，返回面向用户的 block message。
+    // =========================================================================
+    {
+        auto* bar_mgr = tools::get_global_hook_manager();
+        if (bar_mgr && bar_mgr->has_hooks(plugins::PluginHookName::BEFORE_AGENT_RUN)) {
+            tools::PluginHookBeforeAgentRunEvent bar_event;
+            bar_event.prompt = user_input;
+            if (!callbacks.channel_id.empty()) bar_event.channel_id = callbacks.channel_id;
+            tools::PluginHookAgentContext bar_ctx;
+            bar_ctx.session_id = callbacks.session_id.empty()
+                ? std::nullopt : std::make_optional(callbacks.session_id);
+            if (!callbacks.agent_id.empty())      bar_ctx.agent_id     = callbacks.agent_id;
+            if (!callbacks.session_key.empty())   bar_ctx.session_key  = callbacks.session_key;
+            if (!callbacks.workspace_dir.empty()) bar_ctx.workspace_dir = callbacks.workspace_dir;
+            if (!callbacks.channel_id.empty())    bar_ctx.channel_id   = callbacks.channel_id;
+
+            auto gate = bar_mgr->run_before_agent_run(bar_event, bar_ctx);
+            if (gate && gate->block) {
+                // 对齐 OC resolveBlockMessage：面向用户的 block提示。
+                std::string block_msg = gate->message.value_or("Your message could not be sent");
+                log()->warn("[hooks] before_agent_run blocked the run");
+                result.success = false;
+                result.handled_by_hook = true;
+                result.handled_reason = gate->reason;
+                result.final_response = block_msg;
+                result.assistant_texts.push_back(block_msg);
+                if (callbacks.on_assistant_delta) callbacks.on_assistant_delta(block_msg);
+                return result;  // ← 中止本次 run（fail-closed gate）
+            }
+        }
+    }
+
+    // =========================================================================
     // Hook: before_model_resolve
     // Aligned with OpenClaw run.ts:329 — runs before resolveModel()
     // Allows plugins to override provider/model for this run.
@@ -562,6 +598,33 @@ ReactResult ReactEngine::execute_loop(
                 }
             } catch (const std::exception& e) {
                 log()->warn("before_prompt_build hook failed: {}", e.what());
+            }
+        }
+
+        // =====================================================================
+        // Hook: agent_turn_prepare (modifying) — 对齐 OpenClaw runAgentTurnPrepare
+        // 每轮 turn 准备时贡献 prepend/append context（拼接合并），与 prompt build
+        // 同阶段。合并进 hook_prepend_context / hook_append_context。
+        // =====================================================================
+        if (hook_mgr->has_hooks(plugins::PluginHookName::AGENT_TURN_PREPARE)) {
+            tools::PluginHookAgentTurnPrepareEvent atp_event;
+            atp_event.prompt = user_input;
+            try {
+                auto atp_result = hook_mgr->run_agent_turn_prepare(atp_event, hook_ctx);
+                if (atp_result) {
+                    if (atp_result->prepend_context) {
+                        hook_prepend_context = hook_prepend_context
+                            ? std::make_optional(*hook_prepend_context + "\n\n" + *atp_result->prepend_context)
+                            : atp_result->prepend_context;
+                    }
+                    if (atp_result->append_context) {
+                        hook_append_context = hook_append_context
+                            ? std::make_optional(*hook_append_context + "\n\n" + *atp_result->append_context)
+                            : atp_result->append_context;
+                    }
+                }
+            } catch (const std::exception& e) {
+                log()->warn("agent_turn_prepare hook failed: {}", e.what());
             }
         }
     }
@@ -718,6 +781,9 @@ ReactResult ReactEngine::execute_loop(
 
     // ReAct 循环: Reason → Act → Observe → ...
     int step_count = 0;
+    // 🎯 对齐 OpenClaw before_agent_finalize: revise 重跑计数（防无限 revise）
+    int finalize_revise_count = 0;
+    constexpr int kMaxFinalizeRevisions = 3;
     std::string accumulated_response;
     // 🎯 对齐 OpenClaw agent-runner.ts:770 — autoCompactionCount
     // 本轮 run 内累计发生的 auto-compaction 次数
@@ -812,7 +878,7 @@ ReactResult ReactEngine::execute_loop(
 
                     // Fallback 到 compaction_mgr_ (如果 CE compact 失败)
                     if (!compact_ok && compaction_mgr_) {
-                        auto compact_result = trigger_compaction(messages, callbacks.transcript_path);
+                        auto compact_result = trigger_compaction(messages, callbacks.transcript_path, callbacks.session_id);
                         compact_ok = compact_result.compacted;
                         if (!compact_ok) {
                             log()->warn("[ReactEngine] CompactionManager also failed: {}",
@@ -929,7 +995,7 @@ ReactResult ReactEngine::execute_loop(
                 data["phase"] = "start";
                 callbacks.on_agent_event({"compaction", std::move(data)});
             }
-            auto compact_result = trigger_compaction(messages, callbacks.transcript_path);
+            auto compact_result = trigger_compaction(messages, callbacks.transcript_path, callbacks.session_id);
             if (callbacks.on_agent_event) {
                 core::JsonValue data;
                 data["phase"] = "end";
@@ -1082,6 +1148,53 @@ ReactResult ReactEngine::execute_loop(
         
         // 没有工具调用 - 这是最终响应
         reason_step.is_final = true;
+
+        // =====================================================================
+        // Hook: before_agent_finalize (modifying) — 对齐 OpenClaw runBeforeAgentFinalize
+        // 自然 final reply 被接受前触发。若插件返回 action="revise"（可带 retry
+        // 指令），阻止本次收尾并再跑一轮模型（把 retry.instruction 作为新的 user
+        // 输入注入）；action="finalize" 或无hook 则正常收尾。带重跑上限防死循环。
+        // 注意：这不是用户面向的 /stop 取消路径。
+        // =====================================================================
+        {
+            auto* baf_mgr = tools::get_global_hook_manager();
+            if (baf_mgr && baf_mgr->has_hooks(plugins::PluginHookName::BEFORE_AGENT_FINALIZE) &&
+                finalize_revise_count < kMaxFinalizeRevisions) {
+                tools::PluginHookBeforeAgentFinalizeEvent baf_event;
+                baf_event.session_id = callbacks.session_id;
+                if (!callbacks.session_key.empty()) baf_event.session_key = callbacks.session_key;
+                if (!callbacks.run_id.empty())      baf_event.run_id= callbacks.run_id;
+                if (!callbacks.transcript_path.empty()) baf_event.transcript_path = callbacks.transcript_path;
+                baf_event.stop_hook_active = false;
+                baf_event.last_assistant_message = llm_response.text;
+                tools::PluginHookAgentContext baf_ctx;
+                baf_ctx.session_id = callbacks.session_id.empty()
+                    ? std::nullopt : std::make_optional(callbacks.session_id);
+                if (!callbacks.agent_id.empty())      baf_ctx.agent_id      = callbacks.agent_id;
+                if (!callbacks.workspace_dir.empty()) baf_ctx.workspace_dir = callbacks.workspace_dir;
+                try {
+                    auto baf_result = baf_mgr->run_before_agent_finalize(baf_event, baf_ctx);
+                    if (baf_result && baf_result->action.value_or("continue") == "revise") {
+                        // 注入 retry 指令作为新一轮 user 输入，阻止收尾、再跑一轮。
+                        std::string instruction = baf_result->retry
+                            ? baf_result->retry->instruction
+                            : baf_result->reason.value_or("Please continue.");
+                        llm::LLMMessage revise_msg;
+                        revise_msg.role = llm::LLMMessageRole::User;
+                        revise_msg.content = instruction;
+                        messages.push_back(revise_msg);
+                        finalize_revise_count++;
+                        log()->info("[hooks] before_agent_finalize requested revise (#{}/{})",
+                            finalize_revise_count, kMaxFinalizeRevisions);
+                        step_count++;
+                        continue;  // ← 阻止收尾，再跑一轮模型
+                    }
+                } catch (const std::exception& e) {
+                    log()->warn("before_agent_finalize hook failed: {}", e.what());
+                }
+            }
+        }
+
         result.steps.push_back(reason_step);
 
         // 步骤 3: Respond (响应)
@@ -1817,9 +1930,55 @@ ReactEngine::LLMResponseData ReactEngine::call_llm(
         tools_payload.push_back(std::move(tj));
     }
 
+    // =========================================================================
+    // Hook: model_call_started / model_call_ended
+    // 对齐 OpenClaw hooks.ts:1632-1639 + attempt.ts — 包裹每一次实际模型调用
+    // （含 failover 重试，每次调用各触发一对 started/ended，带独立 callId）。
+    // 观测型 void hook：started 在调用前，ended 在调用后（带 durationMs + outcome）。
+    // =========================================================================
     auto attempt_llm_call = [&]() {
-        return llm_client_->generate_stream_from_messages_with_tools(
+        auto* mc_mgr = tools::get_global_hook_manager();
+        const std::string mc_run_id =
+            callbacks.run_id.empty() ? callbacks.session_id : callbacks.run_id;
+        const std::string mc_provider =
+            llm_client_ ? llm_client_->get_config().provider : "unknown";
+        const std::string mc_model =
+            llm_client_ ? llm_client_->get_config().model : "unknown";
+        // callId：每次实际调用唯一（对齐 OC callId 语义）。
+        const std::string mc_call_id = mc_run_id + "-" + std::to_string(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+
+        tools::PluginHookAgentContext mc_ctx;
+        if (!callbacks.session_id.empty()) mc_ctx.session_id = callbacks.session_id;
+
+        if (mc_mgr && mc_mgr->has_hooks(plugins::PluginHookName::MODEL_CALL_STARTED)) {
+            tools::PluginHookModelCallStartedEvent ev;
+            ev.run_id = mc_run_id; ev.call_id = mc_call_id;
+            if (!callbacks.session_id.empty()) ev.session_id = callbacks.session_id;
+            ev.provider = mc_provider; ev.model = mc_model;
+            try { mc_mgr->run_model_call_started(ev, mc_ctx); }
+            catch (const std::exception& e) { log()->warn("model_call_started hook failed: {}", e.what()); }
+        }
+
+        auto mc_t0 = std::chrono::steady_clock::now();
+        auto call_result = llm_client_->generate_stream_from_messages_with_tools(
             messages, tools_payload, stream_callback);
+        auto mc_dur = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - mc_t0).count());
+
+        if (mc_mgr && mc_mgr->has_hooks(plugins::PluginHookName::MODEL_CALL_ENDED)) {
+            tools::PluginHookModelCallEndedEvent ev;
+            ev.run_id = mc_run_id; ev.call_id = mc_call_id;
+            if (!callbacks.session_id.empty()) ev.session_id = callbacks.session_id;
+            ev.provider = mc_provider; ev.model = mc_model;
+            ev.duration_ms = mc_dur;
+            ev.outcome = call_result.ok ? "completed" : "error";
+            if (!call_result.ok && !call_result.error.empty()) ev.error_category = call_result.error;
+            try { mc_mgr->run_model_call_ended(ev, mc_ctx); }
+            catch (const std::exception& e) { log()->warn("model_call_ended hook failed: {}", e.what()); }
+        }
+        return call_result;
     };
 
     auto result = attempt_llm_call();
@@ -2954,7 +3113,8 @@ std::vector<llm::ToolDefinition> ReactEngine::build_tool_definitions(
 
 ReactEngine::CompactionResult ReactEngine::trigger_compaction(
     std::vector<LLMMessage>& messages,
-    const std::string& transcript_path
+    const std::string& transcript_path,
+    const std::string& session_id
 ) {
     CompactionResult result;
     
@@ -2980,7 +3140,11 @@ ReactEngine::CompactionResult ReactEngine::trigger_compaction(
         bc_event.message_count   = static_cast<int>(messages.size());
         bc_event.compacting_count = static_cast<int>(messages.size());
         bc_event.token_count     = current_tokens;
+        // 🎯 对齐 OpenClaw compact.ts: before_compaction 传 sessionFile
+        if (!transcript_path.empty()) bc_event.session_file = transcript_path;
         tools::PluginHookAgentContext bc_ctx;
+        // 🎯 对齐 OpenClaw: hook context 携带 sessionId（供插件定位会话）
+        if (!session_id.empty()) bc_ctx.session_id = session_id;
         try {
             compact_hook_mgr->run_before_compaction(bc_event, bc_ctx);
         } catch (const std::exception& e) {
@@ -3134,7 +3298,10 @@ ReactEngine::CompactionResult ReactEngine::trigger_compaction(
         ac_event.message_count   = static_cast<int>(messages.size());
         ac_event.compacted_count = messages_before - static_cast<int>(messages.size());
         ac_event.token_count     = estimate_conversation_tokens(messages);
+        // 🎯 对齐 OpenClaw compact.ts: after_compaction 传 sessionFile
+        if (!transcript_path.empty()) ac_event.session_file = transcript_path;
         tools::PluginHookAgentContext ac_ctx;
+        if (!session_id.empty()) ac_ctx.session_id = session_id;
         try {
             compact_hook_mgr->run_after_compaction(ac_event, ac_ctx);
         } catch (const std::exception& e) {
