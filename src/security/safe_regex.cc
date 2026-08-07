@@ -112,14 +112,16 @@ std::vector<PatternToken> tokenize_pattern(const std::string& source) {
     for (int i = 0; i < (int)source.size(); i++) {
         char ch = source[i];
 
-        if (ch == '\\') {
-            i++;
-            tokens.push_back({PatternToken::SimpleToken, {}});
+        // 🎯 对齐 OpenClaw: 先处理字符类内部, 再处理转义
+        if (in_char_class) {
+            if (ch == '\\') { i++; continue; }
+            if (ch == ']') in_char_class = false;
             continue;
         }
 
-        if (in_char_class) {
-            if (ch == ']') in_char_class = false;
+        if (ch == '\\') {
+            i++;
+            tokens.push_back({PatternToken::SimpleToken, {}});
             continue;
         }
 
@@ -216,12 +218,23 @@ bool analyze_tokens_for_nested_repetition(const std::vector<PatternToken>& token
         if (prev->contains_repetition) return true;
         if (prev->has_ambiguous_alternation && token.quantifier.max_repeat < 0) return true;
 
+        int previous_min_length = prev->min_length;
+        int previous_max_length = prev->max_length;
         prev->min_length = multiply_length(prev->min_length, token.quantifier.min_repeat);
         prev->max_length = (token.quantifier.max_repeat < 0)
             ? INT_MAX
             : multiply_length(prev->max_length, token.quantifier.max_repeat);
         prev->contains_repetition = true;
         frame.contains_repetition = true;
+
+        // 🎯 对齐 OpenClaw L287-293: 回算 branch 长度 (减去旧长度, 加回乘算后新长度)
+        frame.branch_min_length =
+            frame.branch_min_length - previous_min_length + prev->min_length;
+        int branch_max_base =
+            (frame.branch_max_length != INT_MAX && previous_max_length != INT_MAX)
+                ? frame.branch_max_length - previous_max_length
+                : INT_MAX;
+        frame.branch_max_length = add_length(branch_max_base, prev->max_length);
     }
 
     return false;
