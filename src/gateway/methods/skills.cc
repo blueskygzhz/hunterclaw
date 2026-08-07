@@ -1,6 +1,8 @@
 #include "hunterclaw/gateway/gateway.h"
 #include "hunterclaw/gateway/method_guard.h"
 #include "hunterclaw/skills/skill.h"
+#include "hunterclaw/skills/skill_proposal_service.h"
+#include "hunterclaw/skills/skill_proposal_store.h"
 #include "hunterclaw/core/utils.h"
 #include "skills_install_impl.h"
 #include <nlohmann/json.hpp>
@@ -605,6 +607,130 @@ core::Result<json> method_skill_get(
     result["path"] = skill_meta.skill.file_path.string();
     result["content"] = skill_meta.skill.content;
 
+    return core::Result<json>::Ok(result);
+}
+
+//============================================================================
+// Skill Proposal (Workshop) Methods
+// 🎯 严格对齐 OpenClaw server-methods/skills.ts skills.proposals.*
+// ============================================================================
+
+// Helper: 解析 workspace_dir（对齐 resolveSkillsAgentWorkspace 精简）。
+static std::string resolve_proposal_workspace(std::shared_ptr<GatewayServer> server) {
+    auto cfg = server ? server->config() : nullptr;
+    if (cfg && !cfg->config_dir.empty()) return cfg->config_dir;
+    const char* home = getenv("HOME");
+    return home ? (std::string(home) + "/.hunterclaw") : "./.hunterclaw";
+}
+
+// 🎯 对齐 OpenClaw: skills.proposals.list
+core::Result<json> method_skills_proposals_list(
+    std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>,
+    const ClientContext&, const json& params
+) {
+    std::optional<skills::SkillProposalStatus> filter;
+    if (params.contains("status") && params["status"].is_string())
+        filter = skills::parse_skill_proposal_status(params["status"].get<std::string>());
+    auto res = skills::list_skill_proposals(filter);
+    if (res.is_err()) return core::Result<json>::Err(res.error);
+    json arr = json::array();
+    for (const auto& r : res.get()) arr.push_back(r.to_json());
+    json result; result["proposals"] = arr;
+    return core::Result<json>::Ok(result);
+}
+
+// 🎯 对齐 OpenClaw: skills.proposals.events.list
+core::Result<json> method_skills_proposals_events_list(
+    std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>,
+    const ClientContext&, const json& params
+) {
+    if (!params.contains("proposalId") || !params["proposalId"].is_string())
+        return core::Result<json>::Err("Missing required parameter: proposalId");
+    auto res = skills::list_skill_proposal_events(params["proposalId"].get<std::string>());
+    if (res.is_err()) return core::Result<json>::Err(res.error);
+    json arr = json::array();
+    for (const auto& e : res.get()) arr.push_back(e.to_json());
+    json result; result["events"] = arr;
+    return core::Result<json>::Ok(result);
+}
+
+// 🎯 对齐 OpenClaw: skills.proposals.inspect
+core::Result<json> method_skills_proposals_inspect(
+    std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>,
+    const ClientContext&, const json& params
+) {
+    if (!params.contains("proposalId") || !params["proposalId"].is_string())
+        return core::Result<json>::Err("Missing required parameter: proposalId");
+    auto res = skills::read_skill_proposal(params["proposalId"].get<std::string>());
+    if (res.is_err()) return core::Result<json>::Err(res.error);
+    if (!res.get().has_value())
+        return core::Result<json>::Err("skill proposal not found: " + params["proposalId"].get<std::string>());
+    json result; result["proposal"] = res.get()->to_json();
+    // 附带事件历史（对齐 inspect 返回 record + events）。
+    auto ev = skills::list_skill_proposal_events(res.get()->id);
+    if (ev.is_ok()) {
+        json arr = json::array();
+        for (const auto& e : ev.get()) arr.push_back(e.to_json());
+        result["events"] = arr;
+    }
+    return core::Result<json>::Ok(result);
+}
+
+// 🎯 对齐 OpenClaw: skills.proposals.evaluate（触发 skill_proposal_evaluate hook）
+core::Result<json> method_skills_proposals_evaluate(
+    std::shared_ptr<GatewayServer> server, std::shared_ptr<MethodGuard>,
+    const ClientContext&, const json& params
+) {
+    if (!params.contains("proposalId") || !params["proposalId"].is_string())
+        return core::Result<json>::Err("Missing required parameter: proposalId");
+    skills::EvaluateSkillProposalInput input;
+    input.proposal_id = params["proposalId"].get<std::string>();
+    input.trigger = skills::SkillProposalEvaluationTrigger::Manual;
+    input.workspace_dir = resolve_proposal_workspace(server);
+    if (params.contains("agentId") && params["agentId"].is_string())
+        input.agent_id = params["agentId"].get<std::string>();
+    if (params.contains("expectedRevisionHash") && params["expectedRevisionHash"].is_string())
+        input.expected_revision_hash = params["expectedRevisionHash"].get<std::string>();
+    if (params.contains("correlationId") && params["correlationId"].is_string())
+        input.correlation_id = params["correlationId"].get<std::string>();
+
+    auto res = skills::evaluate_skill_proposal(input);
+    if (res.is_err()) return core::Result<json>::Err(res.error);
+    json result;
+    result["proposal"] = res.get().record.to_json();
+    result["evaluation"] = res.get().evaluation.to_json();
+    return core::Result<json>::Ok(result);
+}
+
+// 🎯 对齐 OpenClaw: skills.proposals.action（reject/apply 状态流转）
+core::Result<json> method_skills_proposals_action(
+    std::shared_ptr<GatewayServer> server, std::shared_ptr<MethodGuard>,
+    const ClientContext&, const json& params
+) {
+    if (!params.contains("proposalId") || !params["proposalId"].is_string())
+        return core::Result<json>::Err("Missing required parameter: proposalId");
+    if (!params.contains("action") || !params["action"].is_string())
+        return core::Result<json>::Err("Missing required parameter: action");
+    std::string proposal_id = params["proposalId"].get<std::string>();
+    std::string action = params["action"].get<std::string>();
+    std::string workspace_dir = resolve_proposal_workspace(server);
+    std::optional<std::string> agent_id, correlation_id;
+    if (params.contains("agentId") && params["agentId"].is_string())
+        agent_id = params["agentId"].get<std::string>();
+    if (params.contains("correlationId") && params["correlationId"].is_string())
+        correlation_id = params["correlationId"].get<std::string>();
+
+    core::Result<skills::SkillProposalRecord> res =
+        core::Result<skills::SkillProposalRecord>::Err("unknown action: " + action);
+    if (action == "reject")
+        res = skills::reject_skill_proposal(proposal_id, workspace_dir, agent_id, correlation_id);
+    else if (action == "apply")
+        res = skills::apply_skill_proposal(proposal_id, workspace_dir, agent_id, correlation_id);
+    else
+        return core::Result<json>::Err("unsupported action: " + action + " (expected reject|apply)");
+
+    if (res.is_err()) return core::Result<json>::Err(res.error);
+    json result; result["proposal"] = res.get().to_json();
     return core::Result<json>::Ok(result);
 }
 

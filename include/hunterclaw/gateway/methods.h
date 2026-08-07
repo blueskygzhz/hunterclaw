@@ -578,6 +578,13 @@ core::Result<json> method_skills_bins(std::shared_ptr<GatewayServer>, std::share
 core::Result<json> method_skills_install(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
 core::Result<json> method_skills_update(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
 
+// 🎯 Skill Proposal (Workshop) Methods — 对齐 OpenClaw skills.proposals.*
+core::Result<json> method_skills_proposals_list(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
+core::Result<json> method_skills_proposals_events_list(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
+core::Result<json> method_skills_proposals_inspect(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
+core::Result<json> method_skills_proposals_evaluate(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
+core::Result<json> method_skills_proposals_action(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
+
 // ============================================================================
 // Secrets Methods (stubs.cc)
 // 🎯 OpenClaw 严格对齐: server-methods/secrets.ts secretsHandlers

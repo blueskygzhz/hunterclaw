@@ -154,6 +154,12 @@ create_method_handler(std::shared_ptr<GatewayServer> server) {
         {"skills.bins",                     methods::method_skills_bins},
         {"skills.install",                  methods::method_skills_install},
         {"skills.update",                   methods::method_skills_update},
+        // 🎯 Skill Proposal (Workshop) — 对齐 OpenClaw skills.proposals.*
+        {"skills.proposals.list",           methods::method_skills_proposals_list},
+        {"skills.proposals.events.list",    methods::method_skills_proposals_events_list},
+        {"skills.proposals.inspect",        methods::method_skills_proposals_inspect},
+        {"skills.proposals.evaluate",       methods::method_skills_proposals_evaluate},
+        {"skills.proposals.action",         methods::method_skills_proposals_action},
         // HunterClaw 扩展 (OpenClaw 无对应)
         {"skill.list",              methods::method_skill_list},
         {"skill.get",               methods::method_skill_get},

@@ -2674,7 +2674,35 @@ core::Result<bool> GatewayServer::start() {
 
                 // Capture everything needed inside the lambda (agent_pool may be gone by the
                 // time the queued task runs, so capture by value).
-                const std::string prompt_copy = req.prompt;
+                std::string prompt_copy = req.prompt;
+
+                // 🎯 Plugin hook: heartbeat_prompt_contribution (modifying) — 对齐 OpenClaw
+                //   runHeartbeatPromptContribution：插件可向 heartbeat prompt 追加/前置上下文。
+                //   在 gateway 注入层调用（tools 可达），规避 infra→tools 循环依赖。
+                {
+                    auto* hb_mgr = tools::get_global_hook_manager();
+                    if (hb_mgr && hb_mgr->has_hooks(plugins::PluginHookName::HEARTBEAT_PROMPT_CONTRIBUTION)) {
+                        plugins::PluginHookHeartbeatPromptContributionEvent hb_event;
+                        if (!req.session_key.empty()) hb_event.session_key = req.session_key;
+                        if (!req.agent_id.empty())    hb_event.agent_id = req.agent_id;
+                        hb_event.heartbeat_name = req.provider;
+                        plugins::PluginHookAgentContext hb_ctx;
+                        if (!req.session_key.empty()) hb_ctx.session_key = req.session_key;
+                        try {
+                            auto contrib = hb_mgr->run_heartbeat_prompt_contribution(hb_event, hb_ctx);
+                            if (contrib) {
+                                if (contrib->prepend_context && !contrib->prepend_context->empty())
+                                    prompt_copy = *contrib->prepend_context + "\n\n" + prompt_copy;
+                                if (contrib->append_context && !contrib->append_context->empty())
+                                    prompt_copy = prompt_copy + "\n\n" + *contrib->append_context;
+                            }
+                        } catch (const std::exception& e) {
+                            auto hb_log = spdlog::get("default");
+                            if (hb_log) hb_log->warn("heartbeat_prompt_contribution hook failed: {}", e.what());
+                        }
+                    }
+                }
+
                 const std::string agent_id_copy = agent_id;
                 const std::string lane_key_copy = lane_key;
                 const std::optional<std::string> originating_channel = req.originating_channel;
