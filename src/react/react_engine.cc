@@ -2212,6 +2212,13 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                 policy_ctx.aborted = &cancelled_;
                 policy_ctx.loop_state = nullptr;
                 policy_ctx.hook_manager = tools::get_global_hook_manager();
+                // 🎯 对齐 OpenClaw senderIsOwner + ownerOnly gate
+                if (tool_manager_) {
+                    policy_ctx.sender_is_owner = tool_manager_->context().sender_is_owner;
+                    if (auto t = tool_manager_->get_tool(tool_call.name)) {
+                        policy_ctx.tool_is_owner_only = t->owner_only();
+                    }
+                }
 
                 auto outcome = tools::run_before_tool_call_policy(policy_ctx, tool_call.input);
 
@@ -2449,6 +2456,13 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                 policy_ctx.aborted = &cancelled_;
                 policy_ctx.loop_state = nullptr;
                 policy_ctx.hook_manager = tools::get_global_hook_manager();
+                // 🎯 对齐 OpenClaw senderIsOwner + ownerOnly gate
+                if (tool_manager_) {
+                    policy_ctx.sender_is_owner = tool_manager_->context().sender_is_owner;
+                    if (auto t = tool_manager_->get_tool(tool_call.name)) {
+                        policy_ctx.tool_is_owner_only = t->owner_only();
+                    }
+                }
 
                 auto outcome = tools::run_before_tool_call_policy(policy_ctx, tool_call.input);
 

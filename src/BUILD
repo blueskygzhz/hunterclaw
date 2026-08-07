@@ -412,6 +412,7 @@ cc_library(
     deps = [
         "//:hunterclaw_headers",
         ":hunterclaw_infra",              # ✅ 添加 infra 依赖 (HttpClient)
+        ":hunterclaw_secguard",           # ✅ dangerous_tools (owner-only gate)
         ":hunterclaw_llm",
         ":hunterclaw_memory",
         ":hunterclaw_sessions",
@@ -513,6 +514,7 @@ cc_library(
     name = "hunterclaw_secguard",
     srcs = [
         "security/ssrf_guard.cc",
+        "security/dangerous_tools.cc",
         "sandbox/sanitize_env_vars.cc",
     ],
     deps = [
@@ -765,6 +767,7 @@ cc_library(
         "auto_reply/session_lifecycle_supplement.cc",
         # ✅ 已移至 hunterclaw_secguard (供 MCP 复用, 避免符号重复)
         "security/ssrf_guard.cc",
+        "security/dangerous_tools.cc",
         "shared/utils.cc",
     ]),
     deps = [

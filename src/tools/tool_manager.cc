@@ -252,15 +252,20 @@ ToolResult ToolManager::execute_tool(
     }
     
     // 3. Before Hooks (参数修改和验证) — 严格对齐 OpenClaw runBeforeToolCallHook()
+    // 🎯 owner-only 门禁 (Stage 0) 需在无插件 hook 时也执行, 因此 policy 链
+    // 无条件运行; hook 阶段在hook_manager 为空时内部跳过。
     core::JsonValue effective_params = params;
-    if (hook_manager_) {
+    {
         BeforeToolCallContext policy_ctx;
         policy_ctx.tool_name = name;
         policy_ctx.agent_id = context_.agent_id;
         policy_ctx.session_key = context_.session_key;
         policy_ctx.run_id = context_.run_id;
         policy_ctx.session_id = context_.session_id;
-        policy_ctx.hook_manager = hook_manager_.get();
+        // 🎯 对齐 OpenClaw senderIsOwner +ownerOnly gate
+        policy_ctx.sender_is_owner = context_.sender_is_owner;
+        policy_ctx.tool_is_owner_only = tool->owner_only();
+        policy_ctx.hook_manager = hook_manager_ ? hook_manager_.get() : nullptr;
 
         auto outcome = run_before_tool_call_policy(policy_ctx, params);
         if (outcome.kind == HookOutcomeKind::Veto) {

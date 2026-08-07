@@ -150,6 +150,10 @@ AgentInstance::AgentInstance(
         tool_context.workspace_dir = ctx_.workspace_dir;
         tool_context.session_key = ctx_.session_id;  // ✅ 直接使用 session_id
         tool_context.agent_id = ctx_.agent_id;
+        // 🎯 对齐 OpenClaw: 本地 owner 认证的 agent turn 具owner 身份
+        // (senderIsOwner:true)。owner-only 工具(cron/gateway/sessions/nodes等)
+        // 的门禁仅用于降级"跨 gateway HTTP 面的非 owner 调用者"。
+        tool_context.sender_is_owner = true;
         
         auto tool_mgr = tools::ToolManager::create(tool_context);
         

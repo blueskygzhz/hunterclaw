@@ -8,6 +8,7 @@
 #include "hunterclaw/tools/before_tool_call_policy.h"
 
 #include "hunterclaw/tools/tool_hooks.h"
+#include "hunterclaw/security/dangerous_tools.h"
 #include "hunterclaw/core/logger.h"
 
 #include <spdlog/spdlog.h>
@@ -88,6 +89,23 @@ std::string validate_tool_execution_params(const Tool& tool,
 // ── run_before_tool_call_policy ─────────────────────────────────────────────
 HookOutcome run_before_tool_call_policy(const BeforeToolCallContext& ctx,
                                         const core::JsonValue& original_params) {
+    // ── Stage 0: owner-only gate ─────────────────────────────────────────────
+    // 🎯 对齐 OpenClaw: senderIsOwner === false 时对GATEWAY_OWNER_ONLY_CORE_TOOLS
+    // (以及 ownerOnly:true 的工具) 注入 deny。非 owner 调用 owner-only 工具 => veto。
+    if (!ctx.sender_is_owner) {
+        const bool owner_only =
+            ctx.tool_is_owner_only ||
+            security::is_gateway_owner_only_core_tool(ctx.tool_name);
+        if (owner_only) {
+            std::string reason =
+                "Tool '" + ctx.tool_name + "' requires owner identity";
+            log()->warn("Tool '{}' denied: owner-only, sender is not owner",
+                        ctx.tool_name);
+            return HookOutcome::veto(reason, denied_reason::kOwnerOnly,
+                                     original_params);
+        }
+    }
+
     // ── Stage 1: tool-loop admission ─────────────────────────────────────────
     // OpenClaw policy.ts:131-144 admitSingleToolCallLoop -> critical => veto{tool-loop}.
     // In HunterClaw, loop detection/record is performed by the caller (react_engine

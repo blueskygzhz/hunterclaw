@@ -164,6 +164,11 @@ struct ToolContext {
     std::string current_thread_ts;
     std::string scope_key;
 
+    // 🎯 对齐 OpenClaw senderIsOwner: 调用者是否具有 owner (operator.admin) 身份。
+    // 非 owner 调用 owner_only 工具时, before_tool_call 门禁会 veto。
+    // 默认 false (最小权限); 由gateway/agent 上下文按 scope 显式置位。
+    bool sender_is_owner = false;
+
     // ===== 依赖注入 (用于工具注册) =====
     std::shared_ptr<infra::HttpClient>    http_client;
     std::shared_ptr<gateway::GatewayClient> gateway_client;

@@ -53,13 +53,15 @@ enum class HookOutcomeKind {
 
 // ── denied_reason canonical values (align OpenClaw HookBlockedReason) ────────
 // "plugin-before-tool-call" | "plugin-approval" | "plugin-approval-unavailable"
-// | "client-voice-confirmation" | "tool-loop"
+// | "client-voice-confirmation" | "tool-loop" | "owner-only"
 namespace denied_reason {
 inline constexpr const char* kPluginBeforeToolCall  = "plugin-before-tool-call";
 inline constexpr const char* kPluginApproval        = "plugin-approval";
 inline constexpr const char* kPluginApprovalUnavail = "plugin-approval-unavailable";
-inline constexpr const char* kClientVoice           = "client-voice-confirmation";
+inline constexpr const char* kClientVoice= "client-voice-confirmation";
 inline constexpr const char* kToolLoop              = "tool-loop";
+// 🎯 对齐 OpenClaw:非 owner 调用 owner-only 工具被 deny (GATEWAY_OWNER_ONLY_CORE_TOOLS)。
+inline constexpr const char* kOwnerOnly             = "owner-only";
 }  // namespace denied_reason
 
 // ── disposition canonical values (align OpenClaw DiagnosticToolTerminalReason) ─
@@ -131,6 +133,12 @@ struct BeforeToolCallContext {
     std::string session_key;
     std::string agent_id;
 
+    // 🎯 对齐 OpenClaw senderIsOwner + GATEWAY_OWNER_ONLY_CORE_TOOLS gate:
+    // sender_is_owner=false 且工具为 owner-only (tool_is_owner_only 或命中
+    // GATEWAY_OWNER_ONLY_CORE_TOOLS 名单) 时, Stage 0 直接 veto{owner-only}。
+    bool sender_is_owner = false;
+    bool tool_is_owner_only = false;
+
     // Cancellation flag observed after the hook, before execution
     // (OpenClaw: signal.throwIfAborted()).
     const std::atomic<bool>* aborted = nullptr;
@@ -145,10 +153,11 @@ struct BeforeToolCallContext {
 
 // ── run_before_tool_call_policy ─────────────────────────────────────────────
 // Strict port of OpenClaw runBeforeToolCallHook(). Ordered stages:
+//   0. owner-only gate                  -> veto{owner-only}
 //   1. tool-loop admission              -> veto{tool-loop}
 //   2. before_tool_call hook runner     -> veto{plugin-before-tool-call}
-//                                        -> params merge (adjusted params)
-//   3. hook threw                -> failure{disposition}
+//                -> params merge (adjusted params)
+//   3. hook threw                       -> failure{disposition}
 // (Approval / voice stages are represented via require_approval on the hook
 //  result and resolved by the injected approval resolver when present.)
 HookOutcome run_before_tool_call_policy(
