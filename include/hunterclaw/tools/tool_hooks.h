@@ -86,6 +86,7 @@ using plugins::PluginHookSkillContext;
 using plugins::PluginHookSkillChangedEvent;
 using plugins::PluginHookSkillProposalEvaluateEvent;
 using plugins::PluginHookSkillProposalEvaluateResult;
+using plugins::PluginHookSkillProposalEvaluationOutcome;
 using plugins::PluginHookSkillProposalChangedEvent;
 using plugins::PluginHookSubagentProgressEvent;
 using plugins::PluginHookBeforeInstallEvent;
@@ -629,8 +630,8 @@ public:
     /// Run skill_changed / skill_proposal_changed hooks (void, sequential)
     void run_skill_changed(const PluginHookSkillChangedEvent& event, const PluginHookSkillContext& ctx);
     void run_skill_proposal_changed(const PluginHookSkillProposalChangedEvent& event, const PluginHookSkillContext& ctx);
-    /// Run skill_proposal_evaluate:收集所有 evaluator 的结果
-    std::vector<PluginHookSkillProposalEvaluateResult> run_skill_proposal_evaluate(
+    /// Run skill_proposal_evaluate:收集所有 evaluator 的 outcome（含 attribution）
+    std::vector<plugins::PluginHookSkillProposalEvaluationOutcome> run_skill_proposal_evaluate(
         const PluginHookSkillProposalEvaluateEvent& event, const PluginHookSkillContext& ctx);
 
     /// Run subagent_progress / deactivate hooks (void, sequential)

@@ -725,23 +725,35 @@ std::optional<PluginHookReplyDispatchResult> ToolHookManager::run_reply_dispatch
 //   evaluator 失败作为数据处理（此处简化：失败跳过，不影响其它evaluator）。
 // ============================================================================
 
-std::vector<PluginHookSkillProposalEvaluateResult> ToolHookManager::run_skill_proposal_evaluate(
+std::vector<PluginHookSkillProposalEvaluationOutcome> ToolHookManager::run_skill_proposal_evaluate(
     const PluginHookSkillProposalEvaluateEvent& event,
     const PluginHookSkillContext& ctx)
 {
     std::vector<SkillProposalEvaluateEntry> hooks;
     { std::lock_guard<std::mutex> lock(mutex_); hooks = skill_proposal_evaluate_hooks_; }
-    std::vector<PluginHookSkillProposalEvaluateResult> outcomes;
+    std::vector<PluginHookSkillProposalEvaluationOutcome> outcomes;
     if (hooks.empty()) return outcomes;
 
     for (const auto& entry : hooks) {
+        // 对齐 normalizeEvaluationOutcomes:每个 evaluator 产生一个带 attribution 的 outcome。
+        PluginHookSkillProposalEvaluationOutcome outcome;
+        outcome.evaluator_id = entry.plugin_id;
+        outcome.plugin_id    = entry.plugin_id;
         try {
             auto result = entry.handler(event, ctx);
-            if (result) outcomes.push_back(*result);
+            if (result) {
+                outcome.status = "completed";
+                outcome.result = *result;
+            } else {
+                outcome.status = "skipped";  // 返回 nullopt → 跳过（对齐 status:"skipped"）
+            }
         } catch (const std::exception& e) {
+            outcome.status = "error";
+            outcome.error = e.what();
             log()->error("[hooks] skill_proposal_evaluate handler from '{}' failed: {}",
                 entry.plugin_id, e.what());
         }
+        outcomes.push_back(std::move(outcome));
     }
     return outcomes;
 }

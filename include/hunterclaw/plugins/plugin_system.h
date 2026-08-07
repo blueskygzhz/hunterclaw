@@ -938,6 +938,21 @@ struct PluginHookSkillProposalEvaluateResult {
   std::optional<std::string> summary;
   std::optional<std::string> findings_json;
   std::optional<std::string> metrics_json;
+  std::optional<std::string> evaluator_version;
+  std::optional<std::string> mode;
+  std::optional<std::string> decision;         // "pass" | "revise" | "block"
+  std::optional<std::string> decision_reason;
+};
+
+// 对齐 PluginHookSkillProposalEvaluationOutcome（带 attribution）：
+//   evaluate hook 每个 evaluator 的归属 + 状态 + 结果。
+struct PluginHookSkillProposalEvaluationOutcome {
+  std::string evaluator_id;
+  std::string plugin_id;
+  std::optional<std::string> plugin_version;
+  std::string status;   // "completed" | "skipped" | "error"
+  std::optional<PluginHookSkillProposalEvaluateResult> result;
+  std::optional<std::string> error;
 };
 
 struct PluginHookSkillProposalChangedEvent {
