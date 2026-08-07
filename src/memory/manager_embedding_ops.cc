@@ -106,7 +106,7 @@ ManagerEmbeddingOps::load_embedding_cache(const std::vector<std::string>& hashes
     }
 
     // 对齐 manager-embedding-ops.ts:loadEmbeddingCache
-    // SELECT hash, embedding FROM embedding_cache
+    // SELECT hash, embedding FROM memory_embedding_cache
     //  WHERE provider = ? AND model = ? AND provider_key = ? AND hash IN (...)
     const std::string provider_id  = provider_->get_id();
     const std::string model        = provider_->get_model();
@@ -125,7 +125,7 @@ ManagerEmbeddingOps::load_embedding_cache(const std::vector<std::string>& hashes
         }
 
         std::string sql =
-            "SELECT hash, embedding FROM embedding_cache"
+            "SELECT hash, embedding FROM memory_embedding_cache"
             " WHERE provider = ? AND model = ? AND provider_key = ?"
             " AND hash IN (" + placeholders + ")";
 
@@ -178,7 +178,7 @@ void ManagerEmbeddingOps::upsert_embedding_cache(
     }
 
     // 对齐 manager-embedding-ops.ts:upsertEmbeddingCache
-    // INSERT INTO embedding_cache (provider, model, provider_key, hash, embedding, dims, updated_at)
+    // INSERT INTO memory_embedding_cache (provider, model, provider_key, hash, embedding, dims, updated_at)
     //  VALUES (?, ?, ?, ?, ?, ?, ?)
     //  ON CONFLICT(...) DO UPDATE SET embedding=..., dims=..., updated_at=...
     const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -190,7 +190,7 @@ void ManagerEmbeddingOps::upsert_embedding_cache(
     const std::string provider_key = compute_provider_key();
 
     const std::string sql =
-        "INSERT INTO embedding_cache"
+        "INSERT INTO memory_embedding_cache"
         " (provider, model, provider_key, hash, embedding, dims, updated_at)"
         " VALUES (?, ?, ?, ?, ?, ?, ?)"
         " ON CONFLICT(provider, model, provider_key, hash) DO UPDATE SET"
@@ -239,8 +239,8 @@ void ManagerEmbeddingOps::prune_embedding_cache_if_needed() {
     }
 
     // 对齐 manager-embedding-ops.ts:pruneEmbeddingCacheIfNeeded
-    // SELECT COUNT(*) as c FROM embedding_cache
-    auto stmt_res = db_->prepare_statement("SELECT COUNT(*) as c FROM embedding_cache");
+    // SELECT COUNT(*) as c FROM memory_embedding_cache
+    auto stmt_res = db_->prepare_statement("SELECT COUNT(*) as c FROM memory_embedding_cache");
     if (stmt_res.is_err()) return;
     sqlite3_stmt* stmt = stmt_res.get();
     int count = 0;
@@ -254,13 +254,13 @@ void ManagerEmbeddingOps::prune_embedding_cache_if_needed() {
     }
 
     const int excess = count - max;
-    // DELETE FROM embedding_cache WHERE rowid IN (
-    //   SELECT rowid FROM embedding_cache ORDER BY updated_at ASC LIMIT ?
+    // DELETE FROM memory_embedding_cache WHERE rowid IN (
+    //   SELECT rowid FROM memory_embedding_cache ORDER BY updated_at ASC LIMIT ?
     // )
     const std::string sql =
-        "DELETE FROM embedding_cache"
+        "DELETE FROM memory_embedding_cache"
         " WHERE rowid IN ("
-        "   SELECT rowid FROM embedding_cache"
+        "   SELECT rowid FROM memory_embedding_cache"
         "   ORDER BY updated_at ASC"
         "   LIMIT ?"
         " )";
@@ -547,7 +547,7 @@ core::Result<bool> ManagerEmbeddingOps::ensure_vector_ready(size_t dimensions) {
     if (dimensions == 0) {
         return core::Result<bool>::Ok(false);
     }
-    // chunks_vec 表在 ensure_schema 中已创建（如果 vec 扩展可用）
+    // memory_index_chunks_vec 表在 ensure_schema 中已创建（如果 vec 扩展可用）
     // 这里只需确认 vec 扩展已加载
     return core::Result<bool>::Ok(true);
 }
@@ -614,8 +614,8 @@ void ManagerEmbeddingOps::clear_indexed_file_data(
     // Vector table
     if (settings_.vector.enabled) {
         const std::string sql_vec =
-            "DELETE FROM chunks_vec WHERE id IN"
-            " (SELECT id FROM chunks WHERE path = ? AND source = ?)";
+            "DELETE FROM memory_index_chunks_vec WHERE id IN"
+            " (SELECT id FROM memory_index_chunks WHERE path = ? AND source = ?)";
         auto s = db_->prepare_statement(sql_vec);
         if (s.is_ok()) {
             sqlite3_bind_text(s.get(), 1, pathname.c_str(),   -1, SQLITE_TRANSIENT);
@@ -628,7 +628,7 @@ void ManagerEmbeddingOps::clear_indexed_file_data(
     // FTS table
     if (settings_.fts.enabled && fts_available_ && provider_) {
         const std::string sql_fts =
-            "DELETE FROM chunks_fts WHERE path = ? AND source = ? AND model = ?";
+            "DELETE FROM memory_index_chunks_fts WHERE path = ? AND source = ? AND model = ?";
         auto s = db_->prepare_statement(sql_fts);
         if (s.is_ok()) {
             sqlite3_bind_text(s.get(), 1, pathname.c_str(),              -1, SQLITE_TRANSIENT);
@@ -640,7 +640,7 @@ void ManagerEmbeddingOps::clear_indexed_file_data(
     }
 
     // Chunks table
-    const std::string sql_chunks = "DELETE FROM chunks WHERE path = ? AND source = ?";
+    const std::string sql_chunks = "DELETE FROM memory_index_chunks WHERE path = ? AND source = ?";
     auto s = db_->prepare_statement(sql_chunks);
     if (s.is_ok()) {
         sqlite3_bind_text(s.get(), 1, pathname.c_str(),   -1, SQLITE_TRANSIENT);
@@ -659,8 +659,8 @@ void ManagerEmbeddingOps::upsert_file_record(
 
     // 对齐 manager-embedding-ops.ts:upsertFileRecord
     const std::string sql =
-        "INSERT INTO files (path, source, hash, mtime, size) VALUES (?, ?, ?, ?, ?)"
-        " ON CONFLICT(path) DO UPDATE SET"
+        "INSERT INTO memory_index_sources (path, source, hash, mtime, size) VALUES (?, ?, ?, ?, ?)"
+        " ON CONFLICT(path, source) DO UPDATE SET"
         "   source=excluded.source,"
         "   hash=excluded.hash,"
         "   mtime=excluded.mtime,"
@@ -685,7 +685,7 @@ void ManagerEmbeddingOps::delete_file_record(
     const std::string source_str = (source == MemorySource::Memory) ? "memory" : "sessions";
 
     // 对齐 manager-embedding-ops.ts:deleteFileRecord
-    const std::string sql = "DELETE FROM files WHERE path = ? AND source = ?";
+    const std::string sql = "DELETE FROM memory_index_sources WHERE path = ? AND source = ?";
     auto s = db_->prepare_statement(sql);
     if (s.is_err()) return;
     sqlite3_bind_text(s.get(), 1, pathname.c_str(),   -1, SQLITE_TRANSIENT);
@@ -708,8 +708,8 @@ void ManagerEmbeddingOps::upsert_session_file_record(
     // 对齐 manager-embedding-ops.ts:upsertFileRecord
     // SessionFileEntry 与 MemoryFileEntry 共享相同的 files 表结构
     const std::string sql =
-        "INSERT INTO files (path, source, hash, mtime, size) VALUES (?, ?, ?, ?, ?)"
-        " ON CONFLICT(path) DO UPDATE SET"
+        "INSERT INTO memory_index_sources (path, source, hash, mtime, size) VALUES (?, ?, ?, ?, ?)"
+        " ON CONFLICT(path, source) DO UPDATE SET"
         "   source=excluded.source,"
         "   hash=excluded.hash,"
         "   mtime=excluded.mtime,"
@@ -821,9 +821,9 @@ core::Result<void> ManagerEmbeddingOps::index_file(
 
     const std::string source_str = (source == MemorySource::Memory) ? "memory" : "sessions";
 
-    // 对齐 openclaw: INSERT INTO chunks ... ON CONFLICT DO UPDATE
+    // 对齐 openclaw: INSERT INTO memory_index_chunks ... ON CONFLICT DO UPDATE
     const std::string sql_chunks =
-        "INSERT INTO chunks"
+        "INSERT INTO memory_index_chunks"
         " (id, path, source, start_line, end_line, hash, model, text, embedding, updated_at)"
         " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         " ON CONFLICT(id) DO UPDATE SET"
@@ -839,20 +839,20 @@ core::Result<void> ManagerEmbeddingOps::index_file(
     }
     sqlite3_stmt* stmt_chunks = stmt_chunks_res.get();
 
-    // 对齐 openclaw: INSERT INTO chunks_vec (id, embedding) VALUES (?, ?)
+    // 对齐 openclaw: INSERT INTO memory_index_chunks_vec (id, embedding) VALUES (?, ?)
     sqlite3_stmt* stmt_vec = nullptr;
     if (vector_ready) {
         const std::string sql_vec =
-            "INSERT INTO chunks_vec (id, embedding) VALUES (?, ?)";
+            "INSERT INTO memory_index_chunks_vec (id, embedding) VALUES (?, ?)";
         auto r = db_->prepare_statement(sql_vec);
         if (r.is_ok()) stmt_vec = r.get();
     }
 
-    // 对齐 openclaw: INSERT INTO chunks_fts (text, id, path, source, model, start_line, end_line)
+    // 对齐 openclaw: INSERT INTO memory_index_chunks_fts (text, id, path, source, model, start_line, end_line)
     sqlite3_stmt* stmt_fts = nullptr;
     if (settings_.fts.enabled && fts_available_) {
         const std::string sql_fts =
-            "INSERT INTO chunks_fts"
+            "INSERT INTO memory_index_chunks_fts"
             " (text, id, path, source, model, start_line, end_line)"
             " VALUES (?, ?, ?, ?, ?, ?, ?)";
         auto r = db_->prepare_statement(sql_fts);
@@ -894,10 +894,10 @@ core::Result<void> ManagerEmbeddingOps::index_file(
         sqlite3_bind_int64(stmt_chunks, 10, now);
         sqlite3_step(stmt_chunks);
 
-        // Insert into chunks_vec (对齐 openclaw: vectorToBlob)
+        // Insert into memory_index_chunks_vec (对齐 openclaw: vectorToBlob)
         if (stmt_vec && !embedding.empty()) {
-            // First delete existing (对齐 openclaw: db.prepare("DELETE FROM chunks_vec WHERE id = ?").run(id))
-            auto del_res = db_->prepare_statement("DELETE FROM chunks_vec WHERE id = ?");
+            // First delete existing (对齐 openclaw: db.prepare("DELETE FROM memory_index_chunks_vec WHERE id = ?").run(id))
+            auto del_res = db_->prepare_statement("DELETE FROM memory_index_chunks_vec WHERE id = ?");
             if (del_res.is_ok()) {
                 sqlite3_bind_text(del_res.get(), 1, id.c_str(), -1, SQLITE_TRANSIENT);
                 sqlite3_step(del_res.get());
@@ -912,7 +912,7 @@ core::Result<void> ManagerEmbeddingOps::index_file(
             sqlite3_step(stmt_vec);
         }
 
-        // Insert into chunks_fts
+        // Insert into memory_index_chunks_fts
         if (stmt_fts) {
             sqlite3_reset(stmt_fts);
             sqlite3_bind_text(stmt_fts, 1, chunk.text.c_str(),              -1, SQLITE_TRANSIENT);
@@ -1087,7 +1087,7 @@ core::Result<void> ManagerEmbeddingOps::index_session_file(
     const std::string source_str = (source == MemorySource::Memory) ? "memory" : "sessions";
 
     const std::string sql_chunks =
-        "INSERT INTO chunks"
+        "INSERT INTO memory_index_chunks"
         " (id, path, source, start_line, end_line, hash, model, text, embedding, updated_at)"
         " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         " ON CONFLICT(id) DO UPDATE SET"
@@ -1105,7 +1105,7 @@ core::Result<void> ManagerEmbeddingOps::index_session_file(
 
     sqlite3_stmt* stmt_vec = nullptr;
     if (vector_ready) {
-        const std::string sql_vec = "INSERT INTO chunks_vec (id, embedding) VALUES (?, ?)";
+        const std::string sql_vec = "INSERT INTO memory_index_chunks_vec (id, embedding) VALUES (?, ?)";
         auto r = db_->prepare_statement(sql_vec);
         if (r.is_ok()) stmt_vec = r.get();
     }
@@ -1113,7 +1113,7 @@ core::Result<void> ManagerEmbeddingOps::index_session_file(
     sqlite3_stmt* stmt_fts = nullptr;
     if (settings_.fts.enabled && fts_available_) {
         const std::string sql_fts =
-            "INSERT INTO chunks_fts"
+            "INSERT INTO memory_index_chunks_fts"
             " (text, id, path, source, model, start_line, end_line)"
             " VALUES (?, ?, ?, ?, ?, ?, ?)";
         auto r = db_->prepare_statement(sql_fts);
@@ -1154,7 +1154,7 @@ core::Result<void> ManagerEmbeddingOps::index_session_file(
         sqlite3_step(stmt_chunks);
 
         if (stmt_vec && !embedding.empty()) {
-            auto del_res = db_->prepare_statement("DELETE FROM chunks_vec WHERE id = ?");
+            auto del_res = db_->prepare_statement("DELETE FROM memory_index_chunks_vec WHERE id = ?");
             if (del_res.is_ok()) {
                 sqlite3_bind_text(del_res.get(), 1, id.c_str(), -1, SQLITE_TRANSIENT);
                 sqlite3_step(del_res.get());

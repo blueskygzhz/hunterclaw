@@ -11,7 +11,7 @@ void delete_memory_fts_rows(const DeleteFtsRowsParams& params) {
     if (!params.db) return;
 
     if (params.current_model) {
-        // DELETE FROM chunks_fts WHERE path = ? AND source = ? AND model = ?
+        // DELETE FROM memory_index_chunks_fts WHERE path = ? AND source = ? AND model = ?
         const std::string sql = "DELETE FROM " + params.table_name +
             " WHERE path = ? AND source = ? AND model = ?";
         auto stmt = params.db->prepare_statement(sql);
@@ -24,7 +24,7 @@ void delete_memory_fts_rows(const DeleteFtsRowsParams& params) {
         return;
     }
 
-    // DELETE FROM chunks_fts WHERE path = ? AND source = ?
+    // DELETE FROM memory_index_chunks_fts WHERE path = ? AND source = ?
     const std::string sql = "DELETE FROM " + params.table_name +
         " WHERE path = ? AND source = ?";
     auto stmt = params.db->prepare_statement(sql);

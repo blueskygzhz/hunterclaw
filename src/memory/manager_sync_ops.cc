@@ -96,20 +96,20 @@ void MemoryManagerSyncOps::ensure_schema() {
 // ============================================================================
 void MemoryManagerSyncOps::seed_embedding_cache(SQLiteVectorStorage& source_db) {
     // 对齐 openclaw manager-sync-ops.ts:seedEmbeddingCache
-    // 从旧 db 复制 embedding_cache 到新 db
+    // 从旧 db 复制 memory_embedding_cache 到新 db
     if (!db_) return;
 
-    // SELECT * FROM embedding_cache
+    // SELECT * FROM memory_embedding_cache
     auto stmt_res = source_db.prepare_statement(
         "SELECT provider, model, provider_key, hash, embedding, dims, updated_at"
-        " FROM embedding_cache"
+        " FROM memory_embedding_cache"
     );
     if (stmt_res.is_err()) return;
     sqlite3_stmt* src_stmt = stmt_res.get();
 
-    // INSERT OR IGNORE INTO embedding_cache ...
+    // INSERT OR IGNORE INTO memory_embedding_cache ...
     const std::string insert_sql =
-        "INSERT OR IGNORE INTO embedding_cache"
+        "INSERT OR IGNORE INTO memory_embedding_cache"
         " (provider, model, provider_key, hash, embedding, dims, updated_at)"
         " VALUES (?, ?, ?, ?, ?, ?, ?)";
     auto dst_res = db_->prepare_statement(insert_sql);
@@ -884,7 +884,7 @@ core::Result<void> MemoryManagerSyncOps::sync_memory_files(
         // 检查 hash 是否变化 (对齐 ts:737-747)
         if (!needs_full_reindex) {
             auto stmt_r = db_->prepare_statement(
-                "SELECT hash FROM files WHERE path = ? AND source = ?");
+                "SELECT hash FROM memory_index_sources WHERE path = ? AND source = ?");
             if (stmt_r.is_ok()) {
                 sqlite3_stmt* stmt = stmt_r.get();
                 sqlite3_bind_text(stmt, 1, entry.path.c_str(), -1, SQLITE_TRANSIENT);
@@ -922,7 +922,7 @@ core::Result<void> MemoryManagerSyncOps::sync_memory_files(
     }
 
     // 清理 stale 条目 (对齐 ts:761-783)
-    auto stale_r = db_->prepare_statement("SELECT path FROM files WHERE source = ?");
+    auto stale_r = db_->prepare_statement("SELECT path FROM memory_index_sources WHERE source = ?");
     if (stale_r.is_ok()) {
         sqlite3_stmt* stmt = stale_r.get();
         sqlite3_bind_text(stmt, 1, "memory", -1, SQLITE_TRANSIENT);
@@ -934,13 +934,13 @@ core::Result<void> MemoryManagerSyncOps::sync_memory_files(
         sqlite3_finalize(stmt);
 
         for (const auto& sp : stale_paths) {
-            db_->exec_sql("DELETE FROM files WHERE path = '" + sp + "' AND source = 'memory'");
+            db_->exec_sql("DELETE FROM memory_index_sources WHERE path = '" + sp + "' AND source = 'memory'");
             try {
                 db_->exec_sql(
                     "DELETE FROM " + std::string(VECTOR_TABLE) +
-                    " WHERE id IN (SELECT id FROM chunks WHERE path = '" + sp + "' AND source = 'memory')");
+                    " WHERE id IN (SELECT id FROM memory_index_chunks WHERE path = '" + sp + "' AND source = 'memory')");
             } catch (...) {}
-            db_->exec_sql("DELETE FROM chunks WHERE path = '" + sp + "' AND source = 'memory'");
+            db_->exec_sql("DELETE FROM memory_index_chunks WHERE path = '" + sp + "' AND source = 'memory'");
             if (fts_.enabled && fts_.available && provider_) {
                 try {
                     db_->exec_sql(
@@ -1041,7 +1041,7 @@ core::Result<void> MemoryManagerSyncOps::sync_session_files(
         // 检查 hash (对齐 ts:848-858)
         if (!needs_full_reindex) {
             auto stmt_r = db_->prepare_statement(
-                "SELECT hash FROM files WHERE path = ? AND source = ?");
+                "SELECT hash FROM memory_index_sources WHERE path = ? AND source = ?");
             if (stmt_r.is_ok()) {
                 sqlite3_stmt* stmt = stmt_r.get();
                 sqlite3_bind_text(stmt, 1, entry.path.c_str(), -1, SQLITE_TRANSIENT);
@@ -1084,7 +1084,7 @@ core::Result<void> MemoryManagerSyncOps::sync_session_files(
 
     // 清理 stale session 条目 (对齐 ts:874-907)
     if (active_paths) {
-        auto stale_r = db_->prepare_statement("SELECT path FROM files WHERE source = ?");
+        auto stale_r = db_->prepare_statement("SELECT path FROM memory_index_sources WHERE source = ?");
         if (stale_r.is_ok()) {
             sqlite3_stmt* stmt = stale_r.get();
             sqlite3_bind_text(stmt, 1, "sessions", -1, SQLITE_TRANSIENT);
@@ -1096,13 +1096,13 @@ core::Result<void> MemoryManagerSyncOps::sync_session_files(
             sqlite3_finalize(stmt);
 
             for (const auto& sp : stale_paths) {
-                db_->exec_sql("DELETE FROM files WHERE path = '" + sp + "' AND source = 'sessions'");
+                db_->exec_sql("DELETE FROM memory_index_sources WHERE path = '" + sp + "' AND source = 'sessions'");
                 try {
                     db_->exec_sql(
                         "DELETE FROM " + std::string(VECTOR_TABLE) +
-                        " WHERE id IN (SELECT id FROM chunks WHERE path = '" + sp + "' AND source = 'sessions')");
+                        " WHERE id IN (SELECT id FROM memory_index_chunks WHERE path = '" + sp + "' AND source = 'sessions')");
                 } catch (...) {}
-                db_->exec_sql("DELETE FROM chunks WHERE path = '" + sp + "' AND source = 'sessions'");
+                db_->exec_sql("DELETE FROM memory_index_chunks WHERE path = '" + sp + "' AND source = 'sessions'");
                 if (fts_.enabled && fts_.available && provider_) {
                     try {
                         db_->exec_sql(
@@ -1123,8 +1123,8 @@ core::Result<void> MemoryManagerSyncOps::sync_session_files(
 // ============================================================================
 void MemoryManagerSyncOps::reset_index() {
     if (!db_) return;
-    db_->exec_sql("DELETE FROM files");
-    db_->exec_sql("DELETE FROM chunks");
+    db_->exec_sql("DELETE FROM memory_index_sources");
+    db_->exec_sql("DELETE FROM memory_index_chunks");
     if (fts_.enabled && fts_.available) {
         try { db_->exec_sql(std::string("DELETE FROM ") + FTS_TABLE); } catch (...) {}
     }

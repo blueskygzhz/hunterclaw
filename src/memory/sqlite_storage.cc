@@ -135,34 +135,38 @@ core::Result<bool> SQLiteVectorStorage::ensure_schema() {
 
     std::string error;
 
-    // 对齐 openclaw memory-schema.ts:ensureMemoryIndexSchema
+    // 🎯 严格对齐 OpenClaw canonical memory schema
+    //   (packages/memory-host-sdk/src/host/memory-schema-{base,fts,recall,provenance}.ts)
+    //   全部使用 memory_index_* 前缀 + STRICT。
 
-    // meta table
+    // memory_index_meta
     if (!::hunterclaw::memory::exec_sql(db_, R"(
-        CREATE TABLE IF NOT EXISTS meta (
+        CREATE TABLE IF NOT EXISTS memory_index_meta (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
-        );
+        ) STRICT;
     )", &error)) {
-        return core::Result<bool>::Err("Failed to create meta: " + error);
+        return core::Result<bool>::Err("Failed to create memory_index_meta: " + error);
     }
 
-    // files table (对齐 openclaw)
+    // memory_index_sources (对齐 OC: 原 files 表 → sources；mtime REAL；UNIQUE(path,source))
     if (!::hunterclaw::memory::exec_sql(db_, R"(
-        CREATE TABLE IF NOT EXISTS files (
-            path TEXT PRIMARY KEY,
+        CREATE TABLE IF NOT EXISTS memory_index_sources (
+            id INTEGER PRIMARY KEY,
+            path TEXT NOT NULL,
             source TEXT NOT NULL DEFAULT 'memory',
             hash TEXT NOT NULL,
-            mtime INTEGER NOT NULL,
-            size INTEGER NOT NULL
-        );
+            mtime REAL NOT NULL,
+            size INTEGER NOT NULL,
+            UNIQUE (path, source)
+        ) STRICT;
     )", &error)) {
-        return core::Result<bool>::Err("Failed to create files: " + error);
+        return core::Result<bool>::Err("Failed to create memory_index_sources: " + error);
     }
 
-    // chunks table (对齐 openclaw: 主表名为 chunks，不是 chunks_vec)
+    // memory_index_chunks (对齐 OC)
     if (!::hunterclaw::memory::exec_sql(db_, R"(
-        CREATE TABLE IF NOT EXISTS chunks (
+        CREATE TABLE IF NOT EXISTS memory_index_chunks (
             id TEXT PRIMARY KEY,
             path TEXT NOT NULL,
             source TEXT NOT NULL DEFAULT 'memory',
@@ -173,14 +177,54 @@ core::Result<bool> SQLiteVectorStorage::ensure_schema() {
             text TEXT NOT NULL,
             embedding TEXT NOT NULL,
             updated_at INTEGER NOT NULL
-        );
+        ) STRICT;
     )", &error)) {
-        return core::Result<bool>::Err("Failed to create chunks: " + error);
+        return core::Result<bool>::Err("Failed to create memory_index_chunks: " + error);
     }
 
-    // embedding_cache table (对齐 openclaw schema)
+    // memory_index_chunk_recall_metadata (对齐 OC memory-schema-recall.ts)
     if (!::hunterclaw::memory::exec_sql(db_, R"(
-        CREATE TABLE IF NOT EXISTS embedding_cache (
+        CREATE TABLE IF NOT EXISTS memory_index_chunk_recall_metadata (
+            chunk_id TEXT PRIMARY KEY,
+            importance INTEGER CHECK (importance IS NULL OR importance BETWEEN 1 AND 10),
+            triggers TEXT,
+            project_key TEXT,
+            FOREIGN KEY (chunk_id) REFERENCES memory_index_chunks(id) ON DELETE CASCADE
+        ) STRICT;
+    )", &error)) {
+        return core::Result<bool>::Err("Failed to create memory_index_chunk_recall_metadata: " + error);
+    }
+
+    // memory_index_chunk_provenance (对齐 OC memory-schema-provenance.ts)
+    if (!::hunterclaw::memory::exec_sql(db_, R"(
+        CREATE TABLE IF NOT EXISTS memory_index_chunk_provenance (
+            chunk_id TEXT PRIMARY KEY,
+            origin_class TEXT NOT NULL CHECK (origin_class IN ('owner', 'agent', 'untrusted', 'system')),
+            session_kind TEXT NOT NULL CHECK (session_kind IN ('interactive', 'cron', 'heartbeat', 'subagent', 'unknown')),
+            observed_at INTEGER NOT NULL,
+            supersedes_key TEXT,
+            FOREIGN KEY (chunk_id) REFERENCES memory_index_chunks(id) ON DELETE CASCADE
+        ) STRICT;
+    )", &error)) {
+        return core::Result<bool>::Err("Failed to create memory_index_chunk_provenance: " + error);
+    }
+
+    // memory_index_state (对齐 OC: 单行 revision 计数)
+    if (!::hunterclaw::memory::exec_sql(db_, R"(
+        CREATE TABLE IF NOT EXISTS memory_index_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            revision INTEGER NOT NULL
+        ) STRICT;
+    )", &error)) {
+        return core::Result<bool>::Err("Failed to create memory_index_state: " + error);
+    }
+    // 初始化 revision 单行（对齐 OC: 默认 revision=0）
+    ::hunterclaw::memory::exec_sql(db_,
+        "INSERT OR IGNORE INTO memory_index_state (id, revision) VALUES (1, 0);");
+
+    // memory_embedding_cache (对齐 OC memory-schema-base.ts)
+    if (!::hunterclaw::memory::exec_sql(db_, R"(
+        CREATE TABLE IF NOT EXISTS memory_embedding_cache (
             provider TEXT NOT NULL,
             model TEXT NOT NULL,
             provider_key TEXT NOT NULL,
@@ -189,28 +233,26 @@ core::Result<bool> SQLiteVectorStorage::ensure_schema() {
             dims INTEGER,
             updated_at INTEGER NOT NULL,
             PRIMARY KEY (provider, model, provider_key, hash)
-        );
+        ) STRICT;
     )", &error)) {
-        return core::Result<bool>::Err("Failed to create embedding_cache: " + error);
+        return core::Result<bool>::Err("Failed to create memory_embedding_cache: " + error);
     }
 
     ::hunterclaw::memory::exec_sql(db_,
-        "CREATE INDEX IF NOT EXISTS idx_embedding_cache_updated_at ON embedding_cache(updated_at);");
+        "CREATE INDEX IF NOT EXISTS idx_embedding_cache_updated_at ON memory_embedding_cache(updated_at);");
 
-    // FTS5 table (对齐 openclaw: chunks_fts)
+    // FTS5 body table (对齐 OC memory-schema-fts.ts: memory_index_chunks_fts)
     if (config_.enable_fts) {
         std::string fts_error;
-        // 对齐 OC: ftsTokenizer 决定 FTS5 tokenizer 配置
-        // unicode61 (default): tokenize="unicode61 remove_diacritics 1"
-        // trigram: tokenize="trigram"
         std::string tokenizer_clause;
         if (config_.fts_tokenizer == "trigram") {
-            tokenizer_clause = ", tokenize=\"trigram\"";
+            tokenizer_clause = ", tokenize=\"trigram case_sensitive 0\"";
         } else {
-            tokenizer_clause = ", tokenize=\"unicode61 remove_diacritics 1\"";
+            tokenizer_clause = ", tokenize=\"unicode61\"";
         }
+        // body FTS: 列顺序严格对齐 OC (text, id, path, source, model, start_line, end_line)
         std::string fts_sql = R"(
-            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+            CREATE VIRTUAL TABLE IF NOT EXISTS memory_index_chunks_fts USING fts5(
                 text,
                 id UNINDEXED,
                 path UNINDEXED,
@@ -223,46 +265,53 @@ core::Result<bool> SQLiteVectorStorage::ensure_schema() {
         bool fts_ok = ::hunterclaw::memory::exec_sql(db_, fts_sql, &fts_error);
         if (fts_ok) {
             fts_available_ = true;
+            // path FTS (对齐 OC ensureMemoryPathFtsSchema: memory_index_paths_fts + triggers)
+            std::string paths_fts_sql = R"(
+                CREATE VIRTUAL TABLE IF NOT EXISTS memory_index_paths_fts USING fts5(
+                    path,
+                    source UNINDEXED)" + tokenizer_clause + R"(
+                );
+            )";
+            ::hunterclaw::memory::exec_sql(db_, paths_fts_sql);
+            // canonical source→path_fts 维护 triggers (对齐 OC MEMORY_PATH_FTS_TRIGGER_DEFINITIONS)
+            ::hunterclaw::memory::exec_sql(db_, R"(
+                CREATE TRIGGER IF NOT EXISTS memory_index_paths_fts_after_insert
+                AFTER INSERT ON memory_index_sources
+                BEGIN
+                    INSERT INTO memory_index_paths_fts (rowid, path, source)
+                    VALUES (NEW.id, NEW.path, NEW.source);
+                END;
+            )");
+            ::hunterclaw::memory::exec_sql(db_, R"(
+                CREATE TRIGGER IF NOT EXISTS memory_index_paths_fts_after_update
+                AFTER UPDATE OF id, path, source ON memory_index_sources
+                BEGIN
+                    DELETE FROM memory_index_paths_fts WHERE rowid = OLD.id;
+                    INSERT INTO memory_index_paths_fts (rowid, path, source)
+                    VALUES (NEW.id, NEW.path, NEW.source);
+                END;
+            )");
+            ::hunterclaw::memory::exec_sql(db_, R"(
+                CREATE TRIGGER IF NOT EXISTS memory_index_paths_fts_after_delete
+                AFTER DELETE ON memory_index_sources
+                BEGIN
+                    DELETE FROM memory_index_paths_fts WHERE rowid = OLD.id;
+                END;
+            )");
         } else {
             fts_available_ = false;
             fts_error_ = fts_error;
         }
     }
 
-    // ensureColumn migrations (对齐 openclaw:ensureColumn)
-    auto ensure_column = [&](const char* table, const char* column, const char* definition) {
-        // Check if column exists via PRAGMA table_info
-        std::string pragma = std::string("PRAGMA table_info(") + table + ")";
-        sqlite3_stmt* stmt = prepare_stmt(db_, pragma);
-        if (!stmt) return;
-        bool found = false;
-        while (sqlite3_step(stmt) == SQLITE_ROW) {
-            const char* col_name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-            if (col_name && std::string(col_name) == column) {
-                found = true;
-                break;
-            }
-        }
-        sqlite3_finalize(stmt);
-        if (!found) {
-            std::string alter = std::string("ALTER TABLE ") + table + " ADD COLUMN " + column + " " + definition;
-            ::hunterclaw::memory::exec_sql(db_, alter);
-        }
-    };
+    // Indices (canonical 表名)
+    ::hunterclaw::memory::exec_sql(db_, "CREATE INDEX IF NOT EXISTS idx_chunks_path ON memory_index_chunks(path);");
+    ::hunterclaw::memory::exec_sql(db_, "CREATE INDEX IF NOT EXISTS idx_chunks_source ON memory_index_chunks(source);");
 
-    ensure_column("files", "source", "TEXT NOT NULL DEFAULT 'memory'");
-    ensure_column("chunks", "source", "TEXT NOT NULL DEFAULT 'memory'");
-
-    // Indices
-    ::hunterclaw::memory::exec_sql(db_, "CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);");
-    ::hunterclaw::memory::exec_sql(db_, "CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source);");
-
-    // sqlite-vec virtual table (chunks_vec) - only if vec extension loaded
+    // sqlite-vec virtual table - only if vec extension loaded
     if (vec_available_) {
-        // chunks_vec is a separate virtual table for vector search
-        // It mirrors chunk IDs and embeddings for fast ANN search
         ::hunterclaw::memory::exec_sql(db_, R"(
-            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
+            CREATE VIRTUAL TABLE IF NOT EXISTS memory_index_chunks_vec USING vec0(
                 id TEXT PRIMARY KEY,
                 embedding FLOAT[1536]
             );
@@ -330,11 +379,11 @@ core::Result<bool> SQLiteVectorStorage::create_indices() {
     }
     
     std::string error;
-    if (!::hunterclaw::memory::exec_sql(db_, "CREATE INDEX IF NOT EXISTS idx_chunks_vec_path ON chunks_vec(path)", &error)) {
+    if (!::hunterclaw::memory::exec_sql(db_, "CREATE INDEX IF NOT EXISTS idx_chunks_vec_path ON memory_index_chunks_vec(path)", &error)) {
         return core::Result<bool>::Err("Failed to create index: " + error);
     }
     
-    if (!::hunterclaw::memory::exec_sql(db_, "CREATE INDEX IF NOT EXISTS idx_chunks_vec_source ON chunks_vec(source)", &error)) {
+    if (!::hunterclaw::memory::exec_sql(db_, "CREATE INDEX IF NOT EXISTS idx_chunks_vec_source ON memory_index_chunks_vec(source)", &error)) {
         return core::Result<bool>::Err("Failed to create index: " + error);
     }
     
@@ -389,62 +438,77 @@ core::Result<std::string> SQLiteVectorStorage::add_chunk(
     }
     
     std::string id = generate_id();
-    
+
+    // 🎯 对齐 OC canonical: 主数据写 memory_index_chunks（非 vec 表）。
     const char* sql = R"(
-        INSERT OR REPLACE INTO chunks_vec 
-        (id, path, source, model, start_line, end_line, content, embedding, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT OR REPLACE INTO memory_index_chunks
+        (id, path, source, start_line, end_line, hash, model, text, embedding, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     )";
-    
+
     std::string error;
     sqlite3_stmt* stmt = prepare_stmt(db_, sql, &error);
     if (!stmt) {
         return core::Result<std::string>::Err("Failed to prepare insert: " + error);
     }
-    
+
+    int64_t updated_at = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    std::string emb_text = serialize_embedding(embedding);
+    std::string content_hash = compute_content_hash(content);
+
     sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 2, path.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 3, to_string(metadata.source).c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 4, metadata.model.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, 5, metadata.start_line);
-    sqlite3_bind_int(stmt, 6, metadata.end_line);
-    sqlite3_bind_text(stmt, 7, content.c_str(), -1, SQLITE_TRANSIENT);
-    
-    std::string blob = serialize_embedding(embedding);
-    sqlite3_bind_blob(stmt, 8, blob.data(), blob.size(), SQLITE_TRANSIENT);
-    
-    int64_t created_at = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    sqlite3_bind_int64(stmt, 9, created_at);
-    
+    sqlite3_bind_int(stmt, 4, metadata.start_line);
+    sqlite3_bind_int(stmt, 5, metadata.end_line);
+    sqlite3_bind_text(stmt, 6, content_hash.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 7, metadata.model.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 8, content.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 9, emb_text.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 10, updated_at);
+
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    
+
     if (rc != SQLITE_DONE) {
         return core::Result<std::string>::Err("Failed to insert chunk: " + std::string(sqlite3_errmsg(db_)));
     }
-    
-    // Update FTS if available
+
+    // vec 表（canonical: 仅 id + embedding），仅在 vec 扩展可用时。
+    if (vec_available_ && !embedding.empty()) {
+        sqlite3_stmt* vstmt = prepare_stmt(db_,
+            "INSERT OR REPLACE INTO memory_index_chunks_vec (id, embedding) VALUES (?, ?)");
+        if (vstmt) {
+            std::string blob = serialize_embedding(embedding);
+            sqlite3_bind_text(vstmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_blob(vstmt, 2, blob.data(), blob.size(), SQLITE_TRANSIENT);
+            sqlite3_step(vstmt);
+            sqlite3_finalize(vstmt);
+        }
+    }
+
+    // FTS（canonical 列顺序: text, id, path, source, model, start_line, end_line）
     if (fts_available_) {
         const char* fts_sql = R"(
-            INSERT INTO chunks_fts (id, path, source, model, start_line, end_line, content)
+            INSERT INTO memory_index_chunks_fts (text, id, path, source, model, start_line, end_line)
             VALUES (?, ?, ?, ?, ?, ?, ?)
         )";
-        
+
         sqlite3_stmt* fts_stmt = prepare_stmt(db_, fts_sql);
         if (fts_stmt) {
-            sqlite3_bind_text(fts_stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(fts_stmt, 2, path.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(fts_stmt, 3, to_string(metadata.source).c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(fts_stmt, 4, metadata.model.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int(fts_stmt, 5, metadata.start_line);
-            sqlite3_bind_int(fts_stmt, 6, metadata.end_line);
-            sqlite3_bind_text(fts_stmt, 7, content.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(fts_stmt, 1, content.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(fts_stmt, 2, id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(fts_stmt, 3, path.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(fts_stmt, 4, to_string(metadata.source).c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(fts_stmt, 5, metadata.model.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int(fts_stmt, 6, metadata.start_line);
+            sqlite3_bind_int(fts_stmt, 7, metadata.end_line);
             sqlite3_step(fts_stmt);
             sqlite3_finalize(fts_stmt);
         }
     }
-    
+
     return core::Result<std::string>::Ok(id);
 }
 
@@ -485,7 +549,7 @@ core::Result<int> SQLiteVectorStorage::delete_chunks_by_path(const std::string& 
         return core::Result<int>::Err("Database not open");
     }
     
-    const char* sql = "DELETE FROM chunks_vec WHERE path = ?";
+    const char* sql = "DELETE FROM memory_index_chunks_vec WHERE path = ?";
     
     std::string error;
     sqlite3_stmt* stmt = prepare_stmt(db_, sql, &error);
@@ -505,7 +569,7 @@ core::Result<int> SQLiteVectorStorage::delete_chunks_by_path(const std::string& 
     
     // Delete from FTS
     if (fts_available_) {
-        const char* fts_sql = "DELETE FROM chunks_fts WHERE path = ?";
+        const char* fts_sql = "DELETE FROM memory_index_chunks_fts WHERE path = ?";
         sqlite3_stmt* fts_stmt = prepare_stmt(db_, fts_sql);
         if (fts_stmt) {
             sqlite3_bind_text(fts_stmt, 1, path.c_str(), -1, SQLITE_TRANSIENT);
@@ -522,7 +586,7 @@ core::Result<int> SQLiteVectorStorage::delete_chunks_by_source(MemorySource sour
         return core::Result<int>::Err("Database not open");
     }
     
-    const char* sql = "DELETE FROM chunks_vec WHERE source = ?";
+    const char* sql = "DELETE FROM memory_index_chunks_vec WHERE source = ?";
     
     std::string error;
     sqlite3_stmt* stmt = prepare_stmt(db_, sql, &error);
@@ -542,7 +606,7 @@ core::Result<int> SQLiteVectorStorage::delete_chunks_by_source(MemorySource sour
     
     // Delete from FTS
     if (fts_available_) {
-        const char* fts_sql = "DELETE FROM chunks_fts WHERE source = ?";
+        const char* fts_sql = "DELETE FROM memory_index_chunks_fts WHERE source = ?";
         sqlite3_stmt* fts_stmt = prepare_stmt(db_, fts_sql);
         if (fts_stmt) {
             sqlite3_bind_text(fts_stmt, 1, to_string(source).c_str(), -1, SQLITE_TRANSIENT);
@@ -560,15 +624,15 @@ core::Result<bool> SQLiteVectorStorage::clear_all() {
     }
     
     std::string error;
-    if (!::hunterclaw::memory::exec_sql(db_, "DELETE FROM chunks_vec", &error)) {
-        return core::Result<bool>::Err("Failed to clear chunks_vec: " + error);
+    if (!::hunterclaw::memory::exec_sql(db_, "DELETE FROM memory_index_chunks_vec", &error)) {
+        return core::Result<bool>::Err("Failed to clear memory_index_chunks_vec: " + error);
     }
     
     if (fts_available_) {
-        ::hunterclaw::memory::exec_sql(db_, "DELETE FROM chunks_fts");
+        ::hunterclaw::memory::exec_sql(db_, "DELETE FROM memory_index_chunks_fts");
     }
     
-    ::hunterclaw::memory::exec_sql(db_, "DELETE FROM embedding_cache");
+    ::hunterclaw::memory::exec_sql(db_, "DELETE FROM memory_embedding_cache");
     
     return core::Result<bool>::Ok(true);
 }
@@ -615,7 +679,7 @@ core::Result<std::vector<MemorySearchResult>> SQLiteVectorStorage::vector_search
     
     // 对齐 openclaw: 向量搜索通过 manager_search.cc 的 search_vector_impl 实现
     // 这里提供一个简单的 fallback: 内存余弦相似度
-    const char* sql = "SELECT id, path, start_line, end_line, text, embedding, source FROM chunks WHERE model != ''";
+    const char* sql = "SELECT id, path, start_line, end_line, text, embedding, source FROM memory_index_chunks WHERE model != ''";
     sqlite3_stmt* stmt = prepare_stmt(db_, sql);
     if (!stmt) return core::Result<std::vector<MemorySearchResult>>::Ok({});
 
@@ -700,8 +764,8 @@ core::Result<std::vector<MemorySearchResult>> SQLiteVectorStorage::fts_search(
     const char* sql = R"(
         SELECT f.path, f.source, f.start_line, f.end_line, f.content,
                bm25(f) as rank
-        FROM chunks_fts f
-        WHERE chunks_fts MATCH ?
+        FROM memory_index_chunks_fts f
+        WHERE memory_index_chunks_fts MATCH ?
         ORDER BY rank
         LIMIT ?
     )";
@@ -744,8 +808,8 @@ core::Result<std::vector<MemorySearchResult>> SQLiteVectorStorage::fts_search_fi
     const char* sql = R"(
         SELECT f.path, f.source, f.start_line, f.end_line, f.content,
                bm25(f) as rank
-        FROM chunks_fts f
-        WHERE chunks_fts MATCH ? AND source = ?
+        FROM memory_index_chunks_fts f
+        WHERE memory_index_chunks_fts MATCH ? AND source = ?
         ORDER BY rank
         LIMIT ?
     )";
@@ -785,9 +849,9 @@ core::Result<std::optional<std::vector<float>>> SQLiteVectorStorage::get_cached_
         return core::Result<std::optional<std::vector<float>>>::Err("Database not open");
     }
     
-    // 对齐 openclaw embedding_cache 表结构: (provider, model, provider_key, hash, embedding, dims, updated_at)
+    // 对齐 openclaw memory_embedding_cache 表结构: (provider, model, provider_key, hash, embedding, dims, updated_at)
     // provider_key = provider + ":" + model
-    const char* sql = "SELECT embedding FROM embedding_cache WHERE hash = ? AND model = ?";
+    const char* sql = "SELECT embedding FROM memory_embedding_cache WHERE hash = ? AND model = ?";
     
     std::string error;
     sqlite3_stmt* stmt = prepare_stmt(db_, sql, &error);
@@ -843,7 +907,7 @@ core::Result<bool> SQLiteVectorStorage::cache_embedding(
         return core::Result<bool>::Err("Database not open");
     }
     
-    // 对齐 openclaw embedding_cache 表结构:
+    // 对齐 openclaw memory_embedding_cache 表结构:
     // (provider, model, provider_key, hash, embedding, dims, updated_at)
     // provider_key 格式: "provider:model"
     std::string provider, model;
@@ -867,7 +931,7 @@ core::Result<bool> SQLiteVectorStorage::cache_embedding(
     std::string emb_str = emb_json.str();
 
     const char* sql = R"(
-        INSERT OR REPLACE INTO embedding_cache
+        INSERT OR REPLACE INTO memory_embedding_cache
         (provider, model, provider_key, hash, embedding, dims, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
     )";
@@ -905,7 +969,7 @@ core::Result<int> SQLiteVectorStorage::cleanup_old_cache(int64_t older_than_time
     }
     
     // 对齐 openclaw: updated_at 字段
-    const char* sql = "DELETE FROM embedding_cache WHERE updated_at < ?";
+    const char* sql = "DELETE FROM memory_embedding_cache WHERE updated_at < ?";
     
     std::string error;
     sqlite3_stmt* stmt = prepare_stmt(db_, sql, &error);
@@ -937,8 +1001,8 @@ core::Result<SQLiteVectorStorage::Stats> SQLiteVectorStorage::get_stats() {
     
     Stats stats{};
     
-    // Count total chunks (对齐 openclaw: SELECT COUNT(*) as c FROM chunks)
-    const char* count_sql = "SELECT COUNT(*) FROM chunks";
+    // Count total chunks (对齐 openclaw: SELECT COUNT(*) as c FROM memory_index_chunks)
+    const char* count_sql = "SELECT COUNT(*) FROM memory_index_chunks";
     sqlite3_stmt* stmt = prepare_stmt(db_, count_sql);
     if (stmt && sqlite3_step(stmt) == SQLITE_ROW) {
         stats.total_chunks = sqlite3_column_int(stmt, 0);
@@ -946,22 +1010,22 @@ core::Result<SQLiteVectorStorage::Stats> SQLiteVectorStorage::get_stats() {
     sqlite3_finalize(stmt);
     
     // Count by source
-    const char* memory_sql = "SELECT COUNT(*) FROM chunks WHERE source = 'memory'";
+    const char* memory_sql = "SELECT COUNT(*) FROM memory_index_chunks WHERE source = 'memory'";
     stmt = prepare_stmt(db_, memory_sql);
     if (stmt && sqlite3_step(stmt) == SQLITE_ROW) {
         stats.memory_chunks = sqlite3_column_int(stmt, 0);
     }
     sqlite3_finalize(stmt);
     
-    const char* sessions_sql = "SELECT COUNT(*) FROM chunks WHERE source = 'sessions'";
+    const char* sessions_sql = "SELECT COUNT(*) FROM memory_index_chunks WHERE source = 'sessions'";
     stmt = prepare_stmt(db_, sessions_sql);
     if (stmt && sqlite3_step(stmt) == SQLITE_ROW) {
         stats.sessions_chunks = sqlite3_column_int(stmt, 0);
     }
     sqlite3_finalize(stmt);
     
-    // Count unique files (对齐 openclaw: SELECT COUNT(*) as c FROM files)
-    const char* files_sql = "SELECT COUNT(*) FROM files";
+    // Count unique files (对齐 openclaw: SELECT COUNT(*) as c FROM memory_index_sources)
+    const char* files_sql = "SELECT COUNT(*) FROM memory_index_sources";
     stmt = prepare_stmt(db_, files_sql);
     if (stmt && sqlite3_step(stmt) == SQLITE_ROW) {
         stats.total_files = sqlite3_column_int(stmt, 0);
@@ -969,7 +1033,7 @@ core::Result<SQLiteVectorStorage::Stats> SQLiteVectorStorage::get_stats() {
     sqlite3_finalize(stmt);
     
     // Count cache entries
-    const char* cache_sql = "SELECT COUNT(*) FROM embedding_cache";
+    const char* cache_sql = "SELECT COUNT(*) FROM memory_embedding_cache";
     stmt = prepare_stmt(db_, cache_sql);
     if (stmt && sqlite3_step(stmt) == SQLITE_ROW) {
         stats.cache_entries = sqlite3_column_int(stmt, 0);
@@ -991,8 +1055,8 @@ core::Result<std::vector<MemoryProviderStatus::SourceCount>> SQLiteVectorStorage
         return core::Result<std::vector<MemoryProviderStatus::SourceCount>>::Err("Database not open");
     }
     
-    // 对齐 openclaw: SELECT source, COUNT(*) as c FROM files GROUP BY source
-    const char* sql = "SELECT source, COUNT(DISTINCT path) as files, COUNT(*) as chunks FROM chunks GROUP BY source";
+    // 对齐 openclaw: SELECT source, COUNT(*) as c FROM memory_index_sources GROUP BY source
+    const char* sql = "SELECT source, COUNT(DISTINCT path) as files, COUNT(*) as chunks FROM memory_index_chunks GROUP BY source";
     
     std::string error;
     sqlite3_stmt* stmt = prepare_stmt(db_, sql, &error);

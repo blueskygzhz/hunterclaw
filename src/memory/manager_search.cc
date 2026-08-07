@@ -91,7 +91,7 @@ core::Result<std::vector<SearchRowResult>> search_vector_impl(
         //        c.source,
         //        vec_distance_cosine(v.embedding, ?) AS dist
         //   FROM {vectorTable} v
-        //   JOIN chunks c ON c.id = v.id
+        //   JOIN memory_index_chunks c ON c.id = v.id
         //  WHERE c.model = ? {sourceFilter}
         //  ORDER BY dist ASC
         //  LIMIT ?
@@ -99,7 +99,7 @@ core::Result<std::vector<SearchRowResult>> search_vector_impl(
             "SELECT c.id, c.path, c.start_line, c.end_line, c.text, c.source,"
             "       vec_distance_cosine(v.embedding, ?) AS dist"
             "  FROM " + vector_table + " v"
-            "  JOIN chunks c ON c.id = v.id"
+            "  JOIN memory_index_chunks c ON c.id = v.id"
             " WHERE c.model = ?" + source_filter_vec.sql +
             " ORDER BY dist ASC"
             " LIMIT ?";
@@ -142,11 +142,11 @@ core::Result<std::vector<SearchRowResult>> search_vector_impl(
     // 2. Fallback: in-memory cosine similarity (对齐 openclaw fallback 分支)
     // 对齐 openclaw SQL:
     // SELECT id, path, start_line, end_line, text, embedding, source
-    //   FROM chunks
+    //   FROM memory_index_chunks
     //  WHERE model = ? {sourceFilter}
     std::string sql =
         "SELECT id, path, start_line, end_line, text, embedding, source"
-        "  FROM chunks"
+        "  FROM memory_index_chunks"
         " WHERE model = ?" + source_filter_vec.sql;
 
     auto stmt_result = db.prepare_statement(sql);
@@ -558,11 +558,11 @@ core::Result<std::vector<ChunkWithEmbedding>> list_chunks_impl(
 
     // 对齐 openclaw SQL:
     // SELECT id, path, start_line, end_line, text, embedding, source
-    //   FROM chunks
+    //   FROM memory_index_chunks
     //  WHERE model = ? {sourceFilter}
     std::string sql =
         "SELECT id, path, start_line, end_line, text, embedding, source"
-        "  FROM chunks"
+        "  FROM memory_index_chunks"
         " WHERE model = ?" + source_filter.sql;
 
     auto stmt_result = db.prepare_statement(sql);

@@ -9,9 +9,9 @@ namespace memory {
 // SQL constant (对齐 manager-status-state.ts:21-24)
 // ============================================================================
 const char* MEMORY_STATUS_AGGREGATE_SQL =
-    "SELECT 'files' AS kind, source, COUNT(*) as c FROM files WHERE 1=1__FILTER__ GROUP BY source "
+    "SELECT 'files' AS kind, source, COUNT(*) as c FROM memory_index_sources WHERE 1=1__FILTER__ GROUP BY source "
     "UNION ALL "
-    "SELECT 'chunks' AS kind, source, COUNT(*) as c FROM chunks WHERE 1=1__FILTER__ GROUP BY source";
+    "SELECT 'chunks' AS kind, source, COUNT(*) as c FROM memory_index_chunks WHERE 1=1__FILTER__ GROUP BY source";
 
 // ============================================================================
 // resolveInitialMemoryDirty (对齐 manager-status-state.ts:26-32)

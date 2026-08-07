@@ -49,9 +49,9 @@ public:
                 "Failed to open database: " + std::string(sqlite3_errmsg(db)));
         }
 
-        // Schema aligned with OpenClaw manager.ts (files + chunks + embedding_cache)
+        // Schema aligned with OpenClaw manager.ts (files + chunks + memory_embedding_cache)
         const char* schema = R"(
-            CREATE TABLE IF NOT EXISTS files (
+            CREATE TABLE IF NOT EXISTS memory_index_sources (
                 path TEXT NOT NULL,
                 source TEXT NOT NULL DEFAULT 'memory',
                 hash TEXT,
@@ -59,7 +59,7 @@ public:
                 size INTEGER,
                 PRIMARY KEY (path)
             );
-            CREATE TABLE IF NOT EXISTS chunks (
+            CREATE TABLE IF NOT EXISTS memory_index_chunks (
                 id TEXT PRIMARY KEY,
                 path TEXT NOT NULL,
                 source TEXT NOT NULL DEFAULT 'memory',
@@ -71,7 +71,7 @@ public:
                 embedding TEXT,
                 updated_at INTEGER
             );
-            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+            CREATE VIRTUAL TABLE IF NOT EXISTS memory_index_chunks_fts USING fts5(
                 text,
                 id UNINDEXED,
                 path UNINDEXED,
@@ -80,7 +80,7 @@ public:
                 start_line UNINDEXED,
                 end_line UNINDEXED
             );
-            CREATE TABLE IF NOT EXISTS embedding_cache (
+            CREATE TABLE IF NOT EXISTS memory_embedding_cache (
                 provider TEXT NOT NULL,
                 model TEXT NOT NULL,
                 provider_key TEXT NOT NULL DEFAULT '',
@@ -167,10 +167,10 @@ std::vector<MemorySearchResult> SQLiteMemoryManager::search(
 
     const char* fts_sql =
         "SELECT c.id, c.path, c.source, c.start_line, c.end_line, c.text,"
-        "       bm25(chunks_fts) AS rank"
-        "  FROM chunks_fts f"
-        "  JOIN chunks c ON c.id = f.id"
-        " WHERE chunks_fts MATCH ?"
+        "       bm25(memory_index_chunks_fts) AS rank"
+        "  FROM memory_index_chunks_fts f"
+        "  JOIN memory_index_chunks c ON c.id = f.id"
+        " WHERE memory_index_chunks_fts MATCH ?"
         " ORDER BY rank ASC"
         " LIMIT ?";
 
@@ -303,14 +303,14 @@ MemoryProviderStatus SQLiteMemoryManager::status() {
         sqlite3_stmt* stmt = nullptr;
         // files count
         if (sqlite3_prepare_v2(impl_->db,
-                "SELECT COUNT(*) FROM files", -1, &stmt, nullptr) == SQLITE_OK) {
+                "SELECT COUNT(*) FROM memory_index_sources", -1, &stmt, nullptr) == SQLITE_OK) {
             if (sqlite3_step(stmt) == SQLITE_ROW)
                 s.files = sqlite3_column_int(stmt, 0);
             sqlite3_finalize(stmt);
         }
         // chunks count
         if (sqlite3_prepare_v2(impl_->db,
-                "SELECT COUNT(*) FROM chunks", -1, &stmt, nullptr) == SQLITE_OK) {
+                "SELECT COUNT(*) FROM memory_index_chunks", -1, &stmt, nullptr) == SQLITE_OK) {
             if (sqlite3_step(stmt) == SQLITE_ROW)
                 s.chunks = sqlite3_column_int(stmt, 0);
             sqlite3_finalize(stmt);
@@ -321,13 +321,13 @@ MemoryProviderStatus SQLiteMemoryManager::status() {
             MemoryProviderStatus::SourceCount sc;
             sc.source = (std::string(src) == "memory") ? MemorySource::Memory : MemorySource::Sessions;
             if (sqlite3_prepare_v2(impl_->db,
-                    "SELECT COUNT(*) FROM files WHERE source = ?", -1, &stmt, nullptr) == SQLITE_OK) {
+                    "SELECT COUNT(*) FROM memory_index_sources WHERE source = ?", -1, &stmt, nullptr) == SQLITE_OK) {
                 sqlite3_bind_text(stmt, 1, src, -1, SQLITE_TRANSIENT);
                 if (sqlite3_step(stmt) == SQLITE_ROW) sc.files = sqlite3_column_int(stmt, 0);
                 sqlite3_finalize(stmt);
             }
             if (sqlite3_prepare_v2(impl_->db,
-                    "SELECT COUNT(*) FROM chunks WHERE source = ?", -1, &stmt, nullptr) == SQLITE_OK) {
+                    "SELECT COUNT(*) FROM memory_index_chunks WHERE source = ?", -1, &stmt, nullptr) == SQLITE_OK) {
                 sqlite3_bind_text(stmt, 1, src, -1, SQLITE_TRANSIENT);
                 if (sqlite3_step(stmt) == SQLITE_ROW) sc.chunks = sqlite3_column_int(stmt, 0);
                 sqlite3_finalize(stmt);

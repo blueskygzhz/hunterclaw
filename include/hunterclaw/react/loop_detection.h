@@ -21,7 +21,8 @@ enum class LoopDetectorKind {
     KnownPollNoProgress,   // "known_poll_no_progress"
     GlobalCircuitBreaker,  // "global_circuit_breaker"
     PingPong,// "ping_pong"
-    UnknownToolRepeat      // "unknown_tool_repeat" (对齐 OpenClaw)
+    UnknownToolRepeat,     // "unknown_tool_repeat" (对齐 OpenClaw)
+    ArgumentChurn          // "argument_churn" (对齐 OpenClaw, warning-only)
 };
 
 // ── LoopDetectionResult ───────────────────────────────────────────────────────
@@ -40,6 +41,10 @@ struct LoopDetectionResult {
     std::string message;
     std::string paired_tool_name;  // ✅ OpenClaw: pairedToolName (ping_pong)
     std::string warning_key;       // ✅ OpenClaw: warningKey
+    // 🎯 对齐 OpenClaw: livenessSignal?: "argument_churn" —
+    //   附加在 poll/ping_pong warning 上的活性信号，供上层判定"虽在循环但参数在变化"。
+    //   空表示未设置。
+    std::string liveness_signal;
 };
 
 // ── ToolCallRecord ────────────────────────────────────────────────────────────
@@ -55,6 +60,10 @@ struct ToolCallRecord {
     //   "unknown/unavailable tool" 错误时，从 error 解析出的工具名，用于
     //   unknown_tool_repeat 检测器。
     std::string unknown_tool_name;
+    // 🎯 对齐 OpenClaw ToolCallRecord.noProgress: 该次调用的 outcome 被判定为
+    //   "无进展"（如 error、write unchanged、poll unchanged）。argument_churn
+    //   检测器依赖此标志。
+    bool no_progress = false;
     int64_t timestamp_ms = 0;
 };
 

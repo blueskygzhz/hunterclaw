@@ -241,7 +241,7 @@ std::vector<MemorySearchResult> MemoryIndexManager::search(
         std::map<std::string, KeywordSearchResultWithScore> seen_ids;
         for (const auto& term : search_terms) {
             auto kr = search_keyword_impl(
-                *db_, "chunks_fts",
+                *db_, "memory_index_chunks_fts",
                 std::nullopt,  // FTS-only: no model filter
                 term,
                 candidate_limit,
@@ -291,7 +291,7 @@ std::vector<MemorySearchResult> MemoryIndexManager::search(
     std::vector<HybridKeywordResult> kw_results;
     if (settings_.hybrid.enabled && fts_.enabled && fts_.available && db_) {
         auto kr = search_keyword_impl(
-            *db_, "chunks_fts",
+            *db_, "memory_index_chunks_fts",
             provider_key_,  // std::string
             cleaned,
             candidate_limit,
@@ -330,7 +330,7 @@ std::vector<MemorySearchResult> MemoryIndexManager::search(
     std::vector<SearchRowResult> vec_results;
     if (has_vector && vector_.enabled && db_) {
         auto vr = search_vector_impl(
-            *db_, "chunks_vec",
+            *db_, "memory_index_chunks_vec",
             provider_key_,  // std::string
             query_vec,
             candidate_limit,
@@ -600,7 +600,7 @@ MemoryProviderStatus MemoryIndexManager::status() {
     if (db_) {
         // files count
         {
-            auto r = db_->prepare_statement("SELECT COUNT(*) FROM files");
+            auto r = db_->prepare_statement("SELECT COUNT(*) FROM memory_index_sources");
             if (r.is_ok()) {
                 if (sqlite3_step(r.get()) == SQLITE_ROW)
                     s.files = sqlite3_column_int(r.get(), 0);
@@ -609,7 +609,7 @@ MemoryProviderStatus MemoryIndexManager::status() {
         }
         // chunks count
         {
-            auto r = db_->prepare_statement("SELECT COUNT(*) FROM chunks");
+            auto r = db_->prepare_statement("SELECT COUNT(*) FROM memory_index_chunks");
             if (r.is_ok()) {
                 if (sqlite3_step(r.get()) == SQLITE_ROW)
                     s.chunks = sqlite3_column_int(r.get(), 0);
@@ -623,7 +623,7 @@ MemoryProviderStatus MemoryIndexManager::status() {
             MemoryProviderStatus::SourceCount sc;
             sc.source = src;
             {
-                auto r = db_->prepare_statement("SELECT COUNT(*) FROM files WHERE source = ?");
+                auto r = db_->prepare_statement("SELECT COUNT(*) FROM memory_index_sources WHERE source = ?");
                 if (r.is_ok()) {
                     sqlite3_bind_text(r.get(), 1, src_str.c_str(), -1, SQLITE_TRANSIENT);
                     if (sqlite3_step(r.get()) == SQLITE_ROW)
@@ -632,7 +632,7 @@ MemoryProviderStatus MemoryIndexManager::status() {
                 }
             }
             {
-                auto r = db_->prepare_statement("SELECT COUNT(*) FROM chunks WHERE source = ?");
+                auto r = db_->prepare_statement("SELECT COUNT(*) FROM memory_index_chunks WHERE source = ?");
                 if (r.is_ok()) {
                     sqlite3_bind_text(r.get(), 1, src_str.c_str(), -1, SQLITE_TRANSIENT);
                     if (sqlite3_step(r.get()) == SQLITE_ROW)
@@ -648,7 +648,7 @@ MemoryProviderStatus MemoryIndexManager::status() {
             cache.enabled    = cache_.enabled;
             cache.max_entries = cache_.max_entries;
             if (cache_.enabled) {
-                auto r = db_->prepare_statement("SELECT COUNT(*) FROM embedding_cache");
+                auto r = db_->prepare_statement("SELECT COUNT(*) FROM memory_embedding_cache");
                 if (r.is_ok()) {
                     if (sqlite3_step(r.get()) == SQLITE_ROW)
                         cache.entries = sqlite3_column_int(r.get(), 0);

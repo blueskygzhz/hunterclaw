@@ -201,45 +201,21 @@ private:
     core::Result<bool> create_indices();
     
     // ========================================================================
-    // Schema定义 (对齐 memory-schema.ts)
+    // Schema 定义 (严格对齐 OpenClaw canonical memory schema:
+    //   packages/memory-host-sdk/src/host/memory-schema-*.ts)
+    //canonical 表名统一使用 memory_index_* 前缀，全部 STRICT。
     // ========================================================================
-    
-    static constexpr const char* SCHEMA_CHUNKS_VEC = R"(
-        CREATE TABLE IF NOT EXISTS chunks_vec (
-            id TEXT PRIMARY KEY,
-            path TEXT NOT NULL,
-            source TEXT NOT NULL,
-            model TEXT NOT NULL,
-            start_line INTEGER NOT NULL,
-            end_line INTEGER NOT NULL,
-            content TEXT NOT NULL,
-            embedding BLOB,
-            created_at INTEGER NOT NULL
-        )
-    )";
-    
-    static constexpr const char* SCHEMA_CHUNKS_FTS = R"(
-        CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-            id UNINDEXED,
-            path,
-            source,
-            model,
-            start_line UNINDEXED,
-            end_line UNINDEXED,
-            content,
-            tokenize='porter'
-        )
-    )";
-    
-    static constexpr const char* SCHEMA_EMBEDDING_CACHE = R"(
-        CREATE TABLE IF NOT EXISTS embedding_cache (
-            content_hash TEXT NOT NULL,
-            model TEXT NOT NULL,
-            embedding BLOB NOT NULL,
-            created_at INTEGER NOT NULL,
-            PRIMARY KEY (content_hash, model)
-        )
-    )";
+
+    // canonical 表名常量（对齐 OC memory-schema-base/fts/recall/provenance）
+    static constexpr const char* TABLE_META= "memory_index_meta";
+    static constexpr const char* TABLE_SOURCES     = "memory_index_sources";
+    static constexpr const char* TABLE_CHUNKS      = "memory_index_chunks";
+    static constexpr const char* TABLE_RECALL      = "memory_index_chunk_recall_metadata";
+    static constexpr const char* TABLE_PROVENANCE  = "memory_index_chunk_provenance";
+    static constexpr const char* TABLE_STATE       = "memory_index_state";
+    static constexpr const char* TABLE_EMB_CACHE   = "memory_embedding_cache";
+    static constexpr const char* TABLE_CHUNKS_FTS  = "memory_index_chunks_fts";
+    static constexpr const char* TABLE_PATHS_FTS   = "memory_index_paths_fts";
     
     // ========================================================================
     // 辅助方法

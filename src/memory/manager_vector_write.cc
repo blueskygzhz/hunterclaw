@@ -10,7 +10,7 @@ namespace memory {
 void replace_memory_vector_row(const ReplaceVectorRowParams& params) {
     if (!params.db || params.embedding.empty()) return;
 
-    // 对齐: try { db.prepare("DELETE FROM chunks_vec WHERE id = ?").run(id); } catch {}
+    // 对齐: try { db.prepare("DELETE FROM memory_index_chunks_vec WHERE id = ?").run(id); } catch {}
     {
         std::string del_sql = "DELETE FROM " + params.table_name + " WHERE id = ?";
         auto del_stmt = params.db->prepare_statement(del_sql);
@@ -20,7 +20,7 @@ void replace_memory_vector_row(const ReplaceVectorRowParams& params) {
         }
     }
 
-    // 对齐: db.prepare("INSERT INTO chunks_vec (id, embedding) VALUES (?, ?)").run(id, vectorToBlob)
+    // 对齐: db.prepare("INSERT INTO memory_index_chunks_vec (id, embedding) VALUES (?, ?)").run(id, vectorToBlob)
     std::string ins_sql = "INSERT INTO " + params.table_name + " (id, embedding) VALUES (?, ?)";
     auto ins_stmt = params.db->prepare_statement(ins_sql);
     if (ins_stmt.is_ok()) {
