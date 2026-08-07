@@ -20,7 +20,8 @@ enum class LoopDetectorKind {
     GenericRepeat,         // "generic_repeat"
     KnownPollNoProgress,   // "known_poll_no_progress"
     GlobalCircuitBreaker,  // "global_circuit_breaker"
-    PingPong               // "ping_pong"
+    PingPong,// "ping_pong"
+    UnknownToolRepeat      // "unknown_tool_repeat" (对齐 OpenClaw)
 };
 
 // ── LoopDetectionResult ───────────────────────────────────────────────────────
@@ -50,6 +51,10 @@ struct ToolCallRecord {
     std::string args_hash;       // ✅ 对齐 OpenClaw: argsHash = toolName:SHA256(stableStringify(params))
     std::string tool_call_id;    // optional
     std::string result_hash;     // 由 record_tool_call_outcome 回填
+    // 🎯 对齐 OpenClaw ToolCallRecord.unknownToolName: 当 outcome 是
+    //   "unknown/unavailable tool" 错误时，从 error 解析出的工具名，用于
+    //   unknown_tool_repeat 检测器。
+    std::string unknown_tool_name;
     int64_t timestamp_ms = 0;
 };
 
@@ -67,6 +72,8 @@ struct LoopDetectionConfig {
     int warning_threshold = 10;
     int critical_threshold = 20;
     int global_circuit_breaker_threshold = 30;
+    // 🎯 对齐 OpenClaw: unknownToolThreshold=10 (UNKNOWN_TOOL_THRESHOLD)
+    int unknown_tool_threshold = 10;
 
     // ✅ 对齐 OpenClaw: detectors (默认全开)
     struct Detectors {

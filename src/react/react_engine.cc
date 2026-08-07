@@ -1132,9 +1132,32 @@ ReactResult ReactEngine::execute_loop(
     if (cancelled_) {
         result.success = false;
         result.error = "ReAct loop cancelled";
+        // 🎯 对齐 OpenClaw abort partial: 中断时保留已生成的 assistant 文本，
+        //   与 gateway chat abort partial 采集语义一致（用户可见已生成内容）。
+        if (result.final_response.empty()) {
+            if (!assistant_texts.empty()) {
+                result.final_response = assistant_texts.back();
+            } else if (!streaming_state_.delta_buffer.empty()) {
+                result.final_response = streaming_state_.delta_buffer;
+            } else if (!streaming_state_.block_buffer.empty()) {
+                result.final_response = streaming_state_.block_buffer;
+            }
+        }
     } else if (step_count >= config_.max_steps) {
         result.success = false;
         result.error = "ReAct loop exceeded max steps";
+        // 🎯 对齐 OpenClaw: 循环因达到内部上限终止时，保留已生成的 assistant 文本
+        //   作为 final_response（此前恒为空 → 丢失用户已看到的流式内容）。
+        //   优先用最后一段 assistant_texts，其次delta/block buffer。
+        if (result.final_response.empty()) {
+            if (!assistant_texts.empty()) {
+                result.final_response = assistant_texts.back();
+            } else if (!streaming_state_.delta_buffer.empty()) {
+                result.final_response = streaming_state_.delta_buffer;
+            } else if (!streaming_state_.block_buffer.empty()) {
+                result.final_response = streaming_state_.block_buffer;
+            }
+        }
     }
 
     // 🎯 对齐 OpenClaw: store assistantTexts in result

@@ -6,6 +6,8 @@
 #include "hunterclaw/react/loop_detection.h"
 #include <sstream>
 #include <algorithm>
+#include <cctype>
+#include <regex>
 #include <openssl/sha.h>
 #include <iomanip>
 #include <spdlog/spdlog.h>
@@ -330,6 +332,64 @@ std::string canonical_pair_key(const std::string& a, const std::string& b) {
     return b + "|" + a;
 }
 
+// ── extractUnknownToolName ────────────────────────────────────────────────────
+// 🎯 对齐 OpenClaw extractUnknownToolName (tool-loop-detection.ts:145-155):
+//   从error 文本解析 "unknown tool: X" / "tool X not found|is not available"，
+//   命中则返回小写工具名，否则空。
+std::string extract_unknown_tool_name(const std::string& error) {
+    if (error.empty()) return "";
+    // 两个正则（大小写不敏感），对齐 OpenClaw。
+    static const std::regex re1(
+        R"(unknown tool[:\s]+["']?([a-z0-9_.\-]+)["']?)",
+        std::regex::icase);
+    static const std::regex re2(
+        R"(tool\s+["']?([a-z0-9_.\-]+)["']?\s+(?:not found|is not available))",
+        std::regex::icase);
+    std::smatch m;
+    std::string name;
+    if (std::regex_search(error, m, re1) && m.size() > 1) {
+        name = m[1].str();
+    } else if (std::regex_search(error, m, re2) && m.size() > 1) {
+        name = m[1].str();
+    }
+    // to lower
+    std::transform(name.begin(), name.end(), name.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return name;
+}
+
+// ── getUnknownToolRepeatStreak ────────────────────────────────────────────────
+// 🎯 对齐 OpenClaw getUnknownToolRepeatStreak (tool-loop-detection.ts:374-398):
+//   从尾部倒序，统计连续同名 unknown_tool_name 的次数（遇到非匹配即break）。
+struct UnknownToolStreak {
+    int count = 0;
+    std::string unknown_tool_name;
+};
+
+UnknownToolStreak get_unknown_tool_repeat_streak(
+    const std::vector<ToolCallRecord>& history,
+    const std::string& tool_name
+) {
+    UnknownToolStreak r;
+    for (int i = static_cast<int>(history.size()) - 1; i >= 0; i--) {
+        const auto& record = history[i];
+        // 对齐 OC: toolName 不匹配 或 无 unknownToolName → break（非continue）。
+        if (record.tool_name != tool_name || record.unknown_tool_name.empty()) {
+            break;
+        }
+        if (r.unknown_tool_name.empty()) {
+            r.unknown_tool_name = record.unknown_tool_name;
+            r.count = 1;
+            continue;
+        }
+        if (record.unknown_tool_name != r.unknown_tool_name) {
+            break;
+        }
+        r.count++;
+    }
+    return r;
+}
+
 } // namespace
 
 // ============================================================================
@@ -376,6 +436,28 @@ LoopDetectionResult LoopDetectionState::detect_tool_call_loop(
     const int no_progress_streak = no_progress.count;
     const bool known_poll_tool = loop_detection::is_known_polling_tool(tool_name, params);
     const auto ping_pong = get_ping_pong_streak(history_, current_hash);
+    const auto unknown_tool = get_unknown_tool_repeat_streak(history_, tool_name);
+
+    // ── 0. unknown_tool_repeat ─────────────────────────────────────────────
+    // 🎯 对齐 OpenClaw (tool-loop-detection.ts:534-543): 最先检查，
+    //   连续调用不存在/不可用的工具达阈值 → critical 阻断。
+    if (unknown_tool.count >= config_.unknown_tool_threshold) {
+        const std::string& missing = unknown_tool.unknown_tool_name.empty()
+            ? tool_name : unknown_tool.unknown_tool_name;
+        log()->error("Unknown tool repeat: attempted unavailable tool {} {} times",
+                     missing, unknown_tool.count);
+        LoopDetectionResult r;
+        r.stuck = true;
+        r.level = LoopDetectionResult::Level::Critical;
+        r.detector = LoopDetectorKind::UnknownToolRepeat;
+        r.count = unknown_tool.count;
+        r.message = "CRITICAL: attempted unavailable tool " + missing + " " +
+                    std::to_string(unknown_tool.count) + " times. Stop retrying that "
+                    "missing tool and answer without it.";
+        r.warning_key = "unknown-tool:" + tool_name + ":" +
+                        (unknown_tool.unknown_tool_name.empty() ? "unknown" : unknown_tool.unknown_tool_name);
+        return r;
+    }
 
     // ── 1. global circuit breaker ──────────────────────────────────────────
     // ✅ 对齐 OpenClaw: noProgressStreak >= globalCircuitBreakerThreshold
@@ -473,9 +555,27 @@ LoopDetectionResult LoopDetectionState::detect_tool_call_loop(
         return r;
     }
 
-    // ── 6. generic_repeat warning (warn-only) ────────────────────────────
-    // ✅ 对齐 OpenClaw: !knownPollTool && recentCount >= warningThreshold
-    // ✅ 对齐 OpenClaw: generic_repeat 只有 Warning，无 Critical
+    // ── 6. generic_repeat ─────────────────────────────────────────────────
+    // 🎯 对齐 OpenClaw (tool-loop-detection.ts:636-671):
+    //   先 critical（noProgressStreak >= critical → 阻断 runaway loop），
+    //   再 warning（recentCount >= warning）。此前 HunterClaw 缺 critical。
+    if (!known_poll_tool && config_.detectors.generic_repeat &&
+        no_progress_streak >= config_.critical_threshold) {
+        log()->error("Critical generic loop detected: {} repeated {} times with no progress",
+                     tool_name, no_progress_streak);
+        LoopDetectionResult r;
+        r.stuck = true;
+        r.level = LoopDetectionResult::Level::Critical;
+        r.detector = LoopDetectorKind::GenericRepeat;
+        r.count = no_progress_streak;
+        r.message = "CRITICAL: Called " + tool_name + " with identical outcomes " +
+                    std::to_string(no_progress_streak) + " times. Session execution "
+                    "blocked to prevent runaway loops.";
+        r.warning_key = "generic:" + tool_name + ":" + current_hash + ":" +
+                        (no_progress.latest_result_hash.empty() ? "none" : no_progress.latest_result_hash);
+        return r;
+    }
+
     if (!known_poll_tool && config_.detectors.generic_repeat) {
         int recent_count = 0;
         for (const auto& record : history_) {
@@ -544,6 +644,9 @@ void LoopDetectionState::record_tool_call_outcome(
     std::string result_hash = hash_tool_outcome(tool_name, params, result, error);
     if (result_hash.empty()) return;
 
+    // 🎯 对齐 OpenClaw: error 时解析 unknownToolName，供 unknown_tool_repeat 检测。
+    std::string unknown_tool_name = error.empty() ? "" : extract_unknown_tool_name(error);
+
     const std::string args_hash = hash_tool_call(tool_name, params);
     bool matched = false;
 
@@ -561,6 +664,7 @@ void LoopDetectionState::record_tool_call_outcome(
             continue;  // 已经有 result_hash，跳过
         }
         call.result_hash = result_hash;
+        call.unknown_tool_name = unknown_tool_name;
         matched = true;
         break;
     }
@@ -572,6 +676,7 @@ void LoopDetectionState::record_tool_call_outcome(
         record.args_hash    = args_hash;
         record.tool_call_id = tool_call_id;
         record.result_hash  = result_hash;
+        record.unknown_tool_name = unknown_tool_name;
         record.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()
         ).count();
@@ -625,6 +730,7 @@ std::string create_loop_summary(
         case LoopDetectorKind::GenericRepeat:       oss << "generic_repeat\n"; break;
         case LoopDetectorKind::KnownPollNoProgress: oss << "known_poll_no_progress\n"; break;
         case LoopDetectorKind::GlobalCircuitBreaker:oss << "global_circuit_breaker\n"; break;
+        case LoopDetectorKind::UnknownToolRepeat:   oss << "unknown_tool_repeat\n"; break;
         case LoopDetectorKind::PingPong:
             oss << "ping_pong\n";
             if (!result.paired_tool_name.empty()) {

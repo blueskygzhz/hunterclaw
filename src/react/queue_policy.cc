@@ -12,13 +12,18 @@ ActiveRunQueueAction resolve_active_run_queue_action(
     bool is_active,
     bool is_heartbeat,
     bool should_followup,
-    QueueMode queue_mode
+    QueueMode queue_mode,
+    bool reset_triggered
 ) {
     if (!is_active) {
         return ActiveRunQueueAction::RunNow;
     }
     if (is_heartbeat) {
         return ActiveRunQueueAction::Drop;
+    }
+    // 🎯 对齐 queue-policy.ts:21-23: resetTriggered 强制立即新 run（绕过 followup 排队）。
+    if (reset_triggered) {
+        return ActiveRunQueueAction::RunNow;
     }
     if (should_followup || queue_mode == QueueMode::Steer) {
         return ActiveRunQueueAction::EnqueueFollowup;
