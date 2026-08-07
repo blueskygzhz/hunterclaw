@@ -11,6 +11,7 @@
 #include "hunterclaw/outbound/deliver.h"
 #include "hunterclaw/acp/acp_server.h"
 #include "hunterclaw/acp/acp_translator.h"
+#include "hunterclaw/cli/mcp_cli.h"  // 🎯 mcp login/logout 子命令
 // #include "hunterclaw/cli/command.h"  // Temporarily disabled
 // #include "hunterclaw/cli/daemon_commands.h"  // Temporarily disabled
 #include <iostream>
@@ -175,6 +176,11 @@ int main(int argc, char** argv) {
     // 🎯 ACP stdio server 子命令（对齐 OpenClaw serveAcpGateway）
     if (argc >= 2 && std::strcmp(argv[1], "acp") == 0) {
    return run_acp_stdio(argc, argv);
+    }
+
+    // 🎯 MCP OAuth 子命令（对齐 OpenClaw mcp login/logout）
+    if (argc >= 2 && std::strcmp(argv[1], "mcp") == 0) {
+        return cli::dispatch_mcp_cli(argc, argv);
     }
 
     // Temporarily disabled CLI commands

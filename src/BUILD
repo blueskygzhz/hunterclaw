@@ -332,6 +332,8 @@ cc_library(
         "-lpthread",
         "-ljsoncpp",
         "-lsqlite3",  # ✅ mcp_oauth_persistence: OAuth 凭证 SQLite 持久化
+        "-lssl",# ✅ mcp_oauth_authorization: PKCE(SHA256/RAND)
+        "-lcrypto",   # ✅ mcp_oauth_authorization: OpenSSL Crypto
     ],
     linkstatic = False,
     visibility = ["//visibility:public"],
@@ -721,6 +723,7 @@ cc_library(
         "markdown/*.cc",
         "shared/*.cc",
         "nodes/*.cc",
+        "cli/mcp_cli.cc",  # ✅ mcp login/logout 子命令（依赖 hunterclaw_mcp）
     ], exclude = [
         "main.cc",
         # ✅ context/context_pruning.cc 已挪至 hunterclaw_react 以避免循环依赖
