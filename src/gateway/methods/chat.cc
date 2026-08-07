@@ -447,6 +447,18 @@ core::Result<json> method_chat_send(
     
     // 助手输出流 (chat.delta)
     callbacks.on_assistant_delta = [server, session_id, run_id](const std::string& delta) {
+        // 🎯 对齐 OpenClaw chatRunState.rawBuffer: 实时累积 delta 到 run buffer，
+        //   供 abort 时 collect_session_abort_partials / abort_chat_run_by_id 采集
+        //   已生成的部分文本（此前从未写入 → abort partial 恒为空的断链修复）。
+        //   key 用 run_id，与读取端 (collect_session_abort_partials) 保持一致。
+        {
+            auto state = server->runtime_state();
+            if (state && state->chat_run_state && !delta.empty()) {
+                std::lock_guard<std::mutex> lock(state->chat_run_state->buffers_mutex);
+                state->chat_run_state->buffers[run_id] += delta;
+            }
+        }
+
         json event;
         event["type"] = "chat.delta";
         event["session_id"] = session_id;
@@ -730,6 +742,13 @@ core::Result<json> method_chat_send(
             if (cleanup_state) {
                 cleanup_state->chat_abort_controllers.erase(run_id_for_cleanup);
                 cleanup_state->remove_chat_run(session_id_for_cleanup, run_id_for_cleanup);
+                // 🎯 对齐 OpenClaw chatRunBuffers.delete(runId): run 结束清理 delta buffer，
+                //   避免 buffer 泄漏（abort partial 若发生已在 abort 路径先采集）。
+                if (cleanup_state->chat_run_state) {
+                    std::lock_guard<std::mutex> lock(cleanup_state->chat_run_state->buffers_mutex);
+                    cleanup_state->chat_run_state->buffers.erase(run_id_for_cleanup);
+                    cleanup_state->chat_run_state->delta_sent_at.erase(run_id_for_cleanup);
+                }
             }
         }).detach();
     } else {

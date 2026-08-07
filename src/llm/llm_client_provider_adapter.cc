@@ -255,6 +255,51 @@ private:
 };
 
 // ============================================================================
+// ErrorLLMClient - 未知/创建失败的 provider 的显式错误客户端
+// 🎯 对齐 OpenClaw simple-completion-runtime.ts:
+//   Unknown model → 返回 error（而非静默 Mock 假回复）。此前adapter 对
+//   未知 provider / 创建失败静默降级 Mock，会用假回复掩盖配置错误。
+//   改为返回本客户端：任何生成调用都返回明确 Err，让上层暴露真实错误。
+// ============================================================================
+class ErrorLLMClient : public LLMClient {
+public:
+    explicit ErrorLLMClient(std::string message, LLMConfig config)
+        : message_(std::move(message)), config_(std::move(config)) {}
+
+    core::Result<std::string> generate(const std::string&) override {
+        return core::Result<std::string>::Err(message_);
+    }
+    core::Result<std::string> generate_from_messages(
+        const std::vector<LLMMessage>&) override {
+        return core::Result<std::string>::Err(message_);
+    }
+    core::Result<std::string> generate_stream(
+        const std::string&, std::function<void(const std::string&)>) override {
+        return core::Result<std::string>::Err(message_);
+    }
+    core::Result<std::string> generate_stream_from_messages(
+        const std::vector<LLMMessage>&,
+        std::function<void(const std::string&)>) override {
+        return core::Result<std::string>::Err(message_);
+    }
+    core::Result<std::string> generate_stream_from_messages_with_tools(
+        const std::vector<LLMMessage>&,
+        const std::vector<core::JsonValue>&,
+        std::function<void(const std::string&)>) override {
+        return core::Result<std::string>::Err(message_);
+    }
+    const LLMConfig& get_config() const override { return config_; }
+    void set_config(const LLMConfig& config) override { config_ = config; }
+    int estimate_tokens(const std::string& text) const override {
+        return static_cast<int>(text.size() / 4);
+    }
+
+private:
+    std::string message_;
+    LLMConfig config_;
+};
+
+// ============================================================================
 // LLMClientFactory 增强实现 - 使用 Provider
 // ============================================================================
 
@@ -268,66 +313,50 @@ LLMClient::Ptr create_from_provider_impl(
 
 // 实现 create_llm_client_impl (被 llm_client.cc 调用)
 LLMClient::Ptr create_llm_client_impl(const LLMConfig& config) {
-    // Note: providers_ is checked in LLMClientFactory::create() before calling this function
-    // So we don't need to check it again here
-    
-    // 🎯 使用新的 Provider 接口
+    // mock 显式保留（测试用途）。
+    if (config.provider == "mock") {
+        return MockLLMClient::create(config);
+    }
+
+    // 🎯 统一走 ProviderFactory::create —— 由工厂负责内置 provider
+    //   (openai/anthropic/ollama/gemini) 与OpenAI 兼容 provider
+    //   (deepseek/openrouter/groq/...) 的路由。此处不再硬编码分支，
+    //   使adapter 与 ReactEngine 走同一套 provider 解析逻辑。
     ProviderConfig provider_config;
+    provider_config.provider_id = (config.provider == "claude") ? "anthropic" : config.provider;
     provider_config.api_key = config.api_key;
-    provider_config.base_url = config.endpoint.empty() 
-        ? "" 
-        : config.endpoint;
+    provider_config.base_url = config.endpoint;  // 空则工厂注入默认 endpoint
     provider_config.model = config.model;
     provider_config.max_tokens = config.max_tokens;
     provider_config.temperature = config.temperature;
     provider_config.top_p = config.top_p;
     provider_config.max_retries = config.max_retries;
     provider_config.retry_delay_ms = config.retry_delay_ms;
-    
-    // 根据 provider 类型创建对应的 Provider
-    core::Result<std::shared_ptr<Provider>> provider_result;
-    
-    if (config.provider == "openai") {
-        provider_result = ProviderFactory::create_openai(
-            config.api_key,
-            config.model.empty() ? "gpt-4" : config.model,
-            config.endpoint
-        );
-    } else if (config.provider == "anthropic" || config.provider == "claude") {
-        provider_result = ProviderFactory::create_anthropic(
-            config.api_key,
-            config.model.empty() ? "claude-3-5-sonnet-20241022" : config.model
-        );
-    } else if (config.provider == "ollama") {
-        provider_result = ProviderFactory::create_ollama(
-            config.model.empty() ? "llama3.2" : config.model,
-            config.endpoint.empty() ? "http://localhost:11434" : config.endpoint
-        );
-    } else if (config.provider == "gemini") {
-        provider_result = ProviderFactory::create_gemini(
-            config.api_key,
-            config.model.empty() ? "gemini-2.0-flash-exp" : config.model
-        );
-    } else if (config.provider == "mock") {
-        // 保留 mock 实现
-        return MockLLMClient::create(config);
-    } else {
-        // ✅ 对齐 OC: Unknown model → 报错而非静默回退 Mock
-        // OC simple-completion-runtime.ts L141:
-        //   return { error: `Unknown model: ${provider}/${modelId}` }
-        spdlog::get("default")->error(
-            "[LLMClient] Unknown provider: '{}'. "
-            "Configure a supported provider (openai/anthropic/ollama/gemini) or "
-            "register a custom provider via ProviderFactory::register_provider().",
-            config.provider);
-        return MockLLMClient::create(config);  // 降级但有明确警告
+
+    // 默认 model 兜底（对齐此前 adapter 各 provider 分支的默认值）。
+    if (provider_config.model.empty()) {
+        if (provider_config.provider_id == "openai") provider_config.model = "gpt-4";
+        else if (provider_config.provider_id == "anthropic") provider_config.model = "claude-3-5-sonnet-20241022";
+        else if (provider_config.provider_id == "ollama") provider_config.model = "llama3.2";
+        else if (provider_config.provider_id == "gemini") provider_config.model = "gemini-2.0-flash-exp";
     }
-    
+    // ollama 默认本地 endpoint（对齐此前 adapter 行为）。
+    if (provider_config.provider_id == "ollama" && provider_config.base_url.empty()) {
+        provider_config.base_url = "http://localhost:11434";
+    }
+
+    auto provider_result = ProviderFactory::create(provider_config);
+
     if (!provider_result.is_ok()) {
-        // Provider creation failed, use mock
-        return MockLLMClient::create(config);
+        // 🎯 对齐 OC: 未知/创建失败 → 返回显式错误客户端，而非静默 Mock。
+        std::string msg = "LLM provider unavailable: " + provider_result.error +
+            " (provider='" + config.provider + "', model='" + config.model + "')";
+        if (auto lg = spdlog::get("default")) {
+            lg->error("[LLMClient] {}", msg);
+        }
+        return std::make_shared<ErrorLLMClient>(msg, config);
     }
-    
+
     return create_from_provider_impl(provider_result.get(), config);
 }
 

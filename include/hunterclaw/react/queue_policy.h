@@ -32,7 +32,8 @@ ActiveRunQueueAction resolve_active_run_queue_action(
     bool is_active,
     bool is_heartbeat,
     bool should_followup,
-    QueueMode queue_mode = QueueMode::Default
+    QueueMode queue_mode = QueueMode::Default,
+    bool reset_triggered = false
 );
 
 // ============================================================================

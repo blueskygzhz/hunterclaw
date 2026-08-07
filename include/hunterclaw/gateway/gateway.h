@@ -260,9 +260,9 @@ struct ChatRunRegistry {
 
 struct ChatRunState {
     ChatRunRegistry registry;
-    // sessionId -> buffer string (streaming delta buffer)
+    // runId -> buffer string (streaming delta buffer; 对齐 OpenClaw chatRunBuffers)
     std::map<std::string, std::string> buffers;
-    // sessionId -> last delta sent timestamp
+    // runId -> last delta sent timestamp
     std::map<std::string, int64_t> delta_sent_at;
     // runId -> abort timestamp
     std::map<std::string, int64_t> aborted_runs;

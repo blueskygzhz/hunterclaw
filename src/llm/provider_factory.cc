@@ -35,6 +35,47 @@ core::Result<Provider::Ptr> ProviderFactory::create(const ProviderConfig& config
     } else if (config.provider_id == "gemini") {
         return create_gemini_provider(config);
     }
+
+    // 🎯 对齐 OpenClaw: 按"API 类型"而非 provider 名组织 — 大量 provider 走
+    //   OpenAI Chat Completions 兼容 API（openai-completions）。此处把这些
+    //   OpenAI 兼容 provider 路由到 OpenAI provider，并在未显式配置 base_url 时
+    //   注入其官方默认 endpoint（对齐 models_config.cc resolve_implicit_providers 表）。
+    //   这样 deepseek/openrouter/groq/... 不再落到 Unknown → 静默 Mock 的断链。
+    {
+        static const std::map<std::string, std::string> kOpenAICompatBaseUrls = {
+            {"deepseek",   "https://api.deepseek.com"},
+            {"openrouter", "https://openrouter.ai/api/v1"},
+            {"groq",       "https://api.groq.com/openai/v1"},
+            {"mistral",    "https://api.mistral.ai/v1"},
+            {"xai",        "https://api.x.ai/v1"},
+            {"grok",       "https://api.x.ai/v1"},
+            {"together",   "https://api.together.xyz/v1"},
+            {"cerebras",   "https://api.cerebras.ai/v1"},
+            {"perplexity", "https://api.perplexity.ai"},
+            {"fireworks",  "https://api.fireworks.ai/inference/v1"},
+            {"moonshot",   "https://api.moonshot.ai/v1"},
+            {"kimi",       "https://api.moonshot.ai/v1"},
+            {"zai",        "https://api.z.ai/api/paas/v4"},
+            {"qwen",       "https://dashscope.aliyuncs.com/compatible-mode/v1"},
+            {"dashscope",  "https://dashscope.aliyuncs.com/compatible-mode/v1"},
+            {"novita",     "https://api.novita.ai/v3/openai"},
+        };
+        auto compat_it = kOpenAICompatBaseUrls.find(config.provider_id);
+        if (compat_it != kOpenAICompatBaseUrls.end()) {
+            ProviderConfig oai = config;
+            // 保留调用方显式指定的 base_url；否则用官方默认 endpoint。
+            if (oai.base_url.empty()) oai.base_url = compat_it->second;
+            // OpenAI 兼容家族统一走 Chat Completions API。
+            oai.api_type = ProviderAPI::OpenAICompletions;
+            oai.supports_tool_calls = true;
+            oai.streaming_enabled = true;
+            if (auto lg = spdlog::get("default")) {
+                lg->info("[ProviderFactory] Routing OpenAI-compatible provider '{}' -> openai (base_url={})",
+                         config.provider_id, oai.base_url);
+            }
+            return create_openai_provider(oai);
+        }
+    }
     
     return core::Result<Provider::Ptr>::Err("Unknown provider: " + config.provider_id);
 }
