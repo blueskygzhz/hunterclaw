@@ -317,6 +317,8 @@ cc_library(
     deps = [
         "//:hunterclaw_headers",
         ":hunterclaw_infra",   # ✅ NativeMcpClient: HttpClient (SSE/StreamableHttp)
+        ":hunterclaw_secguard",  # ✅ SSRF guard + env sanitize (MCP client安全)
+        ":hunterclaw_logging",   # ✅ redact + secret redaction registry (传输日志脱敏)
         "@nlohmann_json//:json",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -446,9 +448,13 @@ cc_library(
 # ============================================================================
 cc_library(
     name = "hunterclaw_sandbox",
-    srcs = glob(["sandbox/*.cc"]),
+    srcs = glob(["sandbox/*.cc"], exclude = [
+        # ✅ 已移至 hunterclaw_secguard (供 MCP 复用, 避免符号重复)
+        "sandbox/sanitize_env_vars.cc",
+    ]),
     deps = [
         "//:hunterclaw_headers",
+        ":hunterclaw_secguard",  # ✅ sanitize_env_vars (已移出 sandbox glob)
         "@nlohmann_json//:json",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -474,7 +480,9 @@ cc_library(
 # ============================================================================
 cc_library(
     name = "hunterclaw_core_base",
-    srcs = glob(["core/*.cc"]),
+    srcs = glob(["core/*.cc"]) + [
+        "shared/utils.cc",  # ✅ is_private_or_loopback_ip_address 等纯工具函数 (供 secguard 使用)
+    ],
     deps = [
         "//:hunterclaw_headers",
         "//third_party:subprocess",  # ✅ subprocess.cc 需要 subprocess.h
@@ -493,6 +501,30 @@ cc_library(
     linkopts = [
         "-lpthread",
         "-ljsoncpp",
+    ],
+    linkstatic = False,
+    visibility = ["//visibility:public"],
+)
+
+# ============================================================================
+# SecGuard Library - SSRF Guard + Env Sanitization (底层安全模块, 供 MCP 等复用)
+# ============================================================================
+cc_library(
+    name = "hunterclaw_secguard",
+    srcs = [
+        "security/ssrf_guard.cc",
+        "sandbox/sanitize_env_vars.cc",
+    ],
+    deps = [
+        "//:hunterclaw_headers",
+        ":hunterclaw_core_base",  # ✅ shared/utils (is_private_or_loopback_ip_address)
+        "@nlohmann_json//:json",
+    ],
+    copts = [
+        "-std=c++17",
+        "-Wall",
+        "-Wextra",
+        "-I/usr/include/spdlog",
     ],
     linkstatic = False,
     visibility = ["//visibility:public"],
@@ -731,9 +763,13 @@ cc_library(
         "context/context_pruning.cc",
         # ✅ auto_reply/*.cc 已全部移至 hunterclaw_agents
         "auto_reply/session_lifecycle_supplement.cc",
+        # ✅ 已移至 hunterclaw_secguard (供 MCP 复用, 避免符号重复)
+        "security/ssrf_guard.cc",
+        "shared/utils.cc",
     ]),
     deps = [
         ":hunterclaw_core_base",  # ✅ 依赖 core_base (core/*.cc)
+        ":hunterclaw_secguard",   # ✅ ssrf_guard + shared/utils (已移出core glob)
         ":hunterclaw_logging",   # ✅ 添加 logging 依赖 (create_subsystem_logger)
         ":hunterclaw_acp",       # ✅ 添加 ACP 控制平面依赖
         ":hunterclaw_agents",    # ✅ 添加 agents 依赖

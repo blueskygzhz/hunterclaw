@@ -265,7 +265,51 @@ Process* popen(
         return nullptr;
     }
     
-    // 创建 Process 包装
+    // 创建Process 包装
+    auto* process = new Process();
+    process->handle = proc;
+    
+    return process;
+}
+
+Process* popen_with_env(
+    const std::vector<std::string>& command,
+    const std::vector<std::string>& env,
+    bool /*capture_stdout*/,
+    bool /*capture_stderr*/
+) {
+    if (command.empty()) {
+        return nullptr;
+    }
+    
+    // 转换命令为 C 风格参数
+    auto args = to_c_args(command);
+    
+    // 转换 env 为 C 风格数组 (NULL 结尾)
+    std::vector<char*> c_env;
+    c_env.reserve(env.size() + 1);
+    for (const auto& e : env) {
+        c_env.push_back(const_cast<char*>(e.c_str()));
+    }
+    c_env.push_back(nullptr);
+    
+    // 创建进程 — 🎯 关键: 不设置 inherit_environment, 传入显式 env,
+    // 子进程仅拥有净化后的环境变量, 不继承宿主全部环境 (防凭据泄露)。
+    auto* proc = new struct subprocess_s;
+    int options = subprocess_option_enable_async;
+    
+    int ret = subprocess_create_ex(
+        args.data(),
+        options,
+        c_env.data(),
+        proc
+    );
+    
+    if (ret != 0) {
+        delete proc;
+        return nullptr;
+    }
+    
     auto* process = new Process();
     process->handle = proc;
     

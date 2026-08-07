@@ -37,6 +37,14 @@ struct HttpRequestOptions {
     int timeout_ms = 5000;                        // 超时时间 (毫秒)
     bool follow_redirects = true;                 // 是否跟随重定向
     int max_redirects = 5;                        // 最大重定向次数
+
+    // 🎯 对齐 OpenClaw sslVerify / clientCert / clientKey (TLS 校验控制)
+    // 默认开启证书 + 主机名校验，防止 MITM。仅在明确信任 self-signed
+    // server 时可显式关闭 (对齐 McpServerConfig.sslVerify:false)。
+    bool ssl_verify = true;// 是否校验对端证书与主机名
+    std::string ca_bundle_path;                   // 自定义 CA bundle (PEM);空则用系统默认
+    std::string client_cert_path;                 // mTLS 客户端证书 (PEM)
+    std::string client_key_path;                  // mTLS 客户端私钥 (PEM)
 };
 
 /**
@@ -227,7 +235,8 @@ private:
     core::Result<SslConnection> connect_ssl(
         const std::string& host,
         int port,
-        int timeout_ms
+        int timeout_ms,
+        const HttpRequestOptions& options
     );
     
     /**

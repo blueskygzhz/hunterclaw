@@ -25,10 +25,15 @@
 #include "hunterclaw/mcp/mcp_oauth.h"
 #include "hunterclaw/mcp/mcp_oauth_token_exchange.h"
 #include "hunterclaw/core/subprocess.h"
+#include "hunterclaw/sandbox/sanitize_env_vars.h"
+#include "hunterclaw/security/ssrf_guard.h"
+#include "hunterclaw/logging/redact.h"
+#include "hunterclaw/logging/secret_redaction_registry.h"
 #include <spdlog/spdlog.h>
 #include <algorithm>
 #include <chrono>
 #include <sstream>
+#include <cstdlib>
 
 using json = nlohmann::json;
 using hunterclaw::mcp::converters::JsonConverter;
@@ -47,6 +52,59 @@ auto log() {
 constexpr const char* MCP_PROTOCOL_VERSION = "2025-03-26";
 constexpr const char* CLIENT_NAME = "hunterclaw";
 constexpr const char* CLIENT_VERSION = "1.0.0";
+
+// 🎯 对齐 OpenClaw registerResolvedConnectionSecrets:
+// 在连接信息进入 transport / 日志之前, 把url / headers / Bearer 裸 token /
+// query 值 / URL 内嵌密码全部登记到脱敏注册表, 使后续任何日志自动遮蔽。
+void register_http_connection_secrets(
+    const std::string& url,
+    const std::map<std::string, std::string>& headers) {
+    for (const auto& [k, v] : headers) {
+        (void)k;
+        if (v.empty()) continue;
+        logging::register_secret_value_for_redaction(v);
+        // "Bearer <token>" 里的裸 token
+        auto sp = v.find_last_of(" \t");
+        if (sp != std::string::npos && sp + 1 < v.size()) {
+            std::string bare = v.substr(sp + 1);
+            if (bare != v) logging::register_secret_value_for_redaction(bare);
+        }
+    }
+    // 完整 URL 本身即凭据(signed / session 路径)
+    if (!url.empty()) logging::register_secret_value_for_redaction(url);
+
+    // query 值 + URL 内嵌 password (userinfo)
+    auto scheme_pos = url.find("://");
+    if (scheme_pos != std::string::npos) {
+        std::string rest = url.substr(scheme_pos + 3);
+        // userinfo: user:pass@host
+        auto at = rest.find('@');
+        if (at != std::string::npos) {
+            std::string userinfo = rest.substr(0, at);
+            auto colon = userinfo.find(':');
+            if (colon != std::string::npos && colon + 1 < userinfo.size()) {
+                logging::register_secret_value_for_redaction(userinfo.substr(colon + 1));
+            }
+        }
+        // query
+        auto q = url.find('?');
+        if (q != std::string::npos) {
+            std::string query = url.substr(q + 1);
+            size_t start = 0;
+            while (start < query.size()) {
+                size_t amp = query.find('&', start);
+                std::string pair = query.substr(
+                    start, amp == std::string::npos ? std::string::npos : amp - start);
+                auto eq = pair.find('=');
+                if (eq != std::string::npos && eq + 1 < pair.size()) {
+                    logging::register_secret_value_for_redaction(pair.substr(eq + 1));
+                }
+                if (amp == std::string::npos) break;
+                start = amp + 1;
+            }
+        }
+    }
+}
 
 } // namespace
 
@@ -68,14 +126,36 @@ core::Result<void> StdioTransport::start() {
     cmdline.push_back(config_.command);
     for (const auto& arg : config_.args) cmdline.push_back(arg);
 
-    // TODO: core::subprocess::popen 目前不直接支持 env/cwd 注入，
-    // 这里以默认环境启动；完整实现应扩展 popen 接口。
-    // 实际 env 可通过 setenv() 临时设置（非线程安全，此处简化）。
-    for (const auto& [k, v] : config_.env) {
-        setenv(k.c_str(), v.c_str(), 1);
+    // 🎯 对齐 OpenClaw sanitizeEnvVars + toMcpEnvRecord:
+    // 净化用户配置的 env, 阻断危险的宿主凭据变量 (仅放行显式 MCP 凭据白名单),
+    // 并构造显式 env 数组 — 子进程不再继承宿主全部环境变量 (防凭据泄露)。
+    auto sanitized = sandbox::sanitize_env_vars(config_.env, /*strict_mode=*/false);
+    for (const auto& blocked_key : sanitized.blocked) {
+        log()->warn("[StdioTransport] blocked dangerous env var for '{}': {}",
+                    config_.command, blocked_key);
+    }
+    for (const auto& warning : sanitized.warnings) {
+        log()->warn("[StdioTransport] env var warning: {}", warning);
     }
 
-    process_ = core::subprocess::popen(cmdline, /*capture_stdout=*/true, /*capture_stderr=*/true);
+    // 构造子进程显式环境: 仅保留少量安全的基础变量 + 净化后的用户 env。
+    // 不整体继承 environ, 避免 ANTHROPIC_API_KEY / GATEWAY_TOKEN 等泄露给
+    // 第三方 MCP server进程。
+    std::vector<std::string> child_env;
+    static const char* kSafeInheritedVars[] = {
+        "PATH", "HOME", "USER", "SHELL", "TERM", "TZ", "LANG"
+    };
+    for (const char* name : kSafeInheritedVars) {
+        if (const char* v = std::getenv(name)) {
+            child_env.push_back(std::string(name) + "=" + v);
+        }
+    }
+    for (const auto& [k, v] : sanitized.allowed) {
+        child_env.push_back(k + "=" + v);
+    }
+
+    process_ = core::subprocess::popen_with_env(
+        cmdline, child_env, /*capture_stdout=*/true, /*capture_stderr=*/true);
     if (!process_) {
         return core::Result<void>::Err(
             "StdioTransport: failed to spawn process: " + config_.command);
@@ -315,18 +395,34 @@ core::Result<void> HttpTransport::start() {
         return core::Result<void>::Err("HttpTransport: http client creation failed");
     }
 
+    // 🎯 对齐 OpenClaw: 进入 transport 前登记连接凭据 (url/headers/bearer/query),
+    // 使后续日志自动脱敏。
+    register_http_connection_secrets(config_.url, config_.headers);
+
     // SSE 传输类型：启动后台流监听线程
     if (config_.transport_type == McpTransportType::Sse) {
         start_sse_stream();
     }
 
     log()->info("[HttpTransport] started: {} (type={})",
-                config_.url,
+                logging::redact_sensitive_text(config_.url),
                 config_.transport_type == McpTransportType::Sse ? "sse" : "streamable-http");
     return core::Result<void>::Ok();
 }
 
 core::Result<json> HttpTransport::send_http_request(const json& message, int timeout_ms) {
+    // 🎯 对齐 OpenClaw fetchWithSsrfGuard: 请求前对目标 URL 做 SSRF 校验,
+    // 阻止解析到私有/回环/link-local IP (防止恶意 MCP server URL 探测内网)。
+    {
+        auto ssrf = security::get_global_ssrf_guard().check_url(config_.url);
+        if (!ssrf.allowed) {
+            log()->warn("[HttpTransport] SSRF check blocked url '{}': {}",
+                        logging::redact_sensitive_text(config_.url), ssrf.reason);
+            return core::Result<json>::Err(
+                "SSRF check blocked MCP server URL: " + ssrf.reason);
+        }
+    }
+
     // 发送一次 HTTP 请求（可选注入 Bearer）；返回原始 HttpResponse 供 OAuth 决策。
     auto do_send = [&](const std::optional<std::string>& bearer)
         -> core::Result<infra::HttpResponse> {
@@ -369,7 +465,10 @@ core::Result<json> HttpTransport::send_http_request(const json& message, int tim
             if (it == resp.headers.end()) it = resp.headers.find("Mcp-Session-Id");
             if (it != resp.headers.end()) {
                 session_id_ = it->second;
-                log()->debug("[HttpTransport] session id = {}", *session_id_);
+                // 🎯 session id 属会话凭据: 登记并脱敏后再打印
+                logging::register_secret_value_for_redaction(*session_id_);
+                log()->debug("[HttpTransport] session id = {}",
+                             logging::redact_sensitive_text(*session_id_));
             }
         }
 

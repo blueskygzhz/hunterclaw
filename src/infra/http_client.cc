@@ -132,7 +132,7 @@ core::Result<HttpResponse> HttpClient::request(
     // 2. Create connection (HTTP or HTTPS)
     if (u.use_ssl) {
 #ifdef HUNTERCLAW_ENABLE_SSL
-        auto ssl_result = connect_ssl(u.host, u.port, options.timeout_ms);
+        auto ssl_result = connect_ssl(u.host, u.port, options.timeout_ms, options);
         if (ssl_result.is_err()) {
             return core::Result<HttpResponse>::Err(ssl_result.error);
         }
@@ -321,7 +321,8 @@ core::Result<int> HttpClient::connect_socket(
 core::Result<HttpClient::SslConnection> HttpClient::connect_ssl(
     const std::string& host,
     int port,
-    int timeout_ms
+    int timeout_ms,
+    const HttpRequestOptions& options
 ) {
     // Initialize SSL library (thread-safe in OpenSSL 1.1.0+)
     static bool ssl_initialized = false;
@@ -346,6 +347,61 @@ core::Result<HttpClient::SslConnection> HttpClient::connect_ssl(
         close(socket_fd);
         return core::Result<SslConnection>::Err("Failed to create SSL context");
     }
+
+    // 🎯 对齐 OpenClaw sslVerify: 证书校验 (默认开启，防止 MITM)
+    if (options.ssl_verify) {
+        // 强制最低 TLS 1.2
+        SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+
+        // 加载 CA: 自定义 bundle 或系统默认信任链
+        if (!options.ca_bundle_path.empty()) {
+            if (SSL_CTX_load_verify_locations(
+                    ctx, options.ca_bundle_path.c_str(), nullptr) != 1) {
+                SSL_CTX_free(ctx);
+                close(socket_fd);
+                return core::Result<SslConnection>::Err(
+                    "Failed to load CA bundle: " + options.ca_bundle_path);
+            }
+        } else if (SSL_CTX_set_default_verify_paths(ctx) != 1) {
+            SSL_CTX_free(ctx);
+            close(socket_fd);
+            return core::Result<SslConnection>::Err(
+                "Failed to load system default CA paths");
+        }
+
+        // 要求校验对端证书 (握手时验证证书链)
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
+        SSL_CTX_set_verify_depth(ctx, 10);
+    } else {
+        // 显式关闭校验 (仅信任的 self-signed server)
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
+    }
+
+    // 🎯 对齐 OpenClaw clientCert/clientKey: mTLS 客户端证书
+    if (!options.client_cert_path.empty()) {
+        if (SSL_CTX_use_certificate_file(
+                ctx, options.client_cert_path.c_str(), SSL_FILETYPE_PEM) != 1) {
+            SSL_CTX_free(ctx);
+            close(socket_fd);
+            return core::Result<SslConnection>::Err(
+                "Failed to load client certificate: " + options.client_cert_path);
+        }
+        const std::string& key_path = options.client_key_path.empty()
+            ? options.client_cert_path : options.client_key_path;
+        if (SSL_CTX_use_PrivateKey_file(
+                ctx, key_path.c_str(), SSL_FILETYPE_PEM) != 1) {
+            SSL_CTX_free(ctx);
+            close(socket_fd);
+            return core::Result<SslConnection>::Err(
+                "Failed to load client private key: " + key_path);
+        }
+        if (SSL_CTX_check_private_key(ctx) != 1) {
+            SSL_CTX_free(ctx);
+            close(socket_fd);
+            return core::Result<SslConnection>::Err(
+                "Client certificate/key mismatch");
+        }
+    }
     
     // Create SSL connection
     SSL* ssl = SSL_new(ctx);
@@ -359,6 +415,20 @@ core::Result<HttpClient::SslConnection> HttpClient::connect_ssl(
     
     // Set SNI hostname
     SSL_set_tlsext_host_name(ssl, host.c_str());
+
+    // 🎯 主机名校验 (防止证书有效但域名不匹配的 MITM)
+    if (options.ssl_verify) {
+        X509_VERIFY_PARAM* param = SSL_get0_param(ssl);
+        X509_VERIFY_PARAM_set_hostflags(
+            param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+        if (X509_VERIFY_PARAM_set1_host(param, host.c_str(), 0) != 1) {
+            SSL_free(ssl);
+            SSL_CTX_free(ctx);
+            close(socket_fd);
+            return core::Result<SslConnection>::Err(
+                "Failed to set hostname for verification: " + host);
+        }
+    }
     
     // Perform SSL handshake
     int ret = SSL_connect(ssl);
@@ -367,6 +437,30 @@ core::Result<HttpClient::SslConnection> HttpClient::connect_ssl(
         SSL_CTX_free(ctx);
         close(socket_fd);
         return core::Result<SslConnection>::Err("SSL handshake failed");
+    }
+
+    // 🎯 握手后确认证书校验结果 (SSL_VERIFY_PEER 已强制，此处显式复核)
+    if (options.ssl_verify) {
+        long verify_result = SSL_get_verify_result(ssl);
+        if (verify_result != X509_V_OK) {
+            std::string reason =
+                X509_verify_cert_error_string(verify_result);
+            SSL_free(ssl);
+            SSL_CTX_free(ctx);
+            close(socket_fd);
+            return core::Result<SslConnection>::Err(
+                "Certificate verification failed: " + reason);
+        }
+        // 确认对端确实提供了证书
+        X509* peer_cert = SSL_get_peer_certificate(ssl);
+        if (!peer_cert) {
+            SSL_free(ssl);
+            SSL_CTX_free(ctx);
+            close(socket_fd);
+            return core::Result<SslConnection>::Err(
+                "Server did not present a certificate");
+        }
+        X509_free(peer_cert);
     }
     
     SslConnection conn;
@@ -382,7 +476,8 @@ core::Result<HttpClient::SslConnection> HttpClient::connect_ssl(
 core::Result<HttpClient::SslConnection> HttpClient::connect_ssl(
     const std::string&,
     int,
-    int
+    int,
+    const HttpRequestOptions&
 ) {
     return core::Result<SslConnection>::Err("SSL not supported");
 }
@@ -654,7 +749,7 @@ core::Result<HttpResponse> HttpClient::post_stream(
     // 2. Create connection
     if (u.use_ssl) {
 #ifdef HUNTERCLAW_ENABLE_SSL
-        auto ssl_result = connect_ssl(u.host, u.port, options.timeout_ms);
+        auto ssl_result = connect_ssl(u.host, u.port, options.timeout_ms, options);
         if (ssl_result.is_err()) {
             return core::Result<HttpResponse>::Err(ssl_result.error);
         }

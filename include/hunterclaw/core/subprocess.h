@@ -77,6 +77,16 @@ Process* popen(
     bool capture_stderr = true
 );
 
+// 🎯 启动进程 (显式环境变量, 不继承父进程环境)
+// 用于 MCP stdio server 等场景: 仅注入净化后的 env, 避免子进程继承宿主
+// 全部环境变量 (含凭据)。env 为 KEY=VALUE 列表。
+Process* popen_with_env(
+    const std::vector<std::string>& command,
+    const std::vector<std::string>& env,
+    bool capture_stdout = true,
+    bool capture_stderr = true
+);
+
 } // namespace subprocess
 } // namespace core
 } // namespace hunterclaw

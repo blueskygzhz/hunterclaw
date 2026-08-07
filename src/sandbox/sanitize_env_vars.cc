@@ -1,11 +1,14 @@
 // 🎯 严格对齐 OpenClaw: src/agents/sandbox/sanitize-env-vars.ts (111 lines)
 // 环境变量净化：阻止 API key/token/密码等敏感变量注入容器
 
+#include "hunterclaw/sandbox/sanitize_env_vars.h"
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <regex>
 #include <algorithm>
+#include <cctype>
 
 namespace hunterclaw {
 namespace sandbox {
@@ -47,11 +50,25 @@ static const std::vector<std::regex> ALLOWED_ENV_VAR_PATTERNS = {
     std::regex("^NODE_ENV$", std::regex::icase),
 };
 
-struct EnvVarSanitizationResult {
-    std::map<std::string, std::string> allowed;
-    std::vector<std::string> blocked;
-    std::vector<std::string> warnings;
+// 🎯 对齐 OpenClaw: MCP_EXPLICIT_CREDENTIAL_ENV_KEYS
+// 显式配置的 MCP server凭据属于运维输入的授权信息，不是被继承的宿主
+// 配置枢纽，故放行；仅拦截被继承的危险宿主变量。
+static const std::set<std::string> MCP_EXPLICIT_CREDENTIAL_ENV_KEYS = {
+    "AWS_ACCESS_KEY_ID",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "MONGODB_URI",
+    "NODE_AUTH_TOKEN",
+    "NPM_TOKEN",
+    "REDIS_URL",
 };
+
+static std::string upper_copy(const std::string& s) {
+    std::string out = s;
+    std::transform(out.begin(), out.end(), out.begin(),
+                   [](unsigned char c) { return std::toupper(c); });
+    return out;
+}
 
 static bool matches_any(const std::string& key, const std::vector<std::regex>& patterns) {
     for (const auto& p : patterns) {
@@ -86,14 +103,19 @@ EnvVarSanitizationResult sanitize_env_vars(
         key = key.substr(s, e - s + 1);
         if (key.empty()) continue;
 
+        // 🎯 对齐 OpenClaw: 显式配置的 MCP 凭据白名单 (绕过 blocked 检查)
+        bool is_explicit_credential =
+            MCP_EXPLICIT_CREDENTIAL_ENV_KEYS.count(upper_copy(key)) > 0;
+
         // 🎯 对齐 OpenClaw: blocked pattern check
-        if (matches_any(key, BLOCKED_ENV_VAR_PATTERNS)) {
+        if (!is_explicit_credential && matches_any(key, BLOCKED_ENV_VAR_PATTERNS)) {
             result.blocked.push_back(key);
             continue;
         }
 
         // 🎯 对齐 OpenClaw: strict mode - only allow known-safe vars
-        if (strict_mode && !matches_any(key, ALLOWED_ENV_VAR_PATTERNS)) {
+        if (strict_mode && !is_explicit_credential &&
+            !matches_any(key, ALLOWED_ENV_VAR_PATTERNS)) {
             result.blocked.push_back(key);
             continue;
         }

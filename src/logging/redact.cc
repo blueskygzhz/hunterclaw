@@ -4,6 +4,7 @@
 // 调用 redact_bounded 的 replace_pattern_bounded 进行大文本分块安全替换
 
 #include "hunterclaw/logging/redact.h"
+#include "hunterclaw/logging/secret_redaction_registry.h"
 #include <algorithm>
 #include <spdlog/spdlog.h>
 
@@ -275,10 +276,19 @@ std::string redact_sensitive_text(const std::string& text, const RedactOptions& 
     auto mode = normalize_mode(options.mode.value_or("tools"));
     if (mode == RedactSensitiveMode::Off) return text;
 
-    auto patterns = resolve_patterns(options.patterns.value_or(std::vector<std::string>{}));
-    if (patterns.empty()) return text;
+    // 🎯 对齐 OpenClaw: 先做已注册精确值脱敏 (registerSecretValueForRedaction),
+    // 再走模式正则脱敏。精确值用与正则相同的 maskToken (前N…后M)。
+    std::string working = text;
+    if (has_registered_secret_values_for_redaction()) {
+        working = redact_registered_secret_values(
+            working,
+            [](const std::string& v) { return mask_token(v); });
+    }
 
-    return redact_text(text, patterns);
+    auto patterns = resolve_patterns(options.patterns.value_or(std::vector<std::string>{}));
+    if (patterns.empty()) return working;
+
+    return redact_text(working, patterns);
 }
 
 // 🎯 严格对齐 OpenClaw: redactToolDetail()
