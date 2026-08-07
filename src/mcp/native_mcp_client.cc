@@ -22,6 +22,8 @@
 #include "hunterclaw/mcp/mcp_transport_config.h"
 #include "hunterclaw/mcp/json_converter.h"
 #include "hunterclaw/mcp/mcp_pagination.h"
+#include "hunterclaw/mcp/mcp_oauth.h"
+#include "hunterclaw/mcp/mcp_oauth_token_exchange.h"
 #include "hunterclaw/core/subprocess.h"
 #include <spdlog/spdlog.h>
 #include <algorithm>
@@ -325,78 +327,160 @@ core::Result<void> HttpTransport::start() {
 }
 
 core::Result<json> HttpTransport::send_http_request(const json& message, int timeout_ms) {
-    infra::HttpRequestOptions options;
-    options.timeout_ms = timeout_ms;
-    options.body = message.dump();
+    // 发送一次 HTTP 请求（可选注入 Bearer）；返回原始 HttpResponse 供 OAuth 决策。
+    auto do_send = [&](const std::optional<std::string>& bearer)
+        -> core::Result<infra::HttpResponse> {
+        infra::HttpRequestOptions options;
+        options.timeout_ms = timeout_ms;
+        options.body = message.dump();
 
-    // 标准 MCP headers
-    options.headers["Content-Type"] = "application/json";
-    options.headers["Accept"] = "application/json, text/event-stream";
+        // 标准 MCP headers
+        options.headers["Content-Type"] = "application/json";
+        options.headers["Accept"] = "application/json, text/event-stream";
 
-    // 用户自定义 headers (如 Authorization)
-    for (const auto& [k, v] : config_.headers) {
-        options.headers[k] = v;
-    }
-
-    // MCP Session ID (StreamableHttp 会话保持)
-    if (session_id_.has_value()) {
-        options.headers["Mcp-Session-Id"] = *session_id_;
-    }
-
-    auto resp_result = http_client_->post(config_.url, options);
-    if (resp_result.is_err()) {
-        return core::Result<json>::Err("HTTP request failed: " + resp_result.error);
-    }
-
-    const auto& resp = resp_result.get();
-
-    // 首次 initialize 响应中提取 Mcp-Session-Id
-    if (!session_id_.has_value()) {
-        auto it = resp.headers.find("mcp-session-id");
-        if (it == resp.headers.end()) it = resp.headers.find("Mcp-Session-Id");
-        if (it != resp.headers.end()) {
-            session_id_ = it->second;
-            log()->debug("[HttpTransport] session id = {}", *session_id_);
+        // 用户自定义 headers (如 Authorization)
+        for (const auto& [k, v] : config_.headers) {
+            options.headers[k] = v;
         }
-    }
 
-    if (!resp.ok) {
-        return core::Result<json>::Err(
-            "HTTP " + std::to_string(resp.status_code) + ": " + resp.body);
-    }
+        // 🎯 OAuth Bearer 注入（对齐 withBearerHeader，覆盖静态 Authorization）。
+        if (bearer.has_value() && !bearer->empty()) {
+            options.headers["Authorization"] = "Bearer " + *bearer;
+        }
 
-    // 响应可能是:
-    //   1. 单条 JSON 响应 (Content-Type: application/json)
-    //   2. SSE 流 (Content-Type: text/event-stream)
-    auto content_type_it = resp.headers.find("content-type");
-    if (content_type_it == resp.headers.end()) content_type_it = resp.headers.find("Content-Type");
+        // MCP Session ID (StreamableHttp 会话保持)
+        if (session_id_.has_value()) {
+            options.headers["Mcp-Session-Id"] = *session_id_;
+        }
 
-    if (content_type_it != resp.headers.end() &&
-        content_type_it->second.find("text/event-stream") != std::string::npos) {
-        // SSE 响应: 解析 data: 行
-        auto event = parse_sse_event(resp.body);
-        if (event) return core::Result<json>::Ok(*event);
-        return core::Result<json>::Err("SSE response has no valid event");
-    }
+        auto resp_result = http_client_->post(config_.url, options);
+        if (resp_result.is_err()) {
+            return core::Result<infra::HttpResponse>::Err(
+                "HTTP request failed: " + resp_result.error);
+        }
+        return core::Result<infra::HttpResponse>::Ok(resp_result.get());
+    };
 
-    // 标准 JSON 响应
-    try {
-        auto parsed = json::parse(resp.body);
-        // 提取 result 或 error
-        if (parsed.contains("error")) {
-            std::string msg = "MCP error";
-            if (parsed["error"].is_object() && parsed["error"].contains("message")) {
-                msg = parsed["error"]["message"].get<std::string>();
+    // 解析 HttpResponse → JSON-RPC result（原send_http_request 的响应处理逻辑）。
+    auto parse_response = [&](const infra::HttpResponse& resp) -> core::Result<json> {
+        // 首次 initialize 响应中提取 Mcp-Session-Id
+        if (!session_id_.has_value()) {
+            auto it = resp.headers.find("mcp-session-id");
+            if (it == resp.headers.end()) it = resp.headers.find("Mcp-Session-Id");
+            if (it != resp.headers.end()) {
+                session_id_ = it->second;
+                log()->debug("[HttpTransport] session id = {}", *session_id_);
             }
-            return core::Result<json>::Err(msg);
         }
-        if (parsed.contains("result")) {
-            return core::Result<json>::Ok(parsed["result"]);
+
+        if (!resp.ok) {
+            return core::Result<json>::Err(
+                "HTTP " + std::to_string(resp.status_code) + ": " + resp.body);
         }
-        return core::Result<json>::Ok(parsed);
-    } catch (const std::exception& e) {
-        return core::Result<json>::Err(std::string("JSON parse error: ") + e.what());
+
+        auto content_type_it = resp.headers.find("content-type");
+        if (content_type_it == resp.headers.end())
+            content_type_it = resp.headers.find("Content-Type");
+
+        if (content_type_it != resp.headers.end() &&
+            content_type_it->second.find("text/event-stream") != std::string::npos) {
+            auto event = parse_sse_event(resp.body);
+            if (event) return core::Result<json>::Ok(*event);
+            return core::Result<json>::Err("SSE response has no valid event");
+        }
+
+        try {
+            auto parsed = json::parse(resp.body);
+            if (parsed.contains("error")) {
+                std::string msg = "MCP error";
+                if (parsed["error"].is_object() && parsed["error"].contains("message")) {
+                    msg = parsed["error"]["message"].get<std::string>();
+                }
+                return core::Result<json>::Err(msg);
+            }
+            if (parsed.contains("result")) {
+                return core::Result<json>::Ok(parsed["result"]);
+            }
+            return core::Result<json>::Ok(parsed);
+        } catch (const std::exception& e) {
+            return core::Result<json>::Err(std::string("JSON parse error: ") + e.what());
+        }
+    };
+
+    // 取 WWW-Authenticate header（大小写不敏感）。
+    auto www_authenticate_of = [](const infra::HttpResponse& resp) -> std::string {
+        auto it = resp.headers.find("www-authenticate");
+        if (it == resp.headers.end()) it = resp.headers.find("WWW-Authenticate");
+        return it != resp.headers.end() ? it->second : "";
+    };
+
+    //---- 非 OAuth：单次发送 ----
+    if (!config_.oauth_enabled) {
+        auto resp = do_send(std::nullopt);
+        if (resp.is_err()) return core::Result<json>::Err(resp.error);
+        return parse_response(resp.get());
     }
+
+    // ---- OAuth：对齐 withMcpOAuthBearer 的注入 + 401/403 重试 ----
+    // 1. 首发：allowMissingToken=true 拿 token（无则不带 Bearer）。
+    ResolveMcpOAuthAccessTokenParams first_params;
+    first_params.server_name = config_.server_name;
+    first_params.server_url = config_.url;
+    first_params.accept_unknown_expiry = true;
+    first_params.allow_missing_token = true;
+    first_params.refresh = make_mcp_oauth_token_refresh_fn(
+        McpOAuthRefreshConfig{config_.server_name, std::nullopt, std::nullopt, timeout_ms, nullptr});
+    auto first_token = resolve_mcp_oauth_access_token(first_params);
+    std::optional<std::string> access_token;
+    if (first_token.is_ok()) access_token = first_token.get();
+
+    auto first_resp = do_send(access_token);
+    if (first_resp.is_err()) return core::Result<json>::Err(first_resp.error);
+    const infra::HttpResponse& r1 = first_resp.get();
+
+    WwwAuthenticateChallenge challenge = parse_www_authenticate(www_authenticate_of(r1));
+    bool insufficient_scope =
+        r1.status_code == 403 && challenge.error.value_or("") == "insufficient_scope";
+    bool should_retry = mcp_oauth_should_retry(r1.status_code, challenge);
+    if (!should_retry) {
+        return parse_response(r1);
+    }
+
+    // 2. 重试前刷新：authorizationChallenge=true，附带 rejectedAccessToken + challenge。
+    ResolveMcpOAuthAccessTokenParams retry_params;
+    retry_params.server_name = config_.server_name;
+    retry_params.server_url = config_.url;
+    retry_params.accept_unknown_expiry = true;
+    retry_params.authorization_challenge = true;
+    retry_params.interactive_authorization_required = insufficient_scope;
+    retry_params.rejected_access_token = access_token;
+    retry_params.challenge_resource_metadata_url = challenge.resource_metadata_url;
+    retry_params.challenge_scope = challenge.scope;
+    retry_params.refresh = make_mcp_oauth_token_refresh_fn(
+        McpOAuthRefreshConfig{config_.server_name, std::nullopt, std::nullopt, timeout_ms, nullptr});
+    auto next_token = resolve_mcp_oauth_access_token(retry_params);
+    if (next_token.is_err()) {
+        // 刷新/授权失败 → 返回该错误（对齐 resolve 抛错语义）。
+        return core::Result<json>::Err(next_token.error);
+    }
+
+    auto retry_resp = do_send(next_token.get());
+    if (retry_resp.is_err()) return core::Result<json>::Err(retry_resp.error);
+    const infra::HttpResponse& r2 = retry_resp.get();
+
+    // 3. 重试仍失败 → 记录需授权（对齐 recordMcpOAuthAuthorizationRequired）。
+    WwwAuthenticateChallenge retry_challenge = parse_www_authenticate(www_authenticate_of(r2));
+    bool retry_insufficient =
+        r2.status_code == 403 && retry_challenge.error.value_or("") == "insufficient_scope";
+    if (r2.status_code == 401 || retry_insufficient) {
+        McpOAuthChallengeParams rec;
+        rec.resource_metadata_url = retry_challenge.resource_metadata_url.has_value()
+            ? retry_challenge.resource_metadata_url : challenge.resource_metadata_url;
+        rec.scope = retry_challenge.scope.has_value() ? retry_challenge.scope : challenge.scope;
+        rec.requires_authorization = retry_insufficient;
+        record_mcp_oauth_authorization_required(config_.server_name, config_.url, rec);
+    }
+    return parse_response(r2);
 }
 
 std::optional<json> HttpTransport::parse_sse_event(const std::string& data) {
@@ -554,6 +638,9 @@ core::Result<std::unique_ptr<McpTransport>> McpServerConnection::create_transpor
         tc.headers = sc.headers;
         tc.transport_type = resolved->transport_type;
         tc.connection_timeout_ms = resolved->connection_timeout_ms;
+        // 🎯 OAuth：启用后send_http_request 走Bearer 注入 + 401 重试。
+        tc.oauth_enabled = sc.oauth;
+        tc.server_name = config_.name;
         return core::Result<std::unique_ptr<McpTransport>>::Ok(
             std::make_unique<HttpTransport>(tc));
     }

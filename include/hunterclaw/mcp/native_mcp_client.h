@@ -171,6 +171,11 @@ public:
         std::map<std::string, std::string> headers;       // 自定义 headers (如 Authorization)
         McpTransportType transport_type = McpTransportType::StreamableHttp;
         int connection_timeout_ms = 30000;
+        // 🎯 对齐 OpenClaw withMcpOAuthBearer: 启用后请求注入 OAuth Bearer 并在
+        //   401/403(insufficient_scope) 时刷新 token 重试一次。server_name 用于
+        //   OAuth store key 与错误文案。
+        bool oauth_enabled = false;
+        std::string server_name;
     };
 
     explicit HttpTransport(const Config& config);

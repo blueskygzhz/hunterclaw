@@ -32,6 +32,7 @@ nlohmann::json McpServerConfig::to_json() const {
         if (tool_filter->has_exclude) tf["exclude"] = tool_filter->exclude;
         if (!tf.empty()) j["toolFilter"] = tf;
     }
+    if (oauth) j["auth"] = "oauth";
     return j;
 }
 
@@ -79,6 +80,13 @@ McpServerConfig McpServerConfig::from_json(const nlohmann::json& j) {
             }
         }
         cfg.tool_filter = std::move(filter);
+    }
+    // 🎯 对齐 auth:"oauth"（或 oauth:true）：启用 OAuth Bearer 流程。
+    if (j.contains("auth") && j["auth"].is_string()) {
+        cfg.oauth = (j["auth"].get<std::string>() == "oauth");
+    }
+    if (j.contains("oauth") && j["oauth"].is_boolean()) {
+        cfg.oauth = cfg.oauth || j["oauth"].get<bool>();
     }
     return cfg;
 }

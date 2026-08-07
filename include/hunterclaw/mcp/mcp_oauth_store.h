@@ -56,5 +56,10 @@ struct McpOAuthChallengeParams {
 McpOAuthStore apply_mcp_oauth_authorization_challenge(
     const McpOAuthStore& current, const McpOAuthChallengeParams& params);
 
+// 对齐 resolveMcpOAuthStoreKey (mcp-oauth-store.ts:197-201):
+//   `${sanitizeServerName(serverName)}-${sha256(serverName + "\0" + serverUrl)[:16]}`
+std::string resolve_mcp_oauth_store_key(
+    const std::string& server_name, const std::string& server_url);
+
 } // namespace mcp
 } // namespace hunterclaw

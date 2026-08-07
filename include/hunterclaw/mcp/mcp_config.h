@@ -29,6 +29,7 @@ struct McpServerConfig {
     std::map<std::string, std::string> headers;           // 🎯 HTTP transport: extra headers
     std::optional<int> connection_timeout_ms;             // 🎯 Optional connection timeout
     std::optional<McpServerToolFilterConfig> tool_filter; // 🎯 对齐 toolFilter (include/exclude)
+    bool oauth = false;                                   // 🎯 对齐 auth:"oauth"：启用 OAuth Bearer
 
     // Serialize to/from JSON
     nlohmann::json to_json() const;

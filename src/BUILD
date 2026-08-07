@@ -331,6 +331,7 @@ cc_library(
     linkopts = [
         "-lpthread",
         "-ljsoncpp",
+        "-lsqlite3",  # ✅ mcp_oauth_persistence: OAuth 凭证 SQLite 持久化
     ],
     linkstatic = False,
     visibility = ["//visibility:public"],

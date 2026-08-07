@@ -1,4 +1,6 @@
 #include "hunterclaw/mcp/mcp_oauth_store.h"
+#include "hunterclaw/mcp/bundle_mcp_types.h"
+#include "hunterclaw/infra/utilities.h"
 
 #include <set>
 
@@ -208,6 +210,21 @@ McpOAuthStore apply_mcp_oauth_authorization_challenge(
         }
     }
     return next;
+}
+
+std::string resolve_mcp_oauth_store_key(
+    const std::string& server_name, const std::string& server_url) {
+    // 对齐 sanitizeServerName(serverName, new Set())
+    std::set<std::string> reserved;
+    std::string safe_server_name = sanitize_server_name(server_name, reserved);
+    // 对齐 createHash("sha256").update(serverName).update("\0").update(serverUrl)
+    std::string material = server_name;
+    material.push_back('\0');
+    material += server_url;
+    std::string hash = infra::sha256_hash(material);
+    // hash.slice(0, 16)
+    std::string short_hash = hash.substr(0, 16);
+    return safe_server_name + "-" + short_hash;
 }
 
 } // namespace mcp
