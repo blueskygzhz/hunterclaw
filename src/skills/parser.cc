@@ -1,9 +1,12 @@
 #include "hunterclaw/skills/skill.h"
 #include "hunterclaw/core/types.h"
 #include <yaml-cpp/yaml.h>
+#include <openssl/sha.h>
 #include <regex>
 #include <sstream>
 #include <fstream>
+#include <cctype>
+#include <initializer_list>
 #include <spdlog/spdlog.h>
 
 namespace hunterclaw {
@@ -16,6 +19,75 @@ namespace {
             logger = spdlog::stdout_logger_mt("skills");
         }
         return logger;
+    }
+
+    // 🎯 对齐 OpenClaw sha256HexPrefix: SHA-256 hex 前 len 个字符
+    std::string sha256_hex_prefix(const std::string& value, int len) {
+        unsigned char hash[SHA256_DIGEST_LENGTH];
+        SHA256(reinterpret_cast<const unsigned char*>(value.data()), value.size(), hash);
+        static const char* hex = "0123456789abcdef";
+        std::string out;
+        out.reserve(SHA256_DIGEST_LENGTH * 2);
+        for (unsigned char c : hash) {
+            out.push_back(hex[(c >> 4) & 0xF]);
+            out.push_back(hex[c & 0xF]);
+        }
+        if (len > 0 && len < static_cast<int>(out.size())) out = out.substr(0, len);
+        return out;
+    }
+
+    std::string trim_copy(const std::string& s) {
+        size_t a = s.find_first_not_of(" \t\r\n");
+        if (a == std::string::npos) return "";
+        size_t b = s.find_last_not_of(" \t\r\n");
+        return s.substr(a, b - a + 1);
+    }
+
+    bool contains_any(const std::string& s, std::initializer_list<const char*> subs) {
+        for (const char* sub : subs) {
+            if (s.find(sub) != std::string::npos) return true;
+        }
+        return false;
+    }
+
+    // 🎯 对齐 OpenClaw normalizeSafeBrewFormula
+    // BREW:^[A-Za-z0-9][A-Za-z0-9@+._/-]*$; 拒绝 前导'-'/反斜杠/'..'
+    bool is_safe_brew_formula(const std::string& raw) {
+        std::string f = trim_copy(raw);
+        if (f.empty() || f.front() == '-' || contains_any(f, {"\\", ".."})) return false;
+        static const std::regex re(R"(^[A-Za-z0-9][A-Za-z0-9@+._/-]*$)");
+        return std::regex_match(f, re);
+    }
+
+    // 🎯 对齐 OpenClaw normalizeSafeGoModule
+    bool is_safe_go_module(const std::string& raw) {
+        std::string m = trim_copy(raw);
+        if (m.empty() || m.front() == '-' || contains_any(m, {"\\", "://"})) return false;
+        static const std::regex re(
+            R"(^[A-Za-z0-9][A-Za-z0-9._~+\-/]*(?:@[A-Za-z0-9][A-Za-z0-9._~+\-/]*)?$)");
+        return std::regex_match(m, re);
+    }
+
+    // 🎯 对齐 OpenClaw normalizeSafeUvPackage
+    bool is_safe_uv_package(const std::string& raw) {
+        std::string p = trim_copy(raw);
+        if (p.empty() || p.front() == '-' || contains_any(p, {"\\", "://"})) return false;
+        static const std::regex re(R"(^[A-Za-z0-9][A-Za-z0-9._\-\[\]=<>!~+,]*$)");
+        return std::regex_match(p, re);
+    }
+
+    // 🎯 对齐 OpenClaw normalizeSafeNpmSpec (宽松: 非空 + 不以 '-' 开头)
+    bool is_safe_npm_spec(const std::string& raw) {
+        std::string s = trim_copy(raw);
+        return !s.empty() && s.front() != '-';
+    }
+
+    // 🎯 对齐 OpenClaw normalizeSafeDownloadUrl: http/https +无空白
+    bool is_safe_download_url(const std::string& raw) {
+        std::string v = trim_copy(raw);
+        if (v.empty()) return false;
+        for (char c : v) if (std::isspace(static_cast<unsigned char>(c))) return false;
+        return v.rfind("http://", 0) == 0 || v.rfind("https://", 0) == 0;
     }
 }
 
@@ -51,6 +123,8 @@ core::Result<Skill> SkillParser::parse_file(const fs::path& skill_path) {
         skill.file_path = skill_path;
         skill.base_dir = skill_path.parent_path();
         skill.frontmatter = fm_result.get();
+        // 🎯 对齐 OpenClaw computeSkillPromptVersion: 基于完整 SKILL.md 内容
+        skill.prompt_version = compute_skill_prompt_version(content);
         
         // Determine source (simplified)
         if (skill_path.string().find("/.hunterclaw/") != std::string::npos) {
@@ -197,7 +271,13 @@ core::Result<SkillFrontmatter> SkillParser::parse_frontmatter(const std::string&
                         spec.target_dir = spec_node["targetDir"].as<std::string>();
                     }
                     
-                    fm.metadata.install.push_back(spec);
+                    // 🎯 对齐 OpenClaw parseInstallSpec: 安全净化 + kind 必填校验,
+                    // 非法 spec 丢弃 (对齐返回 undefined 被过滤)。
+                    if (sanitize_install_spec(spec)) {
+                        fm.metadata.install.push_back(spec);
+                    } else {
+                        log()->warn("[SkillParser] dropped unsafe/invalid install spec (kind check failed)");
+                    }
                 }
             }
         }
@@ -354,6 +434,51 @@ SkillInvocationPolicy SkillParser::resolve_invocation_policy(
     }
 
     return policy;
+}
+
+// ============================================================================
+// 🎯 compute_skill_prompt_version (对齐 OpenClaw computeSkillPromptVersion)
+// ============================================================================
+std::string SkillParser::compute_skill_prompt_version(const std::string& content) {
+    return "sha256:" + sha256_hex_prefix(content, 16);
+}
+
+// ============================================================================
+// 🎯 sanitize_install_spec (对齐 OpenClaw parseInstallSpec 的安全校验)
+// 就地净化各 kind 的关键字段, 非法字段清空; 最后按 kind 校验必填字段。
+// 返回 false 表示 spec 应被丢弃 (对齐 openclaw 返回 undefined)。
+// ============================================================================
+bool SkillParser::sanitize_install_spec(SkillInstallSpec& spec) {
+    // formula: brew (formula 或 cask 都走同一校验)
+    if (!spec.formula.empty() && !is_safe_brew_formula(spec.formula)) {
+        spec.formula.clear();
+    }
+    // package: node(npm) / uv 各自的校验规则
+    if (!spec.package.empty()) {
+        if (spec.kind == SkillInstallSpec::Kind::Node) {
+            if (!is_safe_npm_spec(spec.package)) spec.package.clear();
+        } else if (spec.kind == SkillInstallSpec::Kind::Uv) {
+            if (!is_safe_uv_package(spec.package)) spec.package.clear();
+        }
+    }
+    // module: go
+    if (!spec.module.empty() && !is_safe_go_module(spec.module)) {
+        spec.module.clear();
+    }
+    // url: download (仅 http/https + 无空白)
+    if (!spec.url.empty() && !is_safe_download_url(spec.url)) {
+        spec.url.clear();
+    }
+
+    // 🎯 kind 必填字段校验 (对齐 openclaw:缺失即return undefined)
+    switch (spec.kind) {
+        case SkillInstallSpec::Kind::Brew:return !spec.formula.empty();
+        case SkillInstallSpec::Kind::Node:     return !spec.package.empty();
+        case SkillInstallSpec::Kind::Go:       return !spec.module.empty();
+        case SkillInstallSpec::Kind::Uv:       return !spec.package.empty();
+        case SkillInstallSpec::Kind::Download: return !spec.url.empty();
+    }
+    return false;
 }
 
 } // namespace skills

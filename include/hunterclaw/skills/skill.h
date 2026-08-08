@@ -94,6 +94,10 @@ struct Skill {
     SkillSource source;
     
     SkillFrontmatter frontmatter;
+
+    // 🎯 对齐 OpenClaw computeSkillPromptVersion: 基于 SKILL.md 内容的确定性版本
+    // 标记 ("sha256:<16hex>"), 用于 model-visible skill catalog 的版本标注/去重。
+    std::string prompt_version;
 };
 
 // ✅ 对齐 OpenClaw types.ts: SkillInvocationPolicy
@@ -330,6 +334,15 @@ public:
     // Reads: user-invocable (default: true), disable-model-invocation (default: false)
     static SkillInvocationPolicy resolve_invocation_policy(
         const ParsedSkillFrontmatter& frontmatter);
+
+    // 🎯 对齐 OpenClaw computeSkillPromptVersion (skill-version.ts):
+    // 返回 "sha256:" + sha256HexPrefix(content, 16) 的确定性内容版本标记。
+    static std::string compute_skill_prompt_version(const std::string& content);
+
+    // 🎯 对齐 OpenClaw parseInstallSpec 的安全校验 (frontmatter.ts):
+    // 就地净化一个 install spec (formula/package/module/url 的注入/逃逸/协议校验),
+    // 并按 kind 校验必填字段。返回 false 表示该 spec 非法应被丢弃 (对齐返回 undefined)。
+    static bool sanitize_install_spec(SkillInstallSpec& spec);
     
     // Validate skill structure
     static core::Result<bool> validate_skill(const Skill& skill);

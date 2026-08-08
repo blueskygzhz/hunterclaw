@@ -20,6 +20,23 @@
 namespace hunterclaw {
 namespace agents {
 
+// 🎯 Live Model Catalog 发现钩子 (对齐 openclaw catalog-build-time discovery)。
+// 为避免 agents→core 循环依赖, agent_instance 通过此可注入钩子触发按模型的
+// 上下文窗口动态发现 (真正实现位于 core 层的 llm::model_discovery, 由 bootstrap
+// 注册)。签名: (provider_id, base_url, api_key) → 发现并灌入 ContextTokenCache。
+using ModelContextDiscoveryHook =
+    std::function<void(const std::string& provider_id,
+                       const std::string& base_url,
+                       const std::string& api_key)>;
+
+// 注册发现钩子 (由 core 层 bootstrap 调用)。
+void set_model_context_discovery_hook(ModelContextDiscoveryHook hook);
+
+// 触发一次发现 (agent_instance 内部使用; 未注册则no-op)。
+void run_model_context_discovery(const std::string& provider_id,
+                                 const std::string& base_url,
+                                 const std::string& api_key);
+
 /**
  * Agent 实例隔离上下文
  * 

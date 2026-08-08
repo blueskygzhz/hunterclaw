@@ -6,6 +6,9 @@
 #include "hunterclaw/skills/skill.h"
 #include "hunterclaw/channels/channel.h"
 #include "hunterclaw/channels/manager.h"
+#include "hunterclaw/agents/agent_instance.h"       // ✅ set_model_context_discovery_hook
+#include "hunterclaw/llm/model_discovery.h"          // ✅ discover_and_apply_provider_context_windows
+#include "hunterclaw/infra/http_client.h"            // ✅ HttpClient
 #include "hunterclaw/agents/types.h"
 #include "hunterclaw/queue/delivery_queue.h"
 #include "hunterclaw/outbound/deliver.h"
@@ -292,7 +295,20 @@ int main(int argc, char** argv) {
     }
     
     std::cout << "\n=== HunterClaw Initialization ===" << std::endl;
-    
+
+    // 🎯 注册 Live Model Catalog 发现钩子 (对齐 openclaw catalog-build-time
+    // discovery)。agent_instance 创建 LLMClient 时会按 provider 从其 /models
+    // 端点动态拉取上下文窗口并灌入 ContextTokenCache; 此处在顶层二进制注册真实
+    // 实现 (core 层), 规避 agents→core 循环依赖。
+    agents::set_model_context_discovery_hook(
+        [](const std::string& provider_id,
+           const std::string& base_url,
+           const std::string& api_key) {
+            auto http = std::make_shared<infra::HttpClient>();
+            llm::discover_and_apply_provider_context_windows(
+                http, provider_id, base_url, api_key);
+        });
+
     // Initialize Plugin Manager
     std::cout << "[1/4] Initializing Plugin Manager..." << std::endl;
     auto plugin_mgr = plugins::PluginManager::create();

@@ -74,5 +74,15 @@ class ModelDiscovery {
     std::shared_ptr<infra::HttpClient> http_client_;
 };
 
+// 🎯 便捷入口: 按provider_id 推断 kind + endpoint_path, 拉取并灌入缓存。
+// 供启动/按需接线调用 (advisory: 失败静默, 保留静态 catalog)。
+// provider_id 支持: openai / anthropic / gemini(google) / openrouter /
+// deepseek / groq / 及其它 OpenAI 兼容 provider (默认走 OpenAICompatible)。
+int discover_and_apply_provider_context_windows(
+    std::shared_ptr<infra::HttpClient> http_client,
+    const std::string& provider_id,
+    const std::string& base_url,
+    const std::string& api_key);
+
 }  // namespace llm
 }  // namespace hunterclaw

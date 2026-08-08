@@ -398,6 +398,7 @@ cc_library(
         "-lsqlite3",
         "-luuid",
         "-ldl",  # For dynamic loading
+        "-lcrypto",  # ✅ parser.cc: SHA256 (compute_skill_prompt_version)
     ],
     linkstatic = False,
     visibility = ["//visibility:public"],

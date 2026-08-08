@@ -24,6 +24,31 @@
 namespace hunterclaw {
 namespace agents {
 
+// 🎯 Live Model Catalog 发现钩子存储 (可注入, 避免 agents→core 循环)
+namespace {
+ModelContextDiscoveryHook& discovery_hook() {
+    static ModelContextDiscoveryHook hook;
+    return hook;
+}
+}  // namespace
+
+void set_model_context_discovery_hook(ModelContextDiscoveryHook hook) {
+    discovery_hook() = std::move(hook);
+}
+
+void run_model_context_discovery(const std::string& provider_id,
+                                 const std::string& base_url,
+                                 const std::string& api_key) {
+    auto& hook = discovery_hook();
+    if (hook) {
+        try {
+            hook(provider_id, base_url, api_key);
+        } catch (...) {
+            // advisory: 发现失败不影响 agent 运行
+        }
+    }
+}
+
 // Helper for logging
 inline auto log() { return core::get_logger("agent_instance"); }
 
@@ -224,7 +249,13 @@ AgentInstance::AgentInstance(
         
         spdlog::get("default")->debug("[AgentInstance] Creating LLMClient: provider={}, model={}",
             llm_config.provider, llm_config.model);
-        
+
+        // 🎯 触发 Live Model Catalog 发现: 按当前 provider 从其 /models 端点动态
+        // 拉取模型上下文窗口并灌入 ContextTokenCache (advisory, 失败静默, TTL 缓存),
+        // 使压缩窗口能"从服务器按model 返回", 静态 catalog 仅兜底。
+        run_model_context_discovery(llm_config.provider, llm_config.endpoint,
+                                    llm_config.api_key);
+
         auto llm_client = llm::LLMClientFactory::create(llm_config);
         
         if (!llm_client) {

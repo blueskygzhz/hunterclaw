@@ -343,5 +343,41 @@ int ModelDiscovery::discover_and_apply(const LiveModelDiscoveryParams& params) {
     return static_cast<int>(result.models.size());
 }
 
+// 🎯 便捷入口: provider_id → kind + endpoint_path 映射
+int discover_and_apply_provider_context_windows(
+    std::shared_ptr<infra::HttpClient> http_client,
+    const std::string& provider_id,
+    const std::string& base_url,
+    const std::string& api_key) {
+    if (!http_client || base_url.empty()) return 0;
+
+    LiveModelDiscoveryParams params;
+    params.provider_id = provider_id;
+    params.base_url = base_url;
+    params.api_key = api_key;
+
+    std::string pid = provider_id;
+    std::transform(pid.begin(), pid.end(), pid.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+
+    if (pid == "google" || pid == "gemini") {
+        params.kind = LiveCatalogProviderKind::Google;
+        params.endpoint_path = "v1beta/models";
+    } else if (pid == "openrouter") {
+        params.kind = LiveCatalogProviderKind::OpenRouter;
+        params.endpoint_path = "models";
+    } else if (pid == "anthropic") {
+        params.kind = LiveCatalogProviderKind::Anthropic;
+        params.endpoint_path = "models";
+    } else {
+        // openai 及所有 OpenAI 兼容 provider (deepseek/groq/...)
+        params.kind = LiveCatalogProviderKind::OpenAICompatible;
+        params.endpoint_path = "models";
+    }
+
+    ModelDiscovery discovery(std::move(http_client));
+    return discovery.discover_and_apply(params);
+}
+
 }  // namespace llm
 }  // namespace hunterclaw
