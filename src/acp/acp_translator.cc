@@ -5,6 +5,7 @@
 // ============================================================================
 
 #include "hunterclaw/acp/acp_translator.h"
+#include "hunterclaw/acp/acp_commands.h"
 #include "hunterclaw/acp/acp_event_mapper.h"
 #include "hunterclaw/acp/acp_stdio_transport.h"
 #include "hunterclaw/acp/runtime_errors.h"
@@ -159,7 +160,7 @@ void AcpGatewayAgent::emit_session_update(const std::string& session_id,
 // 🎯 对齐 OC sendAvailableCommands: new/load/resume 后发 available_commands_update
 void AcpGatewayAgent::emit_available_commands(const std::string& session_id) {
     nlohmann::json cmds = nlohmann::json::array();
-    for (auto& c : get_available_commands()) cmds.push_back(c);
+    for (auto& c : get_available_commands_vector()) cmds.push_back(c);
     emit_session_update(session_id, nlohmann::json{
      {"sessionUpdate", "available_commands_update"},
         {"availableCommands", cmds},
@@ -176,7 +177,7 @@ InitializeResponse AcpGatewayAgent::handle_initialize(const InitializeRequest& /
     // HunterClaw 目前不支持 audio/mcp-http/mcp-sse，与 OC 保持一致
     r.agent_capabilities = AcpAgentCapabilities{};
     r.auth_methods = {};                          // authMethods: [] (对齐 OC)
-    r.commands = get_available_commands();        // 兼容旧 HC 字段（OC 通过独立 sendAvailableCommands RPC 发送）
+    r.commands = get_available_commands_vector();        // 兼容旧 HC 字段（OC 通过独立 sendAvailableCommands RPC 发送）
     return r;
 }
 
@@ -844,21 +845,8 @@ AcpSessionMeta_Request AcpGatewayAgent::parse_session_meta(const nlohmann::json&
 }
 
 // ── getAvailableCommands ─────────────────────────────────────────────────────
-std::vector<nlohmann::json> get_available_commands() {
-    return {
-        {{"name","help"},{"description","Show help and common commands."}},
-        {{"name","commands"},{"description","List available commands."}},
-        {{"name","status"},{"description","Show current status."}},
-        {{"name","context"},{"description","Explain context usage."}},
-        {{"name","subagents"},{"description","List or manage sub-agents."}},
-        {{"name","stop"},{"description","Stop the current run."}},
-        {{"name","reset"},{"description","Reset the session."}},
-        {{"name","compact"},{"description","Compact the session history."}},
-        {{"name","model"},{"description","Select a model."}},
-        {{"name","think"},{"description","Set thinking level."}},
-        {{"name","verbose"},{"description","Set verbose mode."}},
-    };
-}
+// ✅ 对齐 OpenClaw: 命令定义统一在 acp_commands.h 中维护。
+// 此处不再重复定义，调用方请使用 get_available_commands_vector().
 
 } // namespace acp
 } // namespace hunterclaw

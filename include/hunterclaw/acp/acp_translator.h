@@ -445,8 +445,10 @@ private:
    const GatewayApprovalEvent& event);
 };
 
-// ── Available Commands ───────────────────────────────────────────────────────
-std::vector<nlohmann::json> get_available_commands();
+// ── Available Commands (✅ 委托给 acp_commands.h) ─────────────────────────
+// commands 定义统一在 acp_commands.h 中维护，此处为向前兼容保留声明。
+// 实现体在 acp_commands.cc 中，通过 get_available_commands_vector() 提供。
+// 调用方请使用 acp_commands.h 中的 get_available_commands_vector()。
 
 } // namespace acp
 } // namespace hunterclaw

@@ -2,6 +2,7 @@
 // Strictly aligned with OpenClaw:
 //   src/agents/tools/sessions-list-tool.ts
 //   src/agents/tools/sessions-send-tool.ts
+//   src/agents/tools/sessions-send-tool.a2a.ts
 //   src/agents/tools/sessions-spawn-tool.ts
 //   src/agents/tools/sessions-history-tool.ts
 //   src/agents/tools/session-status-tool.ts
@@ -13,6 +14,7 @@
 //   src/agents/acp-spawn.ts (spawnAcpDirect)
 
 #include "hunterclaw/tools/sessions_tool.h"
+#include "hunterclaw/tools/sessions_send_a2a.h"
 #include "hunterclaw/logging/redact.h"
 #include "hunterclaw/agents/acp_spawn.h"
 #include "hunterclaw/sessions/session_key_utils.h"
@@ -26,6 +28,7 @@
 #include <string>
 #include <chrono>
 #include <random>
+#include <thread>
 
 using json = nlohmann::json;
 
@@ -1188,6 +1191,30 @@ public:
             send_params["extraSystemPrompt"] = extra_system_prompt;
         }
 
+        // Capture baseline reply snapshot BEFORE agent run
+        // Aligned with OpenClaw: baseline snapshot for round-1 reply diff
+        std::string baseline_reply;
+        if (timeout_seconds == 0 && !ctx_.agent_session_key.empty()) {
+            try {
+                auto hist_result = gw_->request<json>("chat.history", json{
+                    {"sessionKey", resolved_key},
+                    {"limit", 20}
+                });
+                if (hist_result.is_ok()) {
+                    json raw_msgs = hist_result.get().value("messages", json::array());
+                    for (int i = (int)raw_msgs.size() - 1; i >= 0; --i) {
+                        const auto& msg = raw_msgs[i];
+                        if (msg.is_object() && msg.value("role", "") == "assistant") {
+                            if (msg.contains("content") && msg["content"].is_string()) {
+                                baseline_reply = msg["content"].get<std::string>();
+                            }
+                            break;
+                        }
+                    }
+                }
+            } catch (...) {}
+        }
+
         // Start agent run
         if (!gw_) {
             return make_json_result(json{
@@ -1223,8 +1250,35 @@ public:
             });
         }
 
-        // If timeout=0, return accepted immediately (async A2A flow)
+        // If timeout=0, return accepted immediately and spawn A2A background flow
+        // ✓ Aligned with OpenClaw: runWithGatewayIndependentRootWorkContinuation
         if (timeout_seconds == 0) {
+            SessionsSendA2AParams a2a_params;
+            a2a_params.target_session_key = resolved_key;
+            a2a_params.display_key = display_key;
+            a2a_params.message = message;
+            a2a_params.announce_timeout_ms = announce_timeout_ms;
+            a2a_params.max_ping_pong_turns = 5;
+            a2a_params.requester_session_key = ctx_.agent_session_key;
+            a2a_params.requester_channel = ctx_.agent_channel;
+            a2a_params.wait_run_id = run_id;
+            a2a_params.baseline_reply = baseline_reply;
+            a2a_params.notify_requester_on_wait_failure = true;
+
+            std::thread([gw = gw_, a2a_params]() {
+                try {
+                    run_sessions_send_a2a_flow(gw, a2a_params);
+                } catch (const std::exception& e) {
+                    auto log = spdlog::get("sessions.send");
+                    if (!log) log = spdlog::stdout_logger_mt("sessions.send");
+                    log->warn("sessions_send: A2A flow exception: {}", e.what());
+                } catch (...) {
+                    auto log = spdlog::get("sessions.send");
+                    if (!log) log = spdlog::stdout_logger_mt("sessions.send");
+                    log->warn("sessions_send: A2A flow unknown exception");
+                }
+            }).detach();
+
             return make_json_result(json{
                 {"runId", run_id},
                 {"status", "accepted"},
@@ -1345,7 +1399,9 @@ public:
         return Schema{
             "object", "sessions_spawn parameters",
             {
+                // required
                 {"task",              json{{"type","string"}}},
+                // optional
                 {"label",             json{{"type","string"}}},
                 {"runtime",           json{{"type","string"},{"enum",json::array({"subagent","acp"})}}},
                 {"agentId",           json{{"type","string"}}},
@@ -1357,6 +1413,12 @@ public:
                 {"mode",              json{{"type","string"},{"enum",json::array({"run","session"})}}},
                 {"cleanup",           json{{"type","string"},{"enum",json::array({"delete","keep"})}}},
                 {"sandbox",           json{{"type","string"},{"enum",json::array({"inherit","require"})}}},
+                // ✓ 对齐 OpenClaw sessions-spawn-tool.ts: context/collect/swarm 参数
+                {"context",           json{{"type","string"},{"enum",json::array({"isolated","fork"})}}},
+                {"collect",           json{{"type","boolean"}}},
+                {"outputSchema",      json{{"type","object"}}},
+                {"fastMode",          json{{"type","boolean"}}},
+                {"groupId",           json{{"type","string"}}},
             },
             {"task"}
         };
@@ -1472,6 +1534,13 @@ public:
         std::string requested_agent_id = trim(read_string_param(params, "agentId"));
         std::string model_override = read_string_param(params, "model");
         std::string thinking_override = read_string_param(params, "thinking");
+
+        // ✅ 对齐 OpenClaw sessions-spawn-tool.ts: context/collect/swarm 参数
+        std::string context_mode = params.value("context", "isolated");
+        if (context_mode != "isolated" && context_mode != "fork") context_mode = "isolated";
+        bool collect = params.value("collect", false);
+        bool fast_mode = params.value("fastMode", false);
+        std::string group_id = read_string_param(params, "groupId");
 
         // Validate agentId format
         if (!requested_agent_id.empty() && !is_valid_agent_id(requested_agent_id)) {
@@ -1677,6 +1746,33 @@ public:
         }
 
         // Build child task message (aligned with OpenClaw)
+        // ✅ 对齐 OpenClaw: context="fork" → copy parent transcript
+        std::string fork_transcript_context;
+        if (context_mode == "fork" && !effective_requester_key.empty()) {
+            fork_transcript_context =
+                "\n\n[Forked Context] The following is the full conversation transcript "
+                "from the requester session. You have access to all prior context.\n\n";
+            try {
+                auto hist = gw_->request<json>("chat.history", json{
+                    {"sessionKey", effective_requester_key},
+                    {"limit", 500}
+                });
+                if (hist.is_ok()) {
+                    const auto& msgs = hist.get().value("messages", json::array());
+                    for (const auto& msg : msgs) {
+                        std::string role = msg.value("role", "");
+                        std::string content = msg.value("content", "");
+                        if (role == "system" || role == "assistant") {
+                            fork_transcript_context += "[" + role + "]: " + content + "\n";
+                        } else if (role == "user") {
+                            fork_transcript_context += "[user]: " + content + "\n";
+                        }
+                    }
+                }
+            } catch (...) {
+                fork_transcript_context = "";
+            }
+        }
         std::string child_task_message =
             "[Subagent Context] You are running as a subagent (depth " +
             std::to_string(child_depth) + "/" + std::to_string(max_spawn_depth) +
@@ -1684,6 +1780,9 @@ public:
         if (spawn_mode == "session") {
             child_task_message += "\n\n[Subagent Context] This subagent session is persistent "
                                   "and remains available for thread follow-up messages.";
+        }
+        if (!fork_transcript_context.empty()) {
+            child_task_message += fork_transcript_context;
         }
         child_task_message += "\n\n[Subagent Task]: " + task;
 
@@ -1789,7 +1888,7 @@ public:
             entry.spawn_mode         = spawn_mode;
             // ✅ 对齐 OpenClaw: expectsCompletionMessage = params.expectsCompletionMessage !== false
             // sessions_spawn 工具调用时 expectsCompletionMessage 默认为 true
-            entry.expects_completion_message = true;
+            entry.expects_completion_message = !collect;  // ✅ collect=true → false
             entry.timeout_seconds    = run_timeout_seconds > 0 ? run_timeout_seconds : 900;
             entry.state              = agents::SubagentState::Running;
             entry.spawned_at = static_cast<uint64_t>(
@@ -1813,6 +1912,13 @@ public:
         };
         if (!note.empty()) result_json["note"] = note;
         if (!model_override.empty()) result_json["modelApplied"] = model_applied;
+        // ✅ 对齐 OpenClaw: collect/swarm/fastMode/groupId 透传
+        if (collect) {
+            result_json["collect"] = true;
+            if (!group_id.empty()) result_json["groupId"] = group_id;
+            if (fast_mode) result_json["fastMode"] = true;
+        }
+        if (context_mode == "fork") result_json["context"] = "fork";
 
         return make_json_result(result_json);
     }
@@ -2533,6 +2639,698 @@ private:
 // Factory functions
 // ============================================================================
 
+// ✅ 对齐 OpenClaw: agents_wait tool (agents-wait-tool.ts)
+class AgentsWaitTool : public Tool {
+public:
+    explicit AgentsWaitTool(std::shared_ptr<gateway::GatewayClient> gw,
+                            SessionsToolContext ctx)
+        : gw_(std::move(gw)), ctx_(std::move(ctx)) {}
+
+    std::string name() const override { return "agents_wait"; }
+
+    std::string description() const override {
+        return "Wait for agent sub-task runs to complete. "
+               "Use this to collect results from sessions_spawn calls. "
+               "Takes run IDs from previous sessions_spawn responses. "
+               "Returns completed runs with results, and still-pending run IDs.";
+    }
+
+    Schema parameters() const override {
+        return Schema{
+            "object", "agents_wait parameters",
+            {
+                {"runIds", json{
+                    {"type", "array"},
+                    {"items", json{{"type", "string"}}},
+                    {"description", "Array of run IDs from sessions_spawn responses to wait for"}
+                }}
+            },
+            {"runIds"}
+        };
+    }
+
+    ToolResult execute(const core::JsonValue& params) override {
+        // Extract runIds array (using same pattern as SessionsListTool for "kinds")
+        if (!params.contains("runIds") || !params["runIds"].is_array()) {
+            ToolResult err;
+            err.success = false;
+            err.error = "runIds must be a non-empty array";
+            return err;
+        }
+
+        const auto& run_ids_json = params["runIds"];
+        if (run_ids_json.size() == 0) {
+            ToolResult err;
+            err.success = false;
+            err.error = "runIds must be a non-empty array";
+            return err;
+        }
+
+        std::string own_session = ctx_.agent_session_key;
+        auto registry = ctx_.registry;
+
+        // Build valid/unknown ID lists
+        std::vector<std::string> valid_ids, unknown_ids;
+
+        size_t count = run_ids_json.size();
+        for (size_t i = 0; i < count; ++i) {
+            const auto& id_val = run_ids_json[i];
+            if (!id_val.is_string()) continue;
+            std::string rid = id_val.as_string();
+            if (rid.empty()) continue;
+
+            if (registry) {
+                auto entry = registry->get_entry(rid);
+                if (entry != nullptr) {
+                    if (entry->requester_run_id == own_session) {
+                        valid_ids.push_back(rid);
+                    } else {
+                        unknown_ids.push_back(rid);
+                    }
+                    continue;
+                }
+            }
+            unknown_ids.push_back(rid);
+        }
+
+        // Poll for completion
+        constexpr int MAX_POLL = 10;
+        constexpr int INTERVAL_MS = 200;
+
+        json completed_arr = json::array();
+        std::vector<std::string> pending = valid_ids;
+
+        for (int attempt = 0; attempt < MAX_POLL; ++attempt) {
+            if (pending.empty()) break;
+            if (attempt > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(INTERVAL_MS));
+            }
+
+            std::vector<std::string> still;
+            for (const auto& rid : pending) {
+                if (registry) {
+                    auto e = registry->get_entry(rid);
+                    if (!e) { still.push_back(rid); continue; }
+                    if (e->state == agents::SubagentState::Completed) {
+                        json item;
+                        item["runId"]      = rid;
+                        item["status"]     = "completed";
+                        item["sessionKey"] = e->requester_display_key;
+                        if (!e->result_text.empty()) item["result"] = e->result_text;
+                        completed_arr.push_back(item);
+                    } else if (e->state == agents::SubagentState::Failed) {
+                        json item;
+                        item["runId"]  = rid;
+                        item["status"] = "error";
+                        item["error"]  = e->has_error ? e->result_text : "subagent failed";
+                        completed_arr.push_back(item);
+                    } else {
+                        still.push_back(rid);
+                    }
+                } else {
+                    // Fallback: try gateway agent.wait
+                    try {
+                        auto r = gw_->request<json>("agent.wait", json{
+                            {"runId", rid}, {"timeoutMs", INTERVAL_MS}
+                        });
+                        if (r.is_ok() &&
+                            (r.get().value("status", "") == "ok" ||
+                             r.get().value("status", "") == "completed")) {
+                            json item;
+                            item["runId"]  = rid;
+                            item["status"] = "completed";
+                            completed_arr.push_back(item);
+                            continue;
+                        }
+                    } catch (...) {}
+                    still.push_back(rid);
+                }
+            }
+            pending = std::move(still);
+        }
+
+        json pending_arr = json::array();
+        for (auto& id : pending) pending_arr.push_back(id);
+        for (auto& id : unknown_ids) pending_arr.push_back(id);
+
+        ToolResult result;
+        result.content.push_back({
+            ToolResultContent::Type::Json,
+            json{{"ok", true}, {"completed", completed_arr}, {"pending", pending_arr}}.dump(),
+            std::string{},          // data
+            std::string{"application/json"}  // mime_type
+        });
+        result.success = true;
+        return result;
+    }
+
+private:
+    std::shared_ptr<gateway::GatewayClient> gw_;
+    SessionsToolContext ctx_;
+};
+
+// ============================================================================
+// agents_list Tool (✓ 对齐 OpenClaw agents-list-tool.ts)
+// ============================================================================
+
+class AgentsListTool : public Tool {
+public:
+    explicit AgentsListTool(std::shared_ptr<gateway::GatewayClient> gw,
+                            SessionsToolContext ctx)
+        : gw_(std::move(gw)), ctx_(std::move(ctx)) {}
+
+    std::string name() const override { return "agents_list"; }
+
+    std::string description() const override {
+        return "List configured agent ids available as sessions_spawn targets. "
+               "Use this to discover valid agentId values before calling sessions_spawn.";
+    }
+
+    Schema parameters() const override {
+        return Schema{"object", "agents_list parameters", {}, {}};
+    }
+
+    ToolResult execute(const core::JsonValue& /*params*/) override {
+        if (!gw_) {
+            ToolResult err;
+            err.success = false;
+            err.error = "Gateway not available";
+            return err;
+        }
+
+        try {
+            auto result = gw_->request<json>("agents.list", json{
+                {"scope", json{{"visibility", "all"}}}
+            });
+
+            json response;
+            if (result.is_ok()) {
+                const auto& agents_list_resp = result.get();
+                std::string own_agent = ctx_.agent_session_key.empty() ? "" :
+                    ctx_.agent_session_key;
+
+                json agents = json::array();
+                if (agents_list_resp.contains("agents") && agents_list_resp["agents"].is_array()) {
+                    for (const auto& agent : agents_list_resp["agents"]) {
+                        if (!agent.is_object()) continue;
+                        json entry;
+                        entry["id"] = agent.value("id", "");
+                        if (agent.contains("label") && agent["label"].is_string())
+                            entry["label"] = agent["label"];
+                        if (agent.contains("description") && agent["description"].is_string())
+                            entry["description"] = agent["description"];
+                        if (agent.contains("runtime") && agent["runtime"].is_string())
+                            entry["runtime"] = agent["runtime"];
+                        agents.push_back(entry);
+                    }
+                }
+
+                response["ok"] = true;
+                response["agents"] = agents;
+                if (!own_agent.empty()) {
+                    std::string own_id = resolve_agent_id_from_session_key(own_agent);
+                    response["requester"] = own_id.empty() ? own_agent : own_id;
+                }
+                response["allowAny"] = has_allow_any();
+            } else {
+                // Fallback: return empty agents array
+                response["ok"] = true;
+                response["agents"] = json::array();
+                response["note"] = "agents.list unavailable";
+            }
+
+            ToolResult out;
+            out.content.push_back({
+                ToolResultContent::Type::Json,
+                response.dump(),
+                std::string{},
+                std::string{"application/json"}
+            });
+            out.success = true;
+            return out;
+        } catch (const std::exception& e) {
+            ToolResult err;
+            err.success = false;
+            err.error = std::string("agents_list failed: ") + e.what();
+            return err;
+        }
+    }
+
+private:
+    std::shared_ptr<gateway::GatewayClient> gw_;
+    SessionsToolContext ctx_;
+
+    bool has_allow_any() const {
+        for (const auto& allowed : ctx_.subagent_allow_agents) {
+            if (trim(allowed) == "*") return true;
+        }
+        return false;
+    }
+};
+
+// ============================================================================
+// sessions_search Tool (✓ 对齐 OpenClaw sessions-search-tool.ts)
+// ============================================================================
+
+class SessionsSearchTool : public Tool {
+public:
+    explicit SessionsSearchTool(std::shared_ptr<gateway::GatewayClient> gw,
+                                SessionsToolContext ctx)
+        : gw_(std::move(gw)), ctx_(std::move(ctx)) {}
+
+    std::string name() const override { return "sessions_search"; }
+
+    std::string description() const override {
+        return "Full-text search across visible session transcripts. "
+               "Searches message content and returns matching sessions with snippets.";
+    }
+
+    Schema parameters() const override {
+        return Schema{
+            "object", "sessions_search parameters",
+            {
+                {"query", json{
+                    {"type", "string"},
+                    {"description", "Search query string. Searches across all accessible session transcripts."}
+                }},
+                {"sessionKey", json{
+                    {"type", "string"},
+                    {"description", "Optional: restrict search to a specific session."}
+                }},
+                {"limit", json{
+                    {"type", "number"},
+                    {"minimum", 1},
+                    {"maximum", 25},
+                    {"default", 10},
+                    {"description", "Maximum number of results to return."}
+                }},
+            },
+            {"query"}
+        };
+    }
+
+    ToolResult execute(const core::JsonValue& params_val) override {
+        const json params = params_val.to_json();
+
+        std::string query = params.value("query", "");
+        if (query.empty()) {
+            ToolResult err;
+            err.success = false;
+            err.error = "query is required";
+            return err;
+        }
+
+        int limit = params.contains("limit") ? std::max(1, std::min(25, (int)params["limit"].get<double>())) : 10;
+
+        if (!gw_) {
+            ToolResult err;
+            err.success = false;
+            err.error = "Gateway not available";
+            return err;
+        }
+
+        try {
+            json list_params = {
+                {"limit", limit + 5}  // fetch extra for filtering
+            };
+            if (query.find_first_of("\"'`*()[]{}") == std::string::npos &&
+                query.find(" ") == std::string::npos) {
+                // Simple word → sessions.list search
+                list_params["search"] = query;
+            } else {
+                // Complex query → sessions.list with label pattern
+                list_params["search"] = query;
+            }
+
+            auto list_res = gw_->request<json>("sessions.list", list_params);
+
+            json results = json::array();
+            if (list_res.is_ok()) {
+                const auto& list_data = list_res.get();
+                const auto& sessions = list_data.value("sessions", json::array());
+
+                for (const auto& session : sessions) {
+                    if (results.size() >= (size_t)limit) break;
+                    if (!session.is_object()) continue;
+
+                    std::string session_key = session.value("key", "");
+                    if (session_key.empty()) continue;
+
+                    // Try to get preview/snippet
+                    json result_item;
+                    result_item["sessionKey"] = session_key;
+                    if (session.contains("label") && session["label"].is_string())
+                        result_item["label"] = session["label"];
+                    if (session.contains("lastActivity") && session["lastActivity"].is_number())
+                        result_item["timestamp"] = session["lastActivity"];
+
+                    // Search preview for snippet
+                    try {
+                        auto preview = gw_->request<json>("sessions.preview", json{
+                            {"keys", json::array({session_key})},
+                            {"limit", 1}
+                        });
+                        if (preview.is_ok()) {
+                            const auto& entries = preview.get().value("entries", json::array());
+                            for (const auto& entry : entries) {
+                                if (entry.is_object() && entry.contains("recentMessages") &&
+                                    entry["recentMessages"].is_array()) {
+                                    const auto& msgs = entry["recentMessages"];
+                                    for (const auto& msg : msgs) {
+                                        std::string content = msg.value("content", "");
+                                        auto pos = content.find(query);
+                                        if (pos != std::string::npos) {
+                                            size_t start = (pos > 60) ? pos - 60 : 0;
+                                            size_t len = std::min(size_t(200), content.length() - start);
+                                            result_item["snippet"] = "..." +
+                                                content.substr(start, len) + "...";
+                                            result_item["role"] = msg.value("role", "");
+                                            result_item["score"] = 0.8;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } catch (...) {}
+
+                    if (!result_item.contains("snippet")) {
+                        result_item["snippet"] = "(preview unavailable)";
+                        result_item["score"] = 0.3;
+                    }
+
+                    results.push_back(result_item);
+                }
+            }
+
+            ToolResult out;
+            out.content.push_back({
+                ToolResultContent::Type::Json,
+                json{
+                    {"ok", true},
+                    {"query", query},
+                    {"results", results},
+                    {"count", results.size()},
+                }.dump(),
+                std::string{},
+                std::string{"application/json"}
+            });
+            out.success = true;
+            return out;
+        } catch (const std::exception& e) {
+            ToolResult err;
+            err.success = false;
+            err.error = std::string("sessions_search failed: ") + e.what();
+            return err;
+        }
+    }
+
+private:
+    std::shared_ptr<gateway::GatewayClient> gw_;
+    SessionsToolContext ctx_;
+};
+
+// ============================================================================
+// sessions_patch Tool (✓ 对齐 OpenClaw gateway sessions.patch 操作)
+// ============================================================================
+
+class SessionsPatchTool : public Tool {
+public:
+    explicit SessionsPatchTool(std::shared_ptr<gateway::GatewayClient> gw,
+                               SessionsToolContext ctx)
+        : gw_(std::move(gw)), ctx_(std::move(ctx)) {}
+
+    std::string name() const override { return "sessions_patch"; }
+
+    std::string description() const override {
+        return "Update session fields such as label, model, or thinking level. "
+               "Use to set a display label or change the model for a session.";
+    }
+
+    Schema parameters() const override {
+        return Schema{
+            "object", "sessions_patch parameters",
+            {
+                {"key", json{
+                    {"type", "string"},
+                    {"description", "Session key to update. Required."}
+                }},
+                {"label", json{
+                    {"type", "string"},
+                    {"description", "New display label for the session."}
+                }},
+                {"model", json{
+                    {"type", "string"},
+                    {"description", "Model to use for this session."}
+                }},
+                {"thinkingLevel", json{
+                    {"type", "string"},
+                    {"description", "Thinking level override (off/low/medium/high)."}
+                }},
+            },
+            {"key"}
+        };
+    }
+
+    ToolResult execute(const core::JsonValue& params_val) override {
+        const json params = params_val.to_json();
+        std::string key = read_string_param(params, "key", true);
+        if (key.empty()) {
+            ToolResult err;
+            err.success = false;
+            err.error = "key is required";
+            return err;
+        }
+
+        if (!gw_) {
+            ToolResult err;
+            err.success = false;
+            err.error = "Gateway not available";
+            return err;
+        }
+
+        try {
+            json patch = {{"key", key}};
+            if (params.contains("label")) patch["label"] = params["label"];
+            if (params.contains("model")) patch["model"] = params["model"];
+            if (params.contains("thinkingLevel")) {
+                std::string tl = read_string_param(params, "thinkingLevel");
+                patch["thinkingLevel"] = (tl == "off") ? json(nullptr) : json(tl);
+            }
+
+            auto result = gw_->request<json>("sessions.patch", patch);
+            ToolResult out;
+            if (result.is_ok()) {
+                out.content.push_back({
+                    ToolResultContent::Type::Json,
+                    json{{"ok", true}, {"key", key}}.dump(),
+                    std::string{},
+                    std::string{"application/json"}
+                });
+            } else {
+                out.content.push_back({
+                    ToolResultContent::Type::Json,
+                    json{{"ok", false}, {"error", result.error}, {"key", key}}.dump(),
+                    std::string{},
+                    std::string{"application/json"}
+                });
+            }
+            out.success = true;
+            return out;
+        } catch (const std::exception& e) {
+            ToolResult err;
+            err.success = false;
+            err.error = std::string("sessions_patch failed: ") + e.what();
+            return err;
+        }
+    }
+
+private:
+    std::shared_ptr<gateway::GatewayClient> gw_;
+    SessionsToolContext ctx_;
+};
+
+// ============================================================================
+// sessions_reset Tool (✓ 对齐 OpenClaw gateway sessions.reset 操作)
+// ============================================================================
+
+class SessionsResetTool : public Tool {
+public:
+    explicit SessionsResetTool(std::shared_ptr<gateway::GatewayClient> gw,
+                               SessionsToolContext ctx)
+        : gw_(std::move(gw)), ctx_(std::move(ctx)) {}
+
+    std::string name() const override { return "sessions_reset"; }
+
+    std::string description() const override {
+        return "Reset a session to its initial state. "
+               "Parameters: key (required, session key), reason ('new' for fresh start or 'reset').";
+    }
+
+    Schema parameters() const override {
+        return Schema{
+            "object", "sessions_reset parameters",
+            {
+                {"key", json{
+                    {"type", "string"},
+                    {"description", "Session key to reset. Required."}
+                }},
+                {"reason", json{
+                    {"type", "string"},
+                    {"enum", json::array({"new", "reset"})},
+                    {"default", "reset"},
+                    {"description", "Reason for reset: 'new' for fresh session, 'reset' otherwise."}
+                }},
+            },
+            {"key"}
+        };
+    }
+
+    ToolResult execute(const core::JsonValue& params_val) override {
+        const json params = params_val.to_json();
+        std::string key = read_string_param(params, "key", true);
+        if (key.empty()) {
+            ToolResult err;
+            err.success = false;
+            err.error = "key is required";
+            return err;
+        }
+
+        if (!gw_) {
+            ToolResult err;
+            err.success = false;
+            err.error = "Gateway not available";
+            return err;
+        }
+
+        try {
+            std::string reason = params.value("reason", "reset");
+            auto result = gw_->request<json>("sessions.reset", json{
+                {"key", key},
+                {"reason", reason}
+            });
+
+            ToolResult out;
+            if (result.is_ok()) {
+                out.content.push_back({
+                    ToolResultContent::Type::Json,
+                    json{{"ok", true}, {"key", key}, {"reason", reason}}.dump(),
+                    std::string{},
+                    std::string{"application/json"}
+                });
+            } else {
+                out.content.push_back({
+                    ToolResultContent::Type::Json,
+                    json{{"ok", false}, {"error", result.error}, {"key", key}}.dump(),
+                    std::string{},
+                    std::string{"application/json"}
+                });
+            }
+            out.success = true;
+            return out;
+        } catch (const std::exception& e) {
+            ToolResult err;
+            err.success = false;
+            err.error = std::string("sessions_reset failed: ") + e.what();
+            return err;
+        }
+    }
+
+private:
+    std::shared_ptr<gateway::GatewayClient> gw_;
+    SessionsToolContext ctx_;
+};
+
+// ============================================================================
+// sessions_delete Tool (✓ 对齐 OpenClaw gateway sessions.delete 操作)
+// ============================================================================
+
+class SessionsDeleteTool : public Tool {
+public:
+    explicit SessionsDeleteTool(std::shared_ptr<gateway::GatewayClient> gw,
+                                SessionsToolContext ctx)
+        : gw_(std::move(gw)), ctx_(std::move(ctx)) {}
+
+    std::string name() const override { return "sessions_delete"; }
+
+    std::string description() const override {
+        return "Delete a session and optionally its transcript. "
+               "Parameters: key (required, session key), deleteTranscript (default: true).";
+    }
+
+    Schema parameters() const override {
+        return Schema{
+            "object", "sessions_delete parameters",
+            {
+                {"key", json{
+                    {"type", "string"},
+                    {"description", "Session key to delete. Required."}
+                }},
+                {"deleteTranscript", json{
+                    {"type", "boolean"},
+                    {"default", true},
+                    {"description", "Whether to also delete the session transcript."}
+                }},
+            },
+            {"key"}
+        };
+    }
+
+    ToolResult execute(const core::JsonValue& params_val) override {
+        const json params = params_val.to_json();
+        std::string key = read_string_param(params, "key", true);
+        if (key.empty()) {
+            ToolResult err;
+            err.success = false;
+            err.error = "key is required";
+            return err;
+        }
+
+        if (!gw_) {
+            ToolResult err;
+            err.success = false;
+            err.error = "Gateway not available";
+            return err;
+        }
+
+        try {
+            bool delete_transcript = params.value("deleteTranscript", true);
+            auto result = gw_->request<json>("sessions.delete", json{
+                {"key", key},
+                {"deleteTranscript", delete_transcript}
+            });
+
+            ToolResult out;
+            if (result.is_ok()) {
+                out.content.push_back({
+                    ToolResultContent::Type::Json,
+                    json{{"ok", true}, {"key", key}, {"deletedTranscript", delete_transcript}}.dump(),
+                    std::string{},
+                    std::string{"application/json"}
+                });
+            } else {
+                out.content.push_back({
+                    ToolResultContent::Type::Json,
+                    json{{"ok", false}, {"error", result.error}, {"key", key}}.dump(),
+                    std::string{},
+                    std::string{"application/json"}
+                });
+            }
+            out.success = true;
+            return out;
+        } catch (const std::exception& e) {
+            ToolResult err;
+            err.success = false;
+            err.error = std::string("sessions_delete failed: ") + e.what();
+            return err;
+        }
+    }
+
+private:
+    std::shared_ptr<gateway::GatewayClient> gw_;
+    SessionsToolContext ctx_;
+};
+
 std::vector<std::shared_ptr<Tool>> create_sessions_tools(
     std::shared_ptr<gateway::GatewayClient> gw,
     const SessionsToolContext& ctx,
@@ -2549,6 +3347,15 @@ std::vector<std::shared_ptr<Tool>> create_sessions_tools(
     if (ctx.registry) {
         tools.push_back(std::make_shared<SubagentsTool>(gw, ctx));
     }
+    // ✅ 对齐 OpenClaw: agents_wait tool for swarm collect pattern
+    tools.push_back(std::make_shared<AgentsWaitTool>(gw, ctx));
+    // ✅ 对齐 OpenClaw: agents_list, sessions_search
+    tools.push_back(std::make_shared<AgentsListTool>(gw, ctx));
+    tools.push_back(std::make_shared<SessionsSearchTool>(gw, ctx));
+    // ✅ 对齐 OpenClaw: sessions_patch/reset/delete (gateway operations exposed as tools)
+    tools.push_back(std::make_shared<SessionsPatchTool>(gw, ctx));
+    tools.push_back(std::make_shared<SessionsResetTool>(gw, ctx));
+    tools.push_back(std::make_shared<SessionsDeleteTool>(gw, ctx));
     if (on_yield) {
         tools.push_back(std::make_shared<SessionsYieldTool>(ctx, std::move(on_yield)));
     }

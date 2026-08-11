@@ -118,10 +118,15 @@ struct SessionsToolContext {
  *   - sessions_history
  *   - session_status
  *   - sessions_yield (only if on_yield is provided)
+ *   - agents_wait  ✓ 对齐 OpenClaw agents-wait-tool.ts
+ *   - agents_list  ✓ 对齐 OpenClaw agents-list-tool.ts
+ *   - sessions_search  ✓ 对齐 OpenClaw sessions-search-tool.ts
+ *   - sessions_patch/reset/delete  ✓ 对齐 OpenClaw gateway 操作
  *
  * Aligned with OpenClaw: createSessionsListTool, createSessionsSendTool,
  * createSessionsSpawnTool, createSessionsHistoryTool, createSessionStatusTool,
- * createSessionsYieldTool
+ * createSessionsYieldTool, createAgentsWaitTool, createAgentsListTool,
+ * createSessionsSearchTool
  *
  * @param gw         Gateway client for RPC calls
  * @param ctx        Tool context (session key, visibility, A2A policy, etc.)

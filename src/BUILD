@@ -626,6 +626,7 @@ cc_library(
     srcs = glob(["acp/*.cc"]),
     deps = [
         "//:hunterclaw_headers",
+        "@ixwebsocket//:ixwebsocket",  # 新增: acp_session_mapper.cc 引用 gateway/client.h
         "@nlohmann_json//:json",
     ],
     copts = [
@@ -636,6 +637,8 @@ cc_library(
     ],
     linkopts = [
         "-lpthread",
+        "-lssl",       # 新增: acp_secret_file / acp_conversation_id 需要 SHA-256
+        "-lcrypto",
     ],
     linkstatic = False,
     visibility = ["//visibility:public"],
