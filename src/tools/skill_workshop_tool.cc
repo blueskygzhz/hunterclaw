@@ -122,6 +122,7 @@ Actions:
 - reject: Reject a proposal so it won't be applied.
 - quarantine: Quarantine a proposal to remove the skill from loading.
 - revise: Revise a pending proposal's draft body.
+- complete: Complete the skill workshop review session (proposalOnly mode).
 
 When to use each action:
 - Use "create" when you're writing a brand-new skill from scratch. Pass "name" for the new skill name.
@@ -140,6 +141,7 @@ Required parameters:
 - evaluate: "proposal_id" (string)
 - apply/reject/quarantine: "proposal_id" (string)
 - revise: "proposal_id" (string), "proposal_content" (string); optional "description"
+- complete: no required params
 
 Optional shared parameters:
 - "goal" (string): intent / desired goal for the proposal
@@ -160,7 +162,7 @@ Optional shared parameters:
             {"enum", json::array({
                 "create", "update", "patch", "read", "list",
                 "inspect", "evaluate", "apply", "reject",
-                "quarantine", "revise"}),
+                "quarantine", "revise", "complete"}),
             },
             {"description", "Action to perform."},
         });
@@ -168,7 +170,7 @@ Optional shared parameters:
         // ── proposal_id ──
         schema.properties["proposal_id"] = core::JsonValue(json{
             {"type", "string"},
-            {"description", "Proposal ID. Required for inspect, evaluate, apply, reject, quarantine, and revise."},
+            {"description", "Proposal ID. Required for inspect, evaluate, apply, reject, quarantine, and revise."},  // 对齐 OpenClaw：complete 无需 proposal_id
         });
 
         // ── name (for create) ──
@@ -272,11 +274,12 @@ Optional shared parameters:
             if (action == "reject")      return handle_reject(p);
             if (action == "quarantine")  return handle_quarantine(p);
             if (action == "revise")      return handle_revise(p);
+            if (action == "complete")   return handle_complete(p);
 
             return tool_result::error(
                 "Unknown action: " + action +
                 ". Supported: create, update, patch, read, list, inspect, "
-                "evaluate, apply, reject, quarantine, revise");
+                "evaluate, apply, reject, quarantine, revise, complete");
         } catch (const std::exception& e) {
             return tool_result::error(std::string("skill_workshop error: ") + e.what());
         }
@@ -618,6 +621,21 @@ private:
         auto res = skills::revise_skill_proposal(input);
         if (res.is_err()) return tool_result::error(res.error);
         return proposal_result(res.get());
+    }
+
+    // ── action: complete ─────────────────────────────────────────────────
+    // 对齐 OpenClaw: completeProposalReview() — 完成 proposal-only 评审会话
+
+    ToolResult handle_complete(ToolParams& /*p*/) {
+        if (!opts_.proposal_review_completion) {
+            return tool_result::error(
+                "complete is only available during proposal-only reviews");
+        }
+
+        json details;
+        details["completed"] = true;
+
+        return content_result("Completed Skill Workshop review.", details);
     }
 };
 

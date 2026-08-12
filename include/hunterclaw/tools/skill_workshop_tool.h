@@ -15,6 +15,7 @@ struct SkillWorkshopToolOptions {
     std::string workspace_dir;
     std::string skills_dir;
     std::optional<std::string> agent_id;
+    bool proposal_review_completion = false;  // 对齐 OpenClaw proposalOnly 模式
 };
 
 std::shared_ptr<Tool> create_skill_workshop_tool(const SkillWorkshopToolOptions& opts);
