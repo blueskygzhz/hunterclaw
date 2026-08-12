@@ -45,13 +45,28 @@ core::Result<RecordEvaluationResult> record_skill_proposal_evaluation(
     const SkillProposalEvaluation& evaluation,
     const SkillProposalEvent& event);
 
+// 修订 pending proposal 的内容（不改状态）+ 追加 Revised 事件，原子。
+struct ReviseProposalResult { SkillProposalRecord record; SkillProposalEvent event; };
+core::Result<ReviseProposalResult> revise_skill_proposal_content(
+    const std::string& proposal_id,
+    const std::string& new_content,
+    const std::string& new_draft_hash,
+    const std::string& new_proposed_version);
+
 // 状态转换 + 追加对应事件（applied/rejected/quarantined/stale），原子。
+// reason 写入 record.statusReason；expectedRevisionHash 做乐观并发校验。
 core::Result<SkillProposalRecord> transition_skill_proposal_status(
     const std::string& proposal_id, SkillProposalStatus next_status,
-    SkillProposalEventType event_type, std::optional<std::string> correlation_id = std::nullopt);
+    SkillProposalEventType event_type,
+    std::optional<std::string> correlation_id = std::nullopt,
+    std::optional<std::string> reason = std::nullopt,
+    std::optional<std::string> expected_revision_hash = std::nullopt);
 
 // 读取某 proposal 的事件列表（按 sequence 升序）。
 core::Result<std::vector<SkillProposalEvent>> list_skill_proposal_events(const std::string& proposal_id);
+
+// 原地更新 proposal 的 record_json（不改状态/不产生事件）。
+core::Result<void> update_skill_proposal_record(const SkillProposalRecord& record);
 
 // 测试辅助：覆盖 db 路径。
 void set_skill_proposal_state_db_path_for_test(const std::string& path);

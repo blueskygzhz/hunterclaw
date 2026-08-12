@@ -1,6 +1,5 @@
-// 🎯 对齐 OpenClaw skills/workshop/service.ts + service-evaluation.ts + plugin-hooks.ts
-//   Skill Proposal生命周期 + evaluate 流水线，触发 skill_proposal_evaluate /
-//   skill_proposal_changed 两个 plugin hook。
+// 🎯 对齐 OpenClaw src/skills/workshop/service.ts
+//   把底层 Store 的基础 CRUD 拼成带业务语义的 facade。
 
 #include "hunterclaw/skills/skill_proposal_service.h"
 #include "hunterclaw/skills/skill_proposal_store.h"
@@ -34,7 +33,15 @@ std::string iso_now() {
     return std::string(buf);
 }
 
-// 构造 skill_proposal_changed event（对齐 dispatchSkillProposalChanged）。
+// 坐标推导（skill_name → path/key/dir）。
+void resolve_skill_coords(const std::string& workspace_dir, const std::string& skill_name,
+                          std::string& skill_key, std::string& skill_file, std::string& skill_dir) {
+    skill_key = skill_name;  // 对齐：name = key（不含路径前缀）
+    skill_dir = workspace_dir + "/skills/" + skill_key;
+    skill_file = skill_dir + "/SKILL.md";
+}
+
+// 构造 skill_proposal_changed event payload。
 plugins::PluginHookSkillProposalChangedEvent build_changed_event(
     const SkillProposalRecord& record, const SkillProposalEvent& event,
     const std::vector<SkillProposalEvaluationOutcome>* evaluations) {
@@ -43,7 +50,6 @@ plugins::PluginHookSkillProposalChangedEvent build_changed_event(
     ev.sequence    = static_cast<int>(event.sequence);
     ev.action      = to_string(event.type);
     ev.occurred_at = event.occurred_at;
-    // proposal 快照 +可选 evaluations 序列化进 evaluations_json（对齐 event.evaluations）。
     json proposal = {
         {"id", record.id}, {"kind", to_string(record.kind)},
         {"status", to_string(record.status)}, {"revision", record.proposed_version},
@@ -74,7 +80,6 @@ void dispatch_changed(const SkillProposalRecord& record, const SkillProposalEven
     catch (const std::exception& e) { log()->warn("skill_proposal_changed hook failed: {}", e.what()); }
 }
 
-// 把 plugin outcome（plugins 命名空间）转成 skills 领域 outcome。
 SkillProposalEvaluationOutcome convert_outcome(
     const plugins::PluginHookSkillProposalEvaluationOutcome& src) {
     SkillProposalEvaluationOutcome o;
@@ -114,28 +119,43 @@ SkillProposalEvaluationOutcome convert_outcome(
 
 core::Result<SkillProposalRecord> create_skill_proposal(const CreateSkillProposalInput& input) {
     using Ret = core::Result<SkillProposalRecord>;
+
+    std::string title = input.title.empty()
+        ? ((input.kind == SkillProposalKind::Create ? "Create " : "Update ") + input.skill_name)
+        : input.title;
+
+    std::string skill_key, skill_file, skill_dir;
+    resolve_skill_coords(input.workspace_dir, input.skill_name, skill_key, skill_file, skill_dir);
+
     SkillProposalRecord record;
     record.id = "skp_" + infra::generate_uuid();
     record.kind = input.kind;
     record.status = SkillProposalStatus::Pending;
-    record.title = (input.kind == SkillProposalKind::Create ? "Create " : "Update ") + input.skill_name;
+    record.title = title;
     record.description = input.description;
     record.created_at = iso_now();
     record.updated_at = record.created_at;
-    record.created_by = input.created_by;
-    record.proposed_version = input.proposed_version.empty() ? "1" : input.proposed_version;
+    record.created_by = input.source;
+    record.proposed_version = "1";
     record.content = input.content;
     record.draft_hash = infra::sha256_hash(input.content);
+    record.draft_file = "PROPOSAL.md";
     record.target.skill_name = input.skill_name;
-    record.target.skill_key = input.skill_key;
-    record.target.skill_file = input.skill_file;
-    record.target.skill_dir = input.skill_dir;
-    record.target.source = input.source;
+    record.target.skill_key = skill_key;
+    record.target.skill_file = skill_file;
+    record.target.skill_dir = skill_dir;
+    // 对齐 types.ts 扩展字段
+    record.goal = input.goal;
+    record.evidence = input.evidence;
+    record.support_files = input.support_files;
+    record.autonomous_capture = input.autonomous_capture;
+    record.origin = input.origin;
+    record.origin_run_ids = input.origin_run_ids;
+    record.origin_run_mutation_counts = input.origin_run_mutation_counts;
 
     auto res = insert_skill_proposal(record);
     if (res.is_err()) return Ret::Err(res.error);
 
-    // dispatch skill_proposal_changed(created)
     dispatch_changed(res.get().record, res.get().event, input.workspace_dir, input.agent_id, nullptr);
     return Ret::Ok(res.get().record);
 }
@@ -144,7 +164,6 @@ core::Result<EvaluateSkillProposalResult> evaluate_skill_proposal(
     const EvaluateSkillProposalInput& input) {
     using Ret = core::Result<EvaluateSkillProposalResult>;
 
-    // 1. 读 pending proposal。
     auto read = read_skill_proposal(input.proposal_id);
     if (read.is_err()) return Ret::Err(read.error);
     if (!read.get().has_value()) return Ret::Err("skill proposal not found: " + input.proposal_id);
@@ -153,7 +172,6 @@ core::Result<EvaluateSkillProposalResult> evaluate_skill_proposal(
         return Ret::Err("Only pending proposals can be evaluated. Current status: " + to_string(record.status));
 
     const std::string revision_hash = hash_skill_proposal_revision(record);
-    // expectedRevisionHash 校验（对齐 assertExpectedRevisionHash）。
     if (input.expected_revision_hash && !input.expected_revision_hash->empty() &&
         *input.expected_revision_hash != revision_hash)
         return Ret::Err("Skill proposal revision changed; reload and retry.");
@@ -164,10 +182,8 @@ core::Result<EvaluateSkillProposalResult> evaluate_skill_proposal(
     std::string started_at = iso_now();
     std::vector<SkillProposalEvaluationOutcome> outcomes;
 
-    // 2. 触发 skill_proposal_evaluate hook 收集 outcomes（对齐 runSkillProposalEvaluators）。
     if (should_run) {
         plugins::PluginHookSkillProposalEvaluateEvent event;
-        // 构造 evaluate event payload（proposal + skill + candidate 快照）。
         json ev_json = {
             {"proposal", {
                 {"id", record.id}, {"kind", to_string(record.kind)},
@@ -199,7 +215,6 @@ core::Result<EvaluateSkillProposalResult> evaluate_skill_proposal(
 
     std::string completed_at = iso_now();
 
-    // 3. 组装 evaluation。
     SkillProposalEvaluation evaluation;
     evaluation.id = infra::generate_uuid();
     evaluation.proposed_version = record.proposed_version;
@@ -210,7 +225,6 @@ core::Result<EvaluateSkillProposalResult> evaluate_skill_proposal(
     evaluation.correlation_id = input.correlation_id;
     evaluation.outcomes = outcomes;
 
-    // 构造 evaluation_completed 事件。
     SkillProposalEvent event;
     event.event_id = infra::generate_uuid();
     event.proposal_id = record.id;
@@ -225,25 +239,24 @@ core::Result<EvaluateSkillProposalResult> evaluate_skill_proposal(
     };
     event.evaluation = evaluation;
 
-    // 4. 持久化（乐观并发校验）。
     auto stored = record_skill_proposal_evaluation(
         record.id, record.proposed_version, revision_hash, evaluation, event);
     if (stored.is_err()) return Ret::Err(stored.error);
 
-    // 5. dispatch skill_proposal_changed(evaluation_completed, evaluations)。
     dispatch_changed(stored.get().record, stored.get().event, input.workspace_dir,
                      input.agent_id, &outcomes);
-
     return Ret::Ok(EvaluateSkillProposalResult{stored.get().record, evaluation});
 }
 
+// 统一 transition helper — reason / expectedRevisionHash / correlationId 全透传
 static core::Result<SkillProposalRecord> transition_and_dispatch(
     const std::string& proposal_id, SkillProposalStatus next, SkillProposalEventType type,
     const std::string& workspace_dir, std::optional<std::string> agent_id,
-    std::optional<std::string> correlation_id) {
-    auto res = transition_skill_proposal_status(proposal_id, next, type, correlation_id);
+    std::optional<std::string> correlation_id, std::optional<std::string> reason,
+    std::optional<std::string> expected_revision_hash) {
+    auto res = transition_skill_proposal_status(proposal_id, next, type,
+        correlation_id, reason, expected_revision_hash);
     if (res.is_err()) return res;
-    // 转换事件是本函数内追加的最后一条；重新构造用于 dispatch。
     SkillProposalRecord record = res.get();
     SkillProposalEvent ev;
     ev.event_id = infra::generate_uuid();
@@ -259,16 +272,74 @@ static core::Result<SkillProposalRecord> transition_and_dispatch(
 
 core::Result<SkillProposalRecord> reject_skill_proposal(
     const std::string& proposal_id, const std::string& workspace_dir,
-    std::optional<std::string> agent_id, std::optional<std::string> correlation_id) {
+    std::optional<std::string> agent_id, std::optional<std::string> correlation_id,
+    std::optional<std::string> reason, std::optional<std::string> expected_revision_hash) {
     return transition_and_dispatch(proposal_id, SkillProposalStatus::Rejected,
-        SkillProposalEventType::Rejected, workspace_dir, agent_id, correlation_id);
+        SkillProposalEventType::Rejected, workspace_dir, agent_id,
+        correlation_id, reason, expected_revision_hash);
 }
 
 core::Result<SkillProposalRecord> apply_skill_proposal(
     const std::string& proposal_id, const std::string& workspace_dir,
-    std::optional<std::string> agent_id, std::optional<std::string> correlation_id) {
+    std::optional<std::string> agent_id, std::optional<std::string> correlation_id,
+    std::optional<std::string> reason, std::optional<std::string> expected_revision_hash) {
     return transition_and_dispatch(proposal_id, SkillProposalStatus::Applied,
-        SkillProposalEventType::Applied, workspace_dir, agent_id, correlation_id);
+        SkillProposalEventType::Applied, workspace_dir, agent_id,
+        correlation_id, reason, expected_revision_hash);
+}
+
+core::Result<SkillProposalRecord> quarantine_skill_proposal(
+    const std::string& proposal_id, const std::string& workspace_dir,
+    std::optional<std::string> agent_id, std::optional<std::string> correlation_id,
+    std::optional<std::string> reason, std::optional<std::string> expected_revision_hash) {
+    return transition_and_dispatch(proposal_id, SkillProposalStatus::Quarantined,
+        SkillProposalEventType::Quarantined, workspace_dir, agent_id,
+        correlation_id, reason, expected_revision_hash);
+}
+
+core::Result<SkillProposalRecord> revise_skill_proposal(const ReviseSkillProposalInput& input) {
+    using Ret = core::Result<SkillProposalRecord>;
+
+    std::string new_draft_hash = infra::sha256_hash(input.new_content);
+
+    auto read = read_skill_proposal(input.proposal_id);
+    if (read.is_err()) return Ret::Err(read.error);
+    if (!read.get().has_value()) return Ret::Err("skill proposal not found: " + input.proposal_id);
+    SkillProposalRecord cur = *read.get();
+    if (cur.status != SkillProposalStatus::Pending)
+        return Ret::Err("Only pending proposals can be revised. Current status: " + to_string(cur.status));
+
+    // expectedRevisionHash 校验
+    if (input.expected_revision_hash && !input.expected_revision_hash->empty()) {
+        std::string cur_hash = hash_skill_proposal_revision(cur);
+        if (*input.expected_revision_hash != cur_hash)
+            return Ret::Err("Skill proposal revision changed; reload and retry.");
+    }
+
+    int ver = 1;
+    try { ver = std::stoi(cur.proposed_version) + 1; } catch (...) { ver = 2; }
+    std::string new_version = std::to_string(ver);
+
+    auto res = revise_skill_proposal_content(input.proposal_id, input.new_content,
+                                             new_draft_hash, new_version);
+    if (res.is_err()) return Ret::Err(res.error);
+
+    // 修订 description / support_files（如果提供）
+    SkillProposalRecord updated = res.get().record;
+    bool record_changed = false;
+    if (input.description) { updated.description = *input.description; record_changed = true; }
+    if (input.clear_support_files) { updated.support_files.clear(); record_changed = true; }
+    if (!input.support_files.empty()) {
+        updated.support_files = input.support_files; record_changed = true;
+    }
+    if (input.reason) { updated.status_reason = *input.reason; record_changed = true; }
+    if (record_changed) {
+        auto upd = update_skill_proposal_record(updated);
+        if (upd.is_err()) return Ret::Err(upd.error);
+    }
+
+    dispatch_changed(updated, res.get().event, input.workspace_dir, input.agent_id, nullptr);
+    return Ret::Ok(updated);
 }
 
 } // namespace skills

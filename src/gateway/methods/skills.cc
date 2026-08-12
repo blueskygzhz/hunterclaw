@@ -714,18 +714,22 @@ core::Result<json> method_skills_proposals_action(
     std::string proposal_id = params["proposalId"].get<std::string>();
     std::string action = params["action"].get<std::string>();
     std::string workspace_dir = resolve_proposal_workspace(server);
-    std::optional<std::string> agent_id, correlation_id;
+    std::optional<std::string> agent_id, correlation_id, reason, expected_revision_hash;
     if (params.contains("agentId") && params["agentId"].is_string())
         agent_id = params["agentId"].get<std::string>();
     if (params.contains("correlationId") && params["correlationId"].is_string())
         correlation_id = params["correlationId"].get<std::string>();
+    if (params.contains("reason") && params["reason"].is_string())
+        reason = params["reason"].get<std::string>();
+    if (params.contains("expectedRevisionHash") && params["expectedRevisionHash"].is_string())
+        expected_revision_hash = params["expectedRevisionHash"].get<std::string>();
 
     core::Result<skills::SkillProposalRecord> res =
         core::Result<skills::SkillProposalRecord>::Err("unknown action: " + action);
     if (action == "reject")
-        res = skills::reject_skill_proposal(proposal_id, workspace_dir, agent_id, correlation_id);
+        res = skills::reject_skill_proposal(proposal_id, workspace_dir, agent_id, correlation_id, reason, expected_revision_hash);
     else if (action == "apply")
-        res = skills::apply_skill_proposal(proposal_id, workspace_dir, agent_id, correlation_id);
+        res = skills::apply_skill_proposal(proposal_id, workspace_dir, agent_id, correlation_id, reason, expected_revision_hash);
     else
         return core::Result<json>::Err("unsupported action: " + action + " (expected reject|apply)");
 

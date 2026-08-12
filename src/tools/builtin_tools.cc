@@ -15,6 +15,7 @@
 #include "hunterclaw/tools/terminal_tool.h"
 #include "hunterclaw/tools/browser_tool.h"
 #include "hunterclaw/tools/pdf_tool.h"
+#include "hunterclaw/tools/skill_workshop_tool.h"
 #include "hunterclaw/tools/tool_manager.h"
 #include "hunterclaw/sandbox/sandbox.h"
 #include "hunterclaw/core/utils.h"
@@ -859,6 +860,18 @@ void BuiltinTools::register_all(ToolManager& manager, const ToolContext& context
         sess_ctx.workspace_dir     = context.workspace_dir;
         auto sess_tools = create_sessions_tools(context.gateway_client, sess_ctx);
         for (auto& t : sess_tools) manager.register_tool(t);
+    }
+
+    // ✅ 对齐 OpenClaw: skill_workshop 工具 (skill-workshop-tool.ts)
+    // 提供 create/update/read/list/inspect/evaluate/apply/reject/quarantine/revise
+    {
+        SkillWorkshopToolOptions sw_opts;
+        sw_opts.workspace_dir = context.workspace_dir;
+        sw_opts.skills_dir    = context.workspace_dir + "/skills";
+        sw_opts.agent_id      = context.agent_id.empty()
+                                    ? std::optional<std::string>()
+                                    : std::optional<std::string>(context.agent_id);
+        manager.register_tool(create_skill_workshop_tool(sw_opts));
     }
 }
 

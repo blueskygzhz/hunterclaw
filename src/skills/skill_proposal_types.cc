@@ -12,6 +12,15 @@ using json = nlohmann::json;
 std::string to_string(SkillProposalKind v) {
     return v == SkillProposalKind::Create ? "create" : "update";
 }
+std::string to_string(SkillProposalScannerState v) {
+    switch (v) {
+        case SkillProposalScannerState::Pending:     return "pending";
+        case SkillProposalScannerState::Clean:       return "clean";
+        case SkillProposalScannerState::Failed:      return "failed";
+        case SkillProposalScannerState::Quarantined: return "quarantined";
+    }
+    return "pending";
+}
 std::string to_string(SkillProposalStatus v) {
     switch (v) {
         case SkillProposalStatus::Pending:     return "pending";
@@ -50,6 +59,13 @@ std::optional<SkillProposalKind> parse_skill_proposal_kind(const std::string& s)
     if (s == "update") return SkillProposalKind::Update;
     return std::nullopt;
 }
+std::optional<SkillProposalScannerState> parse_skill_proposal_scanner_state(const std::string& s) {
+    if (s == "pending")     return SkillProposalScannerState::Pending;
+    if (s == "clean")       return SkillProposalScannerState::Clean;
+    if (s == "failed")      return SkillProposalScannerState::Failed;
+    if (s == "quarantined") return SkillProposalScannerState::Quarantined;
+    return std::nullopt;
+}
 std::optional<SkillProposalStatus> parse_skill_proposal_status(const std::string& s) {
     if (s == "pending")     return SkillProposalStatus::Pending;
     if (s == "applied")     return SkillProposalStatus::Applied;
@@ -67,6 +83,70 @@ static std::optional<SkillProposalEventType> parse_event_type(const std::string&
     if (s == "quarantined")          return SkillProposalEventType::Quarantined;
     if (s == "stale")                return SkillProposalEventType::Stale;
     return std::nullopt;
+}
+
+// ---- SupportFile ----
+json SkillProposalSupportFile::to_json() const {
+    return {{"path", path}, {"content", content}};
+}
+SkillProposalSupportFile SkillProposalSupportFile::from_json(const json& j) {
+    SkillProposalSupportFile f;
+    f.path    = j.value("path", "");
+    f.content = j.value("content", "");
+    return f;
+}
+
+// ---- ScannerFinding ----
+json ScannerFinding::to_json() const {
+    return {{"level", level}, {"message", message}};
+}
+ScannerFinding ScannerFinding::from_json(const json& j) {
+    ScannerFinding f;
+    f.level   = j.value("level", "info");
+    f.message = j.value("message", "");
+    return f;
+}
+
+// ---- SkillProposalScan ----
+json SkillProposalScan::to_json() const {
+    json j = {{"state", to_string(state)}, {"critical", critical},
+              {"warn", warn}, {"info", info}};
+    if (scanned_at) j["scannedAt"] = *scanned_at;
+    if (!findings.empty()) {
+        json arr = json::array();
+        for (const auto& f : findings) arr.push_back(f.to_json());
+        j["findings"] = arr;
+    }
+    return j;
+}
+SkillProposalScan SkillProposalScan::from_json(const json& j) {
+    SkillProposalScan s;
+    s.state = parse_skill_proposal_scanner_state(j.value("state", "pending"))
+                  .value_or(SkillProposalScannerState::Pending);
+    if (j.contains("scannedAt") && j["scannedAt"].is_string())
+        s.scanned_at = j["scannedAt"].get<std::string>();
+    s.critical = j.value("critical", 0);
+    s.warn     = j.value("warn", 0);
+    s.info     = j.value("info", 0);
+    if (j.contains("findings") && j["findings"].is_array())
+        for (const auto& fj : j["findings"]) s.findings.push_back(ScannerFinding::from_json(fj));
+    return s;
+}
+
+// ---- EventActor ----
+json SkillProposalEventActor::to_json() const {
+    json j = json::object();
+    if (source)   j["source"]   = *source;
+    if (agent_id) j["agentId"]  = *agent_id;
+    return j;
+}
+SkillProposalEventActor SkillProposalEventActor::from_json(const json& j) {
+    SkillProposalEventActor a;
+    if (j.contains("source") && j["source"].is_string())
+        a.source = j["source"].get<std::string>();
+    if (j.contains("agentId") && j["agentId"].is_string())
+        a.agent_id = j["agentId"].get<std::string>();
+    return a;
 }
 
 // ---- Finding ----
@@ -198,8 +278,25 @@ json SkillProposalRecord::to_json() const {
         {"createdAt", created_at}, {"updatedAt", updated_at},
         {"createdBy", to_string(created_by)}, {"proposedVersion", proposed_version},
         {"draftHash", draft_hash}, {"content", content}, {"target", target.to_json()},
+        {"draftFile", draft_file}, {"autonomousCapture", autonomous_capture},
     };
     if (evaluation) j["evaluation"] = evaluation->to_json();
+    if (scan) j["scan"] = scan->to_json();
+    if (applied_at)     j["appliedAt"]     = *applied_at;
+    if (rejected_at)    j["rejectedAt"]    = *rejected_at;
+    if (quarantined_at) j["quarantinedAt"] = *quarantined_at;
+    if (stale_at)       j["staleAt"]       = *stale_at;
+    if (status_reason)  j["statusReason"]  = *status_reason;
+    if (goal)           j["goal"]          = *goal;
+    if (evidence)       j["evidence"]      = *evidence;
+    if (!support_files.empty()) {
+        json arr = json::array();
+        for (const auto& sf : support_files) arr.push_back(sf.to_json());
+        j["supportFiles"] = arr;
+    }
+    if (origin) j["origin"] = *origin;
+    if (!origin_run_ids.empty()) j["originRunIds"] = origin_run_ids;
+    if (!origin_run_mutation_counts.empty()) j["originRunMutationCounts"] = origin_run_mutation_counts;
     return j;
 }
 SkillProposalRecord SkillProposalRecord::from_json(const json& j) {
@@ -218,9 +315,36 @@ SkillProposalRecord SkillProposalRecord::from_json(const json& j) {
     r.proposed_version = j.value("proposedVersion", "");
     r.draft_hash  = j.value("draftHash", "");
     r.content     = j.value("content", "");
+    r.draft_file  = j.value("draftFile", "PROPOSAL.md");
+    r.autonomous_capture = j.value("autonomousCapture", false);
     if (j.contains("target")) r.target = SkillProposalTarget::from_json(j["target"]);
     if (j.contains("evaluation") && j["evaluation"].is_object())
         r.evaluation = SkillProposalEvaluation::from_json(j["evaluation"]);
+    if (j.contains("scan") && j["scan"].is_object())
+        r.scan = SkillProposalScan::from_json(j["scan"]);
+    if (j.contains("appliedAt") && j["appliedAt"].is_string())
+        r.applied_at = j["appliedAt"].get<std::string>();
+    if (j.contains("rejectedAt") && j["rejectedAt"].is_string())
+        r.rejected_at = j["rejectedAt"].get<std::string>();
+    if (j.contains("quarantinedAt") && j["quarantinedAt"].is_string())
+        r.quarantined_at = j["quarantinedAt"].get<std::string>();
+    if (j.contains("staleAt") && j["staleAt"].is_string())
+        r.stale_at = j["staleAt"].get<std::string>();
+    if (j.contains("statusReason") && j["statusReason"].is_string())
+        r.status_reason = j["statusReason"].get<std::string>();
+    if (j.contains("goal") && j["goal"].is_string())
+        r.goal = j["goal"].get<std::string>();
+    if (j.contains("evidence") && j["evidence"].is_string())
+        r.evidence = j["evidence"].get<std::string>();
+    if (j.contains("supportFiles") && j["supportFiles"].is_array())
+        for (const auto& sj : j["supportFiles"])
+            r.support_files.push_back(SkillProposalSupportFile::from_json(sj));
+    if (j.contains("origin") && j["origin"].is_string())
+        r.origin = j["origin"].get<std::string>();
+    if (j.contains("originRunIds") && j["originRunIds"].is_array())
+        for (const auto& v : j["originRunIds"]) r.origin_run_ids.push_back(v.get<std::string>());
+    if (j.contains("originRunMutationCounts") && j["originRunMutationCounts"].is_array())
+        for (const auto& v : j["originRunMutationCounts"]) r.origin_run_mutation_counts.push_back(v.get<int>());
     return r;
 }
 
@@ -232,6 +356,7 @@ json SkillProposalEvent::to_json() const {
         {"type", to_string(type)}, {"occurredAt", occurred_at},
     };
     if (correlation_id) j["correlationId"] = *correlation_id;
+    if (actor) j["actor"] = actor->to_json();
     if (payload) j["payload"] = *payload;
     if (evaluation) j["evaluation"] = evaluation->to_json();
     return j;
@@ -247,6 +372,8 @@ SkillProposalEvent SkillProposalEvent::from_json(const json& j) {
     e.occurred_at     = j.value("occurredAt", "");
     if (j.contains("correlationId") && j["correlationId"].is_string())
         e.correlation_id = j["correlationId"].get<std::string>();
+    if (j.contains("actor") && j["actor"].is_object())
+        e.actor = SkillProposalEventActor::from_json(j["actor"]);
     if (j.contains("payload")) e.payload = j["payload"];
     if (j.contains("evaluation") && j["evaluation"].is_object())
         e.evaluation = SkillProposalEvaluation::from_json(j["evaluation"]);

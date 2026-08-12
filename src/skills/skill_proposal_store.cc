@@ -279,9 +279,64 @@ core::Result<RecordEvaluationResult> record_skill_proposal_evaluation(
     return Ret::Ok(RecordEvaluationResult{record, ev});
 }
 
+core::Result<ReviseProposalResult> revise_skill_proposal_content(
+    const std::string& proposal_id,
+    const std::string& new_content,
+    const std::string& new_draft_hash,
+    const std::string& new_proposed_version) {
+    using Ret = core::Result<ReviseProposalResult>;
+    std::lock_guard<std::mutex> lock(write_mutex());
+    auto dbr = open_db(true);
+    if (dbr.is_err()) return Ret::Err(dbr.error);
+    sqlite3* db = dbr.get();
+
+    char* err = nullptr;
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, &err) != SQLITE_OK) {
+        std::string e = err ? err : "begin failed"; sqlite3_free(err); sqlite3_close(db);
+        return Ret::Err("begin failed: " + e);
+    }
+    auto rollback = [&](const std::string& msg) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); sqlite3_close(db);
+        return Ret::Err(msg);
+    };
+    auto cur = read_row(db, proposal_id);
+    if (cur.is_err()) return rollback(cur.error);
+    if (!cur.get().has_value()) return rollback("skill proposal not found: " + proposal_id);
+    SkillProposalRecord record = *cur.get();
+
+    if (record.status != SkillProposalStatus::Pending)
+        return rollback("Only pending proposals can be revised. Current: " + to_string(record.status));
+
+    std::string ts = std::to_string(now_ms());
+    record.content = new_content;
+    record.draft_hash = new_draft_hash;
+    record.proposed_version = new_proposed_version;
+    record.updated_at = ts;
+    auto w = upsert_proposal_row(db, record);
+    if (w.is_err()) return rollback(w.error);
+
+    SkillProposalEvent ev;
+    ev.event_id = infra::generate_uuid();
+    ev.proposal_id = record.id;
+    ev.proposed_version = record.proposed_version;
+    ev.revision_hash = hash_skill_proposal_revision(record);
+    ev.type = SkillProposalEventType::Revised;
+    ev.occurred_at = ts;
+    auto ew = insert_event_row(db, ev);
+    if (ew.is_err()) return rollback(ew.error);
+
+    if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, &err) != SQLITE_OK) {
+        std::string e = err ? err : "commit failed"; sqlite3_free(err);
+        return rollback("commit failed: " + e);
+    }
+    sqlite3_close(db);
+    return Ret::Ok(ReviseProposalResult{record, ev});
+}
+
 core::Result<SkillProposalRecord> transition_skill_proposal_status(
     const std::string& proposal_id, SkillProposalStatus next_status,
-    SkillProposalEventType event_type, std::optional<std::string> correlation_id) {
+    SkillProposalEventType event_type, std::optional<std::string> correlation_id,
+    std::optional<std::string> reason, std::optional<std::string> expected_revision_hash) {
     using Ret = core::Result<SkillProposalRecord>;
     std::lock_guard<std::mutex> lock(write_mutex());
     auto dbr = open_db(true);
@@ -302,9 +357,25 @@ core::Result<SkillProposalRecord> transition_skill_proposal_status(
     if (!cur.get().has_value()) return rollback("skill proposal not found: " + proposal_id);
     SkillProposalRecord record = *cur.get();
 
+    // 乐观并发校验 expectedRevisionHash（对齐 assertExpectedRevisionHash）
+    if (expected_revision_hash && !expected_revision_hash->empty()) {
+        std::string current_hash = hash_skill_proposal_revision(record);
+        if (*expected_revision_hash != current_hash)
+            return rollback("Skill proposal revision changed; reload and retry.");
+    }
+
     std::string ts = std::to_string(now_ms());
     record.status = next_status;
     record.updated_at = ts;
+    if (reason) record.status_reason = *reason;
+    // 记录状态转换时间戳
+    switch (next_status) {
+        case SkillProposalStatus::Applied:     record.applied_at = ts; break;
+        case SkillProposalStatus::Rejected:    record.rejected_at = ts; break;
+        case SkillProposalStatus::Quarantined: record.quarantined_at = ts; break;
+        case SkillProposalStatus::Stale:       record.stale_at = ts; break;
+        default: break;
+    }
     auto w = upsert_proposal_row(db, record);
     if (w.is_err()) return rollback(w.error);
 
@@ -347,6 +418,33 @@ core::Result<std::vector<SkillProposalEvent>> list_skill_proposal_events(const s
     sqlite3_finalize(stmt);
     sqlite3_close(db);
     return Ret::Ok(std::move(out));
+}
+
+core::Result<void> update_skill_proposal_record(const SkillProposalRecord& record) {
+    std::lock_guard<std::mutex> lock(write_mutex());
+    auto dbr = open_db(true);
+    if (dbr.is_err()) return core::Result<void>::Err(dbr.error);
+    sqlite3* db = dbr.get();
+
+    char* err = nullptr;
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, &err) != SQLITE_OK) {
+        std::string e = err ? err : "begin failed"; sqlite3_free(err); sqlite3_close(db);
+        return core::Result<void>::Err("begin failed: " + e);
+    }
+    auto rollback = [&](const std::string& msg) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); sqlite3_close(db);
+        return core::Result<void>::Err(msg);
+    };
+
+    auto w = upsert_proposal_row(db, record);
+    if (w.is_err()) return rollback(w.error);
+
+    if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, &err) != SQLITE_OK) {
+        std::string e = err ? err : "commit failed"; sqlite3_free(err);
+        return rollback("commit failed: " + e);
+    }
+    sqlite3_close(db);
+    return core::Result<void>::Ok();
 }
 
 } // namespace skills
