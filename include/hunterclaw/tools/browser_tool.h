@@ -10,22 +10,27 @@
 namespace hunterclaw {
 namespace tools {
 
-// ===== Browser Tool - 100% 对齐 OpenClaw browser-tool.ts =====
-// 
+// ===== Browser Tool - 严格对齐 OpenClaw browser-tool.ts =====
+//
 // 功能对齐:
-// 1. ✅ 所有 Action (15个): status, start, stop, profiles, tabs, open, focus, close, 
-//                         snapshot, screenshot, navigate, console, pdf, upload, dialog, act
-// 2. ✅ 所有 Snapshot 格式: aria, ai (role+name refs, aria refs, efficient mode)
-// 3. ✅ Browser Act 操作 (11个): click, type, press, hover, drag, select, fill, resize, wait, evaluate, close
+// 1. ✅ 所有 Action (20个): doctor, status, start, stop, profiles, importprofile,
+//                          tabs, open, focus, close, snapshot, screenshot, navigate,
+//                          console, pdf, download, waitfordownload, upload, dialog, act
+// 2. ✅ 所有 Snapshot 格式: aria, ai (snapshotFormat) + efficient mode + refs(role|aria)
+// 3. ✅ Browser Act 操作 (14个): batch, click, clickCoords, type, press, hover,
+//                              scrollIntoView, drag, select, fill, resize, wait, evaluate, close
 // 4. ✅ 3 种 Target 模式: sandbox, host, node (自动路由到节点代理)
-// 5. ✅ Chrome Extension Relay 支持: profile="chrome" 接管现有 Chrome 标签页
+// 5. ✅ Chrome Extension Relay 支持: profile 接管现有 Chrome 标签页
 // 6. ✅ 外部内容安全包装: snapshot/console/tabs 结果标记为 untrusted
 // 7. ✅ 错误恢复: Chrome stale targetId 自动重试
 // 8. ✅ Node 代理透明路由: gateway.nodes.browser 策略支持
 // 9. ✅ 文件上传: file-chooser hook (路径安全检查)
 // 10. ✅ Dialog 处理: alert/confirm/prompt hook
+// 11. ✅ System profile import: importprofile (browser/systemProfile/into/domains)
+// 12. ✅ Download: download / waitfordownload
 //
-// OpenClaw 原始路径: src/agents/tools/browser-tool.ts (660 行)
+// OpenClaw 原始路径: extensions/browser/src/browser-tool.ts
+//   + browser-tool.schema.ts + browser-tool-description.ts
 
 class BrowserTool : public Tool {
 public:
@@ -81,6 +86,20 @@ private:
     );
     
     ToolResult action_profiles(
+        const std::optional<std::string>& base_url,
+        const std::optional<BrowserNodeTarget>& node_target
+    );
+
+    // ✅ 对齐 OpenClaw: doctor action (browser 健康诊断)
+    ToolResult action_doctor(
+        const std::optional<std::string>& base_url,
+        const std::optional<BrowserNodeTarget>& node_target,
+        const std::string& profile
+    );
+
+    // ✅ 对齐 OpenClaw: importprofile action (system profile import，仅 host)
+    ToolResult action_importprofile(
+        const core::JsonValue& params,
         const std::optional<std::string>& base_url,
         const std::optional<BrowserNodeTarget>& node_target
     );
@@ -146,6 +165,15 @@ private:
     );
     
     ToolResult action_pdf(
+        const core::JsonValue& params,
+        const std::optional<std::string>& base_url,
+        const std::optional<BrowserNodeTarget>& node_target,
+        const std::string& profile
+    );
+
+    // ✅ 对齐 OpenClaw: download / waitfordownload action
+    ToolResult action_download(
+        const std::string& action,
         const core::JsonValue& params,
         const std::optional<std::string>& base_url,
         const std::optional<BrowserNodeTarget>& node_target,
