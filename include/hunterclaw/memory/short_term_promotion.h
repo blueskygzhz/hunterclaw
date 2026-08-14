@@ -32,10 +32,17 @@ namespace memory {
 // ============================================================================
 constexpr double DEFAULT_PROMOTION_MIN_SCORE = 0.75;
 constexpr int DEFAULT_PROMOTION_MIN_RECALL_COUNT = 3;
-constexpr int DEFAULT_PROMOTION_MIN_UNIQUE_QUERIES = 2;
+constexpr int DEFAULT_PROMOTION_MIN_UNIQUE_QUERIES = 3;  // 対齐 dreaming.ts:47
 constexpr int DEFAULT_RECENCY_HALF_LIFE_DAYS = 14;
 constexpr int MAX_QUERY_HASHES = 32;
 constexpr int MAX_RECALL_DAYS = 16;
+// 対齐 short-term-promotion-store.ts:20-21
+constexpr int SHORT_TERM_RECALL_MAX_ENTRIES = 512;
+constexpr int SHORT_TERM_RECALL_MAX_SNIPPET_CHARS = 800;
+// 対齐 short-term-promotion.ts:28-30 — phase-signal boost
+constexpr double PHASE_SIGNAL_LIGHT_BOOST_MAX = 0.06;
+constexpr double PHASE_SIGNAL_REM_BOOST_MAX = 0.09;
+constexpr int PHASE_SIGNAL_HALF_LIFE_DAYS = 14;
 
 // ============================================================================
 // Types (对齐 short-term-promotion.ts:40-207)
@@ -206,6 +213,19 @@ std::vector<ShortTermRecallEntry> read_short_term_recall_entries(
  * (对齐 short-term-promotion.ts:798-807)
  */
 bool is_short_term_memory_path(const std::string& file_path);
+
+/**
+ * Check if a file path is a short-term session-corpus path.
+ * (対齐 short-term-promotion-utils.ts:569-571)
+ */
+bool is_short_term_session_corpus_path(const std::string& file_path);
+
+/**
+ * Detect dreaming/transcript-contaminated snippets that must never be promoted.
+ * (対齐 short-term-promotion-utils.ts:158-186)
+ */
+bool is_contaminated_dreaming_snippet(
+    const std::string& raw, bool allow_transcript_turn_snippet = false);
 
 /**
  * Repair short-term promotion artifacts.

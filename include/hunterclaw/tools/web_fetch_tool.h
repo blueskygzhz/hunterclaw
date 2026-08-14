@@ -40,9 +40,8 @@ public:
     std::string name() const override { return "web_fetch"; }
     
     std::string description() const override {
-        return "Fetch and extract content from a web page. "
-               "Returns readable markdown or plain text, with automatic content cleaning. "
-               "Use for reading articles, documentation, or any web content.";
+        // 🎯 严格对齐 OpenClaw web-fetch.ts:956
+        return "Fetch URL; extract readable markdown/text. Lightweight; no browser automation.";
     }
     
     Schema parameters() const override;

@@ -164,6 +164,11 @@ struct SearchOptions {
     std::optional<int> max_results;
     std::optional<double> min_score;
     std::optional<std::string> session_key;
+    // 対齐 active-memory trigger-recall.ts:167-176 —— lane-1 检索需确定性、本地、无 embedding。
+    std::optional<std::vector<std::string>> sources;             // e.g. ["memory"]
+    std::optional<bool> lexical_only;                            // 禁用 query embedding
+    std::optional<std::string> qmd_search_mode_override;         // e.g. "search"
+    std::optional<std::vector<std::string>> active_project_keys;
 };
 
 // ============================================================================

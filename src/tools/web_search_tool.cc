@@ -415,6 +415,72 @@ WebSearchTool::WebSearchTool(std::shared_ptr<infra::HttpClient> http_client)
 Tool::Schema WebSearchTool::parameters() const {
     Schema schema;
     schema.type = "object";
+
+    // 🎯 严格对齐 OpenClaw web-search.ts:21-77 WebSearchSchema
+    auto make_str = [](const std::string& desc) {
+        core::JsonValue p = core::JsonValue::object();
+        p["type"] = "string";
+        p["description"] = desc;
+        return p;
+    };
+    auto make_num = [](const std::string& desc) {
+        core::JsonValue p = core::JsonValue::object();
+        p["type"] = "number";
+        p["description"] = desc;
+        return p;
+    };
+
+    // query (required)
+    schema.properties["query"] = make_str("Search query.");
+
+    // count: number, minimum 1, maximum MAX_SEARCH_COUNT(10)
+    {
+        core::JsonValue p = core::JsonValue::object();
+        p["type"] = "number";
+        p["description"] = "Result count.";
+        p["minimum"] = static_cast<int64_t>(1);
+        p["maximum"] = static_cast<int64_t>(MAX_SEARCH_COUNT);
+        schema.properties["count"] = p;
+    }
+
+    schema.properties["country"]      = make_str("2-letter country code.");
+    schema.properties["language"]     = make_str("ISO 639-1 language.");
+    schema.properties["freshness"]    = make_str("Time filter: day/week/month/year.");
+    schema.properties["date_after"]   = make_str("Published after YYYY-MM-DD.");
+    schema.properties["date_before"]  = make_str("Published before YYYY-MM-DD.");
+    schema.properties["search_lang"]  = make_str("Brave result language.");
+    schema.properties["ui_lang"]      = make_str("Brave UI locale.");
+
+    // domain_filter: array of string
+    {
+        core::JsonValue p = core::JsonValue::object();
+        p["type"] = "array";
+        p["description"] = "Perplexity domain filter.";
+        core::JsonValue items = core::JsonValue::object();
+        items["type"] = "string";
+        p["items"] = items;
+        schema.properties["domain_filter"] = p;
+    }
+
+    // max_tokens: number, minimum 1, maximum 1000000
+    {
+        core::JsonValue p = core::JsonValue::object();
+        p["type"] = "number";
+        p["description"] = "Perplexity total token budget.";
+        p["minimum"] = static_cast<int64_t>(1);
+        p["maximum"] = static_cast<int64_t>(1000000);
+        schema.properties["max_tokens"] = p;
+    }
+
+    // max_tokens_per_page: number, minimum 1
+    {
+        core::JsonValue p = core::JsonValue::object();
+        p["type"] = "number";
+        p["description"] = "Perplexity tokens per page.";
+        p["minimum"] = static_cast<int64_t>(1);
+        schema.properties["max_tokens_per_page"] = p;
+    }
+
     schema.required.push_back("query");
     return schema;
 }

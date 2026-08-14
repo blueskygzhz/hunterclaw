@@ -27,20 +27,26 @@ using json = nlohmann::json;
 // Constants (aligned with OpenClaw web-fetch.ts)
 // ============================================================================
 
-// 🎯 对齐 OpenClaw: DEFAULT_MAX_CHARS = 50_000
-static constexpr int DEFAULT_MAX_CHARS = 50000;
-// 🎯 对齐 OpenClaw: DEFAULT_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
-static constexpr int DEFAULT_MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
+// 🎯 严格对齐 OpenClaw web-fetch.ts:64  DEFAULT_FETCH_MAX_CHARS = 20_000
+static constexpr int DEFAULT_MAX_CHARS = 20000;
+// 🎯 对齐 OpenClaw:65 DEFAULT_FETCH_MAX_RESPONSE_BYTES = 750_000
+static constexpr int DEFAULT_MAX_RESPONSE_BYTES = 750000;
+// 🎯 对齐 OpenClaw:66-67 clamp 范围 [32_000, 10_000_000]
+static constexpr int FETCH_MAX_RESPONSE_BYTES_MIN = 32000;
+static constexpr int FETCH_MAX_RESPONSE_BYTES_MAX = 10000000;
+// 🎯 对齐 OpenClaw: maxChars 最小值 100
+static constexpr int FETCH_MAX_CHARS_MIN = 100;
 // 🎯 对齐 OpenClaw: DEFAULT_TIMEOUT_SECONDS = 30
 static constexpr int DEFAULT_TIMEOUT_SECONDS = 30;
-// 🎯 对齐 OpenClaw: DEFAULT_MAX_REDIRECTS = 3
+// 🎯 对齐 OpenClaw:68 DEFAULT_FETCH_MAX_REDIRECTS = 3
 static constexpr int DEFAULT_MAX_REDIRECTS = 3;
 // 🎯 对齐 OpenClaw: DEFAULT_CACHE_TTL_MINUTES = 15
 static constexpr int DEFAULT_CACHE_TTL_MINUTES = 15;
 
-// 🎯 对齐 OpenClaw: User-Agent
+// 🎯 严格对齐 OpenClaw web-fetch.ts:74-75 DEFAULT_FETCH_USER_AGENT (Chrome 122 桌面 UA)
 static const std::string USER_AGENT =
-    "Mozilla/5.0 (compatible; OpenClaw/1.0; +https://openclaw.ai)";
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 
 // ============================================================================
 // Helpers
@@ -69,14 +75,21 @@ WebFetchTool::WebFetchTool(std::shared_ptr<infra::HttpClient> http_client)
 Tool::Schema WebFetchTool::parameters() const {
     Tool::Schema schema;
     schema.type = "object";
-    schema.description = "Fetch and extract content from a web page";
-    schema.properties["url"] = core::JsonValue(json{{"type","string"},{"description","URL to fetch"}});
-    schema.properties["extractMode"] = core::JsonValue(json{{"type","string"},{"enum",json::array({"markdown","text"})},{"description","Content extraction mode: markdown (default) or text"}});
-    schema.properties["maxChars"] = core::JsonValue(json{{"type","number"},{"description","Max chars to return (default 50000)"}});
-    schema.properties["maxResponseBytes"] = core::JsonValue(json{{"type","number"},{"description","Max response bytes (default 2MB)"}});
-    schema.properties["timeoutSeconds"] = core::JsonValue(json{{"type","number"},{"description","Request timeout in seconds (default 30)"}});
-    schema.properties["maxRedirects"] = core::JsonValue(json{{"type","number"},{"description","Max redirects (default 3)"}});
-    schema.properties["useFirecrawl"] = core::JsonValue(json{{"type","boolean"},{"description","Use Firecrawl API if available"}});
+    // 🎯 严格对齐 OpenClaw web-fetch.ts:99-112 WebFetchSchema
+    //   仅 url / extractMode(default markdown) / maxChars(integer, minimum 100)。
+    //   OpenClaw 中 maxResponseBytes/timeoutSeconds/maxRedirects/useFirecrawl 均为
+    //   config（tools.web.fetch.*）而非工具入参，故此处不暴露为 schema 参数。
+    schema.properties["url"] = core::JsonValue(json{
+        {"type","string"},{"description","HTTP(S) URL."}});
+    schema.properties["extractMode"] = core::JsonValue(json{
+        {"type","string"},
+        {"enum",json::array({"markdown","text"})},
+        {"description","Extract as markdown/text."},
+        {"default","markdown"}});
+    schema.properties["maxChars"] = core::JsonValue(json{
+        {"type","integer"},
+        {"description","Max chars returned; truncates."},
+        {"minimum", FETCH_MAX_CHARS_MIN}});
     schema.required = {"url"};
     return schema;
 }
@@ -102,11 +115,19 @@ ToolResult WebFetchTool::execute(const core::JsonValue& params_val) {
 
     int max_chars = DEFAULT_MAX_CHARS;
     if (params.contains("maxChars") && params["maxChars"].is_number())
-        max_chars = std::max(1, (int)params["maxChars"].get<double>());
+        max_chars = (int)params["maxChars"].get<double>();
+    // 🎯 对齐 OpenClaw resolveMaxChars: clamp 到 [100, +∞)
+    if (max_chars < FETCH_MAX_CHARS_MIN) max_chars = FETCH_MAX_CHARS_MIN;
 
+    // 🎯 对齐 OpenClaw: maxResponseBytes 为 config，非工具入参；仍容错接受并 clamp 到 [32K,10M]
     int max_response_bytes = DEFAULT_MAX_RESPONSE_BYTES;
-    if (params.contains("maxResponseBytes") && params["maxResponseBytes"].is_number())
-        max_response_bytes = std::max(1, (int)params["maxResponseBytes"].get<double>());
+    if (params.contains("maxResponseBytes") && params["maxResponseBytes"].is_number()) {
+        int raw = (int)params["maxResponseBytes"].get<double>();
+        if (raw > 0) {
+            max_response_bytes = std::min(FETCH_MAX_RESPONSE_BYTES_MAX,
+                                          std::max(FETCH_MAX_RESPONSE_BYTES_MIN, raw));
+        }
+    }
     (void)max_response_bytes;
 
     int timeout_seconds = DEFAULT_TIMEOUT_SECONDS;
@@ -151,12 +172,20 @@ ToolResult WebFetchTool::execute(const core::JsonValue& params_val) {
     // 🎯 对齐 OpenClaw: truncate
     auto truncated = truncate_text(content, max_chars);
 
-    // 🎯 对齐 OpenClaw: wrap_web_content (mark as untrusted)
+    // 🎯 严格对齐 OpenClaw web-fetch.ts:633-647 输出字段
+    //   url/finalUrl/status/contentType/extractMode/extractor/externalContent/truncated/length/rawLength
     json result_json = wrap_web_content(truncated.text, fetched.final_url, mode_str);
-    if (truncated.truncated) result_json["truncated"] = true;
-    result_json["url"] = fetched.final_url;
+    result_json["url"]        = url;                     // 原始请求 URL
+    result_json["finalUrl"]   = fetched.final_url;       // 重定向后最终 URL
+    result_json["status"]     = fetched.status_code;     // 对齐 OpenClaw: status(非 statusCode)
+    if (!fetched.content_type.empty())
+        result_json["contentType"] = fetched.content_type;
     result_json["extractMode"] = mode_str;
-    result_json["statusCode"] = fetched.status_code;
+    // extractor: markdown 模式经 readability+turndown，text 模式为 basic-html
+    result_json["extractor"]  = (mode == ExtractMode::Markdown) ? "readability" : "basic-html";
+    result_json["truncated"]  = truncated.truncated;
+    result_json["length"]     = static_cast<int64_t>(truncated.text.size());
+    result_json["rawLength"]  = static_cast<int64_t>(content.size());
 
     // 🎯 对齐 OpenClaw: write cache
     write_cache(ck, result_json, DEFAULT_CACHE_TTL_MINUTES);
@@ -534,12 +563,18 @@ json WebFetchTool::wrap_web_content(
     const std::string& url,
     const std::string& mode
 ) const {
-    // 🎯 对齐 OpenClaw: wrap external content as untrusted
+    // 🎯 严格对齐 OpenClaw web-fetch.ts:633-647 / 907-920 输出结构：
+    //   text 承载正文（wrapExternalContent 产物），externalContent 为对象
+    //   {untrusted:true, source:"web_fetch", wrapped:true}。
     return json{
-        {"content",     content},
+        {"text",        content},
         {"url",         url},
         {"extractMode", mode},
-        {"untrusted",   true},
+        {"externalContent", {
+            {"untrusted", true},
+            {"source",    "web_fetch"},
+            {"wrapped",   true},
+        }},
     };
 }
 

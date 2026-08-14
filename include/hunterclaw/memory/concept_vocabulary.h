@@ -91,7 +91,8 @@ ConceptTagScriptCoverage summarize_concept_tag_script_coverage(
  * Returns empty string if token should be rejected.
  * (对齐 concept-vocabulary.ts:329-357 normalizeConceptToken)
  */
-std::string normalize_concept_token(const std::string& raw_token);
+std::string normalize_concept_token(const std::string& raw_token,
+                                    bool from_glossary = false);
 
 /**
  * Normalize a string to lowercase (简化的 normalizeLowercaseStringOrEmpty)

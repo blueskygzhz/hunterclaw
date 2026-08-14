@@ -7,6 +7,7 @@
 #include <cmath>
 #include <algorithm>
 #include <set>
+#include <cctype>
 #include <regex>
 #include <iomanip>
 
@@ -243,10 +244,18 @@ RemDreamingPreview preview_rem_dreaming(
     // Build concept tag reflections (対齐:1352-1394)
     std::map<std::string, int> tag_counts;
     std::map<std::string, std::set<std::string>> tag_evidence;
+    // 対齐 dreaming-phases.ts:177 REM_REFLECTION_TAG_BLACKLIST
+    static const std::set<std::string> REM_REFLECTION_TAG_BLACKLIST = {
+        "assistant", "user", "system", "subagent", "the"};
     for (const auto& entry : entries) {
         std::string ev = entry.path + ":" + std::to_string(entry.start_line) + "-" + std::to_string(entry.end_line);
         for (const auto& tag : entry.concept_tags) {
             if (tag.empty()) continue;
+            // 対齐:1213 —— 黑名单 tag（小写比较）跳过。
+            std::string lower = tag;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            if (REM_REFLECTION_TAG_BLACKLIST.count(lower)) continue;
             tag_counts[tag]++;
             tag_evidence[tag].insert(ev);
         }

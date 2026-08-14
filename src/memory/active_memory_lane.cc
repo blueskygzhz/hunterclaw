@@ -42,9 +42,15 @@ ActiveMemoryLaneOneResult run_active_memory_lane_one(
         std::vector<MemorySearchResult> trigger_candidates =
             manager->list_trigger_candidates(TRIGGER_CANDIDATE_LIMIT, keys_opt);
         // 常规检索补充（限定 memory 语义；lane-1 关注 curated，检索作为补充去重来源）。
+        // 対齐 trigger-recall.ts:167-176：lane-1 每条消息都跑，必须确定性、本地、
+        // 禁用 query embedding（lexicalOnly），qmd 走 search 模式，并带 activeProjectKeys。
         SearchOptions opts;
         opts.max_results = TRIGGER_CANDIDATE_LIMIT;
         opts.min_score = 0.0;
+        opts.sources = std::vector<std::string>{"memory"};
+        opts.lexical_only = true;
+        opts.qmd_search_mode_override = std::string("search");
+        opts.active_project_keys = project_keys;
         std::vector<MemorySearchResult> retrieved = manager->search(query, opts);
         return merge_trigger_candidates(trigger_candidates, retrieved);
     };

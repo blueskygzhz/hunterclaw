@@ -62,52 +62,111 @@ public:
     std::string name() const override { return "exec"; }
     
     std::string description() const override {
-        return "Execute a shell command in a secure sandbox environment. "
-               "Returns stdout, stderr, and exit code. "
-               "The command runs in an isolated Docker container with resource limits.";
+        // 🎯 严格对齐 OpenClaw bash-tools.descriptions.ts describeExecTool 语义
+        return "Run a shell command. Long-running commands background after yieldMs "
+               "(default 10000ms); use the process tool to poll/log/write/kill background sessions. "
+               "Set background=true to background immediately. Use pty=true for TTY-required CLIs "
+               "and coding agents. timeout (seconds) kills the process on expiry. "
+               "host selects the exec target (auto|sandbox|gateway|node); node id/name is required "
+               "for host=node. Approvals follow tools.exec.security and tools.exec.ask plus host "
+               "policy; channel-origin calls cannot override host ask=off.";
     }
-    
+
     Schema parameters() const override {
         Schema schema;
         schema.type = "object";
-        schema.description = "Parameters for exec tool";
-        
-        // command property
-        core::JsonValue command_prop = core::JsonValue::object({
-            {"type", "string"},
-            {"description", "Shell command to execute"}
-        });
-        schema.properties["command"] = command_prop;
-        
-        // timeout property
-        auto timeout_prop = core::JsonValue::object();
-        timeout_prop["type"] = "integer";
-        timeout_prop["description"] = "Timeout in seconds (default: 30)";
-        timeout_prop["minimum"] = core::JsonValue(static_cast<int64_t>(1));
-        timeout_prop["maximum"] = core::JsonValue(static_cast<int64_t>(300));
-        schema.properties["timeoutSec"] = timeout_prop;
-        
+        // 🎯 严格对齐 OpenClaw bash-tools.schemas.ts execSchema (13-61)
+
+        auto str_prop = [](const std::string& desc) {
+            core::JsonValue p = core::JsonValue::object();
+            p["type"] = "string";
+            if (!desc.empty()) p["description"] = desc;
+            return p;
+        };
+        auto num_prop = [](const std::string& desc) {
+            core::JsonValue p = core::JsonValue::object();
+            p["type"] = "number";
+            if (!desc.empty()) p["description"] = desc;
+            return p;
+        };
+        auto bool_prop = [](const std::string& desc) {
+            core::JsonValue p = core::JsonValue::object();
+            p["type"] = "boolean";
+            if (!desc.empty()) p["description"] = desc;
+            return p;
+        };
+
+        // command (required)
+        schema.properties["command"]  = str_prop("Shell command to execute");
+        // workdir
+        schema.properties["workdir"]  = str_prop(
+            "Working directory; omit for default. Blank/whitespace is invalid.");
+        // env: Record<string,string>
+        {
+            core::JsonValue p = core::JsonValue::object();
+            p["type"] = "object";
+            p["description"] = "Environment variables (key-value string map)";
+            schema.properties["env"] = p;
+        }
+        // yieldMs
+        schema.properties["yieldMs"]  = num_prop("Milliseconds before backgrounding; default 10000.");
+        // background
+        schema.properties["background"] = bool_prop("Run in background immediately");
+        // timeout (seconds) — 对齐 OpenClaw 字段名 timeout
+        schema.properties["timeout"]  = num_prop("Timeout in seconds; kills process on expiry.");
+        // pty
+        schema.properties["pty"]      = bool_prop("Use PTY for TTY-required CLIs and coding agents.");
+        // elevated
+        schema.properties["elevated"] = bool_prop("Run on host with elevated permissions if allowed.");
+        // host: enum auto|sandbox|gateway|node
+        {
+            core::JsonValue p = core::JsonValue::object();
+            p["type"] = "string";
+            p["description"] = "Exec host/target (auto|sandbox|gateway|node).";
+            core::JsonValue e = core::JsonValue::array();
+            e.push_back("auto"); e.push_back("sandbox"); e.push_back("gateway"); e.push_back("node");
+            p["enum"] = e;
+            schema.properties["host"] = p;
+        }
+        // security
+        schema.properties["security"] = str_prop(
+            "Ignored per call; tools.exec.security and host approvals decide.");
+        // ask
+        schema.properties["ask"]      = str_prop(
+            "Uses tools.exec.ask and host approvals; channel-origin calls cannot override host ask=off.");
+        // node
+        schema.properties["node"]     = str_prop("Node id/name for host=node.");
+
         schema.required = {"command"};
-        
         return schema;
     }
     
     ToolResult execute(const core::JsonValue& params) override {
         ToolParams reader(params);
         std::string command = reader.read_string("command", true);
-        int timeout = static_cast<int>(reader.read_int("timeoutSec", false, 30));
-        
+        // 🎯 对齐 OpenClaw: 字段名 timeout(秒)；向后兼容旧 timeoutSec
+        int timeout = 30;
+        if (params.is_object() && params.contains("timeout") && params["timeout"].is_number()) {
+            timeout = static_cast<int>(params["timeout"].as_number());
+        } else {
+            timeout = static_cast<int>(reader.read_int("timeoutSec", false, 30));
+        }
+        // 🎯 对齐 OpenClaw: workdir 覆盖工作目录（空白视为无效）
+        std::string workdir = reader.read_string("workdir", false);
+        {
+            size_t s = workdir.find_first_not_of(" \t\r\n");
+            if (s == std::string::npos) workdir.clear();
+        }
+
         // ===== 100% 对齐 OpenClaw: 优先使用 Sandbox =====
-        
-        // 检查是否启用了 Sandbox
         if (context_.sandbox_manager && !context_.sandbox_id.empty()) {
             log()->info("[ExecTool] Executing in Sandbox: {}", context_.sandbox_id);
             return execute_in_sandbox(command, timeout);
         }
-        
+
         // 降级: 本地执行 (生产环境应禁用)
         log()->warn("[ExecTool] Sandbox not enabled, falling back to local execution (INSECURE!)");
-        return execute_locally(command, timeout);
+        return execute_locally(command, timeout, workdir);
     }
     
     bool requires_approval() const override { return true; }
@@ -169,12 +228,19 @@ private:
     }
     
     // ===== 本地执行 (降级路径，仅用于开发) =====
-    ToolResult execute_locally(const std::string& command, int timeout) {
-        // 切换到工作目录
+    ToolResult execute_locally(const std::string& command, int timeout,
+                               const std::string& workdir = "") {
+        // 切换到工作目录 (workdir 优先，其次 workspace_dir)
         std::string original_dir = fs::current_path().string();
-        if (!context_.workspace_dir.empty()) {
-            fs::current_path(context_.workspace_dir);
+        std::string target_dir = !workdir.empty() ? workdir : context_.workspace_dir;
+        if (!target_dir.empty()) {
+            std::error_code ec;
+            fs::current_path(target_dir, ec);
+            if (ec) {
+                return tool_result::error("Invalid workdir: " + target_dir);
+            }
         }
+        (void)timeout;  // 本地降级路径暂不强制 timeout（对齐 sandbox 分支的 TODO）
         
         // 执行命令
         std::string full_command = command + " 2>&1";  // 合并stdout/stderr

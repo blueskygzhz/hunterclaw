@@ -47,8 +47,9 @@ public:
     std::string name() const override { return "web_search"; }
 
     std::string description() const override {
-        return "Search the web using Brave Search API. Supports region-specific and localized search "
-               "via country and language parameters. Returns titles, URLs, and snippets for fast research.";
+        // 🎯 严格对齐 OpenClaw web-search.ts:101-102
+        return "Search current web; normalized provider results. Supports freshness and date-range "
+               "filters (freshness, date_after/date_before) and domain filtering (domain_filter).";
     }
 
     Schema parameters() const override;
