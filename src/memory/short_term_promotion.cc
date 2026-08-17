@@ -1180,20 +1180,23 @@ RepairResult repair_short_term_promotion_artifacts(const std::string& workspace_
         }
     } catch (...) {}
 
-    // Normalize store
-    auto store = read_store(workspace_dir, now_iso);
-    int original_count = static_cast<int>(store.entries.size());
+    // Normalize store —— 读-改-写临界区加锁（対齐 store.ts withShortTermLock）
+    int original_count = 0;
+    int normalized_count = 0;
+    with_short_term_lock(workspace_dir, [&]() {
+        auto store = read_store(workspace_dir, now_iso);
+        original_count = static_cast<int>(store.entries.size());
 
-    // Re-derive concept tags for all entries
-    for (auto& [key, entry] : store.entries) {
-        auto tags = derive_concept_tags(entry.path, entry.snippet);
-        if (!tags.empty()) entry.concept_tags = tags;
-    }
+        // Re-derive concept tags for all entries
+        for (auto& [key, entry] : store.entries) {
+            auto tags = derive_concept_tags(entry.path, entry.snippet);
+            if (!tags.empty()) entry.concept_tags = tags;
+        }
 
-    store.updated_at = now_iso;
-    write_store(workspace_dir, store);
-
-    int normalized_count = static_cast<int>(store.entries.size());
+        store.updated_at = now_iso;
+        write_store(workspace_dir, store);
+        normalized_count = static_cast<int>(store.entries.size());
+    });
     result.removed_invalid_entries = std::max(0, original_count - normalized_count);
     result.rewrote_store = true;
     result.changed = true;
