@@ -830,17 +830,70 @@ std::vector<ReplayChunk> AcpGatewayAgent::extract_replay_chunks(
     return out;
 }
 
+// 対齐 session-mapper.ts:15-27 parseSessionMeta
+//   + packages/acp-core/src/meta.ts:4-35 readMetaValue / readString / readBool
+//
+// ⚠ 两处语义此前是错的：
+//   ① readMetaValue（meta.ts:12-17）在归一化失败时**继续试下一个别名**，
+//      只有成功才 return。此前用的 `if (contains && is_string) {...; break; }`
+//      是"第一个存在的键就停"—— 若 meta 里 sessionKey 是空串或数字，
+//      就再也不会去看 session / key，别名链直接断掉。
+//   ② readString 走 normalizeOptionalString：**trim 后为空视为不存在**。
+//      此前原样取值，`sessionKey: "   "` 会被当成合法 key 传下去。
+// readBool 只认真正的 boolean（meta.ts:34），字符串 "true" 不算 —— 这点原实现是对的。
+namespace {
+
+/// 対齐 readString(meta, keys) —— 逐个别名试，trim 非空才采用
+std::string read_meta_string(const nlohmann::json& meta,
+                             const std::vector<std::string>& keys) {
+    for (const auto& k : keys) {
+        if (!meta.contains(k) || !meta[k].is_string()) continue;
+        std::string v = meta[k].get<std::string>();
+        const char* ws = " \t\r\n\f\v";
+        const size_t b = v.find_first_not_of(ws);
+        if (b == std::string::npos) continue;   // 空白串 → 视为不存在，继续下一别名
+        const size_t e = v.find_last_not_of(ws);
+        return v.substr(b, e - b + 1);
+    }
+    return std::string();
+}
+
+/// 対齐 readBool(meta, keys) —— 逐个别名试，仅接受真正的 boolean。
+/// 用 optional 表达"未提供"，不能退化成 false：调用方需要区分
+/// `resetSession: false`（显式关闭）与未提供（走 opts 默认值）。
+std::optional<bool> read_meta_bool(const nlohmann::json& meta,
+                                   const std::vector<std::string>& keys) {
+    for (const auto& k : keys) {
+        if (meta.contains(k) && meta[k].is_boolean()) return meta[k].get<bool>();
+    }
+    return std::nullopt;
+}
+
+}  // namespace
+
 AcpSessionMeta_Request AcpGatewayAgent::parse_session_meta(const nlohmann::json& meta) {
     AcpSessionMeta_Request r;
-    if (meta.is_null() || !meta.is_object()) return r;
-    for (auto& k : {"sessionKey","session","key"})
-        if (meta.contains(k) && meta[k].is_string()) { r.session_key = meta[k].get<std::string>(); break; }
-    for (auto& k : {"sessionLabel","label"})
-        if (meta.contains(k) && meta[k].is_string()) { r.session_label = meta[k].get<std::string>(); break; }
-    for (auto& k : {"resetSession","reset"})
-        if (meta.contains(k) && meta[k].is_boolean()) { r.reset_session = meta[k].get<bool>(); break; }
-    for (auto& k : {"requireExistingSession","requireExisting"})
-        if (meta.contains(k) && meta[k].is_boolean()) { r.require_existing = meta[k].get<bool>(); break; }
+    if (meta.is_null() || !meta.is_object()) return r;   // 対齐:16-18
+
+    // 対齐:21-25 —— 键别名顺序即"当前名 → 历史名"优先级，不可调换。
+    // session_key / session_label 是 optional<string>：空串须保持 nullopt，
+    // 否则下游 `if (r.session_key)` 会对空串成真。
+    if (auto s = read_meta_string(meta, {"sessionKey", "session", "key"}); !s.empty()) {
+        r.session_key = s;
+    }
+    if (auto s = read_meta_string(meta, {"sessionLabel", "label"}); !s.empty()) {
+        r.session_label = s;
+    }
+    if (auto v = read_meta_bool(meta, {"resetSession", "reset"})) {
+        r.reset_session = *v;
+    }
+    if (auto v = read_meta_bool(meta, {"requireExistingSession", "requireExisting"})) {
+        r.require_existing = *v;
+    }
+    // 対齐:25 —— prefixCwd 此前完全缺失，导致该开关在 ACP 侧永久失效
+    if (auto v = read_meta_bool(meta, {"prefixCwd"})) {
+        r.prefix_cwd = *v;
+    }
     return r;
 }
 

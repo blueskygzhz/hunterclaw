@@ -4,131 +4,103 @@
 // acp_session_mapper.h
 // 🎯 严格对齐 OpenClaw: src/acp/session-mapper.ts
 //
-// 职责:
-//   - 解析 ACP 请求 meta 中的 session 路由参数
-//   - 按优先级 resolve 最终的 session key
-//   - 处理 resetSession 语义（清空 session 后重建）
-//   - 在 session metadata 中标记 / 读取 acp_session_id
+// ⚠ 重要历史说明（避免重复踩坑）：
+//   本文件此前的实现与真源出入很大，且整个模块**零外部引用**（死代码）：
+//     ① 发明了 mark_session_with_acp_id / resolve_session_key_from_conversation_id
+//        两个函数 —— 真源不存在（grep 全仓 0 处）；
+//     ② resolve_session_key 的解析顺序自创为
+//        explicit → conversationId → default → new，真源是
+//        label → key → optsLabel → optsKey → fallback（见下方注释）；
+//     ③ reset_session_if_needed 用 `sessions.init` 实现"重置"，
+//        真源用的是 **`sessions.reset`** —— init 不会清历史，
+//        用它当 reset 会导致 resetSession=true 静默无效；
+//     ④ parse_session_meta 漏了 prefixCwd 字段。
 //
-// 设计: session_mapper 不依赖 GatewayClient（避免引入 WebSocket 依赖），
-// 所有 gateway 交互通过函数回调注入。
+//   真源 session-mapper.ts 只导出三个函数：
+//     parseSessionMeta / resolveSessionKey / resetSessionIfNeeded
+//
+// 注：ACP 请求路径上真正生效的 meta 解析在 acp_translator.cc 的
+//     AcpGatewayAgent::parse_session_meta（已单独对齐）。本模块提供的是
+//     与真源同构的独立实现，供后续 ACP client / 独立 server 复用。
 // ============================================================================
 
-#include <string>
-#include <optional>
 #include <functional>
-#include <memory>
+#include <optional>
+#include <string>
 #include <nlohmann/json.hpp>
 
 namespace hunterclaw {
-
-// Forward declarations
-namespace core {
-template<typename T> class Result;
-}
-namespace gateway {
-class GatewayClient;
-}
-
+namespace gateway { class GatewayClient; }
 namespace acp {
 
-// ── Session Meta (从 ACP new/load/resume 请求 meta 字段解析) ─────────────────
-
+/// 対齐 session-mapper.ts:6-12 AcpSessionMeta
 struct AcpSessionMeta_Parsed {
     std::optional<std::string> session_key;
     std::optional<std::string> session_label;
     std::optional<bool> reset_session;
     std::optional<bool> require_existing;
-    std::optional<std::string> conversation_id;
+    std::optional<bool> prefix_cwd;   ///< 対齐:11（此前缺失）
 };
 
-// ── Session Key Resolution Options ────────────────────────────────────────────
-
-struct SessionKeyResolutionOptions {
-    std::optional<std::string> default_session_key;
-    std::optional<std::string> default_session_label;
-    bool require_existing_session = false;
-    bool allow_create = true;
-};
-
-struct SessionKeyResolution {
-    std::string session_key;
-    bool is_new = false;
-    std::string source;  // "explicit" | "conversation" | "default" | "new"
-};
-
-// ── Gateway function types (callbacks instead of direct dependency) ───────────
-
-// Gateway request function: (method, params) -> Result<json>
-using GatewayRequestFn = std::function<core::Result<nlohmann::json>(
-    const std::string& method, const nlohmann::json& params)>;
-
-// ── Public API ────────────────────────────────────────────────────────────────
-
-// 🎯 对齐 session-mapper.ts: parseSessionMeta(meta)
+/// 対齐 session-mapper.ts:15-27 parseSessionMeta(meta)
+///
+/// 键别名顺序即"当前名 → 历史名"优先级。
+/// 字符串走 readString 语义（trim 后为空视为不存在，并**继续试下一个别名**）；
+/// 布尔走 readBool 语义（仅接受真正的 boolean，不认 "true" 字符串）。
 AcpSessionMeta_Parsed parse_session_meta(const nlohmann::json& meta);
 
-// 🎯 对齐 session-mapper.ts: resolveSessionKey(parsed, defaults, opts)
-SessionKeyResolution resolve_session_key(
-    const AcpSessionMeta_Parsed& parsed,
-    const SessionKeyResolutionOptions& opts,
-    std::function<std::optional<std::string>(const std::string&)> conversation_lookup = {});
+/// 対齐 AcpServerOptions 中与会话解析相关的字段
+struct SessionKeyResolutionOptions {
+    std::optional<std::string> default_session_key;    ///< opts.defaultSessionKey
+    std::optional<std::string> default_session_label;  ///< opts.defaultSessionLabel
+    std::optional<bool> require_existing_session;      ///< opts.requireExistingSession
+    std::optional<bool> reset_session;                 ///< opts.resetSession
+};
 
-// 🎯 对齐 session-mapper.ts: resetSessionIfNeeded(meta, requestFn, sessionKey)
-// requestFn: 可选，传入则执行 sessions.reset，否则返回 false
-bool reset_session_if_needed(
-    const AcpSessionMeta_Parsed& parsed,
-    const std::optional<GatewayRequestFn>& request_fn,
-    const std::string& session_key,
-    const std::optional<std::string>& session_label = std::nullopt);
+/// gateway 请求回调：method + params → 解析后的 JSON（失败抛异常或返回 null）
+using GatewayRequestFn =
+    std::function<nlohmann::json(const std::string& method, const nlohmann::json& params)>;
 
-// 🔧 简化版: 通过 GatewayClient 指针调用（forward decl 在 hunterclaw 命名空间顶层）
-// 用于已有 GatewayClient 实例的场景（translator.cc / client.cc）
-// 注意: 使用这些重载需要 #include "hunterclaw/gateway/client.h"
-bool reset_session_if_needed(
-    const AcpSessionMeta_Parsed& parsed,
-    gateway::GatewayClient* gw,
-    const std::string& session_key,
-    const std::optional<std::string>& session_label = std::nullopt);
+/// 対齐 session-mapper.ts:30-88 resolveSessionKey(params)
+///
+/// 解析顺序**严格如下**（真源的 5 段 if，顺序不可调换）：
+///   ① meta.sessionLabel 存在        → sessions.resolve{label} （必须解析成功，否则抛错）
+///   ② meta.sessionKey 存在          → requireExisting ? sessions.resolve{key} : 直接用
+///   ③ opts.defaultSessionLabel 存在 → sessions.resolve{label}
+///   ④ opts.defaultSessionKey 存在   → requireExisting ? sessions.resolve{key} : 直接用
+///   ⑤ 兜底                          → fallback_key
+///
+/// 关键点：
+///   * label 路径**永不**跳过解析 —— label 不是 key，必须查表换算；
+///   * key 路径仅在 requireExisting 为真时才查表校验存在性；
+///   * requireExisting 的取值链是 meta → opts → false（対齐:38-39）；
+///   * 解析失败必须抛错而非静默回落，否则会把消息投到错误会话。
+/// @throws std::runtime_error 当 label/key 无法解析时（対齐:46,59,68,81）
+std::string resolve_session_key(const AcpSessionMeta_Parsed& meta,
+                                const std::string& fallback_key,
+                                const SessionKeyResolutionOptions& opts,
+                                const GatewayRequestFn& request_fn);
 
-// 🎯 对齐 session-mapper.ts: markSessionWithAcpId(requestFn, sessionKey, acpSessionId)
-void mark_session_with_acp_id(
-    const std::optional<GatewayRequestFn>& request_fn,
-    const std::string& session_key,
-    const std::string& acp_session_id);
+/// 対齐 session-mapper.ts:91-102 resetSessionIfNeeded(params)
+///
+/// resetSession 取值链：meta → opts → false（対齐:97）。
+/// 为真时发 **`sessions.reset`**（不是 sessions.init —— 后者不清历史）。
+/// @return 是否真的发出了 reset 请求
+bool reset_session_if_needed(const AcpSessionMeta_Parsed& meta,
+                             const std::string& session_key,
+                             const SessionKeyResolutionOptions& opts,
+                             const GatewayRequestFn& request_fn);
 
-// 🔧 简化版: 通过 GatewayClient 指针标记
-void mark_session_with_acp_id(
-    gateway::GatewayClient* gw,
-    const std::string& session_key,
-    const std::string& acp_session_id);
+/// GatewayClient* 便捷重载（内部包一层 GatewayRequestFn）
+std::string resolve_session_key(const AcpSessionMeta_Parsed& meta,
+                                const std::string& fallback_key,
+                                const SessionKeyResolutionOptions& opts,
+                                gateway::GatewayClient* gw);
 
-// 🎯 对齐 session-mapper.ts: resolveSessionKeyFromConversationId
-std::optional<std::string> resolve_session_key_from_conversation_id(
-    const std::optional<GatewayRequestFn>& request_fn,
-    const std::string& conversation_id);
-
-// 🔧 简化版: 通过 GatewayClient 指针查找
-std::optional<std::string> resolve_session_key_from_conversation_id(
-    gateway::GatewayClient* gw,
-    const std::string& conversation_id);
-
-// ── ACP Session ID helpers ────────────────────────────────────────────────────
-
-static constexpr const char* ACP_SESSION_ID_PREFIX = "acp:";
-
-inline std::string build_acp_session_id(const std::string& session_id) {
-    return std::string(ACP_SESSION_ID_PREFIX) + session_id;
-}
-
-inline std::optional<std::string> parse_acp_session_id(const std::string& id) {
-    std::string prefix(ACP_SESSION_ID_PREFIX);
-    if (id.size() > prefix.size() &&
-        id.compare(0, prefix.size(), prefix) == 0) {
-        return id.substr(prefix.size());
-    }
-    return std::nullopt;
-}
+bool reset_session_if_needed(const AcpSessionMeta_Parsed& meta,
+                             const std::string& session_key,
+                             const SessionKeyResolutionOptions& opts,
+                             gateway::GatewayClient* gw);
 
 } // namespace acp
 } // namespace hunterclaw
