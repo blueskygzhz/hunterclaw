@@ -4,7 +4,6 @@
 // ============================================================================
 
 #include "hunterclaw/acp/acp_session_mapper.h"
-#include "hunterclaw/gateway/client.h"
 
 #include <stdexcept>
 
@@ -160,38 +159,6 @@ bool reset_session_if_needed(const AcpSessionMeta_Parsed& meta,
     // 表面成功而实际历史仍在，后续 baseline/上下文全部错位。
     request_fn("sessions.reset", nlohmann::json{{"key", session_key}});
     return true;
-}
-
-// ── GatewayClient* 便捷重载 ──────────────────────────────────────────────────
-
-namespace {
-
-GatewayRequestFn make_gateway_request_fn(gateway::GatewayClient* gw) {
-    if (!gw) return GatewayRequestFn();
-    return [gw](const std::string& method, const nlohmann::json& params) -> nlohmann::json {
-        auto result = gw->request<nlohmann::json>(method, params);
-        if (!result.is_ok()) {
-            // 让上层的 "resolve 失败即抛错" 语义得以生效
-            throw std::runtime_error(method + " failed: " + result.error);
-        }
-        return result.get();
-    };
-}
-
-}  // namespace
-
-std::string resolve_session_key(const AcpSessionMeta_Parsed& meta,
-                                const std::string& fallback_key,
-                                const SessionKeyResolutionOptions& opts,
-                                gateway::GatewayClient* gw) {
-    return resolve_session_key(meta, fallback_key, opts, make_gateway_request_fn(gw));
-}
-
-bool reset_session_if_needed(const AcpSessionMeta_Parsed& meta,
-                             const std::string& session_key,
-                             const SessionKeyResolutionOptions& opts,
-                             gateway::GatewayClient* gw) {
-    return reset_session_if_needed(meta, session_key, opts, make_gateway_request_fn(gw));
 }
 
 } // namespace acp

@@ -187,6 +187,11 @@ struct AuthenticateResponse {
 struct NewSessionRequest {
     std::string cwd;
     nlohmann::json meta;
+    /// 対齐 ACP NewSessionRequest.mcpServers
+    /// ⚠ 此前完全缺失，导致 assertSupportedSessionSetup 无从判定 ——
+    /// 客户端声明的 per-session MCP server 被静默忽略，客户端却以为已注册，
+    /// 其工具永远不可用且没有任何报错。真源在此拒绝整个请求（translator.ts:1806-1813）。
+    nlohmann::json mcp_servers;
 };
 
 struct AcpSessionInfo {
@@ -201,8 +206,33 @@ struct NewSessionResponse {
     SessionModeState modes;
 };
 
+/// 対齐 translator.session-list.ts:6-7
+/// ⚠ 两者都是 100 —— 默认值与上限相同，即"不指定就给满页，指定也不得超过 100"。
+constexpr int ACP_LIST_SESSIONS_DEFAULT_PAGE_SIZE = 100;
+constexpr int ACP_LIST_SESSIONS_MAX_PAGE_SIZE = 100;
+
+/// 対齐 translator.session-list.ts:73-83 resolveListSessionsPageSize(meta)
+///
+/// ⚠ 注意从 **`_meta`** 里读，键名 "limit" 或 "pageSize"（此前从顶层 params
+/// 读 "limit"，且默认 50、**无上限** —— 客户端传 limit:999999 会被原样接受）。
+/// 未提供 → 默认值；提供则 clamp 到 [1, MAX] 并向下取整。
+int resolve_list_sessions_page_size(const nlohmann::json& meta);
+
+/// 対齐 translator.ts:1157-1171 —— **按 state 分支**的 stopReason 映射。
+///   state=="aborted" → "cancelled"（无条件，不看 rawStopReason/errorKind）
+///   state=="error"   → errorKind=="refusal" ? "refusal" : "end_turn"
+///   其余（final）    → rawStopReason=="max_tokens" ? "max_tokens" : "end_turn"
+///
+/// ⚠ 只有 error 状态能产出 "refusal"。final 状态下即便 rawStopReason 是
+/// "refusal"/"content_filter" 也必须归 end_turn —— 此前的扁平字符串表
+/// 会误映射成 refusal，让客户端把正常结束显示为"被拒绝"。
+/// 同理 "length" **不是** max_tokens，真源只认字面 "max_tokens"。
+std::string map_acp_stop_reason_for_state(const std::string& state,
+                                        const std::string& raw_stop_reason,
+                                        const std::string& error_kind);
+
 struct ListSessionsRequest {
-    int limit = 50;
+    int limit = ACP_LIST_SESSIONS_DEFAULT_PAGE_SIZE;
 };
 
 struct ListSessionsResponse {
@@ -212,6 +242,8 @@ struct ListSessionsResponse {
 struct LoadSessionRequest {
     std::string session_id;
     bool replay = false;
+    /// 対齐 ACP LoadSessionRequest.mcpServers（真源同样在 loadSession 校验，:408）
+    nlohmann::json mcp_servers;
 };
 
 struct ReplayChunk {
@@ -288,6 +320,8 @@ struct ResumeSessionRequest {
     std::string cwd;
     nlohmann::json meta;
     bool replay = true;
+    /// 対齐 ACP ResumeSessionRequest.mcpServers（真源 :526 用 `?? []` 容错）
+    nlohmann::json mcp_servers;
 };
 
 struct ResumeSessionResponse {
@@ -426,6 +460,16 @@ private:
     std::string map_stop_reason(const std::string& gateway_reason);
     std::vector<ReplayChunk> extract_replay_chunks(const TranscriptMessage& msg);
     AcpSessionMeta_Request parse_session_meta(const nlohmann::json& meta);
+
+    /// 対齐 translator.ts:1806-1813 assertSupportedSessionSetup(mcpServers)
+    /// 桥接模式不支持 per-session MCP：非空数组一律抛错，不可静默忽略。
+    /// newSession / loadSession / resumeSession **三处都要调**。
+    void assert_supported_session_setup(const nlohmann::json& mcp_servers);
+
+    /// 対齐 translator.ts:1815-1825 enforceSessionCreateRateLimit(method)
+    /// 三个会话创建入口共享同一个固定窗口配额（默认 120 次 / 10s）。
+    /// @param method 用于错误文案，取 "newSession" / "loadSession" / "resumeSession"
+    void enforce_session_create_rate_limit(const std::string& method);
 
     // 🎯 对齐 OC: sessionUpdates.emit({ sessionId, update })。
     // 通过注入的 connection 向 client 发 session/update notification。

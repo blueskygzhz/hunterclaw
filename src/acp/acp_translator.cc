@@ -11,6 +11,7 @@
 #include "hunterclaw/acp/runtime_errors.h"
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -32,18 +33,73 @@ static constexpr int64_t RATE_DEFAULT_WINDOW_MS = 10000;
 
 // ── Inline rate limiter ──────────────────────────────────────────────────────
 namespace {
-class SimpleRateLimiter {
+/// 対齐 infra/fixed-window-rate-limit.ts:33-74 createFixedWindowRateLimiter
+///
+/// ⚠ 此前的 SimpleRateLimiter 有四处偏差：
+///   ① `return count_++ < max_;` —— 先比较后自增，且**拒绝时也会自增**，
+///      导致窗口内被拒的请求继续累加计数；真源在 `count >= maxRequests` 时
+///      直接 return，**不动 count**（:56-63）。
+///   ② 无锁。ACP 的 stdio 请求与 gateway 事件回流在不同线程，
+///      count_/start_ 存在数据竞争。
+///   ③ 不返回 retryAfterMs，调用方无法按真源格式生成
+///      "retry after Ns" 的错误文案（:1821-1823）。
+///   ④ 初始 start_=0 配合 steady_clock：首次调用时 `ms - 0 >= window_`
+///      恒真所以能重置，行为上侥幸正确，但语义脆弱。真源用 Date.now()
+///      同样从 0 起，此处保留该语义并显式注明。
+class FixedWindowRateLimiter {
 public:
-    SimpleRateLimiter(int max_req, int64_t window_ms)
-        : max_(max_req), window_(window_ms) {}
-    bool try_acquire() {
-        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
-        if (ms - start_ >= window_) { start_ = ms; count_ = 0; }
-        return count_++ < max_;
+    struct Budget {
+        bool allowed = false;
+        int64_t retry_after_ms = 0;
+        int remaining = 0;
+    };
+
+    FixedWindowRateLimiter(int max_req, int64_t window_ms)
+        // 対齐:41-42 resolveFixedWindowRateLimitInteger(..., { min: 1 })
+        : max_(max_req > 0 ? max_req : 1),
+          window_(window_ms > 0 ? window_ms : 1) {}
+
+    Budget consume() {
+        std::lock_guard<std::mutex> lk(mu_);
+        const int64_t now_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        // 対齐:51-55 —— 固定窗口：过期后第一个请求重置全部配额
+        if (now_ms - window_start_ms_ >= window_) {
+            window_start_ms_ = now_ms;
+            count_ = 0;
+        }
+        // 対齐:56-63 —— 超限时**不自增** count
+        if (count_ >= max_) {
+            Budget b;
+            b.allowed = false;
+            // 対齐:60 —— Math.max(0, windowStart + window - now)
+            b.retry_after_ms = std::max<int64_t>(0, window_start_ms_ + window_ - now_ms);
+            b.remaining = 0;
+            return b;
+        }
+        // 対齐:64-69
+        count_ += 1;
+        Budget b;
+        b.allowed = true;
+        b.retry_after_ms = 0;
+        b.remaining = std::max(0, max_ - count_);
+        return b;
     }
+
+    /// 対齐:71-74 reset()
+    void reset() {
+        std::lock_guard<std::mutex> lk(mu_);
+        count_ = 0;
+        window_start_ms_ = 0;
+    }
+
 private:
-    int max_; int64_t window_; int64_t start_ = 0; int count_ = 0;
+    std::mutex mu_;
+    int max_;
+    int64_t window_;
+    int64_t window_start_ms_ = 0;
+    int count_ = 0;
 };
 
 struct PendingToolCallEntry {
@@ -88,7 +144,7 @@ struct AcpGatewayAgent::Impl {
     std::map<std::string, PendingPromptEntry> pending;
     int disconnect_gen = 0;
     bool gw_connected = false;
-    std::unique_ptr<SimpleRateLimiter> rate_limiter;
+    std::unique_ptr<FixedWindowRateLimiter> rate_limiter;
     AcpAgentInfo info{"hunterclaw-acp", "HunterClaw ACP Gateway", HUNTERCLAW_VERSION};
     // 🎯 stdio 连接（session/update 回推 + request_permission）
 AcpStdioConnection* connection = nullptr;
@@ -112,7 +168,63 @@ AcpGatewayAgent::AcpGatewayAgent(gateway::GatewayClient* /*gw*/,
         ? opts.session_create_rate_limit_max_requests : RATE_DEFAULT_MAX;
     int64_t wm = opts.session_create_rate_limit_window_ms > 0
         ? opts.session_create_rate_limit_window_ms : RATE_DEFAULT_WINDOW_MS;
-    impl_->rate_limiter = std::make_unique<SimpleRateLimiter>(mr, wm);
+    impl_->rate_limiter = std::make_unique<FixedWindowRateLimiter>(mr, wm);
+}
+
+// ── 会话创建的两道闸（対齐 translator.ts:1806-1825）─────────────────────────
+// ⚠ 此前 assert_supported_session_setup **完全缺失**，
+//   enforce_session_create_rate_limit 只在 newSession 手写了一次 ——
+//   loadSession / resumeSession 两条同样能创建会话的路径完全裸奔。
+//   真源在这三处**都**调了双闸（:376-377、:408-410、:526-531）。
+
+int resolve_list_sessions_page_size(const nlohmann::json& meta) {
+    // 対齐 translator.session-list.ts:73-83
+    if (!meta.is_object()) return ACP_LIST_SESSIONS_DEFAULT_PAGE_SIZE;
+    // 対齐 readNumber(meta, ["limit","pageSize"]) —— 逐个别名试，
+    // 仅接受有限数值（对齐 meta.ts:42-44 的 Number.isFinite 校验）
+    for (const char* key : {"limit", "pageSize"}) {
+        if (!meta.contains(key) || !meta[key].is_number()) continue;
+        const double raw = meta[key].get<double>();
+        if (!std::isfinite(raw)) continue;
+        // 対齐:81 —— Math.min(MAX, Math.max(1, Math.floor(requested)))
+        const long long floored = static_cast<long long>(std::floor(raw));
+        const long long clamped_low = std::max<long long>(1, floored);
+        return static_cast<int>(
+            std::min<long long>(ACP_LIST_SESSIONS_MAX_PAGE_SIZE, clamped_low));
+    }
+    // 対齐:78-80 —— 未提供则用默认值
+    return ACP_LIST_SESSIONS_DEFAULT_PAGE_SIZE;
+}
+
+// ⚠ 此前 assert_supported_session_setup **完全缺失**，
+//   enforce_session_create_rate_limit 只在 newSession 手写了一次 ——
+//   loadSession / resumeSession 两条同样能创建会话的路径完全裸奔。
+//   真源在这三处**都**调了双闸（:376-377、:408-410、:526-531）。
+
+void AcpGatewayAgent::assert_supported_session_setup(
+    const nlohmann::json& mcp_servers) {
+    // 対齐:1806-1813 —— 空数组放行，非空一律拒绝。
+    // 桥接模式下 per-session MCP 无法生效（MCP 配在 gateway/agent 层），
+    // 静默忽略会让客户端以为自己的 MCP server 已注册，实际工具永不可用。
+    if (mcp_servers.is_null()) return;
+    if (mcp_servers.is_array() && mcp_servers.empty()) return;
+    if (!mcp_servers.is_array()) return;   // 非数组视为未提供
+    throw AcpRuntimeError(
+        AcpErrorCode::ACP_TURN_FAILED,
+        "ACP bridge mode does not support per-session MCP servers. "
+        "Configure MCP on the HunterClaw gateway or agent instead.");
+}
+
+void AcpGatewayAgent::enforce_session_create_rate_limit(const std::string& method) {
+    // 対齐:1815-1825
+    const auto budget = impl_->rate_limiter->consume();
+    if (budget.allowed) return;
+    // 対齐:1821-1823 —— 文案含 method 与向上取整的秒数，便于客户端退避
+    const int64_t retry_s = (budget.retry_after_ms + 999) / 1000;
+    throw AcpRuntimeError(
+        AcpErrorCode::ACP_TURN_FAILED,
+        "ACP session creation rate limit exceeded for " + method +
+            "; retry after " + std::to_string(retry_s) + "s.");
 }
 
 AcpGatewayAgent::~AcpGatewayAgent() = default;
@@ -188,9 +300,10 @@ AuthenticateResponse AcpGatewayAgent::handle_authenticate(const AuthenticateRequ
 
 // ── handleNewSession ─────────────────────────────────────────────────────────
 NewSessionResponse AcpGatewayAgent::handle_new_session(const NewSessionRequest& req) {
-    if (!impl_->rate_limiter->try_acquire())
-        throw AcpRuntimeError(AcpErrorCode::ACP_TURN_FAILED,
-                              "Session creation rate limit exceeded");
+    // 対齐:376-377 —— 顺序不可颠倒：先拒绝不支持的会话配置，再消耗限流配额。
+    // 反过来会让非法请求白白吃掉配额，被用来做配额耗尽攻击。
+    assert_supported_session_setup(req.mcp_servers);
+    enforce_session_create_rate_limit("newSession");
 
     auto meta = parse_session_meta(req.meta);
     std::string sk = meta.session_key.value_or(
@@ -219,6 +332,15 @@ ListSessionsResponse AcpGatewayAgent::handle_list_sessions(const ListSessionsReq
 //   replay 通过 session/update 逐条推送（user/agent message/thought chunk），
 //   随后推送 available_commands_update。
 LoadSessionResponse AcpGatewayAgent::handle_load_session(const LoadSessionRequest& req) {
+    // 対齐:408 —— MCP 闸无条件执行
+    assert_supported_session_setup(req.mcp_servers);
+    // 対齐:409-411 —— 限流**有条件**：仅在会话尚不存在（即本次调用会创建）时消耗配额。
+    // 对已存在会话的 load 是纯读取，不应吃创建配额，否则正常的重连 replay
+    // 会被限流误伤。
+    if (!impl_->session_store->get_session(req.session_id)) {
+        enforce_session_create_rate_limit("loadSession");
+    }
+
     auto session = impl_->session_store->get_session(req.session_id);
     if (!session)
  throw AcpRuntimeError(AcpErrorCode::ACP_SESSION_INIT_FAILED,
@@ -248,7 +370,21 @@ LoadSessionResponse AcpGatewayAgent::handle_load_session(const LoadSessionReques
 // 🎯 严格对齐 OC resumeSession: 与 load 类似，返回 { configOptions, modes }，
 //   replay 通过 session/update 推送，随后推送 available_commands_update。
 ResumeSessionResponse AcpGatewayAgent::handle_resume_session(const ResumeSessionRequest& req) {
+    // 対齐:526 —— `params.mcpServers ?? []`，缺失按空数组处理
+    assert_supported_session_setup(req.mcp_servers);
+    // 対齐:527 assertAbsoluteCwd(params.cwd, "session/resume")
+    // ⚠ 此前完全缺失。resume 允许带 cwd，相对路径会被后续按 gateway 进程的
+    // 工作目录解析 —— 客户端以为自己指定了工作区，实际落到别处。
+    if (!req.cwd.empty() && req.cwd[0] != '/') {
+        throw AcpRuntimeError(AcpErrorCode::ACP_SESSION_INIT_FAILED,
+                              "ACP session/resume requires an absolute cwd.");
+    }
+
     auto session = impl_->session_store->get_session(req.session_id);
+    // 対齐:529-532 —— 同 loadSession，限流仅在会话不存在时消耗
+    if (!session) {
+        enforce_session_create_rate_limit("resumeSession");
+    }
     if (!session)
      throw AcpRuntimeError(AcpErrorCode::ACP_SESSION_INIT_FAILED,
       "Session not found: " + req.session_id);
@@ -792,27 +928,42 @@ std::string AcpGatewayAgent::format_config_value_name(const std::string& v) {
     std::string r = v; r[0] = static_cast<char>(toupper(r[0])); return r;
 }
 
-// ✅ 严格对齐 OC translator.ts:957-971:
+// ✅ 严格对齐 OC translator.ts:1157-1171:
 //   Gateway → ACP StopReason 映射。ACP spec 枚举（snake_case）:
 //     "end_turn" | "max_tokens" | "cancelled" | "refusal"
 //
-// OC 逻辑:
+// 真源逻辑（**按 state 分支**，不是一张扁平字符串表）：
 //   state === "final"   → rawStopReason === "max_tokens" ? "max_tokens" : "end_turn"
-//   state === "aborted" → "cancelled"
+//   state === "aborted" → "cancelled"                       （无条件）
 //   state === "error"   → errorKind === "refusal" ? "refusal" : "end_turn"
 //
-// 此 helper 用于 Gateway 事件（chat.state / chat.stopReason）→ ACP StopReason 转换
+// ⚠ 此前的实现虽然注释抄对了，但代码把三个 state 压成了一张扁平表，
+//   导致两处语义错误：
+//     ① final 状态下 rawStopReason=="refusal"/"content_filter" 会被映射成
+//        "refusal" —— 真源在 final 只认 max_tokens，其余**全部**归 end_turn。
+//        refusal 只能来自 state=="error" 且 errorKind=="refusal"。
+//     ② aborted 状态被要求 rawStopReason 也长得像 abort 才返回 cancelled；
+//        真源在 state=="aborted" 时**无条件** cancelled，与 rawStopReason 无关。
+//   后果：客户端收到错误的 turn 结局，UI 上"被拒绝"与"正常结束"互相串台。
+std::string map_acp_stop_reason_for_state(
+    const std::string& state,
+    const std::string& raw_stop_reason,
+    const std::string& error_kind) {
+    // 対齐:1163-1166 —— aborted 无条件 cancelled
+    if (state == "aborted") return "cancelled";
+    // 対齐:1168-1170 —— 仅 error 状态下 errorKind=="refusal" 才是 refusal
+    if (state == "error") {
+        return error_kind == "refusal" ? "refusal" : "end_turn";
+    }
+    // 対齐:1158-1159 —— final（及其余状态）只认字面 "max_tokens"
+    return raw_stop_reason == "max_tokens" ? "max_tokens" : "end_turn";
+}
+
+// 兼容旧调用点的薄封装：只有 rawStopReason 可用（无 state 上下文）时使用。
+// 按真源 final 分支语义处理 —— 这是最常见的场景（正常收尾）。
 std::string AcpGatewayAgent::map_stop_reason(const std::string& g) {
-    // aborted / cancelled
-    if (g == "aborted" || g == "cancelled" || g == "abort") return "cancelled";
-    // max_tokens
-    if (g == "max_tokens" || g == "length") return "max_tokens";
-    // refusal
-    if (g == "refusal" || g == "content_filtered" || g == "content_filter") return "refusal";
-    // end_turn (默认，对齐 OC 最终 fallback)
-    //   OC: "stop", "end_turn", "endTurn" 全归为 "end_turn"
-    //   tool_use 在 ACP spec 中不是合法 StopReason，按 OC 统一归到 "end_turn"
-    return "end_turn";
+    return map_acp_stop_reason_for_state(/*state=*/"final", /*raw_stop_reason=*/g,
+                                        /*error_kind=*/std::string());
 }
 
 std::vector<ReplayChunk> AcpGatewayAgent::extract_replay_chunks(

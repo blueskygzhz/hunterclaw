@@ -164,6 +164,9 @@ void serve_acp_stdio(const AcpServerOptions& opts, const AcpStdioServerDeps& dep
         req.cwd = ctx.params.value("cwd", ".");
         req.meta = ctx.params.contains("_meta") ? ctx.params["_meta"]
        : ctx.params.value("meta", nlohmann::json::object());
+        // 対齐 ACP NewSessionRequest.mcpServers —— 必须透传，
+        // 由 assert_supported_session_setup 判定（桥接模式不支持 per-session MCP）。
+        req.mcp_servers = ctx.params.value("mcpServers", nlohmann::json::array());
      try {
     auto r = ag->handle_new_session(req);
             return nlohmann::json{
@@ -181,6 +184,8 @@ void serve_acp_stdio(const AcpServerOptions& opts, const AcpStdioServerDeps& dep
         LoadSessionRequest req;
         req.session_id = ctx.params.value("sessionId", "");
  req.replay = ctx.params.value("replay", true);
+        // 対齐 ACP LoadSessionRequest.mcpServers（真源 :408 同样校验）
+        req.mcp_servers = ctx.params.value("mcpServers", nlohmann::json::array());
       try {
             auto r = ag->handle_load_session(req);
   return nlohmann::json{
@@ -199,6 +204,8 @@ void serve_acp_stdio(const AcpServerOptions& opts, const AcpStdioServerDeps& dep
      req.meta = ctx.params.contains("_meta") ? ctx.params["_meta"]
       : ctx.params.value("meta", nlohmann::json::object());
         req.replay = ctx.params.value("replay", true);
+        // 対齐 ACP ResumeSessionRequest.mcpServers（真源 :526 用 `?? []` 容错）
+        req.mcp_servers = ctx.params.value("mcpServers", nlohmann::json::array());
     try {
      auto r = ag->handle_resume_session(req);
    return nlohmann::json{
@@ -222,7 +229,13 @@ void serve_acp_stdio(const AcpServerOptions& opts, const AcpStdioServerDeps& dep
     // ── session/list ────────────────────────────────────────────────────────────
     conn.register_method("session/list", [ag](const AcpRequestContext& ctx) -> nlohmann::json {
         ListSessionsRequest req;
-        req.limit = ctx.params.value("limit", 50);
+        // 対齐 translator.ts:480 —— 从 **_meta** 读 limit/pageSize，
+        // 并 clamp 到 [1,100]。此前从顶层 params 读且无上限，
+        // 客户端传 limit:999999 会被原样接受。
+        const nlohmann::json list_meta = ctx.params.contains("_meta")
+            ? ctx.params["_meta"]
+            : ctx.params.value("meta", nlohmann::json::object());
+        req.limit = resolve_list_sessions_page_size(list_meta);
         auto r = ag->handle_list_sessions(req);
         nlohmann::json arr = nlohmann::json::array();
  for (auto& s : r.sessions)

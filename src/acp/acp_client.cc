@@ -9,7 +9,6 @@
 
 #include "hunterclaw/acp/acp_client.h"
 #include "hunterclaw/core/types.h"
-#include "hunterclaw/infra/utilities.h"
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
@@ -235,6 +234,35 @@ std::string resolve_absolute_scoped_path(const std::string& value, const std::st
     }
 }
 
+/// 対齐 approval-classifier.ts:188-194 isToolPathScopedToCwd
+///   → infra/path-guards.ts → fs-safe 的 isPathInside：
+///     `const rel = path.relative(parent, child);
+///      return !rel.startsWith("..") && !path.isAbsolute(rel);`
+///
+/// ⚠ 刻意**不**复用 infra::is_path_inside：那个实现用 realpath()，
+/// 对**不存在的路径**直接返回 false。审批场景下 write/create 的目标文件
+/// 天然还不存在，用它会把合法的 cwd 内写入判成越界；read 一个尚未创建的
+/// 路径同样会被判越界而要求人工确认 —— 两者都与真源不符。
+/// 真源是纯词法比较，不碰文件系统。
+bool path_inside_lexical(const std::string& root, const std::string& candidate) {
+    try {
+        const std::filesystem::path r = std::filesystem::path(root).lexically_normal();
+        const std::filesystem::path c = std::filesystem::path(candidate).lexically_normal();
+        const std::filesystem::path rel = c.lexically_relative(r);
+        if (rel.empty()) return false;
+        const std::string s = rel.generic_string();
+        // lexically_relative 对同一路径返回 "."，対齐真源 rel === "" 的情形
+        if (s == ".") return true;
+        // 対齐 !rel.startsWith("..")
+        if (s == ".." || s.rfind("../", 0) == 0) return false;
+        // 対齐 !path.isAbsolute(rel)
+        if (rel.is_absolute()) return false;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 }  // namespace
 
 std::string normalize_tool_name(const std::string& value) {
@@ -260,7 +288,8 @@ bool is_tool_path_scoped_to_cwd(const std::string& raw_path, const std::string& 
     } catch (...) {
         return false;
     }
-    return infra::is_path_inside(root, abs);
+    // 対齐:193 —— isPathInside(path.resolve(cwd), absolutePath)，纯词法比较
+    return path_inside_lexical(root, abs);
 }
 
 std::string resolve_tool_name_for_permission(const nlohmann::json& tool_call) {
