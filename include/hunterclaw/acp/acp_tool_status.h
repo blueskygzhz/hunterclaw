@@ -4,78 +4,60 @@
 // acp_tool_status.h
 // 🎯 严格对齐 OpenClaw: src/acp/tool-status.ts
 //
-// 职责:
-//   - 工具调用结果分类（completed / failed / cancelled）
-//   - 工具权限级别判定（read/write/execute）
-//   - 工具结果质量评估（success/failure/cancelled outcome）
+// ⚠ 重要历史说明（避免重复踩坑）：
+//   本文件此前包含 classify_tool_result / resolve_tool_kind_for_permission /
+//   classify_outcome 三个函数，注释标称"严格对齐 tool-status.ts"，但真源
+//   **完全没有**这三个函数 —— 它们是凭空发明的，且零外部引用（死代码）。
+//   其中 classify_tool_result 用子串匹配 "error"/"timeout" 判定工具失败，
+//   任何输出里含这些词的成功结果都会被误判为失败。
+//
+//   真源 tool-status.ts 只导出**一个**函数 resolveAcpToolTerminalOutcome，
+//   有 2 处真实调用方（agents/command/attempt-execution.ts:1446、
+//   auto-reply/reply/acp-projector.ts:353,371），而 HunterClaw 此前没有它。
+//   现按真源重写。
 // ============================================================================
 
-#include <string>
 #include <optional>
-#include <nlohmann/json.hpp>
+#include <string>
 
 namespace hunterclaw {
 namespace acp {
 
-// ── Tool Result Outcome ───────────────────────────────────────────────────────
-
-// 🎯 对齐 tool-status.ts: ToolResultOutcome = { kind, status, error? }
-enum class ToolResultKind {
+/// 対齐 tool-status.ts:11-12 AcpToolTerminalOutcome
+/// 注意只有三个取值 —— 真源的映射表把 done→completed、error→failed 做了归一。
+enum class AcpToolTerminalOutcome {
     Completed,
     Failed,
     Cancelled,
 };
 
-struct ToolResultOutcome {
-    ToolResultKind kind = ToolResultKind::Completed;
-    std::optional<std::string> error_code;
-    std::optional<std::string> error_message;
-};
+/// 対齐 tool-status.ts:14-20 resolveAcpToolTerminalOutcome(status)
+///
+/// 把 ACP tool_call 的 status 字段映射成终态；**非终态或未知值返回 nullopt**。
+/// 调用方据"是否有返回值"判断该 tool_call 是否已结束
+/// （見 acp-projector.ts:353 `resolveAcpToolTerminalOutcome(status) !== undefined`）。
+///
+/// 映射表（対齐:3-9，逐条一致，不可增减）：
+///   completed → Completed
+///   done      → Completed
+///   failed    → Failed
+///   error     → Failed
+///   cancelled → Cancelled
+///
+/// ⚠ 注意 "canceled"（单 l 美式拼写）**不在**映射表内 —— 真源只认 "cancelled"。
+/// ⚠ 判定是 lowercase 后的**严格相等**（対齐:15 normalizeOptionalLowercaseString），
+///   不是子串包含。
+std::optional<AcpToolTerminalOutcome> resolve_acp_tool_terminal_outcome(
+    const std::string& status);
 
-// ── Tool Permission Kind ──────────────────────────────────────────────────────
+/// 便捷谓词：该 status 是否代表 tool_call 已到终态。
+/// 対齐 acp-projector.ts:353,371 的 `!== undefined` 用法。
+inline bool is_acp_tool_terminal_status(const std::string& status) {
+    return resolve_acp_tool_terminal_outcome(status).has_value();
+}
 
-// 🎯 对齐 tool-status.ts: ToolPermissionKind
-enum class ToolPermissionKind {
-    Read,
-    Write,
-    Execute,
-    Unknown,
-};
-
-// ── Public API ────────────────────────────────────────────────────────────────
-
-// 🎯 对齐 tool-status.ts: classifyToolResult(content)
-// 解析工具返回内容判断是否成功/失败/取消:
-//   - 检测 exitCode != 0 → Failed
-//   - 检测 kill/cancel/abort → Cancelled
-//   - 检测 error/message 字段 → Failed
-//   - 默认 → Completed
-ToolResultOutcome classify_tool_result(const nlohmann::json& content);
-
-// 🎯 对齐 tool-status.ts: resolveToolKindForPermission(toolName, toolInput)
-// 根据工具名和参数判断权限级别:
-//   - read/search/grep 等 → Read
-//   - write/edit/delete 等 → Write
-//   - exec/spawn/bash 等 → Execute
-//   - 无法判断 → Unknown
-ToolPermissionKind resolve_tool_kind_for_permission(
-    const std::string& tool_name,
-    const nlohmann::json& tool_input = {});
-
-// 🎯 对齐 tool-status.ts: classifyOutcome(status, kind)
-// 基于 ToolResultOutcome 和 ToolPermissionKind 判定最终结果:
-//   - Failed + Write → 写入失败
-//   - Cancelled + Execute → 执行取消
-//   - 统一返回结构化判定
-struct ToolOutcomeVerdict {
-    ToolResultKind kind;
-    bool is_success = false;
-    bool is_failure = false;
-    bool is_cancelled = false;
-};
-ToolOutcomeVerdict classify_outcome(
-    const ToolResultOutcome& outcome,
-    ToolPermissionKind perm_kind = ToolPermissionKind::Unknown);
+/// 対齐 AcpToolTerminalOutcome 的字面量（用于日志/事件投影）
+const char* to_string(AcpToolTerminalOutcome outcome);
 
 } // namespace acp
 } // namespace hunterclaw

@@ -4,171 +4,56 @@
 // ============================================================================
 
 #include "hunterclaw/acp/acp_tool_status.h"
+
 #include <algorithm>
-#include <unordered_set>
+#include <cctype>
 
 namespace hunterclaw {
 namespace acp {
 
-// ── classify_tool_result ─────────────────────────────────────────────────────
-// 🎯 对齐 tool-status.ts: classifyToolResult(content)
-// 解析工具返回内容判断成功/失败/取消
-ToolResultOutcome classify_tool_result(const nlohmann::json& content) {
-    ToolResultOutcome result;
+namespace {
 
-    if (content.is_null()) {
-        result.kind = ToolResultKind::Completed;
-        return result;
-    }
-
-    // 处理字符串内容
-    if (content.is_string()) {
-        std::string s = content.get<std::string>();
-        std::string lower = s;
-        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-
-        // 检测取消标记
-        if (lower.find("killed") != std::string::npos ||
-            lower.find("cancelled") != std::string::npos ||
-            lower.find("canceled") != std::string::npos ||
-            lower.find("timed out") != std::string::npos ||
-            lower.find("timeout") != std::string::npos) {
-            result.kind = ToolResultKind::Cancelled;
-            return result;
-        }
-
-        // 检测错误标记
-        if (lower.find("error") != std::string::npos ||
-            lower.find("failed") != std::string::npos ||
-            lower.find("exception") != std::string::npos) {
-            result.kind = ToolResultKind::Failed;
-            result.error_message = s.substr(0, 200);  // truncated
-            return result;
-        }
-
-        result.kind = ToolResultKind::Completed;
-        return result;
-    }
-
-    // 处理 JSON 对象内容
-    if (content.is_object()) {
-        // exitCode != 0 → Failed
-        if (content.contains("exitCode") && content["exitCode"].is_number()) {
-            int code = content["exitCode"].get<int>();
-            if (code != 0) {
-                result.kind = ToolResultKind::Failed;
-                result.error_code = std::to_string(code);
-                if (content.contains("stderr") && content["stderr"].is_string()) {
-                    result.error_message = content["stderr"].get<std::string>();
-                }
-                return result;
-            }
-        }
-
-        // killed / cancelled 标记
-        if (content.contains("killed") && content["killed"].is_boolean() &&
-            content["killed"].get<bool>()) {
-            result.kind = ToolResultKind::Cancelled;
-            return result;
-        }
-
-        if (content.contains("cancelled") && content["cancelled"].is_boolean() &&
-            content["cancelled"].get<bool>()) {
-            result.kind = ToolResultKind::Cancelled;
-            return result;
-        }
-
-        // error 字段
-        if (content.contains("error") && content["error"].is_string()) {
-            result.kind = ToolResultKind::Failed;
-            result.error_message = content["error"].get<std::string>();
-            return result;
-        }
-
-        // is_error 标记
-        if (content.contains("is_error") && content["is_error"].is_boolean() &&
-            content["is_error"].get<bool>()) {
-            result.kind = ToolResultKind::Failed;
-            return result;
-        }
-
-        // success=false
-        if (content.contains("success") && content["success"].is_boolean() &&
-            !content["success"].get<bool>()) {
-            result.kind = ToolResultKind::Failed;
-            return result;
-        }
-    }
-
-    result.kind = ToolResultKind::Completed;
-    return result;
+/// 対齐 @openclaw/normalization-core/string-coerce
+/// normalizeOptionalLowercaseString —— trim + lowercase，空则视为无值。
+std::string normalize_lowercase(const std::string& s) {
+    const char* ws = " \t\r\n\f\v";
+    const size_t b = s.find_first_not_of(ws);
+    if (b == std::string::npos) return std::string();
+    const size_t e = s.find_last_not_of(ws);
+    std::string out = s.substr(b, e - b + 1);
+    std::transform(out.begin(), out.end(), out.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return out;
 }
 
-// ── resolve_tool_kind_for_permission ─────────────────────────────────────────
-// 🎯 对齐 tool-status.ts: resolveToolKindForPermission(toolName, toolInput)
-ToolPermissionKind resolve_tool_kind_for_permission(
-    const std::string& tool_name,
-    const nlohmann::json& /*tool_input*/) {
+}  // namespace
 
-    if (tool_name.empty()) return ToolPermissionKind::Unknown;
+std::optional<AcpToolTerminalOutcome> resolve_acp_tool_terminal_outcome(
+    const std::string& status) {
+    // 対齐 tool-status.ts:15-16 —— 归一化后为空即返回 undefined
+    const std::string normalized = normalize_lowercase(status);
+    if (normalized.empty()) return std::nullopt;
 
-    std::string lower = tool_name;
-    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    // 対齐 tool-status.ts:3-9 ACP_TOOL_TERMINAL_OUTCOMES
+    // 严格相等查表，5 个键 → 3 个终态。
+    // ⚠ 不含 "canceled"（单 l），不做子串匹配。
+    if (normalized == "completed") return AcpToolTerminalOutcome::Completed;
+    if (normalized == "done")      return AcpToolTerminalOutcome::Completed;
+    if (normalized == "failed")    return AcpToolTerminalOutcome::Failed;
+    if (normalized == "error")     return AcpToolTerminalOutcome::Failed;
+    if (normalized == "cancelled") return AcpToolTerminalOutcome::Cancelled;
 
-    // Exec-capable tools
-    static const std::unordered_set<std::string> exec_tools = {
-        "exec", "spawn", "shell", "bash", "process",
-        "code_execution", "run", "terminal"
-    };
-    if (exec_tools.count(lower)) return ToolPermissionKind::Execute;
-
-    // Read-only tools
-    static const std::unordered_set<std::string> read_tools = {
-        "read", "read_file", "search", "grep", "find",
-        "list_dir", "list_files", "cat", "head", "tail",
-        "web_search", "web_fetch", "memory_search",
-        "session_status", "sessions_history", "sessions_list",
-        "sessions_search", "agents_list", "agents_wait",
-        "subagents"
-    };
-    if (read_tools.count(lower)) return ToolPermissionKind::Read;
-
-    // Write/mutating tools
-    static const std::unordered_set<std::string> write_tools = {
-        "write", "write_file", "edit", "replace", "insert",
-        "delete", "remove", "create", "move", "rename",
-        "patch", "append",
-        "sessions_patch", "sessions_reset", "sessions_delete",
-        "sessions_spawn", "sessions_send", "sessions_yield",
-        "set_session_mode", "set_session_config"
-    };
-    if (write_tools.count(lower)) return ToolPermissionKind::Write;
-
-    return ToolPermissionKind::Unknown;
+    // 対齐:16-18 —— 表里没有即非终态（如 "pending" / "in_progress"）
+    return std::nullopt;
 }
 
-// ── classify_outcome ────────────────────────────────────────────────────────
-// 🎯 对齐 tool-status.ts: classifyOutcome(status, kind)
-ToolOutcomeVerdict classify_outcome(
-    const ToolResultOutcome& outcome,
-    ToolPermissionKind /*perm_kind*/) {
-
-    ToolOutcomeVerdict v;
-    v.kind = outcome.kind;
-
-    switch (outcome.kind) {
-        case ToolResultKind::Completed:
-            v.is_success = true;
-            break;
-        case ToolResultKind::Failed:
-            v.is_failure = true;
-            break;
-        case ToolResultKind::Cancelled:
-            v.is_cancelled = true;
-            break;
+const char* to_string(AcpToolTerminalOutcome outcome) {
+    switch (outcome) {
+        case AcpToolTerminalOutcome::Completed: return "completed";
+        case AcpToolTerminalOutcome::Failed:    return "failed";
+        case AcpToolTerminalOutcome::Cancelled: return "cancelled";
     }
-
-    return v;
+    return "completed";
 }
 
 } // namespace acp
