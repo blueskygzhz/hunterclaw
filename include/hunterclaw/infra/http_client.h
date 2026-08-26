@@ -186,7 +186,33 @@ public:
         const HttpRequestOptions& options,
         std::function<void(const std::string& line)> line_callback
     );
-    
+
+    /**
+     * @brief SSE 流式 POST — 可中断 + 可设空闲/总截止 (remote_a2a SSE 分支专用)
+     *
+     * 与 post_stream() 的三个关键差异（也正是新增此方法的理由）:
+     *   ① line_callback 返回 false ⇒ 立即关闭连接并返回已累积内容。
+     *      post_stream() 的回调返回 void，调用方【无法】让它提前停下 ——
+     *      对端只要持续发心跳就能把调用线程永久占住。
+     *   ② idle_timeout_ms: 两次数据之间的最大间隔。超过即断开。
+     *   ③ total_timeout_ms: 整条流的总时长上限。超过即断开。
+     *
+     * ⚠ 刻意【不复用】post_stream() 的实现: 那条路径服务于 LLM 流式聊天,
+     *   属高频关键路径, 为本方法改造它得不偿失。此处的少量重复是有意为之。
+     *
+     * @param line_callback   返回 false 请求停止; 返回 true 继续
+     * @param idle_timeout_ms 0 表示沿用 options.timeout_ms
+     * @param total_timeout_ms 0 表示无总时长上限
+     * @return 已累积的响应 (被中断时 ok 仍为 true, 由调用方按事件判断语义)
+     */
+    core::Result<HttpResponse> post_stream_until(
+        const std::string& url,
+        const HttpRequestOptions& options,
+        std::function<bool(const std::string& line)> line_callback,
+        int idle_timeout_ms = 0,
+        int total_timeout_ms = 0
+    );
+
     HttpClient() = default;
     
 private:

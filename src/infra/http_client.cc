@@ -7,6 +7,8 @@
 #include <poll.h>
 #include <netdb.h>
 #include <cstring>
+#include <cerrno>
+#include <chrono>
 #include <sstream>
 #include <iostream>
 #include <algorithm>
@@ -915,6 +917,187 @@ core::Result<HttpResponse> HttpClient::post_stream(
     
     close_connection(socket_fd, ssl_ctx, ssl);
     
+    response.body = accumulated_body;
+    return core::Result<HttpResponse>::Ok(response);
+}
+
+// ----------------------------------------------------------------------------
+// Interruptible SSE Streaming POST (remote_a2a)
+// ----------------------------------------------------------------------------
+
+core::Result<HttpResponse> HttpClient::post_stream_until(
+    const std::string& url,
+    const HttpRequestOptions& options,
+    std::function<bool(const std::string& line)> line_callback,
+    int idle_timeout_ms,
+    int total_timeout_ms
+) {
+    auto parsed = parse_url(url);
+    if (parsed.is_err()) {
+        return core::Result<HttpResponse>::Err(parsed.error);
+    }
+    auto& u = parsed.get();
+
+    int socket_fd = -1;
+    void* ssl_ctx = nullptr;
+    void* ssl = nullptr;
+
+    if (u.use_ssl) {
+#ifdef HUNTERCLAW_ENABLE_SSL
+        auto ssl_result = connect_ssl(u.host, u.port, options.timeout_ms, options);
+        if (ssl_result.is_err()) {
+            return core::Result<HttpResponse>::Err(ssl_result.error);
+        }
+        socket_fd = ssl_result.get().socket_fd;
+        ssl_ctx = ssl_result.get().ssl_ctx;
+        ssl = ssl_result.get().ssl;
+#else
+        return core::Result<HttpResponse>::Err(
+            "HTTPS not supported (compile with HUNTERCLAW_ENABLE_SSL)");
+#endif
+    } else {
+        auto socket_result = connect_socket(u.host, u.port, options.timeout_ms);
+        if (socket_result.is_err()) {
+            return core::Result<HttpResponse>::Err(socket_result.error);
+        }
+        socket_fd = socket_result.get();
+    }
+
+    auto send_result = send_request(socket_fd, ssl, "POST", u.path, u.host, u.port, options);
+    if (send_result.is_err()) {
+        close_connection(socket_fd, ssl_ctx, ssl);
+        return core::Result<HttpResponse>::Err(send_result.error);
+    }
+
+    HttpResponse response;
+    response.status_code = 0;
+    response.ok = false;
+
+    const int idle_ms = idle_timeout_ms > 0 ? idle_timeout_ms
+                                           : std::max(options.timeout_ms, 30000);
+    const auto start = std::chrono::steady_clock::now();
+
+    // ★ SSL 路径下 SSL_read 会阻塞, 单纯 poll fd 不足 (数据可能已在 SSL
+    //   内部缓冲)。故对 SSL 也设 socket SO_RCVTIMEO, 让 SSL_read 自己超时。
+    if (ssl) {
+        struct timeval tv;
+        tv.tv_sec = idle_ms / 1000;
+        tv.tv_usec = (idle_ms % 1000) * 1000;
+        setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    }
+
+    std::string recv_buffer;
+    char buf[4096];
+    bool headers_done = false;
+    std::string accumulated_body;
+    bool stopped_by_callback = false;
+
+    auto exceeded_total = [&]() -> bool {
+        if (total_timeout_ms <= 0) return false;
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - start)
+                            .count();
+        return ms >= total_timeout_ms;
+    };
+
+    while (!stopped_by_callback) {
+        if (exceeded_total()) break;
+
+        if (!ssl) {
+            struct pollfd pfd;
+            pfd.fd = socket_fd;
+            pfd.events = POLLIN;
+            int wait_ms = idle_ms;
+            if (total_timeout_ms > 0) {
+                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now() - start)
+                                         .count();
+                const int remain = static_cast<int>(total_timeout_ms - elapsed);
+                if (remain <= 0) break;
+                wait_ms = std::min(wait_ms, remain);
+            }
+            int ret = poll(&pfd, 1, wait_ms);
+            if (ret == 0) break;  // idle 超时 → 交由调用方决定是否转探测
+            if (ret < 0) {
+                if (errno == EINTR) continue;
+                close_connection(socket_fd, ssl_ctx, ssl);
+                return core::Result<HttpResponse>::Err("Poll error during streaming");
+            }
+        }
+
+        ssize_t received;
+        if (ssl) {
+#ifdef HUNTERCLAW_ENABLE_SSL
+            received = SSL_read(static_cast<SSL*>(ssl), buf, sizeof(buf) - 1);
+            if (received <= 0) break;
+#else
+            break;
+#endif
+        } else {
+            received = recv(socket_fd, buf, sizeof(buf) - 1, 0);
+            if (received < 0 && errno == EINTR) continue;
+            if (received <= 0) break;
+        }
+
+        buf[received] = '\0';
+        recv_buffer.append(buf, received);
+
+        if (!headers_done) {
+            size_t header_end = recv_buffer.find("\r\n\r\n");
+            if (header_end == std::string::npos) {
+                // ⚠ 防御: 对端只发 header 不发空行时无界增长
+                if (recv_buffer.size() > 64 * 1024) {
+                    close_connection(socket_fd, ssl_ctx, ssl);
+                    return core::Result<HttpResponse>::Err("Response headers too large");
+                }
+                continue;
+            }
+            headers_done = true;
+            std::string header_str = recv_buffer.substr(0, header_end);
+            recv_buffer = recv_buffer.substr(header_end + 4);
+
+            std::istringstream header_stream(header_str);
+            std::string status_line;
+            std::getline(header_stream, status_line);
+            std::istringstream status_stream(status_line);
+            std::string http_version;
+            status_stream >> http_version >> response.status_code;
+            response.ok = (response.status_code >= 200 && response.status_code < 300);
+
+            std::string header_line;
+            while (std::getline(header_stream, header_line) && !header_line.empty()) {
+                if (!header_line.empty() && header_line.back() == '\r') header_line.pop_back();
+                size_t colon = header_line.find(':');
+                if (colon != std::string::npos) {
+                    std::string key = header_line.substr(0, colon);
+                    std::string value = header_line.substr(colon + 1);
+                    value.erase(0, value.find_first_not_of(" \t"));
+                    value.erase(value.find_last_not_of(" \t\r\n") + 1);
+                    response.headers[key] = value;
+                }
+            }
+
+            // 非 2xx: 把状态码带回去, 由调用方区分 401/403(补凭据) 与 5xx(重试)
+            if (!response.ok) {
+                close_connection(socket_fd, ssl_ctx, ssl);
+                response.body = recv_buffer;
+                return core::Result<HttpResponse>::Ok(response);
+            }
+        }
+
+        accumulated_body += recv_buffer;
+        size_t pos;
+        while ((pos = recv_buffer.find('\n')) != std::string::npos) {
+            std::string line = recv_buffer.substr(0, pos + 1);
+            recv_buffer.erase(0, pos + 1);
+            if (line_callback && !line_callback(line)) {
+                stopped_by_callback = true;
+                break;
+            }
+        }
+    }
+
+    close_connection(socket_fd, ssl_ctx, ssl);
     response.body = accumulated_body;
     return core::Result<HttpResponse>::Ok(response);
 }
