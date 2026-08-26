@@ -527,6 +527,34 @@ struct ChannelResolverAdapter {
 // ChannelMessagingAdapter
 struct ChannelMessagingAdapter {
     std::function<std::optional<std::string>(const std::string&)> normalize_target;
+
+    // ── 対齐 OpenClaw types.plugin.ts ChannelMessagingAdapter ──────────────
+    // 下面三项是 announce target 解析所需（見 sessions-send-helpers.ts:42-71）。
+    // 缺了它们，群/频道与 DM 的投递地址只能退化到 normalize_target 一条路，
+    // 丢失频道特有的 ID 形态与 thread 归属。
+
+    /// 対齐 messaging.resolveSessionTarget({kind, id, threadId})
+    /// 群/频道会话优先用它推地址，比 normalize_target 更精确（能感知 thread）。
+    /// kind 取 "channel" | "group"
+    struct SessionTargetRef {
+        std::string kind;
+        std::string id;
+        std::string thread_id;
+    };
+    std::function<std::optional<std::string>(const SessionTargetRef&)> resolve_session_target;
+
+    /// 対齐 messaging.resolveDeliveryTarget({conversationId})
+    /// DM 会话用它把 peerId 还原成 API 认的投递地址，可同时给出 threadId。
+    struct DeliveryTarget {
+        std::string to;
+        std::string thread_id;
+    };
+    std::function<std::optional<DeliveryTarget>(const std::string&)> resolve_delivery_target;
+
+    /// 対齐 messaging.directTargetStyle —— 取 "user-prefixed" 时表示该频道的
+    /// DM 地址就是 "user:<peerId>" 形态，**不得**再走 resolve_delivery_target
+    /// （那会把明确的私聊对象错当成房间，見 helpers.ts:45-50）。
+    std::string direct_target_style;
 };
 
 // ChannelAgentPromptAdapter

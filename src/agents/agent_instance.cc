@@ -984,6 +984,33 @@ core::Result<std::string> AgentInstance::process_message_with_overflow_retry(
     spdlog::get("default")->debug("[AgentInstance] Loaded {} history messages from transcript: session={}",
         history.size(), ctx_.session_id);
 
+    // ✅ 对齐 OpenClaw agent-step.ts:93,113 —— extraSystemPrompt
+    //
+    // 跨会话步骤（A2A ping-pong / announce / subagent）需要为**本次 run** 附加
+    // 一段系统指令，用于交代当前角色、轮次与控制约定（例如
+    // 「若要停止对话请仅回复 REPLY_SKIP」）。它是 per-run 的，不进 transcript，
+    // 也不改变会话的常驻 system prompt。
+    //
+    // 此前该字段在 gateway 与 AgentInstance 两层都未被消费，导致 A2A 的
+    // reply/announce 上下文从未送达模型 —— 模型不知道 REPLY_SKIP 之类的约定，
+    // 整套 A2A 控制流（终止 ping-pong、静默 announce）全部失效。
+    //
+    // 以 System 消息追加到 history 末尾（即紧贴本轮 user 输入之前），语义等价于
+    // 真源把 extraSystemPrompt 作为附加系统指令下发。刻意不覆盖首条 System
+    // 消息：那是会话常驻 prompt，覆盖会丢失 agent 身份与工具约定。
+    {
+        auto it = options.find("extra_system_prompt");
+        if (it != options.end() && !it->second.empty()) {
+            react::LLMMessage extra_sys;
+            extra_sys.role = llm::LLMMessageRole::System;
+            extra_sys.content = it->second;
+            history.push_back(extra_sys);
+            spdlog::get("default")->debug(
+                "[AgentInstance] Appended extraSystemPrompt ({} bytes): session={}",
+                it->second.size(), ctx_.session_id);
+        }
+    }
+
     if (ctx_.memory) {
         try {
             memory::SyncParams sync_params;

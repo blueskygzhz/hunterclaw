@@ -6,6 +6,7 @@
 // 包含: round-1 reply 获取、ping-pong 多轮交互、announce 判断与投递。
 // ============================================================================
 
+#include "hunterclaw/agents/run_wait.h"
 #include "hunterclaw/gateway/client.h"
 #include <string>
 #include <memory>
@@ -41,7 +42,13 @@ struct SessionsSendA2AParams {
     std::string requester_channel;     // GatewayMessageChannel enum
     std::string wait_run_id;           // agent.runId for round-1 wait
     std::string round_one_reply;       // when timeout>0: reply already fetched
-    std::string baseline_reply;        // snapshot from before agent run
+
+    /// 対齐 a2a.ts:93 baseline?: AssistantReplySnapshot
+    /// ⚠ 必须传完整快照而非只传文本：fingerprint 才能识别"同文本但属新消息"
+    /// 的情形（対齐 run-wait.ts:323-325）。只比文本会把重复内容的新回复误判
+    /// 为"未更新"而丢弃。
+    agents::AssistantReplySnapshot baseline;
+
     bool notify_requester_on_wait_failure = false;
 };
 

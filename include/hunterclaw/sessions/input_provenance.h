@@ -1,126 +1,60 @@
-#ifndef HUNTERCLAW_SESSIONS_INPUT_PROVENANCE_H
-#define HUNTERCLAW_SESSIONS_INPUT_PROVENANCE_H
+#pragma once
+// ============================================================================
+// Input Provenance — 严格对齐 OpenClaw sessions/input-provenance.ts
+// ============================================================================
+// 跨会话消息的来源标注。核心是 annotate_inter_session_prompt_text()：
+// 在 prompt 正文前置一段「来源信封」，明确告知模型这段内容来自另一个会话
+// 或内部工具，**不是**本会话最终用户的直接指令。
+//
+// 这是一层安全边界：没有它，A 会话的用户就能通过 sessions_send 让 B 会话
+// 把注入内容当作 B 的最终用户指令执行（越权 / prompt 注入）。
+// ============================================================================
 
 #include <string>
-#include <optional>
-#include "hunterclaw/core/json.h"
 
 namespace hunterclaw {
 namespace sessions {
 
-/**
- * Input Provenance System
- * 100% 对齐 OpenClaw sessions/input-provenance.ts
- * 
- * 功能:
- * 1. 输入来源追踪 (external_user, inter_session, internal_system)
- * 2. 来源验证与规范化
- * 3. User Message 来源标注
- * 4. Inter-Session 来源检测
- */
-
-// ============================================================================
-// Types (100% 对齐 OpenClaw)
-// ============================================================================
-
-/// 输入来源类型 (对齐 InputProvenanceKind)
+/// 対齐 input-provenance.ts:8 INPUT_PROVENANCE_KIND_VALUES
 enum class InputProvenanceKind {
-    ExternalUser,    ///< external_user - 外部用户输入
-    InterSession,    ///< inter_session - 会话间传递
-    InternalSystem   ///< internal_system - 内部系统生成
+    ExternalUser,    ///< "external_user"
+    InterSession,    ///< "inter_session"
+    InternalSystem,  ///< "internal_system"
 };
 
-/// 输入来源信息 (对齐 InputProvenance)
+/// 対齐 input-provenance.ts:12-18 InputProvenance
 struct InputProvenance {
-    InputProvenanceKind kind;                    ///< 来源类型
-    std::optional<std::string> origin_session_id;  ///< 原始会话ID
-    std::optional<std::string> source_session_key; ///< 来源会话key
-    std::optional<std::string> source_channel;     ///< 来源频道
-    std::optional<std::string> source_tool;        ///< 来源工具
-    
-    InputProvenance() : kind(InputProvenanceKind::ExternalUser) {}
-    explicit InputProvenance(InputProvenanceKind k) : kind(k) {}
-    
-    /// 转换为 JSON
-    nlohmann::json to_json() const;
-    
-    /// 从 JSON 解析
-    static std::optional<InputProvenance> from_json(const nlohmann::json& j);
+    InputProvenanceKind kind = InputProvenanceKind::InterSession;
+    std::string origin_session_id;
+    std::string source_session_key;
+    std::string source_channel;
+    std::string source_tool;
 };
 
-// ============================================================================
-// Input Provenance Utilities (100% 对齐 OpenClaw)
-// ============================================================================
+/// 対齐 input-provenance.ts:22 INTER_SESSION_PROMPT_PREFIX_BASE
+extern const std::string INTER_SESSION_PROMPT_PREFIX_BASE;
 
-/**
- * 规范化输入来源
- * 
- * 对齐 OpenClaw: normalizeInputProvenance
- * 
- * 行为:
- * 1. ✅ 验证 kind 字段
- * 2. ✅ Trim + normalize optional fields
- * 3. ✅ Return std::nullopt if invalid
- * 
- * @param value 输入值 (JSON object)
- * @return 规范化的来源信息,无效则返回 nullopt
- */
-std::optional<InputProvenance> normalize_input_provenance(const nlohmann::json& value);
+/// 対齐 input-provenance.ts:29-30 INTER_SESSION_PROMPT_EXPLANATION
+extern const std::string INTER_SESSION_PROMPT_EXPLANATION;
 
-/**
- * 为 User Message 添加输入来源
- * 
- * 对齐 OpenClaw: applyInputProvenanceToUserMessage
- * 
- * 行为:
- * 1. ✅ 只处理 role=user 的消息
- * 2. ✅ 如果已有 provenance,保留不覆盖
- * 3. ✅ 添加 provenance 字段
- * 
- * @param message Agent 消息 (JSON)
- * @param provenance 输入来源 (可选)
- * @return 添加了 provenance 的消息
- */
-nlohmann::json apply_input_provenance_to_user_message(
-    const nlohmann::json& message,
-    const std::optional<InputProvenance>& provenance
-);
-
-/**
- * 检测是否为 Inter-Session 来源
- * 
- * 对齐 OpenClaw: isInterSessionInputProvenance
- * 
- * @param value 输入值 (JSON)
- * @return 是否为 inter_session 来源
- */
-bool is_inter_session_input_provenance(const nlohmann::json& value);
-
-/**
- * 检测 User Message 是否来自 Inter-Session
- * 
- * 对齐 OpenClaw: hasInterSessionUserProvenance
- * 
- * 行为:
- * 1. ✅ 检查 role=user
- * 2. ✅ 检查 provenance.kind=inter_session
- * 
- * @param message Agent 消息 (JSON)
- * @return 是否为 inter_session 来源的 user message
- */
-bool has_inter_session_user_provenance(const nlohmann::json& message);
-
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-/// InputProvenanceKind to string
 std::string to_string(InputProvenanceKind kind);
 
-/// String to InputProvenanceKind
-std::optional<InputProvenanceKind> provenance_kind_from_string(const std::string& str);
+/// 対齐 input-provenance.ts:149-170 removeFirstInterSessionPromptPrefix
+/// 幂等性的基础：重复标注时先摘掉已有信封，避免层层堆叠。
+std::string strip_inter_session_prompt_prefix_for_display(const std::string& text);
 
-} // namespace sessions
-} // namespace hunterclaw
+/// 対齐 input-provenance.ts:178-194 annotateInterSessionPromptText
+///
+/// 行为要点（顺序不可变）：
+///   * kind != inter_session      → 原样返回（対齐:182-184）
+///   * text trim 后为空           → 原样返回（対齐:185-187）
+///   * 已以该信封开头             → 原样返回，保证**幂等**（対齐:189-191）
+///   * 否则先摘旧信封再前置新的   → 信封恒在最顶部（対齐:192-193）
+///
+/// 最后一条是关键：信封必须在最顶部，否则后续装饰会把安全说明埋在下面，
+/// 模型可能先读到被注入的内容。
+std::string annotate_inter_session_prompt_text(const std::string& text,
+                                               const InputProvenance& provenance);
 
-#endif // HUNTERCLAW_SESSIONS_INPUT_PROVENANCE_H
+}  // namespace sessions
+}  // namespace hunterclaw

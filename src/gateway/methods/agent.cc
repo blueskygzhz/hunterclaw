@@ -419,6 +419,18 @@ core::Result<json> method_agent(
     // Step 5: 异步 dispatch（对齐 OpenClaw: dispatchAgentRunFromGateway）
     // ========================================================================
     // 构建 process_message options，传递 run_id、deliver 标志和 internalEvents
+    //
+    // ✅ 对齐 OpenClaw agent-step.ts:103-117 —— callGateway("agent", {...}) 还会带
+    //    extraSystemPrompt / transcriptMessage / sourceReplyDeliveryMode /
+    //    channel / lane 五个字段。此前这五个**全部被静默丢弃**，后果最严重的是
+    //    extraSystemPrompt：A2A 的 reply/announce 上下文（含 "reply exactly
+    //    REPLY_SKIP" 这类控制约定）从未送达模型，整套 A2A 控制流形同虚设。
+    std::string extra_system_prompt = get_str("extraSystemPrompt", "extra_system_prompt");
+    std::string source_reply_delivery_mode =
+        get_str("sourceReplyDeliveryMode", "source_reply_delivery_mode");
+    std::string req_channel = get_str("channel", "channel");
+    std::string req_lane = get_str("lane", "lane");
+
     std::map<std::string, std::string> inject_options = {
         {"run_id", run_id},
         {"deliver", deliver ? "true" : "false"},
@@ -429,6 +441,33 @@ core::Result<json> method_agent(
         // ✅ 对齐 OpenClaw: internalEvents 序列化传递
         {"internal_events", internal_events.empty() ? "[]" : internal_events.dump()},
     };
+    // 仅在确实传入时才写入，避免用空串覆盖下游默认值
+    if (!extra_system_prompt.empty()) {
+        inject_options["extra_system_prompt"] = extra_system_prompt;
+    }
+    if (!source_reply_delivery_mode.empty()) {
+        // 対齐 agent-step.ts:89,110 —— "message_tool_only" 表示本次 run 的回复
+        // 不得自动外发，只能由 message tool 显式投递。A2A 的内部步骤全靠它，
+        // 否则 ping-pong 的每一轮中间回复都会漏给终端用户。
+        inject_options["source_reply_delivery_mode"] = source_reply_delivery_mode;
+    }
+    if (!req_channel.empty()) {
+        inject_options["channel"] = req_channel;
+    }
+    if (!req_lane.empty()) {
+        // 対齐 agent-step.ts:80 —— per-session 泳道，串行化同一会话的嵌套工作
+        inject_options["lane"] = req_lane;
+    }
+    // 対齐 agent-step.ts:82-86 —— transcriptMessage 有值（**含空串**）时透传。
+    // 空串是有意义的取值（announce 步骤就传 ""），故须用 contains 判定而非非空。
+    if (params.contains("transcriptMessage") && params["transcriptMessage"].is_string()) {
+        inject_options["transcript_message"] = params["transcriptMessage"].get<std::string>();
+        inject_options["has_transcript_message"] = "true";
+    } else if (params.contains("transcript_message") &&
+               params["transcript_message"].is_string()) {
+        inject_options["transcript_message"] = params["transcript_message"].get<std::string>();
+        inject_options["has_transcript_message"] = "true";
+    }
 
     // ✅ 对齐 OpenClaw: dispatchAgentRunFromGateway (fire-and-forget)
     // 通过 MessageDispatcher 调度（支持 queue mode），或直接调用 process_message

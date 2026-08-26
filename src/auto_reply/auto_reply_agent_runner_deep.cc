@@ -113,16 +113,17 @@ std::string build_usage_line(int64_t input_tokens, int64_t output_tokens,
 
 static std::string sanitize_response_for_payload(const std::string& text) {
     if (text.empty()) return text;
-    // Strip trailing NO_REPLY token
-    auto result = text;
-    auto silent_pos = result.rfind("NO_REPLY");
-    if (silent_pos != std::string::npos && silent_pos == result.size() - 8) {
-        result = result.substr(0, silent_pos);
-    }
-    // Trim trailing whitespace
-    auto end = result.find_last_not_of(" \t\n\r");
-    if (end != std::string::npos) result = result.substr(0, end + 1);
-    return result;
+    // 対齐 OC stripSilentToken(text, SILENT_REPLY_TOKEN)（tokens.ts:236-238）
+    //
+    // ⚠ 此前是手写的 `rfind("NO_REPLY") == size-8`，丢掉了真源正则里的
+    //   `(?:^|\s+|\*+)` **前置边界**，两个后果：
+    //     ① "他说 NO_REPLYING" 这类正文虽不以 token 结尾故不受影响，
+    //        但 "abcNO_REPLY" 会被误切成 "abc" —— token 紧贴单词却被当控制符；
+    //     ② `**NO_REPLY**` / `**NO_REPLY` 这类 Markdown 包裹形态识别不出来，
+    //        模型加粗后控制符就失效了。
+    //   auto_reply/tokens.h 里的 strip_silent_token 已按真源正则实现
+    //   （含 `\*+` 边界与结尾 `\s*$`），且本文件已 include，直接复用。
+    return auto_reply::strip_silent_token(text, auto_reply::SILENT_REPLY_TOKEN);
 }
 
 static bool is_markdown_capable_channel(const std::string& channel) {

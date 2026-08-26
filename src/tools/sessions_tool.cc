@@ -15,6 +15,11 @@
 
 #include "hunterclaw/tools/sessions_tool.h"
 #include "hunterclaw/tools/sessions_send_a2a.h"
+#include "hunterclaw/tools/a2a_context.h"
+#include "hunterclaw/tools/support_tokens.h"
+#include "hunterclaw/agents/agent_lanes.h"
+#include "hunterclaw/agents/run_wait.h"
+#include "hunterclaw/sessions/input_provenance.h"
 #include "hunterclaw/logging/redact.h"
 #include "hunterclaw/agents/acp_spawn.h"
 #include "hunterclaw/sessions/session_key_utils.h"
@@ -46,10 +51,21 @@ static constexpr int SESSIONS_HISTORY_MAX_BYTES = 80 * 1024;
 static constexpr int SESSIONS_HISTORY_TEXT_MAX_CHARS = 4000;
 static constexpr int SESSIONS_LIST_MESSAGE_LIMIT_CAP = 20;
 
-// Aligned with OpenClaw: AGENT_LANE_NESTED
-static const std::string AGENT_LANE_NESTED = "nested";
-// Aligned with OpenClaw: INTERNAL_MESSAGE_CHANNEL
-static const std::string INTERNAL_MESSAGE_CHANNEL = "internal";
+/// 対齐 sessions-send-tool.ts:149 SESSIONS_SEND_REPLY_HISTORY_LIMIT
+/// baseline 与回复读取都必须用同一个 limit（50），否则 baseline 取样窗口比
+/// 回复窗口窄，比对会失真。此前 baseline 处硬编码 20 即属此类偏差。
+static constexpr int SESSIONS_SEND_REPLY_HISTORY_LIMIT = 50;
+
+// lane / channel 常量统一由 agents/agent_lanes.h 提供。
+// ⚠ 此前本文件自带一份 INTERNAL_MESSAGE_CHANNEL = "internal" 与
+//   AGENT_LANE_NESTED = "nested"，把 agent_lanes.h 里已对齐的取值旁路掉了：
+//     * 真源 INTERNAL_MESSAGE_CHANNEL 是 "webchat"（message-channel-constants.ts:4），
+//       "internal" 不在白名单里会被 channel 校验判为 unknown channel；
+//     * lane 必须 per-session（resolveNestedAgentLaneForSession），
+//       全局 "nested" 会让 A2A ping-pong 的两个会话争同一泳道而自我死锁。
+using agents::AGENT_LANE_NESTED;
+using agents::INTERNAL_MESSAGE_CHANNEL;
+using agents::resolve_nested_agent_lane_for_session;
 
 // Aligned with OpenClaw: SUBAGENT_SPAWN_ACCEPTED_NOTE
 static const std::string SUBAGENT_SPAWN_ACCEPTED_NOTE =
@@ -1161,58 +1177,77 @@ public:
         }
         int timeout_ms = timeout_seconds * 1000;
         int announce_timeout_ms = (timeout_seconds == 0) ? 30000 : timeout_ms;
-        (void)announce_timeout_ms; // used for A2A flow
 
         std::string idempotency_key = generate_uuid();
         run_id = idempotency_key;
 
-        // Build agent-to-agent message context (aligned with OpenClaw buildAgentToAgentMessageContext)
-        std::string extra_system_prompt;
-        if (!ctx_.agent_session_key.empty()) {
-            extra_system_prompt = "[Inter-session message from " + ctx_.agent_session_key + "]";
-        }
+        // 対齐 sessions-send-tool.ts:827-831 buildAgentToAgentMessageContext
+        // ⚠ 此前是手写 "[Inter-session message from <key>]"，两处问题：
+        //   ① 内容与真源完全不同，模型收不到 Agent 1/Agent 2 的角色说明；
+        //   ② 把高基数的真实 session key 拼进 system prompt。真源刻意用
+        //      <REQUESTER_SESSION>/<TARGET_SESSION> 占位符，就是为了让
+        //      provider 的 prompt-cache 能在 A2A 多轮之间复用。
+        const std::string extra_system_prompt = build_agent_to_agent_message_context(
+            ctx_.agent_session_key, ctx_.agent_channel, display_key);
 
-        // Send params (aligned with OpenClaw sessions-send-tool.ts)
+        // 対齐:832-837 inputProvenance
+        sessions::InputProvenance provenance;
+        provenance.kind = sessions::InputProvenanceKind::InterSession;
+        provenance.source_session_key = ctx_.agent_session_key;
+        provenance.source_channel = ctx_.agent_channel;
+        provenance.source_tool = "sessions_send";
+
+        // 対齐:838-848 sendParams
         json send_params = {
-            {"message",         message},
+            // 対齐:839 —— 第一跳（requester → target）的正文同样必须加安全信封。
+            // 缺了它，A 会话的用户可借 sessions_send 让 B 会话把注入内容当作
+            // B 的用户指令执行（prompt 注入 / 越权）。此前这里是原样透传。
+            {"message",         sessions::annotate_inter_session_prompt_text(
+                                    message, provenance)},
             {"sessionKey",      resolved_key},
             {"idempotencyKey",  idempotency_key},
             {"deliver",         false},
+            // 対齐:843 —— A2A 内部步骤的回复不得自动外发到目标频道，
+            // 是否公告由后续 announce step 决定。此前完全缺失该字段。
+            {"sourceReplyDeliveryMode", "message_tool_only"},
             {"channel",         INTERNAL_MESSAGE_CHANNEL},
-            {"lane",            AGENT_LANE_NESTED},
+            // 対齐:845 —— per-session 泳道，不是全局 "nested"
+            {"lane",            resolve_nested_agent_lane_for_session(resolved_key)},
+            {"extraSystemPrompt", extra_system_prompt},
             {"inputProvenance", json{
-                {"kind",             "inter_session"},
-                {"sourceSessionKey", ctx_.agent_session_key},
-                {"sourceChannel",    ctx_.agent_channel},
-                {"sourceTool",       "sessions_send"}
+                {"kind",             sessions::to_string(provenance.kind)},
+                {"sourceSessionKey", provenance.source_session_key},
+                {"sourceChannel",    provenance.source_channel},
+                {"sourceTool",       provenance.source_tool}
             }}
         };
-        if (!extra_system_prompt.empty()) {
-            send_params["extraSystemPrompt"] = extra_system_prompt;
-        }
 
-        // Capture baseline reply snapshot BEFORE agent run
-        // Aligned with OpenClaw: baseline snapshot for round-1 reply diff
-        std::string baseline_reply;
-        if (timeout_seconds == 0 && !ctx_.agent_session_key.empty()) {
-            try {
-                auto hist_result = gw_->request<json>("chat.history", json{
-                    {"sessionKey", resolved_key},
-                    {"limit", 20}
-                });
-                if (hist_result.is_ok()) {
-                    json raw_msgs = hist_result.get().value("messages", json::array());
-                    for (int i = (int)raw_msgs.size() - 1; i >= 0; --i) {
-                        const auto& msg = raw_msgs[i];
-                        if (msg.is_object() && msg.value("role", "") == "assistant") {
-                            if (msg.contains("content") && msg["content"].is_string()) {
-                                baseline_reply = msg["content"].get<std::string>();
-                            }
-                            break;
-                        }
-                    }
-                }
-            } catch (...) {}
+        // 対齐:795-816 —— 运行前抓 baseline 快照。
+        //
+        // ⚠ 此前的条件写反了：真源在 timeoutSeconds !== 0 时**恒取**，
+        //   仅在 === 0 时才按 sameSession/isolatedCron 收窄。原实现只在
+        //   == 0 时取 → timeout>0 路径 baseline 恒空 →
+        //   has_updated_assistant_reply_snapshot 恒真 → 上一轮的旧回复
+        //   会被当成本轮结果返回。
+        // 另外必须用 read_latest_assistant_reply_snapshot：它带轮次边界判定
+        //   与 fingerprint，手写的"倒扫找最后一条 assistant"既跨轮次、
+        //   又丢 fingerprint（退化成纯文本比对，识别不出"同文本新消息"），
+        //   还漏了 content 为数组的形态。
+        const bool same_session_a2a =
+            !ctx_.agent_session_key.empty() && ctx_.agent_session_key == resolved_key;
+        // 対齐:772 —— cron 隔离 run 的 requester（agent:<id>:cron:<job>:run:<runId>）
+        const bool is_isolated_cron_requester =
+            sessions::is_cron_run_session_key(ctx_.agent_session_key);
+        agents::AssistantReplySnapshot baseline_snapshot;
+        if (timeout_seconds != 0) {
+            baseline_snapshot = agents::read_latest_assistant_reply_snapshot(
+                gw_, resolved_key, SESSIONS_SEND_REPLY_HISTORY_LIMIT);
+        } else if (same_session_a2a || is_isolated_cron_requester) {
+            // 対齐:809-816 —— fire-and-forget 的同会话发送也需要 baseline，
+            // 因为 A2A 后续可能直投源频道；cron 隔离 requester 同样需要，
+            // 否则会把目标会话的陈旧回复错认成本次结果。
+            baseline_snapshot = agents::read_latest_assistant_reply_snapshot(
+                gw_, resolved_key, SESSIONS_SEND_REPLY_HISTORY_LIMIT);
         }
 
         // Start agent run
@@ -1250,20 +1285,31 @@ public:
             });
         }
 
-        // If timeout=0, return accepted immediately and spawn A2A background flow
-        // ✓ Aligned with OpenClaw: runWithGatewayIndependentRootWorkContinuation
-        if (timeout_seconds == 0) {
+        // 対齐 sessions-send-tool.ts:897-935 startA2AFlow —— 统一的 flow 启动器。
+        //
+        // ⚠ 此前 A2A flow **只在 timeout_seconds == 0 时启动**，导致 timeout>0
+        //   的同步调用完全不跑 ping-pong 与 announce，目标会话的回复永远回不到
+        //   源频道 —— A2A 能力在同步模式下整体静默失效。真源在 timeout>0 的
+        //   **每一条**返回路径上都会启动 flow（:987/:998/:1029）。
+        auto start_a2a_flow = [&](const std::string& round_one_reply,
+                                  const std::string& wait_run_id,
+                                  bool notify_requester_on_wait_failure) {
             SessionsSendA2AParams a2a_params;
             a2a_params.target_session_key = resolved_key;
             a2a_params.display_key = display_key;
             a2a_params.message = message;
             a2a_params.announce_timeout_ms = announce_timeout_ms;
-            a2a_params.max_ping_pong_turns = 5;
+            // 対齐:921 —— cron 隔离任务不得让目标回复变成新的 requester 轮次，
+            // 但 target 侧的 announce 仍要跑，故是 0 而非跳过整个 flow。
+            a2a_params.max_ping_pong_turns =
+                is_isolated_cron_requester ? 0 : resolve_ping_pong_turns();
             a2a_params.requester_session_key = ctx_.agent_session_key;
             a2a_params.requester_channel = ctx_.agent_channel;
-            a2a_params.wait_run_id = run_id;
-            a2a_params.baseline_reply = baseline_reply;
-            a2a_params.notify_requester_on_wait_failure = true;
+            a2a_params.wait_run_id = wait_run_id;
+            a2a_params.round_one_reply = round_one_reply;
+            a2a_params.baseline = baseline_snapshot;
+            a2a_params.notify_requester_on_wait_failure =
+                notify_requester_on_wait_failure;
 
             std::thread([gw = gw_, a2a_params]() {
                 try {
@@ -1278,7 +1324,12 @@ public:
                     log->warn("sessions_send: A2A flow unknown exception");
                 }
             }).detach();
+        };
 
+        // 対齐:937-960 —— timeout=0：立即返回 accepted，后台跑 flow
+        if (timeout_seconds == 0) {
+            start_a2a_flow(/*round_one_reply=*/"", /*wait_run_id=*/run_id,
+                           /*notify_requester_on_wait_failure=*/true);
             return make_json_result(json{
                 {"runId", run_id},
                 {"status", "accepted"},
@@ -1287,71 +1338,65 @@ public:
             });
         }
 
-        // Wait for agent run to complete
-        std::string wait_status, wait_error;
-        try {
-            auto wait_result = gw_->request<json>("agent.wait", json{
-                {"runId", run_id},
-                {"timeoutMs", timeout_ms}
-            });
-            if (wait_result.is_ok()) {
-                const auto& w = wait_result.get();
-                wait_status = w.value("status", "");
-                wait_error  = w.value("error", "");
-            }
-        } catch (const std::exception& e) {
-            std::string msg = e.what();
-            return make_json_result(json{
-                {"runId", run_id},
-                {"status", msg.find("gateway timeout") != std::string::npos ? "timeout" : "error"},
-                {"error", msg},
-                {"sessionKey", display_key}
-            });
-        }
+        // 対齐:975-982 —— timeout>0：wait + 读取相对 baseline 已更新的回复。
+        // ⚠ 此前是手写 agent.wait + "取 history 最后一条"：既不做 baseline
+        //   比对，也只看最后一条（若末条是 transcript artifact 就返回空回复），
+        //   且丢掉了 wait 的 endedAt/stopReason/livenessState，无法区分
+        //   终态超时与"还在跑"。现改用共享实现。
+        const agents::WaitAndReadResult wait_result =
+            agents::wait_for_agent_run_and_read_updated_assistant_reply(
+                gw_, run_id, resolved_key, timeout_ms, baseline_snapshot);
 
-        if (wait_status == "timeout") {
+        if (wait_result.wait.status == agents::AgentWaitStatus::Timeout) {
+            // 対齐:985-995 —— pendingError 超时：消息可能已发出但确认失败。
+            // 仍挂 flow（不通知 requester，因为这里已经把状态回给调用方了）。
+            if (wait_result.wait.is_pending_error_timeout()) {
+                start_a2a_flow("", run_id, false);
+                return make_json_result(json{
+                    {"runId", run_id},
+                    {"status", "timeout"},
+                    {"error", wait_result.wait.error},
+                    {"sentBeforeError", true},
+                    {"sessionKey", display_key},
+                    {"delivery", json{{"status","pending"},{"mode","announce"}}}
+                });
+            }
+            // 対齐:997-1005 —— 非终态超时：run 还在跑。返回 accepted 并挂 flow
+            // 继续等（notify=true，投递真失败时会回头通知 requester）。
+            if (!wait_result.wait.is_terminal_timeout()) {
+                start_a2a_flow("", run_id, true);
+                return make_json_result(json{
+                    {"runId", run_id},
+                    {"status", "accepted"},
+                    {"sessionKey", display_key},
+                    {"delivery", json{{"status","pending"},{"mode","announce"}}}
+                });
+            }
+            // 対齐:1006-1013 —— 终态超时：run 已结束且无回复，不再挂 flow
             return make_json_result(json{
                 {"runId", run_id},
                 {"status", "timeout"},
-                {"error", wait_error},
+                {"error", wait_result.wait.error},
+                {"sentBeforeError", true},
                 {"sessionKey", display_key}
             });
         }
-        if (wait_status == "error") {
+        if (wait_result.wait.status == agents::AgentWaitStatus::Error) {
+            // 対齐:1015-1024 —— error 不挂 flow
             return make_json_result(json{
                 {"runId", run_id},
                 {"status", "error"},
-                {"error", wait_error.empty() ? "agent error" : wait_error},
+                {"error", wait_result.wait.error.empty()
+                              ? std::string("agent error") : wait_result.wait.error},
+                {"sentBeforeError", true},
                 {"sessionKey", display_key}
             });
         }
 
-        // Fetch reply from history
-        std::string reply;
-        try {
-            auto hist_result = gw_->request<json>("chat.history", json{
-                {"sessionKey", resolved_key},
-                {"limit", 50}
-            });
-            if (hist_result.is_ok()) {
-                json raw_msgs = hist_result.get().value("messages", json::array());
-                json filtered = strip_tool_messages(raw_msgs);
-                if (!filtered.empty()) {
-                    const auto& last = filtered.back();
-                    if (last.is_object() && last.value("role", "") == "assistant") {
-                        if (last.contains("content") && last["content"].is_string()) {
-                            reply = last["content"].get<std::string>();
-                        } else if (last.contains("content") && last["content"].is_array()) {
-                            for (const auto& block : last["content"]) {
-                                if (block.is_object() && block.value("type", "") == "text") {
-                                    reply += block.value("text", "");
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (...) {}
+        // 対齐:1026-1027 —— ok：把 round-1 回复交给 flow 继续 ping-pong/announce。
+        // notify=false：本次已同步把结果回给调用方，无需再打断 requester。
+        const std::string reply = wait_result.reply_text;
+        start_a2a_flow(reply, /*wait_run_id=*/"", /*notify=*/false);
 
         json result_json = {
             {"runId", run_id},
@@ -1359,6 +1404,7 @@ public:
             {"sessionKey", display_key},
             {"delivery", json{{"status","pending"},{"mode","announce"}}}
         };
+        // 対齐:1035 —— reply 仅在存在时才带上
         if (!reply.empty()) result_json["reply"] = reply;
 
         return make_json_result(result_json);
@@ -2573,16 +2619,28 @@ public:
 
             std::string steer_idem = generate_uuid();
             try {
+                // 対齐 agent-steering-queue.ts —— steer 也是跨会话注入：
+                //   ① lane 必须 per-session，全局 "nested" 会让并发 steer
+                //      与目标子代理自身的 nested 工作互相排队阻塞；
+                //   ② 正文必须过 inter-session 安全信封，否则子代理会把
+                //      注入内容当成自己的用户指令执行。
+                sessions::InputProvenance steer_prov;
+                steer_prov.kind = sessions::InputProvenanceKind::InterSession;
+                steer_prov.source_session_key = ctx_.agent_session_key;
+                steer_prov.source_tool = "subagents_steer";
+
                 auto resp = gw_->request("agent", json{
                     {"sessionKey",     found->subagent_run_id},
-                    {"message",        message},
+                    {"message",        sessions::annotate_inter_session_prompt_text(
+                                           message, steer_prov)},
                     {"idempotencyKey", steer_idem},
                     {"deliver",        false},
-                    {"lane",           AGENT_LANE_NESTED},
+                    {"lane",           resolve_nested_agent_lane_for_session(
+                                           found->subagent_run_id)},
                     {"inputProvenance", json{
-                        {"kind",             "inter_session"},
-                        {"sourceSessionKey", ctx_.agent_session_key},
-                        {"sourceTool",       "subagents_steer"}
+                        {"kind",             sessions::to_string(steer_prov.kind)},
+                        {"sourceSessionKey", steer_prov.source_session_key},
+                        {"sourceTool",       steer_prov.source_tool}
                     }}
                 });
                 if (!resp.is_ok()) {
