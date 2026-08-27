@@ -39,6 +39,7 @@
 #include "hunterclaw/core/types.h"
 #include "hunterclaw/infra/http_client.h"
 #include "hunterclaw/remote_a2a/agent_tool.h"
+#include "hunterclaw/remote_a2a/callback_endpoint.h"
 #include "hunterclaw/remote_a2a/config.h"
 #include "hunterclaw/remote_a2a/execution_engine.h"
 #include "hunterclaw/remote_a2a/pending_tasks.h"
@@ -96,6 +97,17 @@ public:
     ///   后者会让 handle 变成不可序列化的东西（二期落盘时无法恢复）。
     std::shared_ptr<ExecutionEngine> engine_for_handle(const std::string& handle) const;
 
+    /// 回调接收端。★ 仅在有 agent 启用了 enableCallback 时非空。
+    ///
+    /// 调用方需自行把它挂到 HTTP 路由上（见 make_callback_http_handler），
+    /// 并对 CALLBACK_PATH_PREFIX 注册鉴权旁路。
+    /// ⚠ 注册路由但【忘记】注册旁路 = 所有回调 401；
+    ///   注册旁路但【忘记】注册路由 = 所有回调 404。两者都是静默失效。
+    std::shared_ptr<CallbackEndpoint> callback_endpoint() const;
+
+    /// 是否有任何 agent 启用了回调（决定是否需要挂路由）
+    bool callback_enabled() const;
+
     std::shared_ptr<PendingTaskStore> store() const { return store_; }
 
     std::vector<RemoteAgentRuntime> runtimes() const;
@@ -112,6 +124,8 @@ private:
     infra::HttpClient::Ptr http_;
     /// ★ 全局单例（见文件头说明）
     std::shared_ptr<PendingTaskStore> store_;
+    /// 仅在有 agent 启用回调时创建
+    std::shared_ptr<CallbackEndpoint> callback_;
 
     mutable std::mutex mu_;
     /// agent_name → runtime

@@ -133,6 +133,23 @@ core::Result<RemoteA2aConfig> parse_remote_a2a_config(const nlohmann::json& node
         }
     }
 
+    // ── 回调端点配置 ────────────────────────────────────────────────────
+    {
+        auto it = node.find("callback");
+        if (it != node.end() && it->is_object()) {
+            cfg.callback.max_failures_per_window = static_cast<int>(clamp_positive(
+                jint(*it, "maxFailuresPerWindow", 10, "max_failures_per_window"), 10, 1,
+                1000));
+            cfg.callback.failure_window_ms = clamp_positive(
+                jint(*it, "failureWindowMs", 60000, "failure_window_ms"), 60000, 1000,
+                3600000);
+            const int64_t mb = jint(*it, "maxBodyBytes", 65536, "max_body_bytes");
+            cfg.callback.max_body_bytes =
+                static_cast<size_t>(clamp_positive(mb, 65536, 512, 4 * 1024 * 1024));
+            cfg.callback.echo_handle = jbool(*it, "echoHandle", false, "echo_handle");
+        }
+    }
+
     // ── defaults ────────────────────────────────────────────────────────
     ExecutionConfig def_exec;
     int64_t def_card_ttl = 15 * 60 * 1000;

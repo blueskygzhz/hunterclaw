@@ -333,6 +333,108 @@ static void test_tool_name_collision() {
 }
 
 // ============================================================================
+static void test_callback_wiring() {
+    SECTION("回调端点接线");
+
+    const std::string p = write_card("/tmp/hc_reg_cb.json", "cb",
+                                    "https://cb.example.com/a2a");
+
+    // ── 未启用回调 → 不创建端点 ────────────────────────────────────────
+    {
+        json node;
+        node["enabled"] = true;
+        node["agents"] = json::array(
+            {json{{"name", "cb"}, {"card", p}, {"resolveDns", false}}});
+
+        auto reg = RemoteA2aRegistry::create(parse_remote_a2a_config(node).get());
+        reg->build();
+        // ★ [不可回退] 一个存在的回调端点意味着一个鉴权旁路路径，
+        //   没人用的时候不该存在
+        CHECK(!reg->callback_enabled(), "未启用回调");
+        CHECK(reg->callback_endpoint() == nullptr,
+              "未启用时不创建端点 [不可回退]");
+    }
+
+    // ── 启用回调 → 创建端点且可用 ──────────────────────────────────────
+    {
+        json node;
+        node["enabled"] = true;
+        node["callbackBaseUrl"] = "https://hc.example.com";
+        node["agents"] = json::array({json{{"name", "cb"},
+                                           {"card", p},
+                                           {"resolveDns", false},
+                                           {"enableCallback", true}}});
+
+        auto parsed = parse_remote_a2a_config(node);
+        CHECK(parsed.is_ok(), "启用回调的配置解析成功");
+
+        auto reg = RemoteA2aRegistry::create(parsed.get());
+        reg->build();
+        CHECK(reg->callback_enabled(), "callback_enabled 为真");
+        auto ep = reg->callback_endpoint();
+        CHECK(ep != nullptr, "端点已创建");
+        if (!ep) {
+            std::remove(p.c_str());
+            return;
+        }
+
+        // 端点能通过 registry 反查到引擎（即闭环成立）
+        auto store = reg->store();
+        auto h = store->register_task("cb", "t1", "", "s1").get();
+        store->set_callback_token(h, "tok-abc");
+
+        auto o = ep->handle_callback(std::string(CALLBACK_PATH_PREFIX) + h,
+                                   "Bearer tok-abc", "{}", "1.1.1.1");
+        CHECK(o.http_status == 200, "合法回调受理");
+        // ★ 引擎反查成功 → 走了权威拉取分支（而非"引擎不可用"）
+        CHECK(o.polled, "触发了 tasks/get 权威拉取 [不可回退]");
+        CHECK(o.note.find("引擎已不可用") == std::string::npos, "引擎可用");
+
+        // ★ [不可回退] 拉取必然失败（卡是本地文件，URL 不可达），
+        //   但任务【不能】因此被判终态 —— 一次拉取失败不是任务失败
+        auto t = store->get(h);
+        CHECK(t->phase == PendingPhase::Running,
+              "拉取失败不判任务终态 [不可回退]");
+
+        // 错 token 被拒
+        CHECK(ep->handle_callback(std::string(CALLBACK_PATH_PREFIX) + h,
+                                 "Bearer wrong", "{}", "2.2.2.2")
+                  .http_status == 404,
+              "错 token 被拒");
+
+        // ★ [不可回退] registry 销毁后端点不崩溃（weak_ptr 捕获）
+        reg.reset();
+        auto o2 = ep->handle_callback(std::string(CALLBACK_PATH_PREFIX) + h,
+                                     "Bearer tok-abc", "{}", "1.1.1.1");
+        CHECK(o2.http_status == 200, "registry 销毁后端点不崩溃 [不可回退]");
+        CHECK(!o2.polled, "registry 销毁后无引擎可用");
+    }
+
+    // ── 回调配置钳制 ────────────────────────────────────────────────────
+    {
+        json node;
+        node["enabled"] = true;
+        node["callbackBaseUrl"] = "https://hc.example.com";
+        node["callback"] = json{{"maxFailuresPerWindow", 0},
+                                {"maxBodyBytes", 1},
+                                {"failureWindowMs", 1}};
+        node["agents"] = json::array({json{{"name", "cb"},
+                                           {"card", p},
+                                           {"resolveDns", false},
+                                           {"enableCallback", true}}});
+        auto parsed = parse_remote_a2a_config(node);
+        CHECK(parsed.is_ok(), "回调配置解析成功");
+        const auto& c = parsed.get().callback;
+        CHECK(c.max_failures_per_window >= 1, "失败阈值下限");
+        CHECK(c.max_body_bytes >= 512, "体积上限下限（不能设成 1 字节）");
+        CHECK(c.failure_window_ms >= 1000, "窗口下限");
+        CHECK(!c.echo_handle, "默认不回显 handle [不可回退]");
+    }
+
+    std::remove(p.c_str());
+}
+
+// ============================================================================
 int main() {
     std::cout << "===== remote_a2a M11 registry 测试 =====" << std::endl;
 
@@ -342,6 +444,7 @@ int main() {
     test_sweeper();
     test_enable_entry();
     test_tool_name_collision();
+    test_callback_wiring();
 
     std::cout << "\n===== 结果: " << g_pass << " 通过, " << g_fail << " 失败 ====="
               << std::endl;

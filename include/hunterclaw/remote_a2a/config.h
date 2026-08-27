@@ -37,6 +37,7 @@
 
 #include "hunterclaw/core/types.h"
 #include "hunterclaw/remote_a2a/agent_tool.h"
+#include "hunterclaw/remote_a2a/callback_endpoint.h"
 #include "hunterclaw/remote_a2a/card_resolver.h"
 #include "hunterclaw/remote_a2a/execution_engine.h"
 #include "hunterclaw/remote_a2a/remote_agent_client.h"
@@ -65,6 +66,7 @@ struct RemoteA2aConfig {
     std::string callback_base_url;
     std::vector<RemoteAgentConfig> agents;
     PendingStoreConfig store;
+    CallbackEndpointConfig callback;
 
     /// 解析期收集的警告（配置错误、被跳过的 agent 等）。
     /// ★ 非空【不】代表失败 —— 调用方应记日志但继续启动。

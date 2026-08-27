@@ -27,9 +27,11 @@ RemoteA2aRegistry::RemoteA2aRegistry(const RemoteA2aConfig& cfg,
 RemoteA2aRegistry::~RemoteA2aRegistry() { stop_sweeper(); }
 
 core::Result<int> RemoteA2aRegistry::build() {
-    std::lock_guard<std::mutex> lk(mu_);
-    if (built_) {
-        return core::Result<int>::Ok(static_cast<int>(runtimes_.size()));
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (built_) {
+            return core::Result<int>::Ok(static_cast<int>(runtimes_.size()));
+        }
     }
 
     // 工具名去重表。★ 按配置顺序推进，保证名字稳定
@@ -37,6 +39,12 @@ core::Result<int> RemoteA2aRegistry::build() {
     std::vector<std::string> reserved;
     reserved.push_back(TOOL_STATUS);
     reserved.push_back(TOOL_CANCEL);
+
+    // ⚠ 整个循环在【锁外】执行：ensure_card() 会发 HTTP。
+    //   持锁做网络 IO 会把 engine_for_handle / callback_endpoint 等
+    //   热路径全部阻塞数秒（N 个远端串行拉卡）。
+    std::map<std::string, RemoteAgentRuntime> built;
+    std::vector<std::string> new_warnings;
 
     for (const auto& ac : cfg_.agents) {
         RemoteAgentRuntime rt;
@@ -60,19 +68,61 @@ core::Result<int> RemoteA2aRegistry::build() {
         } else {
             rt.card_ready = false;
             rt.card_error = card.error;
-            warnings_.push_back("远端 '" + ac.name +
-                               "' 的 AgentCard 拉取失败（工具仍已注册，调用时会重试）: " +
-                               card.error);
+            new_warnings.push_back("远端 '" + ac.name +
+                                  "' 的 AgentCard 拉取失败（工具仍已注册，调用时会重试）: " +
+                                  card.error);
         }
 
-        runtimes_[ac.name] = std::move(rt);
+        built[ac.name] = std::move(rt);
     }
 
-    built_ = true;
-    if (runtimes_.empty()) {
+    if (built.empty()) {
         return core::Result<int>::Err("没有任何远端 A2A agent 构造成功");
     }
-    return core::Result<int>::Ok(static_cast<int>(runtimes_.size()));
+
+    // ── 回调端点（仅在确有 agent 启用时创建）──────────────────────────
+    // ⚠ 不无条件创建：一个存在的回调端点意味着一个鉴权旁路路径，
+    //   没人用的时候不该存在。
+    std::shared_ptr<CallbackEndpoint> cb;
+    if (callback_enabled()) {
+        // ⚠ weak_ptr 捕获：端点会被挂到 HTTP 路由上，生命周期可能长于 registry。
+        //   shared_ptr 会循环引用，裸 this 会悬垂。
+        std::weak_ptr<RemoteA2aRegistry> weak = weak_from_this();
+        CallbackEngineLookupFn lookup = [weak](const std::string& h)
+            -> std::shared_ptr<ExecutionEngine> {
+            auto self = weak.lock();
+            if (!self) return nullptr;
+            return self->engine_for_handle(h);
+        };
+        cb = CallbackEndpoint::create(store_, lookup, cfg_.callback);
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        // ⚠ 双检：并发 build() 时后到者放弃自己的成果，沿用先到者的。
+        //   否则两个 runtime 集合会互相覆盖，其中一份的引擎变成孤儿
+        //   （已登记的任务反查不到引擎）。
+        if (built_) {
+            return core::Result<int>::Ok(static_cast<int>(runtimes_.size()));
+        }
+        runtimes_ = std::move(built);
+        for (auto& w : new_warnings) warnings_.push_back(std::move(w));
+        callback_ = std::move(cb);
+        built_ = true;
+        return core::Result<int>::Ok(static_cast<int>(runtimes_.size()));
+    }
+}
+
+std::shared_ptr<CallbackEndpoint> RemoteA2aRegistry::callback_endpoint() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return callback_;
+}
+
+bool RemoteA2aRegistry::callback_enabled() const {
+    for (const auto& a : cfg_.agents) {
+        if (a.exec.enable_callback) return true;
+    }
+    return false;
 }
 
 core::Result<int> RemoteA2aRegistry::register_tools(tools::ToolManager& manager) {

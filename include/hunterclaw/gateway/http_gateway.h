@@ -110,9 +110,27 @@ class AuthMiddleware : public HttpMiddleware {
 public:
     explicit AuthMiddleware(const std::string& bearer_token);
     void execute(const httplib::Request& req, httplib::Response& res, NextHandler next) override;
-    
+
+    /// 注册一个【绕过共享 bearer_token 校验】的路径前缀。
+    ///
+    /// ⚠ 只允许用于「自带一次性凭据」的端点。目前唯一用例是
+    ///   remote_a2a 的回调（/remote-a2a/callback/<handle>）——
+    ///   远端带的是我们发给该任务的一次性 token，不是 gateway 共享 token；
+    ///   不旁路会让所有回调 401，表现为「回调配了但从不生效」。
+    ///
+    /// ★ 旁路只跳过本中间件，不等于无鉴权：被旁路的 handler
+    ///   【必须】自己完成凭据校验 + 失败节流（见 callback_endpoint.h 三道闸门）。
+    ///
+    /// ⚠ 前缀必须以 '/' 开头且不得为 "/"（否则等于关闭全局鉴权）。
+    ///   非法前缀会被静默忽略。
+    void add_public_prefix(const std::string& prefix);
+
+    /// 路径是否命中旁路前缀（単测与诊断用）
+    bool is_public_path(const std::string& path) const;
+
 private:
     std::string bearer_token_;
+    std::vector<std::string> public_prefixes_;
 };
 
 /// Middleware Chain
@@ -159,7 +177,12 @@ public:
     
     // Middleware registration
     void use_middleware(std::shared_ptr<HttpMiddleware> middleware);
-    
+
+    /// 注册一个绕过 AuthMiddleware 的路径前缀。
+    /// ★ 见 AuthMiddleware::add_public_prefix 的约束说明。
+    /// 未启用鉴权（bearer_token 为空）时本调用无副作用。
+    void add_auth_bypass_prefix(const std::string& prefix);
+
 private:
     // ========== REST API Endpoints (对齐 OpenClaw) ==========
     
@@ -290,6 +313,9 @@ private:
     std::atomic<bool> running_{false};
     
     MiddlewareChain middleware_chain_;
+    /// ★ 保留 AuthMiddleware 的引用以便注册旁路前缀。
+    ///   为空表示未启用鉴权（此时旁路无意义）。
+    std::shared_ptr<AuthMiddleware> auth_middleware_;
     
     // ✅ 对齐 OpenClaw: hookAuthLimiter (20 failures / 60s)
     mutable std::mutex auth_limiter_mutex_;

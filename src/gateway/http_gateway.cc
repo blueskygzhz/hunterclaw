@@ -214,6 +214,23 @@ void CorsMiddleware::execute(
 AuthMiddleware::AuthMiddleware(const std::string& bearer_token)
     : bearer_token_(bearer_token) {}
 
+void AuthMiddleware::add_public_prefix(const std::string& prefix) {
+    // ⚠ 前缀必须以 '/' 开头且不得为 "/"（"/" 等于关闭全局鉴权）。
+    //   非法前缀静默忽略 —— 抛异常会让一个配置笔误变成启动失败。
+    if (prefix.size() < 2 || prefix.front() != '/') return;
+    for (const auto& p : public_prefixes_) {
+        if (p == prefix) return;  // 幂等
+    }
+    public_prefixes_.push_back(prefix);
+}
+
+bool AuthMiddleware::is_public_path(const std::string& path) const {
+    for (const auto& p : public_prefixes_) {
+        if (path.size() >= p.size() && path.compare(0, p.size(), p) == 0) return true;
+    }
+    return false;
+}
+
 void AuthMiddleware::execute(
     const httplib::Request& req,
     httplib::Response& res,
@@ -221,6 +238,13 @@ void AuthMiddleware::execute(
 ) {
     // Skip auth for health/metrics endpoints
     if (req.path == "/health" || req.path == "/metrics") {
+        next(req, res);
+        return;
+    }
+
+    // ★ 自带一次性凭据的端点旁路（目前仅 remote_a2a 回调）。
+    //   旁路只跳过本中间件 —— 被旁路的 handler 必须自己校验凭据并做失败节流。
+    if (is_public_path(req.path)) {
         next(req, res);
         return;
     }
@@ -329,7 +353,8 @@ HttpGateway::HttpGateway(
     use_middleware(std::make_shared<LoggingMiddleware>());
     
     if (!options_.bearer_token.empty()) {
-        use_middleware(std::make_shared<AuthMiddleware>(options_.bearer_token));
+        auth_middleware_ = std::make_shared<AuthMiddleware>(options_.bearer_token);
+        use_middleware(auth_middleware_);
     }
     
     // Setup routes
@@ -428,6 +453,12 @@ void HttpGateway::register_route(
 
 void HttpGateway::use_middleware(std::shared_ptr<HttpMiddleware> middleware) {
     middleware_chain_.use(middleware);
+}
+
+void HttpGateway::add_auth_bypass_prefix(const std::string& prefix) {
+    // 未启用鉴权时 auth_middleware_ 为空 —— 无需旁路，直接返回。
+    if (!auth_middleware_) return;
+    auth_middleware_->add_public_prefix(prefix);
 }
 
 void HttpGateway::setup_routes() {

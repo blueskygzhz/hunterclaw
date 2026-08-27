@@ -569,6 +569,57 @@ void ExecutionEngine::background_loop(std::string handle) {
     run_probe(handle, &dummy, nullptr, 0);
 }
 
+// ── poll_once（回调分支专用）────────────────────────────────────────────────
+
+bool ExecutionEngine::poll_once(const std::string& handle) {
+    if (!client_ || !store_) return false;
+
+    auto cur = store_->get(handle);
+    if (!cur) return false;
+    // 已终结 → 无需再拉（回调可能重复投递，远端在没收到 2xx 时会重试）
+    if (cur->phase != PendingPhase::Running) return true;
+
+    if (!client_->capabilities().should_try_tasks_get()) {
+        // 远端不支持 tasks/get 却配了回调 —— 无权威来源可用。
+        // ⚠ 此时【不能】采信回调 payload 作为替代（那正是我们要防的），
+        //   也不能判失败（任务可能真在跑）。只记一次无推进，交给 HardTimeout 兜底。
+        store_->note_no_progress(handle);
+        return false;
+    }
+
+    auto t = client_->get_task(cur->task_id);
+    if (t.is_err()) {
+        // ★ TaskNotFound 是终态：远端已丢弃该任务
+        if (t.error.find("task_not_found") != std::string::npos) {
+            store_->update_terminal(handle, TerminalReason::RemoteFailed, "",
+                                   "远端已不存在该任务（TaskNotFound）");
+            return true;
+        }
+        store_->note_no_progress(handle);
+        return false;
+    }
+
+    ingest_task(handle, t.get(), nullptr);
+
+    auto after = store_->get(handle);
+    if (!after) return false;
+    if (after->phase != PendingPhase::Running) return true;
+
+    // 未终结但要检查 HardTimeout / Zombie（回调分支没有探测循环兜底）
+    if (auto reason = evaluate(*after, false, "")) {
+        std::string err;
+        if (*reason == TerminalReason::HardTimeout) {
+            err = "远端任务超过最长时限 " + std::to_string(cfg_.max_task_ms) + "ms";
+        } else if (*reason == TerminalReason::Zombie) {
+            err = "远端任务连续 " + std::to_string(cfg_.probe.max_no_progress) +
+                  " 次无推进，判定为僵死";
+        }
+        store_->update_terminal(handle, *reason, "", err);
+        return true;
+    }
+    return false;
+}
+
 // ── follow_up ───────────────────────────────────────────────────────────────
 
 ExecutionResult ExecutionEngine::follow_up(const std::string& handle, int64_t wait_ms) {

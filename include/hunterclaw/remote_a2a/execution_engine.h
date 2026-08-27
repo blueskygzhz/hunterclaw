@@ -166,6 +166,18 @@ public:
     /// @param wait_ms 0 = 只看当前状态
     ExecutionResult follow_up(const std::string& handle, int64_t wait_ms);
 
+    /// 单次权威拉取 —— ★ 回调分支专用。
+    ///
+    /// 做一次 tasks/get 并把快照并入登记表（含终态判定）。
+    ///
+    /// ★ 为什么回调必须走这个而不是直接采信回调 payload：
+    ///   回调 payload 由远端构造、经公网传输、可被伪造。攻击者只要猜到句柄
+    ///   与 token 就能伪造「任务已完成，结果是 X」。tasks/get 是我们主动发起、
+    ///   走已鉴权通道的，是唯一可信来源。回调只是「有更新了，快来拉」的信号。
+    ///
+    /// @return 是否已到终态（false 表示仍在跑，或拉取失败）
+    bool poll_once(const std::string& handle);
+
     /// 取消（best-effort）。
     /// ⚠ 対标 ADK executor/utils.py:31-48：远端的 cancel 往往只塞一个
     ///   canceled 事件而【不中断】实际执行 —— 远端会继续烧 token。
