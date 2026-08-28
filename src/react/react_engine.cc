@@ -2225,8 +2225,8 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                         //   声明方以为受保护, 实际直通且无日志可查。
                         policy_ctx.tool_requires_approval = t->requires_approval();
                     }
-                    // ★ 为空时 Stage 1 按"不可用"处理并拒绝执行, 绝不放行。
-                    policy_ctx.approval_manager = tool_manager_->approval_manager();
+                    // ★ 为空时 Stage 1 按"审批面不可用"拒绝执行, 绝不放行。
+                    policy_ctx.approval_broker = tool_manager_->approval_broker();
                 }
 
                 auto outcome = tools::run_before_tool_call_policy(policy_ctx, tool_call.input);
@@ -2484,8 +2484,8 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                         //   声明方以为受保护, 实际直通且无日志可查。
                         policy_ctx.tool_requires_approval = t->requires_approval();
                     }
-                    // ★ 为空时 Stage 1 按"不可用"处理并拒绝执行, 绝不放行。
-                    policy_ctx.approval_manager = tool_manager_->approval_manager();
+                    // ★ 为空时 Stage 1 按"审批面不可用"拒绝执行, 绝不放行。
+                    policy_ctx.approval_broker = tool_manager_->approval_broker();
                 }
 
                 auto outcome = tools::run_before_tool_call_policy(policy_ctx, tool_call.input);
