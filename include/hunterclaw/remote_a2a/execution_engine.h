@@ -77,6 +77,15 @@ struct ExecutionConfig {
     /// SSE 静默多久后转入探测
     int64_t idle_timeout_ms = 120000;
 
+    /// ★★ 强制要求：该远端的所有 input-required 都必须由【用户】确认。
+    ///
+    /// 与远端 metadata 的 requiresUserAction 取「或」——
+    /// 远端【能加严不能放松】，与 requires_approval 绝不从卡读同一原则。
+    ///
+    /// ⚠ 只听远端是不安全的：远端声明 requiresUserAction=false 就能让
+    ///   模型代答本应由用户决定的事（如"确认转账"）。
+    bool require_user_confirm_on_input = false;
+
     ProbePolicy probe;
 
     /// 是否启用回调分支（需要远端支持 pushNotificationConfig）
@@ -102,6 +111,29 @@ struct ExecutionConfig {
 ///   （system_events.cc:86-88 会跳过连续重复文本，但不同文本仍会入队，
 ///    20 条上限 MAX_EVENTS 很快被进度刷满，把真正的事件挤掉）。
 using ProgressFn = std::function<void(const std::string& text, bool is_heartbeat)>;
+
+// ── 二次确认信号的解析（★ 隔离在一处，便于对接后调整）──────────────────────
+//
+// ⚠⚠ tokenIds 在 A2A 报文里的位置【尚未与企微确认】。
+//   当前按 `status.message.parts[].metadata` 读取，因为:
+//     · Part 已有 metadata 字段（types.h:78），是 A2A 规范内的扩展位
+//     · 独立 artifact 语义不符（artifact 是"产出"而非"待办"）
+//     · Task.metadata 在 A2A 规范里用途较模糊
+//
+// ★ 全部解析集中在这一个函数里 —— 位置定了只改这里，
+//   调用方（ingest_task / render）不受影响。
+//
+// 识别的 metadata 键（大小写敏感，两种命名都收）:
+//   requiresUserAction / requires_user_action : bool
+//   tokenIds / token_ids                      : string[]
+struct ConfirmSignal {
+    bool requires_user_action = false;
+    std::vector<std::string> token_ids;
+};
+
+/// 从远端 Task 中提取二次确认信号。
+/// @param force_user_action 本地配置强制要求用户确认（取「或」）
+ConfirmSignal extract_confirm_signal(const Task& t, bool force_user_action);
 
 // ── 执行结果 ────────────────────────────────────────────────────────────────
 
@@ -143,6 +175,26 @@ struct ExecutionResult {
     bool is_suspended() const {
         return state == TaskState::InputRequired || state == TaskState::AuthRequired;
     }
+
+    /// ★★ 必须由【用户】决定，模型不得代答。
+    ///
+    /// 判据取「或」，与 requires_approval 同一原则 —— 远端能加严不能放松：
+    ///   · 本地配置 requireUserConfirmOnInput=true → 该远端所有 input-required
+    ///     一律必须问用户
+    ///   · 本地为 false 时才听远端 metadata 的标记
+    ///
+    /// ⚠ 为什么需要这个字段：is_suspended() 只说"挂起了"，区分不了
+    ///   「模型可代答」（"用哪种格式导出？"）与「必须用户决定」
+    ///   （"确认转账 5000 元？"）。后者若让模型代答，决定权被悄悄拿走，
+    ///   而这类错误极难发现 —— 流程走通了、结果返回了，只是那个"确认"
+    ///   是模型猜的。
+    bool requires_user_action = false;
+
+    /// 远端侧的待确认凭据（如企微二次确认的 tokenId 列表）。
+    ///
+    /// ★ 我们【只透传】不解析其含义 —— 它是远端与终端之间的约定。
+    ///   带出来是为了进 details 供终端消费（拉起对应确认页面）。
+    std::vector<std::string> pending_token_ids;
 
     /// 面向模型的一段文本（工具返回值）。
     ///

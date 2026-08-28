@@ -40,6 +40,9 @@ src/remote_a2a/agent_tool.cc
 src/remote_a2a/config.cc
 src/remote_a2a/agent_registry.cc
 src/remote_a2a/runtime.cc
+src/tools/after_tool_call_policy.cc
+src/tools/before_tool_call_policy.cc
+src/tools/tool_approval_runtime.cc
 "
 
 exists() {
@@ -53,7 +56,11 @@ LOW="$(exists "$LOW_SRCS")"
 HIGH="$(exists "$HIGH_SRCS")"
 
 INFRA="src/infra/http_client.cc src/infra/system_events.cc"
-STUBS="tests/test_stub_tool_result.cc tests/test_stub_tool_manager.cc"
+# ⚠ test_stub_approval_deps.cc 提供 core::get_logger / core::utils /
+#   security::is_gateway_owner_only_core_tool / ToolHookManager 的占位实现 ——
+#   before/after_tool_call_policy 依赖它们, 而链真实实现会拖入
+#   llm/sessions/memory 一大串。
+STUBS="tests/test_stub_tool_result.cc tests/test_stub_tool_manager.cc tests/test_stub_approval_deps.cc"
 
 TOTAL_PASS=0
 TOTAL_FAIL=0

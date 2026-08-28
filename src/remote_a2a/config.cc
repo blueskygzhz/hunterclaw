@@ -302,6 +302,15 @@ core::Result<RemoteA2aConfig> parse_remote_a2a_config(const nlohmann::json& node
         rc.exec.callback_base_url = cfg.callback_base_url;
         if (rc.exec.enable_callback) any_callback = true;
 
+        // ★★ 强制用户确认：该远端的所有 input-required 都必须由用户答复。
+        //   与远端 metadata 的 requiresUserAction 取「或」——
+        //   远端能加严不能放松（与 requiresApproval 绝不从卡读同一原则）。
+        //   ⚠ 只听远端是不安全的：远端声明 false 就能让模型代答
+        //     本应由用户决定的事（如"确认转账"）。
+        rc.exec.require_user_confirm_on_input =
+            jbool(a, "requireUserConfirmOnInput", false,
+                  "require_user_confirm_on_input");
+
         // ★ 策略字段只从这里读，绝不从卡读（agent_card.h:10 第三条纪律）
         rc.policy.requires_approval =
             jbool(a, "requiresApproval", false, "requires_approval");

@@ -14,6 +14,7 @@
 #include "hunterclaw/tools/tool_manager.h"
 #include "hunterclaw/tools/tool_hooks.h"             // PluginHook* types + get_global_hook_manager()
 #include "hunterclaw/tools/before_tool_call_policy.h"
+#include "hunterclaw/tools/after_tool_call_policy.h"      // ✅ 执行后二次确认
 #include "hunterclaw/tools/deferred_approval_registry.h"  // ✅ Defer 凭据收敛 // unified before_tool_call policy chain
 #include "hunterclaw/sessions/transcript_io.h"       // append_tool_result_to_transcript (tool_result_persist)
 #include "hunterclaw/observability/observability.h"  // ✅ Span, Tracer, SpanKind
@@ -2336,6 +2337,45 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                 exec_opts.before_tool_call_applied = true;
                 auto result = tool_manager_->execute_tool(tool_call.name, effective_params,
                                                           nullptr, exec_opts);
+
+                // ── after_tool_call POLICY：执行后二次确认 ─────────────────
+                // ★★ 位置关键：必须在 results[] 写入、on_tool_end 回调、
+                //   AgentEvent 发出【之前】。
+                //
+                //   ⚠ 与下方 after_tool_call HOOK 是两件事：
+                //     · 本阶段：同步、可改结果、可拦截（fail-closed）
+                //     · 下方 hook：fire-and-forget、纯观测、改不了结果
+                //   把确认放到 hook 里会得到"确认还在等，结果已进 transcript"。
+                //
+                // ★ 绝大多数工具不声明 postExecConfirm，这里只是一次 has_key。
+                {
+                    tools::AfterToolCallContext post_ctx;
+                    post_ctx.tool_name = tool_call.name;
+                    post_ctx.tool_call_id = tool_call.id;
+                    post_ctx.run_id = callbacks.run_id;
+                    post_ctx.session_id = callbacks.session_id;
+                    post_ctx.aborted = &cancelled_;
+                    if (tool_manager_) {
+                        post_ctx.agent_id = tool_manager_->context().agent_id;
+                        post_ctx.session_key = tool_manager_->context().session_key;
+                    }
+                    auto post = tools::run_after_tool_call_policy(post_ctx, result);
+                    if (post.kind != tools::AfterToolCallOutcomeKind::Unchanged) {
+                        // ★ 无论 Confirmed 还是 Rejected 都改用加工后的结果:
+                        //   Confirmed 会在 details 标注决策(供审计),
+                        //   Rejected 则把结果整体替换为 blocked。
+                        result = std::move(post.result);
+                        if (post.needs_compensation()) {
+                            // ⚠ 补偿由【工具侧】完成而非这里 —— 策略层不知道
+                            //   这是个 remote_a2a 任务, 也不该知道。
+                            //   工具通过 details.postExecConfirmed=false 得知
+                            //   需要回收远端任务（否则留下僵尸任务占配额）。
+                            log()->warn("Tool '{}' post-exec confirmation rejected: {}",
+                                        tool_call.name, post.reason.value_or(""));
+                        }
+                    }
+                }
+
                 if (span) span->set_status(result.success, result.error);
                 if (callbacks.on_tool_end) callbacks.on_tool_end(tool_call.name, result);
                 results[tool_call.id] = result;
@@ -2644,6 +2684,35 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                     exec_opts.before_tool_call_applied = true;
                     auto result = tool_manager_->execute_tool(tool_call.name, args,
                                                               nullptr, exec_opts);
+
+                    // ── after_tool_call POLICY（并行路径）─────────────────
+                    // ⚠ 与串行路径【必须一致】。若这里漏做，并行调用的结果
+                    //   会绕过二次确认 —— 而"能否绕过"取决于模型是否并行发起，
+                    //   这类缺陷极难发现。
+                    //
+                    // ⚠ 本阶段可能阻塞等用户确认（≤120s），而这里在线程池
+                    //   worker 上。这会占住一个 worker —— 已知代价，可接受：
+                    //   声明 postExecConfirm 的工具本就极少，且确认是用户
+                    //   主动发起的交互（不是后台批量）。
+                    //   ★ 真正不可接受的是"不等就采信"：那份未确认的结果会
+                    //     进 transcript 并进入下一轮 prompt。
+                    {
+                        tools::AfterToolCallContext post_ctx;
+                        post_ctx.tool_name = tool_call.name;
+                        post_ctx.tool_call_id = tool_call.id;
+                        post_ctx.run_id = callbacks.run_id;
+                        post_ctx.session_id = callbacks.session_id;
+                        post_ctx.aborted = &cancelled_;
+                        if (tool_manager_) {
+                            post_ctx.agent_id = tool_manager_->context().agent_id;
+                            post_ctx.session_key = tool_manager_->context().session_key;
+                        }
+                        auto post = tools::run_after_tool_call_policy(post_ctx, result);
+                        if (post.kind != tools::AfterToolCallOutcomeKind::Unchanged) {
+                            result = std::move(post.result);
+                        }
+                    }
+
                     if (span) span->set_status(result.success, result.error);
                     auto dur = std::chrono::steady_clock::now() - start;
                     double ms = std::chrono::duration<double, std::milli>(dur).count();

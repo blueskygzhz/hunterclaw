@@ -4,6 +4,7 @@
 // ============================================================================
 
 #include "hunterclaw/remote_a2a/agent_tool.h"
+#include "hunterclaw/tools/after_tool_call_policy.h"  // PostExecConfirmRequest
 
 #include <algorithm>
 #include <cctype>
@@ -296,6 +297,12 @@ tools::ToolResult RemoteA2aAgentTool::execute(const core::JsonValue& params) {
     //   ⚠ details 不进 prompt（react_engine.cc:1076-1088 只读 content），
     //     所以模型看不到它 —— 模型所需的信息全在 r.render() 的文本里。
     details["suspended"] = r.is_suspended();
+    // ★★ 二次确认信号 —— 供终端（企微 SDK）消费以拉起确认页面。
+    //   ⚠ details 不进 prompt（模型看不到），模型所需的全在 render() 文本里。
+    details["requiresUserAction"] = r.requires_user_action;
+    if (!r.pending_token_ids.empty()) {
+        details["pendingTokenIds"] = r.pending_token_ids;
+    }
     if (r.reason) details["terminalReason"] = terminal_reason_text(*r.reason);
 
     if (!r.success) {
@@ -309,6 +316,35 @@ tools::ToolResult RemoteA2aAgentTool::execute(const core::JsonValue& params) {
     //   让渡返回 error 会让模型认为工具坏了并重试 → 同一远端任务被起两遍。
     auto res = tools::tool_result::text(r.render());
     res.details = core::JsonValue(details);
+
+    // ── 挂起且必须用户确认 → 声明执行后二次确认 ──────────────────────────
+    //
+    // ★★ 这次确认【买到的是什么】：确保那个"确认"来自用户而不是模型的猜测。
+    //   它不代替续接 —— 用户确认后，模型仍需带 task_id 把答复发回远端
+    //   （远端正停在 input-required 等消息）。
+    //   若没有这道确认，模型完全可能自己填"确认"并发回远端，
+    //   而流程照样走通、结果照样返回，只是决定权被悄悄拿走了。
+    //
+    // ⚠ 只在 requires_user_action 时声明。普通 input-required
+    //   （如"用哪种格式导出"）模型可以代答，弹确认卡片只是骚扰。
+    if (r.is_suspended() && r.requires_user_action) {
+        tools::PostExecConfirmRequest cr;
+        cr.title = "远端任务需要确认";
+        cr.description = r.prompt_text.empty()
+                             ? ("远端 agent '" + agent_name_ + "' 需要你确认后才能继续")
+                             : r.prompt_text;
+        cr.token_ids = r.pending_token_ids;
+        // ★ 必须 Request（等到答复才采信）。Defer 在这里等于"未确认就放行"，
+        //   after_tool_call_policy 会把它降级为 Request 并记 warn。
+        cr.mode = "request";
+        // ⚠ 不允许 allow-always：一次误点永久授权会让该远端后续所有
+        //   需确认操作全部免确认 —— 而这类操作恰恰是最需要每次都问的。
+        cr.allowed_decisions = {"allow-once", "deny"};
+        core::JsonValue d = res.details;
+        tools::attach_post_exec_confirm(d, cr);
+        res.details = std::move(d);
+    }
+
     // 远端明确失败时才置 success=false（让渡不算失败）。
     //
     // ★★ 挂起态【绝不】置 success=false —— 即使 error_text 因某条路径
@@ -404,6 +440,12 @@ tools::ToolResult RemoteA2aStatusTool::execute(const core::JsonValue& params) {
     details["completed"] = r.completed;
     details["yielded"] = r.yielded;
     details["suspended"] = r.is_suspended();
+    // ★★ 二次确认信号 —— 供终端（企微 SDK）消费以拉起确认页面。
+    //   ⚠ details 不进 prompt（模型看不到），模型所需的全在 render() 文本里。
+    details["requiresUserAction"] = r.requires_user_action;
+    if (!r.pending_token_ids.empty()) {
+        details["pendingTokenIds"] = r.pending_token_ids;
+    }
     if (r.reason) details["terminalReason"] = terminal_reason_text(*r.reason);
 
     if (!r.success) {

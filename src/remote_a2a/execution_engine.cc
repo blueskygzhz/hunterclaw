@@ -56,6 +56,64 @@ int64_t ExecutionConfig::effective_yield_ms() const {
     return std::max<int64_t>(10, std::min<int64_t>(yield_ms, 120000));
 }
 
+// ── 二次确认信号解析（★ 全部集中在此，报文位置定了只改这里）─────────────────
+
+ConfirmSignal extract_confirm_signal(const Task& t, bool force_user_action) {
+    ConfirmSignal sig;
+    // ★ 本地配置优先加严：远端【能加严不能放松】。
+    //   与 requires_approval 绝不从卡读同一原则 —— 若只听远端，
+    //   远端声明 requiresUserAction=false 就能绕过本地的用户确认要求。
+    sig.requires_user_action = force_user_action;
+
+    if (!t.status.message.has_value()) return sig;
+
+    for (const auto& p : t.status.message->parts) {
+        if (!p.metadata.is_object()) continue;
+
+        // requiresUserAction —— 取「或」，任一处声明即为真
+        for (const char* k : {"requiresUserAction", "requires_user_action"}) {
+            auto it = p.metadata.find(k);
+            if (it != p.metadata.end() && it->is_boolean() && it->get<bool>()) {
+                sig.requires_user_action = true;
+            }
+        }
+
+        // tokenIds
+        for (const char* k : {"tokenIds", "token_ids"}) {
+            auto it = p.metadata.find(k);
+            if (it == p.metadata.end() || !it->is_array()) continue;
+            for (const auto& v : *it) {
+                if (!v.is_string()) continue;
+                const std::string s = v.get<std::string>();
+                // ⚠ 空串与超长值一律丢弃：它们会原样进 details 供终端消费，
+                //   终端拿一个空 token 去拉页面只会失败；超长值可能是
+                //   远端把整段 JSON 塞进来（防御性截断上限 512）。
+                if (s.empty() || s.size() > 512) continue;
+                sig.token_ids.push_back(s);
+            }
+        }
+    }
+
+    // ⚠ 去重但【保序】：终端可能按顺序逐个确认，
+    //   用 set 去重会打乱顺序，让"先确认哪一个"变得不可预期。
+    std::vector<std::string> uniq;
+    for (const auto& s : sig.token_ids) {
+        bool dup = false;
+        for (const auto& u : uniq) {
+            if (u == s) { dup = true; break; }
+        }
+        if (!dup) uniq.push_back(s);
+    }
+    sig.token_ids = std::move(uniq);
+
+    // ★ 有 tokenIds 就意味着"有东西待用户确认" —— 隐含 requires_user_action。
+    //   ⚠ 不做这个推断会出现"给了 token 却没标 requiresUserAction"的报文
+    //     被当成模型可代答，而那些 token 永远没人去确认。
+    if (!sig.token_ids.empty()) sig.requires_user_action = true;
+
+    return sig;
+}
+
 // ── 结果渲染 ────────────────────────────────────────────────────────────────
 
 std::string ExecutionResult::render() const {
@@ -78,7 +136,15 @@ std::string ExecutionResult::render() const {
     //   再起一个新任务 —— 远端上于是堆积一串永远等不到输入的僵尸任务。
     if (is_suspended()) {
         const bool need_auth = (state == TaskState::AuthRequired);
-        ss << (need_auth ? "远端任务需要鉴权后才能继续" : "远端任务需要补充输入才能继续");
+        // ★★ 措辞按「谁来答」分流。
+        //   requires_user_action 时必须明说是【用户】确认 ——
+        //   否则模型会把"补充输入"理解成自己的任务。
+        if (requires_user_action) {
+            ss << "远端任务需要【用户】确认后才能继续";
+        } else {
+            ss << (need_auth ? "远端任务需要鉴权后才能继续"
+                             : "远端任务需要补充输入才能继续");
+        }
         ss << "（handle " << handle;
         // ★★ task_id 必须出现在【文本】里。
         //   ToolResult.details 不进 prompt（react_engine.cc:1076-1088 只读
@@ -94,6 +160,8 @@ std::string ExecutionResult::render() const {
         //   完全不知道要补什么。
         if (!prompt_text.empty()) {
             ss << "\n远端要求: " << prompt_text;
+        } else if (requires_user_action) {
+            ss << "\n远端未说明具体确认内容，请向用户转述并请其确认。";
         } else {
             // 远端没说要什么 —— 明确告诉模型，避免它凭空猜测后乱填
             ss << "\n远端未说明具体需要什么，请根据上下文判断或向用户询问。";
@@ -102,10 +170,28 @@ std::string ExecutionResult::render() const {
             ss << "\n已获得的部分结果: " << text;
         }
 
-        // 明确的续接指令：模型知道"要做什么"才不会卡住或改走别的工具
-        ss << "\n补齐后请再次调用本工具，并带上 task_id";
-        if (!context_id.empty()) ss << " 与 context_id";
-        ss << "，message 填写补充内容。";
+        if (requires_user_action) {
+            // ★★★ 必须【显式禁止代答】。
+            //
+            //   没有这句，模型完全可能自己填一个"确认"——
+            //   远端要的是用户的决定，拿到的是模型的猜测。
+            //   而这类错误极难发现：流程走通了、结果返回了，
+            //   只是决定权被悄悄拿走了。
+            ss << "\n⚠ 此项必须由用户明确答复，你【不得】代为判断、猜测或"
+                  "自行确认。请向用户转述上述内容并等待其明确答复。";
+            if (!pending_token_ids.empty()) {
+                ss << "\n（有 " << pending_token_ids.size()
+                   << " 项待用户在终端确认）";
+            }
+            ss << "\n拿到用户答复后，再次调用本工具并带上 task_id";
+            if (!context_id.empty()) ss << " 与 context_id";
+            ss << "，message 填写用户的原话。";
+        } else {
+            // 明确的续接指令：模型知道"要做什么"才不会卡住或改走别的工具
+            ss << "\n补齐后请再次调用本工具，并带上 task_id";
+            if (!context_id.empty()) ss << " 与 context_id";
+            ss << "，message 填写补充内容。";
+        }
         return ss.str();
     }
 
@@ -223,6 +309,20 @@ void ExecutionEngine::ingest_task(const std::string& handle, const Task& t,
     }
     if (!advanced) {
         store_->note_no_progress(handle);
+    }
+
+    // ── 二次确认信号 ────────────────────────────────────────────────────
+    // ★ 必须在【终态判定之前】记录: update_terminal 之后 phase 转 Terminal,
+    //   而 note_confirm_signal 需要在记录仍可写时落库。
+    //
+    // ★ 只在挂起态解析 —— 其他状态带 metadata 也无意义,
+    //   且能省掉绝大多数调用的遍历开销。
+    if (t.status.state == TaskState::InputRequired ||
+        t.status.state == TaskState::AuthRequired) {
+        ConfirmSignal sig = extract_confirm_signal(t, cfg_.require_user_confirm_on_input);
+        if (sig.requires_user_action || !sig.token_ids.empty()) {
+            store_->note_confirm_signal(handle, sig.requires_user_action, sig.token_ids);
+        }
     }
 
     if (is_terminal(t.status.state)) {
@@ -608,6 +708,8 @@ ExecutionResult ExecutionEngine::execute_with_yield(const Message& msg,
         //   在这里就合并会让挂起态丢掉追问（见 render 里的说明）。
         out.text = fin->result_text;
         out.prompt_text = fin->progress_text;
+        out.requires_user_action = fin->requires_user_action;
+        out.pending_token_ids = fin->pending_token_ids;
         out.error_text = fin->error_text;
         return out;
     }
@@ -623,6 +725,8 @@ ExecutionResult ExecutionEngine::execute_with_yield(const Message& msg,
         out.state = cur->state;
         out.text = cur->result_text;
         out.prompt_text = cur->progress_text;
+        out.requires_user_action = cur->requires_user_action;
+        out.pending_token_ids = cur->pending_token_ids;
     }
 
     if (cfg_.background_follow_up && !stopping_.load()) {
@@ -720,6 +824,8 @@ ExecutionResult ExecutionEngine::follow_up(const std::string& handle, int64_t wa
             out.state = now->state;
             out.text = now->result_text;
             out.prompt_text = now->progress_text;
+            out.requires_user_action = now->requires_user_action;
+            out.pending_token_ids = now->pending_token_ids;
         }
         return out;
     }
@@ -736,6 +842,8 @@ ExecutionResult ExecutionEngine::follow_up(const std::string& handle, int64_t wa
     //     input-required 最常见的入口（让渡后模型来取结果）。
     out.text = t.result_text;
     out.prompt_text = t.progress_text;
+    out.requires_user_action = t.requires_user_action;
+    out.pending_token_ids = t.pending_token_ids;
     out.error_text = t.error_text;
     return out;
 }

@@ -218,6 +218,31 @@ int PendingTaskStore::note_no_progress(const std::string& handle) {
 
 // ── 终结 ────────────────────────────────────────────────────────────────────
 
+bool PendingTaskStore::note_confirm_signal(const std::string& handle,
+                                          bool requires_user_action,
+                                          const std::vector<std::string>& token_ids) {
+    std::lock_guard<std::mutex> lk(mu_);
+    PendingTask* t = find_locked(handle);
+    if (!t) return false;
+
+    bool changed = false;
+    // ★ 单调置位 —— 只从 false→true，绝不反向。
+    //   ⚠ 远端通常只在【触发那一刻】的快照里带 metadata，后续 tasks/get
+    //     往往不再重复。若按最新快照覆盖，标记会被清掉，
+    //     措辞退回"请补充输入"，模型于是自行代答 —— 决定权被悄悄拿走。
+    if (requires_user_action && !t->requires_user_action) {
+        t->requires_user_action = true;
+        changed = true;
+    }
+    // 同理：空列表不覆盖已有 token（那通常意味着"这次快照没带"而非"清空了"）
+    if (!token_ids.empty() && t->pending_token_ids != token_ids) {
+        t->pending_token_ids = token_ids;
+        changed = true;
+    }
+    if (changed) t->updated_at_ms = now_ms();
+    return changed;
+}
+
 bool PendingTaskStore::update_terminal(const std::string& handle,
                                        TerminalReason reason, const std::string& text,
                                        const std::string& error_text,

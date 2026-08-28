@@ -80,6 +80,18 @@ struct PendingTask {
     std::string progress_text;
     std::string error_text;
 
+    /// ★★ 必须由【用户】决定，模型不得代答（见 ExecutionResult 同名字段）。
+    ///
+    /// ⚠ 必须持久在这里而非只存于 ExecutionResult：
+    ///   input-required 最常见的入口是让渡后模型调 status 工具（follow_up），
+    ///   那条路径【只读 store】—— 若信号不落库，follow_up 拿到的结果
+    ///   会丢掉"必须用户确认"这件事，措辞退回"请补充输入"，
+    ///   模型于是自行代答。
+    bool requires_user_action = false;
+
+    /// 远端侧的待确认凭据（透传给终端，我们不解析其含义）
+    std::vector<std::string> pending_token_ids;
+
     ProgressFingerprint fp;
     int consecutive_no_progress = 0;
 
@@ -138,6 +150,15 @@ public:
 
     /// 记录一次探测无推进（用于 Zombie 判定计数）
     int note_no_progress(const std::string& handle);
+
+    /// 记录二次确认信号（挂起态专用）。
+    ///
+    /// ★ 单调置位：一旦标记为"需用户确认"就【不再取消】。
+    ///   ⚠ 远端后续快照若漏带 metadata（很常见 —— 只有触发那一刻带），
+    ///     取消标记会让措辞退回"请补充输入"，模型于是自行代答。
+    ///   token_ids 为空时不覆盖已有值，同理。
+    bool note_confirm_signal(const std::string& handle, bool requires_user_action,
+                            const std::vector<std::string>& token_ids);
 
     /// 标记终结。
     ///
