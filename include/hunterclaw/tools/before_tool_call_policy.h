@@ -75,6 +75,38 @@ inline constexpr const char* kFailed    = "failed";
 inline constexpr const char* kCancelled = "cancelled";
 }  // namespace disposition
 
+// ── ApprovalMode ────────────────────────────────────────────────────────────
+// Strict port of OpenClaw approvalMode: "request" | "report" | "deny" | "defer"
+// (agent-tools.before-tool-call.approval.ts:482).
+//
+// ★ 存在四态而非一个 bool，是因为【不同宿主对"等用户"的承受能力不同】：
+//   · Request : 宿主有交互面, 可以阻塞等决策 (OpenClaw 的 fall-through 默认)
+//   · Report  : 宿主无法等 —— 把"需要审批"作为结果报回去, 由上层转述
+//   · Deny    : 批处理/无人值守 —— 需审批即等于拒绝
+//   · Defer   : 异步渠道 —— 不阻塞放行, 审批凭据交给调用方另行收敛
+//
+// ⚠ 默认取 Request 以严格对齐 OpenClaw。若宿主没有审批 UI,
+//   应【显式】设成 Report 或 Deny —— 不要把默认值改掉,
+//   否则所有宿主都跟着变, 而这是安全语义。
+enum class ApprovalMode {
+    Request,  // 默认: 请求并等待决策
+    Report,   // 不等待, 以 failure{blocked} 报回"需要审批"
+    Deny,     // 需审批即拒绝 -> veto{plugin-approval}
+    Defer,    // 不阻塞放行, 携带 deferred 凭据
+};
+
+// ── DeferredApproval ────────────────────────────────────────────────────────
+// Analog of OpenClaw DeferredPluginToolApproval (approval.ts:458).
+//
+// ★ Defer 模式下审批【已发起但未决策】, 工具照常执行。
+//   调用方必须自己收敛这张凭据 (等决策 / 取消), 否则请求会一直挂在
+//   ApprovalManager 里直到 timeout_ms 到期。
+struct DeferredApproval {
+    std::string approval_id;   // ApprovalManager 中的请求 id
+    std::string tool_name;
+    std::string tool_call_id;
+};
+
 // ── HookOutcome ─────────────────────────────────────────────────────────────
 // Direct analog of OpenClaw's HookOutcome union, flattened into one struct.
 struct HookOutcome {
@@ -89,6 +121,15 @@ struct HookOutcome {
     std::optional<std::string> reason;
     std::optional<std::string> denied_reason;// veto + failure
     std::optional<std::string> disposition;    // failure only
+
+    // ── Approval 相关 (OpenClaw: approvalResolution / deferredApproval) ─────
+    // 审批放行时记录决策 ("allow-once" / "allow-always"), 供审计与
+    // 上层"是否已批"判断使用。未经审批的 Pass 此字段为空。
+    std::optional<std::string> approval_resolution;
+
+    // ★ 仅 ApprovalMode::Defer 且确实发起了审批时有值。
+    //   有值意味着 "已放行但审批仍悬空", 调用方【必须】收敛它。
+    std::optional<DeferredApproval> deferred_approval;
 
     static HookOutcome pass(core::JsonValue params) {
         HookOutcome o;
