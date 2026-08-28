@@ -88,6 +88,10 @@ static const std::vector<std::string> GATEWAY_EVENTS = {
     "node.pair.requested", "node.pair.resolved", "node.invoke.request",
     "device.pair.requested", "device.pair.resolved", "voicewake.changed",
     "exec.approval.requested", "exec.approval.resolved", "update.available",
+    // ★ 工具审批事件。⚠ 不加进白名单会让 broadcast 静默丢弃 ——
+    //   审批请求发出了但客户端收不到, 于是必然等到超时,
+    //   而日志里只有一条"审批超时", 完全指不到事件被丢这件事。
+    "plugin.approval.requested", "plugin.approval.resolved",
 };
 
 // 🎯 OpenClaw 对齐: BASE_METHODS 列表 (对应 server-methods-list.ts:BASE_METHODS)
@@ -101,6 +105,12 @@ static const std::vector<std::string> GATEWAY_METHODS = {
     "exec.approvals.get", "exec.approvals.set",
     "exec.approvals.node.get", "exec.approvals.node.set",
     "exec.approval.request", "exec.approval.waitDecision", "exec.approval.resolve",
+    // ★ canonical 决策入口 + 工具审批四方法。
+    // ⚠ 不加进 GATEWAY_METHODS 会让客户端的能力协商看不到它们,
+    //   于是客户端不会去调 —— 功能存在却无人使用, 且无任何报错。
+    "approval.resolve",
+    "plugin.approval.list", "plugin.approval.request",
+    "plugin.approval.resolve", "plugin.approval.waitDecision",
     "talk.config", "talk.mode",
     "models.list", "tools.catalog",
     "agents.list", "agents.create", "agents.update", "agents.delete",
@@ -1420,6 +1430,15 @@ private:
                     // APPROVALS_SCOPE 方法
                     static const std::set<std::string> APPROVALS_METHODS = {
                         "exec.approval.request", "exec.approval.waitDecision", "exec.approval.resolve",
+                        // ★★ 必须与 method_guard.cc 的 scope 表保持一致。
+                        //   ⚠ 这里漏登记 = 非 admin operator 调这些方法时
+                        //     required_scope 为空 → 走默认分支放行,
+                        //     等于任何 operator 都能决策别人的审批,
+                        //     而 method_guard 那边却是要 APPROVALS scope 的。
+                        //     两张表不一致时以先命中者为准, 属静默的权限漏洞。
+                        "approval.resolve",
+                        "plugin.approval.list", "plugin.approval.request",
+                        "plugin.approval.resolve", "plugin.approval.waitDecision",
                     };
                     // PAIRING_SCOPE 方法
                     static const std::set<std::string> PAIRING_METHODS = {

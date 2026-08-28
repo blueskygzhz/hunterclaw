@@ -2215,9 +2215,18 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                 // 🎯 对齐 OpenClaw senderIsOwner + ownerOnly gate
                 if (tool_manager_) {
                     policy_ctx.sender_is_owner = tool_manager_->context().sender_is_owner;
+                    policy_ctx.agent_id = tool_manager_->context().agent_id;
+                    policy_ctx.session_key = tool_manager_->context().session_key;
                     if (auto t = tool_manager_->get_tool(tool_call.name)) {
                         policy_ctx.tool_is_owner_only = t->owner_only();
+                        // 🎯 对齐 OpenClaw needsApproval: 工具自我声明需审批。
+                        // ⚠ 此前 Tool::requires_approval() 【零消费】——
+                        //   声明要审批的工具(builtin_tools.cc:172/536 等)从不审批,
+                        //   声明方以为受保护, 实际直通且无日志可查。
+                        policy_ctx.tool_requires_approval = t->requires_approval();
                     }
+                    // ★ 为空时 Stage 1 按"不可用"处理并拒绝执行, 绝不放行。
+                    policy_ctx.approval_manager = tool_manager_->approval_manager();
                 }
 
                 auto outcome = tools::run_before_tool_call_policy(policy_ctx, tool_call.input);
@@ -2268,7 +2277,13 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                 span->set_attribute("tool_call_id", tool_call.id);
             } catch (...) {}
             try {
-                auto result = tool_manager_->execute_tool(tool_call.name, effective_params);
+                // ⚠ before_tool_call 链已在上方跑过(含 Stage 1 审批)。
+                //   不传此标志会让 execute_tool 再跑一遍 ——
+                //   用户会被【问两遍】同一个审批, hook 副作用也会重复。
+                tools::ToolManager::ExecuteOptions exec_opts;
+                exec_opts.before_tool_call_applied = true;
+                auto result = tool_manager_->execute_tool(tool_call.name, effective_params,
+                                                          nullptr, exec_opts);
                 if (span) span->set_status(result.success, result.error);
                 if (callbacks.on_tool_end) callbacks.on_tool_end(tool_call.name, result);
                 results[tool_call.id] = result;
@@ -2459,9 +2474,18 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                 // 🎯 对齐 OpenClaw senderIsOwner + ownerOnly gate
                 if (tool_manager_) {
                     policy_ctx.sender_is_owner = tool_manager_->context().sender_is_owner;
+                    policy_ctx.agent_id = tool_manager_->context().agent_id;
+                    policy_ctx.session_key = tool_manager_->context().session_key;
                     if (auto t = tool_manager_->get_tool(tool_call.name)) {
                         policy_ctx.tool_is_owner_only = t->owner_only();
+                        // 🎯 对齐 OpenClaw needsApproval: 工具自我声明需审批。
+                        // ⚠ 此前 Tool::requires_approval() 【零消费】——
+                        //   声明要审批的工具(builtin_tools.cc:172/536 等)从不审批,
+                        //   声明方以为受保护, 实际直通且无日志可查。
+                        policy_ctx.tool_requires_approval = t->requires_approval();
                     }
+                    // ★ 为空时 Stage 1 按"不可用"处理并拒绝执行, 绝不放行。
+                    policy_ctx.approval_manager = tool_manager_->approval_manager();
                 }
 
                 auto outcome = tools::run_before_tool_call_policy(policy_ctx, tool_call.input);
@@ -2521,7 +2545,11 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                 
                 try {
                     core::JsonValue args = parallel_effective_params;
-                    auto result = tool_manager_->execute_tool(tool_call.name, args);
+                    // ⚠ 同串行路径: 链已跑过, 避免审批问两遍 / hook 重复触发。
+                    tools::ToolManager::ExecuteOptions exec_opts;
+                    exec_opts.before_tool_call_applied = true;
+                    auto result = tool_manager_->execute_tool(tool_call.name, args,
+                                                              nullptr, exec_opts);
                     if (span) span->set_status(result.success, result.error);
                     auto dur = std::chrono::steady_clock::now() - start;
                     double ms = std::chrono::duration<double, std::milli>(dur).count();

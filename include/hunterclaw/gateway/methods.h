@@ -659,6 +659,38 @@ core::Result<json> method_exec_approval_wait_decision(std::shared_ptr<GatewaySer
 core::Result<json> method_exec_approval_resolve(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
 
 // ============================================================================
+// Canonical Approval Method
+// 🎯 严格对齐 OpenClaw: approval.resolve { id, kind, decision }
+//    (approval-gateway-resolver.ts:112-134 的 canonical 分支)
+//
+// ★ 这是【推荐】的决策入口。exec.approval.resolve 与
+//   plugin.approval.resolve 在 OpenClaw 中已明确标为 legacy
+//   (approval-gateway-resolver.ts:137-156 的 requestLegacyResolve)。
+//
+// ★★ kind 由调用方【显式传入】并与记录的实际归属【校验一致】,
+//   而不是由服务端猜。两个 legacy 方法各自隐含一种归属, 客户端
+//   一旦选错方法就会失败, 且失败原因("id 不存在")完全指错方向。
+// ============================================================================
+core::Result<json> method_approval_resolve(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
+
+// ============================================================================
+// Plugin Approval Methods (plugin_approval.cc)
+// 🎯 严格对齐 OpenClaw: server-methods/plugin-approval.ts
+//
+// ★ 工具审批走这一组 (PluginApprovalRequestPayload: title/description/
+//   toolName/toolCallId), 与 exec 审批共用同一个 ExecApprovalManager,
+//   归属由 payload 形状判别。
+//
+// ⚠ 这四个方法此前【未在 methods_registry 注册】—— 整个 plugin_approval.cc
+//   是死代码, 客户端调 plugin.approval.* 会得到 "unknown method"。
+//   这也是它内部四处偏离能长期存在而没被发现的原因。
+// ============================================================================
+core::Result<json> method_plugin_approval_list(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
+core::Result<json> method_plugin_approval_request(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
+core::Result<json> method_plugin_approval_resolve(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
+core::Result<json> method_plugin_approval_wait_decision(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
+
+// ============================================================================
 // Exec Approvals Methods (stubs.cc)
 // 🎯 OpenClaw 严格对齐: server-methods/exec-approvals.ts execApprovalsHandlers
 // ============================================================================

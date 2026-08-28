@@ -156,6 +156,15 @@ ToolResult ToolManager::execute_tool(
     const core::JsonValue& params,
     ToolUpdateCallback on_update
 ) {
+    return execute_tool(name, params, std::move(on_update), ExecuteOptions{});
+}
+
+ToolResult ToolManager::execute_tool(
+    const std::string& name,
+    const core::JsonValue& params,
+    ToolUpdateCallback on_update,
+    const ExecuteOptions& options
+) {
     auto start = std::chrono::steady_clock::now();
     
     // 1. 查找工具
@@ -165,6 +174,17 @@ ToolResult ToolManager::execute_tool(
     }
     
     // 2. 策略检查 (100% 对齐 OpenClaw)
+    //
+    // ★★ 审批【已移出本段】, 现为 before_tool_call 链的 Stage 1
+    //   (before_tool_call_policy.cc 的 run_approval_gate)。原因有两条:
+    //
+    //   ① 本段被 `policy_enabled_ && policy_pipeline_` 门控, 而
+    //      policy_enabled_ 默认 false —— 默认部署下审批链路根本不存在。
+    //      安全门禁不能挂在一个默认关闭的开关后面。
+    //   ② 审批语义(四种 ApprovalMode / 三类 denied_reason)只该实现一份。
+    //
+    //   本段现在只保留 DENY 与「把 REQUIRE_APPROVAL 转交策略链」两件事。
+    bool policy_requires_approval = false;
     if (policy_enabled_ && policy_pipeline_) {
         PolicyContext policy_ctx;
         policy_ctx.tool_name = name;
@@ -180,82 +200,28 @@ ToolResult ToolManager::execute_tool(
         
         if (policy_result.decision == PolicyDecision::REQUIRE_APPROVAL) {
             log()->info("Tool '{}' requires approval: {}", name, policy_result.reason);
-            
-            // 实现用户审批流程（对齐 OpenClaw）
-            if (approval_manager_) {
-                // 构建审批请求
-                std::string command = name;
-                if (params.is_object() && params.contains("command")) {
-                    command = params["command"].as_string();
-                }
-                
-                std::vector<std::string> argv = {name};
-                if (params.is_object() && params.contains("args") && params["args"].is_array()) {
-                    // 简化处理：从字符串解析参数
-                    if (params["args"].is_string()) {
-                        std::string args_str = params["args"].as_string();
-                        // 简单的空格分割
-                        std::istringstream iss(args_str);
-                        std::string arg;
-                        while (iss >> arg) {
-                            argv.push_back(arg);
-                        }
-                    }
-                }
-                
-                std::string cwd = context_.workspace_dir;
-                if (params.is_object() && params.contains("cwd")) {
-                    cwd = params["cwd"].as_string();
-                }
-                
-                auto agent_config = approval_manager_->get_agent_config(context_.agent_id);
-                auto approval_req = build_approval_request(
-                    command, argv, cwd, 
-                    context_.agent_id, context_.session_key, 
-                    agent_config
-                );
-                
-                // 请求审批
-                auto req_result = approval_manager_->request_approval(approval_req);
-                if (req_result.is_err()) {
-                    return tool_result::error("Failed to request approval: " + req_result.error);
-                }
-                
-                log()->info("Waiting for approval: {}", approval_req.id);
-                
-                // 等待用户决策
-                auto resp_result = approval_manager_->wait_decision(approval_req.id);
-                if (resp_result.is_err()) {
-                    return tool_result::error("Approval wait failed: " + resp_result.error);
-                }
-                
-                auto& response = resp_result.get();
-                
-                // 处理决策
-                if (response.decision == ApprovalDecision::DENY) {
-                    log()->warn("Tool '{}' denied by user", name);
-                    return tool_result::error("Execution denied by user: " + response.reason);
-                }
-                
-                if (response.decision == ApprovalDecision::TIMEOUT) {
-                    log()->warn("Tool '{}' approval timeout", name);
-                    return tool_result::error("Approval timeout");
-                }
-                
-                // ALLOW_ONCE 或 ALLOW_ALWAYS，继续执行
-                log()->info("Tool '{}' approved by {}", name, response.resolved_by);
-            } else {
-                // 没有 approval_manager，直接拒绝
-                return tool_result::error("Tool requires approval but approval manager not configured");
-            }
+            // ★ 只记录, 不在此处发起审批 —— 交给下面 before_tool_call 链的
+            //   Stage 1 统一处理。这样审批只有【一个】执行点:
+            //     · 不会与 react_engine 已跑过的链重复问用户
+            //     · 不受 policy_enabled_ 门控 (工具自声明的审批照样生效)
+            //     · 四种 ApprovalMode / denied_reason 语义只实现一份
+            policy_requires_approval = true;
         }
     }
     
     // 3. Before Hooks (参数修改和验证) — 严格对齐 OpenClaw runBeforeToolCallHook()
     // 🎯 owner-only 门禁 (Stage 0) 需在无插件 hook 时也执行, 因此 policy 链
     // 无条件运行; hook 阶段在hook_manager 为空时内部跳过。
+    //
+    // ⚠⚠ options.before_tool_call_applied=true 时【整段跳过】:
+    //   调用方(react_engine)已经跑过同一条链。重复跑的后果:
+    //     · 审批被问两遍 —— 用户点了同意又被弹一次
+    //     · before_tool_call 插件 hook 副作用执行两次
+    //     · 参数被 hook 改写两轮, 第二轮基于已改写的值
+    //   跳过是安全的: 调用方跑的是【同一个函数】, 门禁强度完全相同,
+    //   且它已按结果决定是否继续（Veto/Failure 时根本不会走到这里）。
     core::JsonValue effective_params = params;
-    {
+    if (!options.before_tool_call_applied) {
         BeforeToolCallContext policy_ctx;
         policy_ctx.tool_name = name;
         policy_ctx.agent_id = context_.agent_id;
@@ -265,6 +231,13 @@ ToolResult ToolManager::execute_tool(
         // 🎯 对齐 OpenClaw senderIsOwner +ownerOnly gate
         policy_ctx.sender_is_owner = context_.sender_is_owner;
         policy_ctx.tool_is_owner_only = tool->owner_only();
+        // 🎯 对齐 OpenClaw needsApproval / trustedPolicyResult.requireApproval:
+        //   工具自声明 与 策略判定 两个来源取"或", 由 Stage 1 统一裁决。
+        // ⚠ tool_requires_approval 此前【零消费】—— 声明要审批的工具从不审批。
+        policy_ctx.tool_requires_approval = tool->requires_approval();
+        policy_ctx.policy_requires_approval = policy_requires_approval;
+        // ★ 为空时 Stage 1 拒绝执行而非放行 (plugin-approval-unavailable)。
+        policy_ctx.approval_broker = approval_broker_.get();
         policy_ctx.hook_manager = hook_manager_ ? hook_manager_.get() : nullptr;
 
         auto outcome = run_before_tool_call_policy(policy_ctx, params);
@@ -620,6 +593,10 @@ void ToolManager::set_loop_detector(std::shared_ptr<ToolLoopDetector> detector) 
 
 void ToolManager::set_result_processor(std::shared_ptr<ResultProcessingPipeline> processor) {
     result_processor_ = processor;
+}
+
+void ToolManager::set_approval_broker(std::shared_ptr<ToolApprovalBroker> broker) {
+    approval_broker_ = std::move(broker);
 }
 
 void ToolManager::set_mcp_registry(std::shared_ptr<void> registry) {

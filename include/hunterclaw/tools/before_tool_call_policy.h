@@ -33,6 +33,7 @@
 #include <atomic>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace hunterclaw {
 
@@ -100,11 +101,51 @@ enum class ApprovalMode {
 //
 // ★ Defer 模式下审批【已发起但未决策】, 工具照常执行。
 //   调用方必须自己收敛这张凭据 (等决策 / 取消), 否则请求会一直挂在
-//   ApprovalManager 里直到 timeout_ms 到期。
+//   审批 broker 里直到 timeout_ms 到期。
 struct DeferredApproval {
-    std::string approval_id;   // ApprovalManager 中的请求 id
+    std::string approval_id;   // broker 中的请求 id
     std::string tool_name;
     std::string tool_call_id;
+};
+
+// ── ToolApprovalBroker ──────────────────────────────────────────────────────
+// 工具审批的传输抽象。
+//
+// ★★ 为什么是接口而不是直接用某个 manager:
+//   OpenClaw 的工具审批走 PluginApprovalRequestPayload
+//   (title/description/toolName/toolCallId), 由 gateway 侧的
+//   审批 store 承载, 并经 plugin.approval.requested 事件推给客户端。
+//   而 tools 层【不依赖】gateway (bazel query 可证 somepath 为空) ——
+//   直接引用会形成 tools→gateway→agents→tools 的依赖环。
+//
+//   故此处只声明"发起 + 等待"两个动作, 由 gateway 侧注入实现。
+//   与 remote_a2a 用 std::function 注入路由挂载器是同一手法。
+//
+// ⚠ 实现方【必须】构造 plugin 形状的载荷 (title+description),
+//   不能塞进 exec 的 command 字段 —— OpenClaw 按载荷形状判别归属
+//   (resolveApprovalRequestKind, "never from id spelling"),
+//   形状错了会让客户端按命令卡片渲染工具审批, 且 allow-always
+//   会把工具名当命令写进 exec 白名单。
+class ToolApprovalBroker {
+public:
+    virtual ~ToolApprovalBroker() = default;
+
+    /// 发起一次工具审批。
+    /// @param allowed_decisions 为空表示默认全集; 非空时限定可选决策
+    ///        (例如不允许 allow-always —— 见 remote_a2a 的用户确认场景)。
+    /// @return 审批 id; 空字符串表示发起失败
+    virtual std::string request_tool_approval(
+        const std::string& tool_name,
+        const std::string& tool_call_id,
+        const std::string& agent_id,
+        const std::string& session_key,
+        int64_t timeout_ms,
+        const std::vector<std::string>& allowed_decisions) = 0;
+
+    /// 等待决策。
+    /// @return "allow-once" / "allow-always" / "deny"；nullopt = 超时/不存在
+    virtual std::optional<std::string> wait_tool_approval(
+        const std::string& approval_id, int64_t timeout_ms) = 0;
 };
 
 // ── HookOutcome ─────────────────────────────────────────────────────────────
@@ -184,6 +225,40 @@ struct BeforeToolCallContext {
     // (OpenClaw: signal.throwIfAborted()).
     const std::atomic<bool>* aborted = nullptr;
 
+    // ── Approval gate (Stage 1) ─────────────────────────────────────────────
+    // 🎯 对齐 OpenClaw trustedPolicyResult.requireApproval ->
+    //    resolveBeforeToolCallApprovalOutcome() (policy.ts:274-294)。
+    //
+    // ★★ tool_requires_approval 来自 Tool::requires_approval()。
+    //   在此之前该虚函数【定义了却零消费】—— builtin_tools.cc:172/536 两个
+    //   工具声明 requires_approval()=true 却从不审批, 是静默失效的安全缺口:
+    //   声明方以为受保护, 实际上直接执行, 且没有任何日志能看出来。
+    bool tool_requires_approval = false;
+
+    // 命中策略管道 REQUIRE_APPROVAL 时置真 (与 tool_requires_approval 取"或")。
+    // ⚠ 两个来源都要, 不能二选一: 前者是工具的自我声明(静态),
+    //   后者是策略对本次参数的判定(动态)。任一要求审批即需审批。
+    bool policy_requires_approval = false;
+
+    // ⚠ 见 ApprovalMode 的说明: 默认 Request 是为了对齐 OpenClaw,
+    //   宿主无审批 UI 时应【显式】改成 Report/Deny, 而不是改默认值。
+    ApprovalMode approval_mode = ApprovalMode::Request;
+
+    // ★★ 工具审批的传输通道 (plugin 形状载荷 + gateway 广播)。
+    //   为空时按【不可用】处理 -> failure{plugin-approval-unavailable},
+    //   【绝不】放行。对齐 OpenClaw
+    //   resolveUnavailablePluginApprovalSurfaceReason()。
+    //   ⚠ 放行是安全漏洞: 没配 broker 的部署会让所有需审批工具静默直通。
+    ToolApprovalBroker* approval_broker = nullptr;
+
+    // 限定本次审批允许的决策集合; 为空用默认全集。
+    // ★ 用途: 某些操作不该允许 allow-always
+    //   (例如"确认转账 5000 元" —— 永久授权绝不行)。
+    std::vector<std::string> allowed_decisions;
+
+    // 审批等待上限。<=0 时由 broker 用默认值 (120s)。
+    int64_t approval_timeout_ms = 0;
+
     // Optional loop-detection state (OpenClaw: admitSingleToolCallLoop).
     // When null, loop admission is skipped.
     LoopDetectionState* loop_state = nullptr;
@@ -195,12 +270,37 @@ struct BeforeToolCallContext {
 // ── run_before_tool_call_policy ─────────────────────────────────────────────
 // Strict port of OpenClaw runBeforeToolCallHook(). Ordered stages:
 //   0. owner-only gate                  -> veto{owner-only}
-//   1. tool-loop admission              -> veto{tool-loop}
-//   2. before_tool_call hook runner     -> veto{plugin-before-tool-call}
+//   1. approval gate                    -> 见下表 (OpenClaw policy.ts:274-294)
+//   2. tool-loop admission              -> veto{tool-loop}
+//   3. before_tool_call hook runner     -> veto{plugin-before-tool-call}
 //                -> params merge (adjusted params)
-//   3. hook threw                       -> failure{disposition}
-// (Approval / voice stages are represented via require_approval on the hook
-//  result and resolved by the injected approval resolver when present.)
+//   4. hook threw                       -> failure{disposition}
+//   5. post-hook cancellation check     -> failure{cancelled}
+//
+// ★ Approval 在 Stage 1 (owner-only 之后、tool-loop 之前) —— 与 OpenClaw
+//   一致: 身份门禁最先(连问都不该问), 审批在业务判定之前。
+//
+// ⚠⚠ Approval 【不受任何 enable 开关控制】。它曾经被放在
+//   tool_manager.cc 的 `if (policy_enabled_ && policy_pipeline_)` 里,
+//   而 policy_enabled_ 默认 false —— 等于默认部署下审批链路根本不存在。
+//   安全门禁不能挂在一个默认关闭的开关后面。
+//
+// Approval 结果映射 (逐字对齐 approval.ts, ⚠ 注意其中的不对称):
+//   ┌──────────────────────┬─────────┬────────────┬───────────────────────────┐
+//   │ 场景                 │ kind    │disposition │ denied_reason             │
+//   ├──────────────────────┼─────────┼────────────┼───────────────────────────┤
+//   │ ALLOW_ONCE/ALWAYS    │ Pass    │ —          │ —                         │
+//   │ 用户 DENY            │ Failure │ blocked    │ plugin-approval           │
+//   │ 超时                 │ Failure │ timed_out  │ plugin-approval           │
+//   │ manager 缺失         │ Failure │ failed     │ plugin-approval-unavailable│
+//   │ mode=Report          │ Failure │ blocked    │ plugin-approval           │
+//   │ mode=Deny            │ Veto    │ —          │ plugin-approval           │
+//   │ mode=Defer           │ Pass    │ —          │ — (+deferred_approval)    │
+//   └──────────────────────┴─────────┴────────────┴───────────────────────────┘
+//   ★ "用户 DENY 是 Failure" 而 "mode=Deny 是 Veto" 【不是笔误】——
+//     OpenClaw approval.ts:232-240 vs :526-535 原样如此。
+//     语义差别: 前者是"审批流程跑完了, 结论是拒绝"(事故性终止, 带 disposition);
+//     后者是"根本没跑审批, 策略直接否决"(意图性拒绝)。
 HookOutcome run_before_tool_call_policy(
     const BeforeToolCallContext& ctx,
     const core::JsonValue& original_params);

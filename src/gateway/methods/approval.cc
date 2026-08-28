@@ -578,6 +578,18 @@ core::Result<json> method_exec_approval_resolve(
     // 获取 snapshot（用于广播 request 信息）
     auto snapshot = manager->get_snapshot(approval_id);
 
+    // ⚠ 归属校验: 本方法(legacy exec 路径)只该决策 exec 审批。
+    //   同一 store 现在同时承载 exec 与 plugin 两类记录, 放行 plugin
+    //   会让"exec 方法批了一条工具审批" —— 审计对不上, 且下面的
+    //   allow-always 白名单逻辑是为 exec 命令写的, 对 plugin 无意义。
+    //   ★ 客户端应改用 canonical approval.resolve (带 kind) 或
+    //     plugin.approval.resolve。
+    if (snapshot.has_value() && snapshot->kind() != ApprovalKind::Exec) {
+        return core::Result<json>::Err(
+            "approval id does not belong to an exec approval; "
+            "use approval.resolve with kind or plugin.approval.resolve");
+    }
+
     // resolved_by: client display name or id
     std::string resolved_by;
     if (!client_ctx.connect.client.display_name.value_or("").empty()) {
@@ -601,7 +613,10 @@ core::Result<json> method_exec_approval_resolve(
         if (!resolved_by.empty()) event_payload["resolvedBy"] = resolved_by;
         event_payload["ts"] = now_ms();
         if (snapshot.has_value()) {
-            event_payload["request"] = snapshot.value().request.to_json();
+            // ★ 按归属输出对应形状的 request —— plugin 记录要输出
+            //   title/description 而非 command, 否则接收方用
+            //   resolve_approval_request_kind 反推会得到错误归属。
+            event_payload["request"] = snapshot.value().request_to_json();
         }
         runtime->broadcast(
             "exec.approval.resolved",
@@ -613,7 +628,15 @@ core::Result<json> method_exec_approval_resolve(
     // 对齐 OpenClaw: allow-always → 使用 resolveAllowAlwaysPatterns 添加到白名单
     // OpenClaw bash-tools.exec-host-gateway.ts:226-239
     // 当 shell wrapper 时，持久化内层可执行文件路径而非 shell 二进制本身
-    if (decision == "allow-always" && snapshot.has_value()) {
+    //
+    // ⚠⚠ 必须限定 kind == Exec。
+    //   现在同一个 store 里同时有 exec 与 plugin 两类记录, 而 plugin 记录的
+    //   `request.command` 是【空字符串】。若不加这道判定, 对一条 plugin
+    //   审批点 allow-always 会把空 pattern 写进 exec 白名单 ——
+    //   空 pattern 在 glob 匹配下的行为取决于实现, 最坏情况是匹配一切,
+    //   等于一次点击就把 exec 审批整体关掉。
+    if (decision == "allow-always" && snapshot.has_value() &&
+        snapshot.value().kind() == ApprovalKind::Exec) {
         const auto& req = snapshot.value().request;
         std::string agent_id = req.agent_id.value_or("main");
         
@@ -810,6 +833,105 @@ core::Result<json> method_exec_approvals_node_set(
     result["ok"] = true;
     result["nodeId"] = node_id;
     return core::Result<json>::Ok(result);
+}
+
+// ============================================================================
+// approval.resolve — canonical 决策入口
+// 🎯 严格对齐 OpenClaw approval-gateway-resolver.ts:112-134
+//    canonicalGatewayRuntime.request("approval.resolve", {id, kind, decision})
+// ============================================================================
+core::Result<json> method_approval_resolve(
+    std::shared_ptr<GatewayServer> server,
+    std::shared_ptr<MethodGuard> method_guard,
+    const ClientContext& client_ctx,
+    const json& params
+) {
+    if (!params.contains("id") || !params["id"].is_string()) {
+        return core::Result<json>::Err("id is required");
+    }
+    if (!params.contains("decision") || !params["decision"].is_string()) {
+        return core::Result<json>::Err("decision is required");
+    }
+
+    auto manager = server->exec_approval_manager();
+    if (!manager) {
+        return core::Result<json>::Err("approval manager not available");
+    }
+
+    std::string id = params["id"].get<std::string>();
+    while (!id.empty() && id.front() == ' ') id.erase(0, 1);
+    while (!id.empty() && id.back() == ' ') id.pop_back();
+    if (id.empty()) return core::Result<json>::Err("id is required");
+
+    // ── 定位记录（支持前缀，与两个 legacy 方法一致）─────────────────────
+    auto lookup = manager->lookup_pending_id(id);
+    if (lookup.kind == ExecApprovalIdLookupResult::Kind::None) {
+        return core::Result<json>::Err("unknown or expired approval id");
+    }
+    if (lookup.kind == ExecApprovalIdLookupResult::Kind::Ambiguous) {
+        std::string candidates;
+        int count = 0;
+        for (const auto& cid : lookup.ids) {
+            if (count > 0) candidates += ", ";
+            candidates += cid;
+            if (++count >= 3) break;
+        }
+        int remainder = (int)lookup.ids.size() - 3;
+        std::string suffix = remainder > 0
+            ? " (+" + std::to_string(remainder) + " more)" : "";
+        return core::Result<json>::Err(
+            "ambiguous approval id prefix; matches: " + candidates + suffix +
+            ". Use the full id.");
+    }
+
+    auto snapshot = manager->get_snapshot(lookup.id);
+    if (!snapshot.has_value()) {
+        return core::Result<json>::Err("unknown or expired approval id");
+    }
+    const ApprovalKind actual_kind = snapshot->kind();
+
+    // ── kind 校验 ───────────────────────────────────────────────────────
+    // ★★ kind 由调用方【显式传入】, 服务端只做【校验】不做推断。
+    //
+    // ⚠ 为什么要校验而不是"有就用没有就推断":
+    //   客户端传错 kind 说明它对这条审批的理解与服务端不一致 ——
+    //   继续执行会让它以为批的是 A 实际批的是 B。宁可报错让它重新拉列表。
+    //
+    // ★ kind 缺省时【允许】(取记录的实际归属): OpenClaw 的
+    //   canonical 分支要求 canonicalKind 非空才走, 缺省时回落 legacy;
+    //   我们这里直接用实际归属, 效果等价且少一次往返。
+    if (params.contains("kind")) {
+        if (!params["kind"].is_string()) {
+            return core::Result<json>::Err("kind must be a string");
+        }
+        auto want = approval_kind_from_wire(params["kind"].get<std::string>());
+        if (!want.has_value()) {
+            return core::Result<json>::Err("invalid kind (expected exec or plugin)");
+        }
+        if (*want != actual_kind) {
+            return core::Result<json>::Err(
+                std::string("kind mismatch: approval is '") +
+                approval_kind_to_wire(actual_kind) + "'");
+        }
+    }
+
+    // ── 委派到对应的 legacy 实现 ────────────────────────────────────────
+    // ★ 刻意【委派】而非重新实现: 决策的副作用(白名单写入、广播、
+    //   allowedDecisions 校验)各有一份且已被验证。在这里复制一遍
+    //   会产生第二份实现, 两份必然随时间漂移 —— 而漂移点是安全逻辑。
+    //
+    // ⚠ 传【完整 id】而非用户给的前缀: legacy 方法会再做一次
+    //   lookup_pending_id, 若把前缀传下去, 在两次 lookup 之间
+    //   新增了同前缀的审批就会变成 Ambiguous 而失败。
+    json forwarded = params;
+    forwarded["id"] = lookup.id;
+    forwarded.erase("kind");   // legacy 方法不认识 kind
+
+    if (actual_kind == ApprovalKind::Plugin) {
+        return method_plugin_approval_resolve(server, method_guard, client_ctx,
+                                             forwarded);
+    }
+    return method_exec_approval_resolve(server, method_guard, client_ctx, forwarded);
 }
 
 } // namespace methods

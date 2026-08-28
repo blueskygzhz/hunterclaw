@@ -26,6 +26,7 @@ class ToolLoopDetector;
 class PolicyPipeline;
 class ResultProcessingPipeline;
 class ApprovalManager;
+class ToolApprovalBroker;
 
 struct ToolUpdate;
 using ToolUpdateCallback = std::function<void(const ToolUpdate&)>;
@@ -45,6 +46,28 @@ public:
     ToolResult execute_tool(const std::string& name, const core::JsonValue& params);
     ToolResult execute_tool(const std::string& name, const core::JsonValue& params, 
                            ToolUpdateCallback on_update);
+
+    /// 执行选项。
+    ///
+    /// ★ before_tool_call_applied：调用方【已经】跑过 before_tool_call 策略链。
+    ///
+    /// ⚠⚠ 这个开关是必需的，不是优化。react_engine 出于 loop-detection 的
+    ///   归属（它持有 LoopDetectionState，见 before_tool_call_policy.cc 的
+    ///   Stage 2 说明）自己先跑一遍链，随后才调 execute_tool。若 execute_tool
+    ///   再跑一遍，后果是：
+    ///     · **审批被问两遍** —— 用户点了同意，又被弹一次
+    ///     · before_tool_call 插件 hook 触发两次（副作用重复执行）
+    ///     · 参数被 hook 改写两轮，第二轮基于已改写的值
+    ///   审批加入后第一条变成用户可见的 bug，故必须显式关掉重复执行。
+    ///
+    /// ★ 默认 false：对于**没有**自己跑链的调用方（外部/未来接入方），
+    ///   execute_tool 必须自带完整门禁 —— 安全默认值不能是"跳过检查"。
+    struct ExecuteOptions {
+        bool before_tool_call_applied = false;
+    };
+
+    ToolResult execute_tool(const std::string& name, const core::JsonValue& params,
+                           ToolUpdateCallback on_update, const ExecuteOptions& options);
     
     // Policy management
     void set_policy_enabled(bool enabled);
@@ -52,6 +75,17 @@ public:
     
     // Approval management
     void set_approval_manager(std::shared_ptr<ApprovalManager> manager);
+
+    /// 工具审批的传输通道（gateway 侧注入）。
+    ///
+    /// ★ 与 ApprovalManager 是两件事:
+    ///   · ApprovalManager  —— exec 命令审批的白名单/配置管理
+    ///   · ToolApprovalBroker —— 工具审批的发起+等待 (plugin 形状载荷)
+    ///
+    /// ⚠ 为空时 before_tool_call Stage 1 按「审批面不可用」拒绝执行，
+    ///   【不会】放行 —— 否则没配 broker 的部署会让所有需审批工具静默直通。
+    void set_approval_broker(std::shared_ptr<ToolApprovalBroker> broker);
+    ToolApprovalBroker* approval_broker() const { return approval_broker_.get(); }
     
     // Hook management
     void set_hook_manager(std::shared_ptr<ToolHookManager> manager);
@@ -103,6 +137,7 @@ private:
     std::shared_ptr<PolicyPipeline> policy_pipeline_;
     std::shared_ptr<ResultProcessingPipeline> result_processor_;
     std::shared_ptr<ApprovalManager> approval_manager_;
+    std::shared_ptr<ToolApprovalBroker> approval_broker_;
     
     // MCP integration
     std::shared_ptr<mcp::McporterClient> mcp_client_;

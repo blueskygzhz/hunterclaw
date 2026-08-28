@@ -387,6 +387,16 @@ std::map<std::string, std::string> MethodGuard::get_default_method_scopes() {
         {"exec.approval.request",       operator_scope::APPROVALS},
         {"exec.approval.waitDecision",  operator_scope::APPROVALS},
         {"exec.approval.resolve",       operator_scope::APPROVALS},
+        // ★ canonical 入口与 plugin(工具)审批同属 APPROVALS scope。
+        //
+        // ⚠⚠ 必须显式列出。审批决策是【授权动作】—— 漏登记会让它落到
+        //   默认分支: 要么无 scope 校验(任何 operator 都能批别人的审批),
+        //   要么被一律拒绝(功能静默不可用)。两种都不能接受, 且都不会报错。
+        {"approval.resolve",               operator_scope::APPROVALS},
+        {"plugin.approval.list",           operator_scope::APPROVALS},
+        {"plugin.approval.request",        operator_scope::APPROVALS},
+        {"plugin.approval.resolve",        operator_scope::APPROVALS},
+        {"plugin.approval.waitDecision",   operator_scope::APPROVALS},
 
         // ========== operator.pairing ==========
         {"node.pair.request",    operator_scope::PAIRING},

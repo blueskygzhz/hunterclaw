@@ -215,9 +215,26 @@ create_method_handler(std::shared_ptr<GatewayServer> server) {
 
         // ── Exec Approval (exec-approval.ts) ────────────────────────────────
         // 🎯 OpenClaw 对齐: execApprovalHandlers
+        // ⚠ LEGACY: 新客户端请用 canonical "approval.resolve"（带 kind）。
+        //   对齐 OpenClaw approval-gateway-resolver.ts:137-156 的
+        //   requestLegacyResolve —— 那里明确把这两个方法标为 legacy。
         {"exec.approval.request",           methods::method_exec_approval_request},
         {"exec.approval.waitDecision",      methods::method_exec_approval_wait_decision},
         {"exec.approval.resolve",           methods::method_exec_approval_resolve},
+
+        // ── Canonical Approval (approval-gateway-resolver.ts:112-134) ────────
+        // 🎯 推荐入口: approval.resolve { id, kind, decision }
+        //   kind 由调用方显式传入并与记录实际归属校验一致。
+        {"approval.resolve",                methods::method_approval_resolve},
+
+        // ── Plugin Approval (plugin-approval.ts) ─────────────────────────────
+        // 🎯 OpenClaw 对齐: 工具审批走这一组（PluginApprovalRequestPayload）
+        // ⚠ 这四个方法此前【从未注册】—— plugin_approval.cc 整个是死代码,
+        //   客户端调用会得到 "unknown method"。
+        {"plugin.approval.list",            methods::method_plugin_approval_list},
+        {"plugin.approval.request",         methods::method_plugin_approval_request},
+        {"plugin.approval.resolve",         methods::method_plugin_approval_resolve},
+        {"plugin.approval.waitDecision",    methods::method_plugin_approval_wait_decision},
 
         // ── Exec Approvals (exec-approvals.ts) ──────────────────────────────
         // 🎯 OpenClaw 对齐: execApprovalsHandlers
