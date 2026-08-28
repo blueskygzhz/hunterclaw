@@ -7,6 +7,7 @@
 #include "hunterclaw/channels/channel.h"
 #include "hunterclaw/channels/manager.h"
 #include "hunterclaw/agents/agent_instance.h"       // ✅ set_model_context_discovery_hook
+#include "hunterclaw/remote_a2a/runtime.h"          // ✅ RemoteA2aRuntime（进程级初始化）
 #include "hunterclaw/llm/model_discovery.h"          // ✅ discover_and_apply_provider_context_windows
 #include "hunterclaw/infra/http_client.h"            // ✅ HttpClient
 #include "hunterclaw/agents/types.h"
@@ -394,7 +395,65 @@ int main(int argc, char** argv) {
     
     // 🎯 对齐 OpenClaw: channel 消息回调由 Gateway inbound worker 处理
     // channel_mgr 的消息路由在 Gateway 启动时通过 inbound plugin hooks 注册
-    
+
+    // ============================================================================
+    // Remote A2A 初始化（进程级）
+    // ============================================================================
+    //   ★ 必须在 Gateway 启动【之前】：
+    //     若配了回调，需要在 HTTP 路由表冻结前挂上端点。
+    //     （本进程目前只起 WebSocket GatewayServer，HttpGateway 尚未接线，
+    //      故回调路由在此处仅做"就绪但未挂载"的状态记录 ——
+    //      见下方对 callback_needed() 的告警。）
+    //
+    //   ★ 必须在任何 AgentInstance 创建之前：
+    //     agent_instance.cc 会从 RemoteA2aRuntime 单例取 registry；
+    //     若那时还没 init，会话就拿不到 remote_a2a 工具。
+    //
+    //   ★ 卡拉取失败不阻断启动（远端离线是常态），
+    //     但【配置无效】要明确报错 —— 否则运维以为功能在跑。
+    // ============================================================================
+    {
+        auto& ra2a = remote_a2a::RemoteA2aRuntime::instance();
+        auto ra2a_result = ra2a.init(config.data.contains("remoteA2a")
+                                        ? config.data["remoteA2a"]
+                                        : nlohmann::json());
+        if (ra2a_result.is_err()) {
+            // ⚠ 只警告不退出：一个配错的 remoteA2a 不该让整个 daemon 起不来。
+            std::cerr << "  Warning: Remote A2A init failed: " << ra2a_result.error
+                      << std::endl;
+        } else if (ra2a.enabled()) {
+            std::cout << "  Remote A2A: " << ra2a_result.value.value_or(0)
+                      << " remote agent(s) ready" << std::endl;
+            for (const auto& w : ra2a.warnings()) {
+                std::cout << "    - " << w << std::endl;
+            }
+            // ⚠ 配了回调却没有 HTTP 面可挂 —— 必须显式告警。
+            //   否则表现为「回调配了但远端的推送永远打不进来」，
+            //   而日志里一个字都没有。
+            if (ra2a.callback_needed()) {
+                std::cerr << "  Warning: Remote A2A 已启用 enableCallback，"
+                             "但本进程未启动 HTTP 面（仅 WebSocket Gateway），"
+                             "回调端点未挂载；任务将回落到 SSE / 轮询分支。"
+                          << std::endl;
+            }
+        } else {
+            // ★ 未启用，但要区分两种情况：
+            //   · 配置里根本没写 remoteA2a  → 静默（绝大多数部署）
+            //   · 配置写了却被禁用/跳过      → 必须说出来
+            //
+            // ⚠ 后者若静默，就是我们在其他地方反复防的「静默失效」：
+            //   用户配了 3 个远端、启动毫无提示、然后发现工具不存在，
+            //   而日志里一个字都没有。
+            const bool configured = config.data.contains("remoteA2a");
+            if (configured) {
+                std::cout << "  Remote A2A: 已配置但未启用" << std::endl;
+                for (const auto& w : ra2a.warnings()) {
+                    std::cout << "    - " << w << std::endl;
+                }
+            }
+        }
+    }
+
     // Initialize Gateway Server
     std::cout << "[4/4] Starting Gateway Server..." << std::endl;
     auto gateway = gateway::GatewayServer::create(config.gateway);
@@ -421,7 +480,14 @@ int main(int argc, char** argv) {
     
     // Graceful shutdown
     std::cout << "\n=== Shutting down ===" << std::endl;
-    
+
+    // ★ Remote A2A 先停：它的 sweeper 线程与后台探测线程会访问 HttpClient。
+    //   放在 gateway->stop() 之后也能工作（两者无依赖），但先停后台线程
+    //   能让「停止过程中仍有远端任务在探测」的窗口最短。
+    //   ⚠ shutdown 是幂等的，重复调用安全。
+    std::cout << "Stopping Remote A2A..." << std::endl;
+    remote_a2a::RemoteA2aRuntime::instance().shutdown();
+
     std::cout << "Stopping Gateway..." << std::endl;
     gateway->stop();
     

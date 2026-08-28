@@ -11,6 +11,7 @@
 #include "hunterclaw/tools/tool_manager.h"    // ✅ ToolManager::create
 #include "hunterclaw/mcp/mcporter_client.h"   // ✅ McporterConfig
 #include "hunterclaw/mcp/mcp_config.h"        // ✅ list_configured_mcp_servers
+#include "hunterclaw/remote_a2a/runtime.h"    // ✅ RemoteA2aRuntime（进程级 registry）
 #include "hunterclaw/sessions/transcript_io.h"  // ✅ 对齐 OpenClaw: transcript 读写
 #include "hunterclaw/sessions/session_manager.h" // ✅ 对齐 OC: SessionEntry (compactionCount/memoryFlushCompactionCount)
 #include "hunterclaw/memory/memory_flush_plan.h"  // ✅ 对齐 OC extensions/memory-core/flush-plan.ts
@@ -233,7 +234,46 @@ AgentInstance::AgentInstance(
                 "[AgentInstance] MCP integration error (non-fatal): {}", e.what()
             );
         }
-        
+
+        // ============================================================================
+        // Remote A2A 集成：把已配置的远端 A2A agent 注册成本会话的工具
+        // ============================================================================
+        //   ★ registry 是【进程级】的（RemoteA2aRuntime 单例，由 main 初始化）：
+        //     卡缓存 / 让渡任务表 / sweeper 线程全进程共享一份。
+        //     这里【只做】"把工具注册进本会话的 ToolManager"这一件事 ——
+        //     工具实例携带本会话的 session_key，跨会话读取由
+        //     check_handle_ownership 拦下（agent_tool.cc）。
+        //
+        //   ★ 未启用时 register_into 返回 Ok(0)，不是错误 ——
+        //     绝大多数部署不用 remote A2A，不该在日志里刷警告。
+        //
+        //   ⚠ 与 tools/sessions_send_a2a（会话间 A2A）完全独立，互不影响。
+        // ============================================================================
+        try {
+            auto& ra2a = remote_a2a::RemoteA2aRuntime::instance();
+            if (ra2a.enabled()) {
+                auto r = ra2a.register_into(*tool_mgr);
+                if (r.is_ok()) {
+                    if (r.value.value_or(0) > 0) {
+                        spdlog::get("default")->info(
+                            "[AgentInstance] Remote A2A registered {} tool(s) for session={}",
+                            r.value.value_or(0), session_id
+                        );
+                    }
+                } else {
+                    // ⚠ 注册失败不阻断会话创建：远端不可用时用户仍应能正常对话，
+                    //   只是少了这几个工具（対标 MCP 的处理方式）。
+                    spdlog::get("default")->warn(
+                        "[AgentInstance] Remote A2A tool registration failed: {}", r.error
+                    );
+                }
+            }
+        } catch (const std::exception& e) {
+            spdlog::get("default")->warn(
+                "[AgentInstance] Remote A2A integration error (non-fatal): {}", e.what()
+            );
+        }
+
         // ✅ 从 Agent 配置创建 LLMClient
         llm::LLMConfig llm_config;
         

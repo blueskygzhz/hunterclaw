@@ -144,9 +144,26 @@ public:
     /// ★ 粘性规则（対标 AgentWaitResult::is_sticky_terminal，run_wait.h:105-108）：
     ///   已有粘性终态（HardTimeout / Canceled）时，后到的普通终态【不覆盖】。
     ///   场景：用户取消后远端才把 completed 发回来 —— 用户看到的必须是"已取消"。
+    ///
+    /// @param remote_state
+    ///   远端报告的真实 TaskState。给出时【原样保留】，不给则由 reason 推导。
+    ///
+    /// ★★ 这个参数是必需的，不是便利参数。
+    ///   `reason` 是【我们的归因】，`state` 是【远端的事实】，两者不同源。
+    ///   input-required / auth-required 的归因是 Completed（它们不是失败），
+    ///   但若让 state 跟着 reason 推导，就会被写成 TaskState::Completed ——
+    ///   远端"我还需要订单号"的事实被抹成"任务成功了"，
+    ///   于是 render() 把追问当最终答案输出，续接流程彻底断掉。
+    ///
+    ///   反过来，HardTimeout / Zombie 是我们【自己】判的（远端根本没回话），
+    ///   此时不传 remote_state，由 reason 推导出 Failed 才是对的。
+    ///
+    /// ⚠ 只接受终态。传入非终态会被忽略并回落到 reason 推导 ——
+    ///   否则一条 working 会把记录写成"已终结但状态是进行中"的矛盾态。
     /// @return 是否发生了状态变更
     bool update_terminal(const std::string& handle, TerminalReason reason,
-                        const std::string& text, const std::string& error_text);
+                        const std::string& text, const std::string& error_text,
+                        std::optional<TaskState> remote_state = std::nullopt);
 
     /// 取走结果并标记 Harvested。★ 未终结时返回 nullopt（不阻塞）。
     std::optional<PendingTask> harvest(const std::string& handle);

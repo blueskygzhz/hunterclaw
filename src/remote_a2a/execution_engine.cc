@@ -66,9 +66,49 @@ std::string ExecutionResult::render() const {
         ss << "远端任务仍在执行（handle " << handle;
         if (!task_id.empty()) ss << ", task " << task_id;
         ss << "）。使用 remote_a2a_status 跟进结果。";
-        if (!text.empty()) ss << "\n当前进度: " << text;
+        // 让渡时"当前进度"来自中间态，不是正式结果
+        const std::string& progress = prompt_text.empty() ? text : prompt_text;
+        if (!progress.empty()) ss << "\n当前进度: " << progress;
         return ss.str();
     }
+
+    // ★ 挂起态必须在 error_text 分支【之前】判定。
+    //   input-required / auth-required 不是失败，而是一次正常的往返中断；
+    //   若落进失败分支，模型会认为工具坏了并重试，而重试会用同样的输入
+    //   再起一个新任务 —— 远端上于是堆积一串永远等不到输入的僵尸任务。
+    if (is_suspended()) {
+        const bool need_auth = (state == TaskState::AuthRequired);
+        ss << (need_auth ? "远端任务需要鉴权后才能继续" : "远端任务需要补充输入才能继续");
+        ss << "（handle " << handle;
+        // ★★ task_id 必须出现在【文本】里。
+        //   ToolResult.details 不进 prompt（react_engine.cc:1076-1088 只读
+        //   content），模型只能看到这段文本。缺 task_id 就无法续接，
+        //   整个 input-required 流程直接断掉。
+        if (!task_id.empty()) ss << ", task_id " << task_id;
+        if (!context_id.empty()) ss << ", context_id " << context_id;
+        ss << "）。";
+
+        // ★★ 追问与部分结果【都要】输出，不能二选一。
+        //   远端可以同时给出「已完成的部分」与「还缺什么」；
+        //   只输出其一会让模型看到"需要补充输入: <部分结果>"，
+        //   完全不知道要补什么。
+        if (!prompt_text.empty()) {
+            ss << "\n远端要求: " << prompt_text;
+        } else {
+            // 远端没说要什么 —— 明确告诉模型，避免它凭空猜测后乱填
+            ss << "\n远端未说明具体需要什么，请根据上下文判断或向用户询问。";
+        }
+        if (!text.empty()) {
+            ss << "\n已获得的部分结果: " << text;
+        }
+
+        // 明确的续接指令：模型知道"要做什么"才不会卡住或改走别的工具
+        ss << "\n补齐后请再次调用本工具，并带上 task_id";
+        if (!context_id.empty()) ss << " 与 context_id";
+        ss << "，message 填写补充内容。";
+        return ss.str();
+    }
+
     if (!error_text.empty()) {
         ss << "远端任务失败";
         if (reason) ss << "（" << terminal_reason_text(*reason) << "）";
@@ -76,15 +116,11 @@ std::string ExecutionResult::render() const {
         if (!text.empty()) ss << "\n已获得的部分结果: " << text;
         return ss.str();
     }
-    if (state == TaskState::InputRequired) {
-        ss << "远端任务需要补充输入（handle " << handle << "）: " << text;
-        return ss.str();
-    }
-    if (state == TaskState::AuthRequired) {
-        ss << "远端任务需要鉴权（handle " << handle << "）: " << text;
-        return ss.str();
-    }
-    return text.empty() ? "远端任务已完成，但未返回内容。" : text;
+
+    // 正常完成：artifacts 优先，无 artifacts 时回落到 status.message
+    if (!text.empty()) return text;
+    if (!prompt_text.empty()) return prompt_text;
+    return "远端任务已完成，但未返回内容。";
 }
 
 // ── 回调配置 ────────────────────────────────────────────────────────────────
@@ -209,9 +245,22 @@ void ExecutionEngine::ingest_task(const std::string& handle, const Task& t,
         // ⚠ input-required / auth-required 也是终态，但【不是失败】：
         //   它们是「挂起」，本轮结束等外部回填。用 Completed 归因，
         //   由 state 字段区分（ExecutionResult::render 会分开渲染）。
-        store_->update_terminal(handle,
-                               reason,
-                               final_text.empty() ? progress : final_text, err);
+        const bool suspended = (t.status.state == TaskState::InputRequired ||
+                                t.status.state == TaskState::AuthRequired);
+
+        // ★ 挂起态【不】把 status.message 回落进 result_text。
+        //   status.message 此时是「还需要什么」的追问，不是结果。
+        //   若把它当结果写进 result_text，会造成两个后果：
+        //     ① 追问与部分结果挤在同一字段，render 无法同时呈现
+        //     ② 追问被当成「已获得的结果」持久化，后续 harvest
+        //        取到的是一句提问而不是答案
+        //   追问始终留在 progress_text 里，由 render 从 prompt_text 取。
+        const std::string terminal_text =
+            suspended ? final_text : (final_text.empty() ? progress : final_text);
+
+        // ★ 传入远端的【真实状态】。不传会让 input-required 被 reason(Completed)
+        //   推导覆盖成 TaskState::Completed —— 追问就变成了"最终答案"。
+        store_->update_terminal(handle, reason, terminal_text, err, t.status.state);
     }
 }
 
@@ -272,7 +321,9 @@ bool ExecutionEngine::run_stream(const Message& msg, const std::string& handle,
             } else if (ev.state == TaskState::Canceled) {
                 reason = TerminalReason::Canceled;
             }
-            store_->update_terminal(handle, reason, "", err);
+            // ★ 同 ingest_task：必须带上远端真实状态，否则 input-required
+            //   会被覆盖成 Completed。
+            store_->update_terminal(handle, reason, "", err, ev.state);
             terminal = true;
             return false;  // 拿到终态，停止读流
         }
@@ -465,7 +516,27 @@ ExecutionResult ExecutionEngine::execute_with_yield(const Message& msg,
                 TerminalReason reason = TerminalReason::Completed;
                 if (terminal_state == TaskState::Failed) reason = TerminalReason::RemoteFailed;
                 else if (terminal_state == TaskState::Canceled) reason = TerminalReason::Canceled;
-                store_->update_terminal(handle, reason, terminal_text, terminal_err);
+
+                // ★ 挂起态：ev.text 是「还需要什么」的追问，不是结果。
+                //   必须落进 progress_text（经 note_progress），而非
+                //   update_terminal 的 text 参数（那会写进 result_text）。
+                //   ⚠ 顺序关键：note_progress 会拒绝已终结的记录
+                //     （pending_tasks.cc 的 phase != Running 检查），
+                //     所以必须在 update_terminal 【之前】写。
+                const bool suspended = (terminal_state == TaskState::InputRequired ||
+                                        terminal_state == TaskState::AuthRequired);
+                if (suspended && !terminal_text.empty()) {
+                    // ⚠ ProgressFingerprint 没有 state 字段（它刻意只比对
+                    //   「有没有新内容」，不比状态 —— 见 task_tracking.h）。
+                    //   这里用追问长度让指纹产生变化，确保 note_progress
+                    //   认定"有推进"从而真的写入 progress_text。
+                    ProgressFingerprint fp;
+                    fp.last_status_message_len = terminal_text.size();
+                    store_->note_progress(handle, fp, terminal_state, terminal_text);
+                }
+                store_->update_terminal(handle, reason,
+                                       suspended ? std::string() : terminal_text,
+                                       terminal_err, terminal_state);
             } else {
                 // 继续读流直到终态或让渡窗口结束
                 run_stream(msg, handle, &out, on_progress, deadline);
@@ -532,7 +603,11 @@ ExecutionResult ExecutionEngine::execute_with_yield(const Message& msg,
         out.completed = true;
         out.state = fin->state;
         out.reason = fin->reason;
-        out.text = fin->result_text.empty() ? fin->progress_text : fin->result_text;
+        // ★ 两个字段【原样分开】带出，不在这里做二选一 ——
+        //   合并逻辑归 render() 一处所有（它才知道当前状态该怎么呈现）。
+        //   在这里就合并会让挂起态丢掉追问（见 render 里的说明）。
+        out.text = fin->result_text;
+        out.prompt_text = fin->progress_text;
         out.error_text = fin->error_text;
         return out;
     }
@@ -546,7 +621,8 @@ ExecutionResult ExecutionEngine::execute_with_yield(const Message& msg,
     auto cur = store_->get(handle);
     if (cur) {
         out.state = cur->state;
-        out.text = cur->progress_text;
+        out.text = cur->result_text;
+        out.prompt_text = cur->progress_text;
     }
 
     if (cfg_.background_follow_up && !stopping_.load()) {
@@ -642,7 +718,8 @@ ExecutionResult ExecutionEngine::follow_up(const std::string& handle, int64_t wa
         auto now = store_->get(handle);
         if (now) {
             out.state = now->state;
-            out.text = now->progress_text;
+            out.text = now->result_text;
+            out.prompt_text = now->progress_text;
         }
         return out;
     }
@@ -653,7 +730,12 @@ ExecutionResult ExecutionEngine::follow_up(const std::string& handle, int64_t wa
     out.completed = true;
     out.state = t.state;
     out.reason = t.reason;
-    out.text = t.result_text.empty() ? t.progress_text : t.result_text;
+    // ★ 与 execute() 一致：分开带出，合并逻辑只在 render() 里做一份。
+    //   ⚠ 这里若沿用 `result_text.empty() ? progress_text : result_text`，
+    //     follow_up 拿到的挂起态就会丢掉追问 —— 而 follow_up 恰恰是
+    //     input-required 最常见的入口（让渡后模型来取结果）。
+    out.text = t.result_text;
+    out.prompt_text = t.progress_text;
     out.error_text = t.error_text;
     return out;
 }

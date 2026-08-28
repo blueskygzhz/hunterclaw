@@ -12,12 +12,53 @@
 #include <sstream>
 #include <iostream>
 #include <algorithm>
+#include <mutex>       // std::once_flag / std::call_once（SSL 库初始化）
 
 // OpenSSL support (optional)
 #ifdef HUNTERCLAW_ENABLE_SSL
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/x509v3.h>   // X509_VERIFY_PARAM_set1_host / set_hostflags
+#include <openssl/opensslv.h>
+
+// ============================================================================
+// OpenSSL 1.0.2 兼容层
+//
+// 本文件的 SSL 代码按 OpenSSL 1.1.0+ 编写，但构建环境可能是 1.0.2
+// （RHEL/CentOS 7 系默认 1.0.2k，且仍在大量生产环境中）。
+//
+// ⚠ 这段兼容层【不降低安全性】—— 三个替换都是等价或更严格的：
+//   ① TLS_client_method → SSLv23_client_method
+//      名字有误导：SSLv23_client_method 是"协商最高可用版本"的方法，
+//      并非"启用 SSLv2/v3"。真正的版本下限由 ② 控制。
+//      在 1.1.0 里前者只是后者的别名（ssl.h: # define TLS_client_method
+//      SSLv23_client_method 的反向兼容宏）。
+//   ② SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION)
+//      → SSL_CTX_set_options(ctx, NO_SSLv2|NO_SSLv3|NO_TLSv1|NO_TLSv1_1)
+//      等价效果：下限同样是 TLS 1.2。1.0.2 里 min_proto_version 这个
+//      setter 不存在，但 SSL_OP_NO_* 位掩码从 0.9.x 起就有。
+//   ③ 主机名校验（X509_VERIFY_PARAM_set1_host）在 1.0.2 里【已存在】
+//      （1.0.2 是引入它的版本），故无需替换 —— 这点很关键，
+//      否则就得手写 SAN 比对，那才是真正会引入漏洞的地方。
+//
+// ★ 判据用 OPENSSL_VERSION_NUMBER 而非编译器探测：
+//   LibreSSL 会伪装成 OPENSSL_VERSION_NUMBER 2.0.0 但缺 1.1.0 的 API，
+//   故额外排除 LIBRESSL_VERSION_NUMBER。
+// ============================================================================
+#if (OPENSSL_VERSION_NUMBER < 0x10100000L) || defined(LIBRESSL_VERSION_NUMBER)
+
+#ifndef HUNTERCLAW_OPENSSL_LEGACY
+#define HUNTERCLAW_OPENSSL_LEGACY 1
 #endif
+
+// ① 1.0.2 无 TLS_client_method；SSLv23_client_method 才是"协商最高版本"
+#ifndef TLS_client_method
+#define TLS_client_method SSLv23_client_method
+#endif
+
+#endif  // OpenSSL < 1.1.0
+
+#endif  // HUNTERCLAW_ENABLE_SSL
 
 namespace hunterclaw {
 namespace infra {
@@ -326,22 +367,27 @@ core::Result<HttpClient::SslConnection> HttpClient::connect_ssl(
     int timeout_ms,
     const HttpRequestOptions& options
 ) {
-    // Initialize SSL library (thread-safe in OpenSSL 1.1.0+)
-    static bool ssl_initialized = false;
-    if (!ssl_initialized) {
+    // Initialize SSL library.
+    // ⚠ 1.1.0+ 会自动初始化，这些调用是 no-op；1.0.2 则【必须】显式调用，
+    //   否则 SSL_CTX_new 返回 nullptr 且 ERR 队列为空（极难排查）。
+    // ⚠ static 局部变量的初始化是线程安全的（C++11），但这三个 OpenSSL
+    //   函数本身在 1.0.2 下不是 —— 用 std::call_once 保证只执行一次。
+    static std::once_flag ssl_init_once;
+    std::call_once(ssl_init_once, []() {
         SSL_load_error_strings();
         SSL_library_init();
         OpenSSL_add_all_algorithms();
-        ssl_initialized = true;
-    }
-    
+    });
+
     // Create TCP connection first
     auto socket_result = connect_socket(host, port, timeout_ms);
     if (socket_result.is_err()) {
         return core::Result<SslConnection>::Err(socket_result.error);
     }
-    int socket_fd = socket_result.value;
-    
+    // ⚠ 必须用 .get()：value 是 std::optional<int>，直接赋给 int 编译失败。
+    //   （此处曾是编译错误 —— 本分支从未被编译过，见 src/BUILD 的说明）
+    int socket_fd = socket_result.get();
+
     // Create SSL context
     const SSL_METHOD* method = TLS_client_method();
     SSL_CTX* ctx = SSL_CTX_new(method);
@@ -353,7 +399,16 @@ core::Result<HttpClient::SslConnection> HttpClient::connect_ssl(
     // 🎯 对齐 OpenClaw sslVerify: 证书校验 (默认开启，防止 MITM)
     if (options.ssl_verify) {
         // 强制最低 TLS 1.2
+#ifdef HUNTERCLAW_OPENSSL_LEGACY
+        // OpenSSL 1.0.2 无 SSL_CTX_set_min_proto_version。
+        // ★ 用 SSL_OP_NO_* 位掩码达到【完全等价】的下限：禁掉 1.2 以下全部。
+        //   ⚠ SSL_OP_NO_TLSv1_1 在 1.0.1 起才有；1.0.0 及更早不支持 TLS 1.2，
+        //     那种环境本就不该跑这个项目，故不再往下兼容。
+        SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 |
+                                    SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1);
+#else
         SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+#endif
 
         // 加载 CA: 自定义 bundle 或系统默认信任链
         if (!options.ca_bundle_path.empty()) {
@@ -435,10 +490,24 @@ core::Result<HttpClient::SslConnection> HttpClient::connect_ssl(
     // Perform SSL handshake
     int ret = SSL_connect(ssl);
     if (ret != 1) {
+        // ★ 必须带出 OpenSSL 的具体原因。
+        //   裸 "SSL handshake failed" 无法区分"证书过期"/"协议版本不匹配"
+        //   /"对端不是 TLS 服务"，而这三者的处置完全不同。
+        const int ssl_err = SSL_get_error(ssl, ret);
+        std::string detail = "SSL handshake failed (SSL_get_error=" +
+                             std::to_string(ssl_err) + ")";
+        // ERR 队列里可能堆了多条，取最近一条最相关的
+        if (unsigned long e = ERR_get_error()) {
+            char buf[256] = {0};
+            ERR_error_string_n(e, buf, sizeof(buf));
+            detail += ": ";
+            detail += buf;
+        }
+        ERR_clear_error();  // ⚠ 不清空会污染后续请求的错误判断
         SSL_free(ssl);
         SSL_CTX_free(ctx);
         close(socket_fd);
-        return core::Result<SslConnection>::Err("SSL handshake failed");
+        return core::Result<SslConnection>::Err(detail);
     }
 
     // 🎯 握手后确认证书校验结果 (SSL_VERIFY_PEER 已强制，此处显式复核)

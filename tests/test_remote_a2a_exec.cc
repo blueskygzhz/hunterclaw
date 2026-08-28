@@ -245,6 +245,65 @@ static void test_terminal_sticky() {
         CHECK(s->get(h)->reason == TerminalReason::Canceled, "先到的粘性终态胜出");
     }
 
+    // ★★★ [不可回退] state 与 reason 不同源，reason 不得覆盖远端真实 state。
+    //
+    //   曾经的缺陷：update_terminal 无条件写
+    //   `t->state = terminal_reason_to_task_state(reason)`。
+    //   input-required 的归因是 Completed（它不是失败），于是 state 被
+    //   改成 TaskState::Completed —— 远端"我还需要订单号"的事实被抹成
+    //   "任务成功了"，render() 把追问当最终答案输出，续接流程彻底断裂。
+    //   而且这个 bug 在 render() 的单测里【看不出来】（那里直接构造
+    //   ExecutionResult 手动设 state），只有走 store 才暴露。
+    {
+        auto s = PendingTaskStore::create();
+        auto h = s->register_task("x", "t1", "", "sess").get();
+        // 归因 Completed + 远端状态 input-required
+        s->update_terminal(h, TerminalReason::Completed, "", "", TaskState::InputRequired);
+        auto t = s->get(h);
+        CHECK(t->state == TaskState::InputRequired,
+              "远端 state 被保留，未被 reason 覆盖 [不可回退]");
+        CHECK(t->reason == TerminalReason::Completed, "reason 仍是 Completed");
+        CHECK(t->phase == PendingPhase::Terminal, "phase 转 Terminal");
+    }
+    // auth-required 同理
+    {
+        auto s = PendingTaskStore::create();
+        auto h = s->register_task("x", "t1", "", "sess").get();
+        s->update_terminal(h, TerminalReason::Completed, "", "", TaskState::AuthRequired);
+        CHECK(s->get(h)->state == TaskState::AuthRequired,
+              "auth-required 亦被保留 [不可回退]");
+    }
+    // ★ 不传 remote_state 时仍由 reason 推导（HardTimeout/Zombie 是我们
+    //   自己判的，远端根本没回话，此时推导才是对的）
+    {
+        auto s = PendingTaskStore::create();
+        auto h = s->register_task("x", "t1", "", "sess").get();
+        s->update_terminal(h, TerminalReason::HardTimeout, "", "超时");
+        CHECK(s->get(h)->state == TaskState::Failed,
+              "无 remote_state 时由 reason 推导 [不可回退]");
+    }
+    // ★ [不可回退] 非终态的 remote_state 必须被忽略 ——
+    //   否则会写出 "phase=Terminal 但 state=working" 的矛盾态
+    {
+        auto s = PendingTaskStore::create();
+        auto h = s->register_task("x", "t1", "", "sess").get();
+        s->update_terminal(h, TerminalReason::Completed, "", "", TaskState::Working);
+        auto t = s->get(h);
+        CHECK(t->state == TaskState::Completed, "非终态 remote_state 被忽略 [不可回退]");
+        CHECK(is_terminal(t->state), "phase 与 state 一致（都是终态）[不可回退]");
+    }
+
+    // ★ 粘性保护不受 remote_state 影响：取消后远端推 completed 仍不覆盖
+    {
+        auto s = PendingTaskStore::create();
+        auto h = s->register_task("x", "t1", "", "sess").get();
+        s->update_terminal(h, TerminalReason::Canceled, "", "用户取消");
+        CHECK(!s->update_terminal(h, TerminalReason::Completed, "late", "",
+                                 TaskState::Completed),
+              "粘性保护优先于 remote_state [不可回退]");
+        CHECK(s->get(h)->state == TaskState::Canceled, "仍是 Canceled");
+    }
+
     // 非粘性之间可覆盖（后到的更精确）
     {
         auto s = PendingTaskStore::create();
@@ -531,26 +590,114 @@ static void test_render() {
               "失败时仍保留部分结果 [不可回退]");
     }
 
-    // input-required / auth-required 单独渲染（★ 它们不是失败）
+    // ── input-required / auth-required：挂起态渲染 ────────────────────────
+    // ★ 这一组锁死两个曾经的真实缺陷（详见每条断言）。
     {
         ExecutionResult r;
         r.success = true;
         r.completed = true;
         r.state = TaskState::InputRequired;
         r.handle = "h1";
-        r.text = "请提供订单号";
+        r.task_id = "task-77";
+        r.context_id = "ctx-9";
+        r.prompt_text = "请提供订单号";
         const std::string s = r.render();
+
         CHECK(s.find("补充输入") != std::string::npos, "input-required 单独渲染");
         CHECK(s.find("失败") == std::string::npos, "input-required 不渲染为失败 [不可回退]");
+        CHECK(r.is_suspended(), "is_suspended 为真");
+
+        // ★★ 缺陷 1（已修）：task_id 必须出现在【文本】里。
+        //   ToolResult.details 不进 prompt（react_engine.cc:1076-1088 只读
+        //   content），模型只能看到 render() 的输出。缺 task_id 就无法续接，
+        //   整个 input-required 流程直接断掉。
+        CHECK(s.find("task-77") != std::string::npos,
+              "文本含 task_id（否则模型无法续接）[不可回退]");
+        CHECK(s.find("ctx-9") != std::string::npos, "文本含 context_id [不可回退]");
+        // 必须给出明确的续接指令，否则模型不知道该做什么
+        CHECK(s.find("再次调用") != std::string::npos, "给出续接指令 [不可回退]");
+        CHECK(s.find("请提供订单号") != std::string::npos, "含远端追问");
     }
+
+    // ★★ 缺陷 2（已修）：追问与部分结果【都要】输出，不能二选一。
+    //   远端可同时给出"已完成的部分"(artifacts) 与"还缺什么"(status.message)；
+    //   只输出其一会让模型看到「需要补充输入: <部分结果>」，
+    //   完全不知道要补什么 —— 流程死锁。
+    {
+        ExecutionResult r;
+        r.success = true;
+        r.completed = true;
+        r.state = TaskState::InputRequired;
+        r.handle = "h1";
+        r.task_id = "task-88";
+        r.text = "已查到 3 条候选记录";   // artifacts（部分结果）
+        r.prompt_text = "请指定要哪一条";  // status.message（追问）
+        const std::string s = r.render();
+
+        CHECK(s.find("请指定要哪一条") != std::string::npos,
+              "有部分结果时追问不被吞掉 [不可回退]");
+        CHECK(s.find("已查到 3 条候选记录") != std::string::npos,
+              "部分结果同时保留 [不可回退]");
+        CHECK(s.find("task-88") != std::string::npos, "仍含 task_id");
+    }
+
+    // 远端没说要什么 → 必须明说，避免模型凭空猜测后乱填
+    {
+        ExecutionResult r;
+        r.success = true;
+        r.completed = true;
+        r.state = TaskState::InputRequired;
+        r.handle = "h1";
+        r.task_id = "t1";
+        // prompt_text 与 text 都空
+        const std::string s = r.render();
+        CHECK(s.find("未说明") != std::string::npos,
+              "远端未说明需求时明确提示 [不可回退]");
+    }
+
+    // auth-required
     {
         ExecutionResult r;
         r.success = true;
         r.completed = true;
         r.state = TaskState::AuthRequired;
         r.handle = "h1";
-        r.text = "需要 OAuth";
-        CHECK(r.render().find("鉴权") != std::string::npos, "auth-required 单独渲染");
+        r.task_id = "task-99";
+        r.prompt_text = "需要 OAuth";
+        const std::string s = r.render();
+        CHECK(s.find("鉴权") != std::string::npos, "auth-required 单独渲染");
+        CHECK(s.find("task-99") != std::string::npos, "auth-required 也含 task_id [不可回退]");
+        CHECK(r.is_suspended(), "auth-required 也算挂起");
+    }
+
+    // ★ 挂起态必须在 error_text 分支【之前】判定 ——
+    //   否则一个残留的 error_text 会把挂起渲染成失败，模型据此重试，
+    //   远端堆积永远等不到输入的僵尸任务。
+    {
+        ExecutionResult r;
+        r.success = true;
+        r.completed = true;
+        r.state = TaskState::InputRequired;
+        r.handle = "h1";
+        r.task_id = "t2";
+        r.prompt_text = "请补充";
+        r.error_text = "某条路径残留的错误文本";
+        const std::string s = r.render();
+        CHECK(s.find("补充输入") != std::string::npos,
+              "有 error_text 时仍按挂起渲染 [不可回退]");
+        CHECK(s.find("远端任务失败") == std::string::npos,
+              "不落入失败分支 [不可回退]");
+    }
+
+    // 正常完成：无 artifacts 时回落到 prompt_text（status.message）
+    {
+        ExecutionResult r;
+        r.success = true;
+        r.completed = true;
+        r.state = TaskState::Completed;
+        r.prompt_text = "答案在这里";
+        CHECK(r.render() == "答案在这里", "completed 无 artifacts 回落 status.message");
+        CHECK(!r.is_suspended(), "completed 非挂起");
     }
 }
 
@@ -675,6 +822,106 @@ static void test_follow_up_cancel() {
 }
 
 // ============================================================================
+// input-required 端到端：追问与结果的字段归属
+//
+// ★ 这一组走 store → follow_up 的真实链路，验证「追问不进 result_text」。
+//   上面的 test_render 只测渲染，这里测【数据落在哪个字段】——
+//   两者都必须锁死：字段错了渲染再对也没用（harvest 拿到的会是一句提问）。
+// ============================================================================
+static void test_input_required_field_ownership() {
+    SECTION("input-required 字段归属");
+
+    RemoteAgentClientConfig cc;
+    cc.name = "ir";
+    auto store = PendingTaskStore::create();
+    auto engine = ExecutionEngine::create(RemoteAgentClient::create(cc, nullptr), store,
+                                         ExecutionConfig{});
+
+    // 场景 A：只有追问，无部分结果
+    {
+        auto h = store->register_task("ir", "t1", "c1", "s1").get();
+
+        // 模拟 ingest_task 对挂起态的处理：追问进 progress_text，
+        // update_terminal 的 text 传空（不写 result_text）
+        ProgressFingerprint fp;
+        fp.last_status_message_len = 6;
+        store->note_progress(h, fp, TaskState::InputRequired, "请提供订单号");
+        store->update_terminal(h, TerminalReason::Completed, "", "");
+
+        auto t = store->get(h);
+        // ★★ [不可回退] 追问【不能】进 result_text ——
+        //   否则 harvest 取到的"结果"是一句提问，
+        //   且后续无法与真正的部分结果区分
+        CHECK(t->result_text.empty(), "追问未写入 result_text [不可回退]");
+        CHECK(t->progress_text == "请提供订单号", "追问在 progress_text [不可回退]");
+
+        auto r = engine->follow_up(h, 0);
+        CHECK(r.success, "follow_up 成功");
+        CHECK(r.is_suspended(), "识别为挂起态");
+        CHECK(r.prompt_text == "请提供订单号", "prompt_text 带出追问 [不可回退]");
+        CHECK(r.text.empty(), "text（正式结果）为空");
+        CHECK(r.task_id == "t1", "task_id 带出");
+        CHECK(r.context_id == "c1", "context_id 带出");
+
+        const std::string s = r.render();
+        CHECK(s.find("t1") != std::string::npos, "渲染含 task_id [不可回退]");
+        CHECK(s.find("请提供订单号") != std::string::npos, "渲染含追问");
+    }
+
+    // 场景 B：追问 + 部分结果同时存在（曾经会吞掉追问）
+    {
+        auto h = store->register_task("ir", "t2", "c2", "s1").get();
+
+        store->append_result(h, "已查到 3 条候选");   // artifacts
+        ProgressFingerprint fp;
+        fp.last_status_message_len = 9;
+        store->note_progress(h, fp, TaskState::InputRequired, "请指定要哪一条");
+        store->update_terminal(h, TerminalReason::Completed, "", "");
+
+        auto r = engine->follow_up(h, 0);
+        CHECK(r.is_suspended(), "识别为挂起态");
+        // ★★ [不可回退] 两者都要在，且分属不同字段
+        CHECK(r.text.find("已查到 3 条候选") != std::string::npos,
+              "部分结果在 text [不可回退]");
+        CHECK(r.prompt_text == "请指定要哪一条", "追问在 prompt_text [不可回退]");
+
+        const std::string s = r.render();
+        CHECK(s.find("请指定要哪一条") != std::string::npos,
+              "有部分结果时追问仍被渲染 [不可回退]");
+        CHECK(s.find("已查到 3 条候选") != std::string::npos, "部分结果也渲染");
+        CHECK(s.find("t2") != std::string::npos, "含 task_id");
+    }
+
+    // 场景 C：让渡时的中间态不该被当成正式结果
+    {
+        auto h = store->register_task("ir", "t3", "", "s1").get();
+        ProgressFingerprint fp;
+        fp.last_status_message_len = 5;
+        store->note_progress(h, fp, TaskState::Working, "思考中...");
+
+        auto r = engine->follow_up(h, 0);
+        CHECK(r.yielded && !r.completed, "在途 → 让渡");
+        CHECK(r.prompt_text == "思考中...", "中间态在 prompt_text");
+        CHECK(r.text.empty(), "中间态不进 text [不可回退]");
+        CHECK(r.render().find("思考中...") != std::string::npos, "让渡文案含进度");
+    }
+
+    // 场景 D：auth-required 与 input-required 同构
+    {
+        auto h = store->register_task("ir", "t4", "", "s1").get();
+        ProgressFingerprint fp;
+        fp.last_status_message_len = 8;
+        store->note_progress(h, fp, TaskState::AuthRequired, "需要重新授权");
+        store->update_terminal(h, TerminalReason::Completed, "", "");
+
+        auto r = engine->follow_up(h, 0);
+        CHECK(r.is_suspended(), "auth-required 也是挂起");
+        CHECK(r.render().find("t4") != std::string::npos, "含 task_id [不可回退]");
+        CHECK(r.render().find("需要重新授权") != std::string::npos, "含追问");
+    }
+}
+
+// ============================================================================
 // 分支枚举文本
 // ============================================================================
 static void test_texts() {
@@ -704,6 +951,7 @@ int main() {
     test_push_config();
     test_engine_uninitialized();
     test_follow_up_cancel();
+    test_input_required_field_ownership();
     test_texts();
 
     std::cout << "\n===== 结果: " << g_pass << " 通过, " << g_fail << " 失败 ====="

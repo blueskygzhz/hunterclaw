@@ -121,13 +121,34 @@ struct ExecutionResult {
     std::string task_id;
     std::string context_id;
 
-    std::string text;       // 结果或让渡说明
+    /// 正式结果（来自 artifacts）。可能为空。
+    std::string text;
+
+    /// 远端的追问 / 中间态文本（来自 status.message）。
+    ///
+    /// ★ 必须与 text 【分开】存放，不能二选一。
+    ///   input-required 时远端可以【同时】给出「已完成的部分结果」(artifacts)
+    ///   与「还需要什么」(status.message)。若合并成一个字段并取其一，
+    ///   有部分结果的场景下追问会被吞掉 —— 模型看到
+    ///   「需要补充输入: <部分结果>」，完全不知道要补什么，流程直接死锁。
+    std::string prompt_text;
+
     std::string error_text;
 
     TaskState state = TaskState::Submitted;
     std::optional<TerminalReason> reason;
 
-    /// 面向模型的一段文本（工具返回值）
+    /// 本轮是否处于「挂起等外部输入」状态（input-required / auth-required）。
+    /// ★ 这不是失败 —— 是一次正常的往返中断，需要模型带 task_id 再调一次。
+    bool is_suspended() const {
+        return state == TaskState::InputRequired || state == TaskState::AuthRequired;
+    }
+
+    /// 面向模型的一段文本（工具返回值）。
+    ///
+    /// ⚠ 这是模型能看到的【唯一】内容 —— ToolResult.details 不进 prompt
+    ///   （react_engine.cc:1076-1088 只读 content）。因此续接所需的
+    ///   task_id 必须出现在这段文本里，否则模型无法续接。
     std::string render() const;
 };
 

@@ -39,6 +39,7 @@ HIGH_SRCS="
 src/remote_a2a/agent_tool.cc
 src/remote_a2a/config.cc
 src/remote_a2a/agent_registry.cc
+src/remote_a2a/runtime.cc
 "
 
 exists() {
@@ -101,6 +102,7 @@ run_suite test_remote_a2a_exec         $LOW $INFRA
 run_suite test_remote_a2a_callback     $LOW $INFRA
 run_suite test_remote_a2a_tools        $LOW $HIGH $INFRA $STUBS
 run_suite test_remote_a2a_registry     $LOW $HIGH $INFRA $STUBS
+run_suite test_remote_a2a_runtime      $LOW $HIGH $INFRA $STUBS
 
 echo
 echo "===== 合计: $TOTAL_PASS 通过, $TOTAL_FAIL 失败 ====="
@@ -113,8 +115,19 @@ grep -rn "std::future\|std::promise\|std::async\|packaged_task" \
   | grep -vE ":[0-9]+:[[:space:]]*(//|\*|/\*)" || echo "(通过)"
 
 echo
-echo "--- callback_route 之外不得引用 httplib（应为空）---"
-grep -rln "httplib" src/remote_a2a/ include/hunterclaw/remote_a2a/ \
+echo "--- callback_route 之外不得 include httplib（应为空）---"
+# ⚠ 只匹配真实的 #include 行 —— 注释里提到 httplib 是允许的
+#   （runtime.h 就在注释里解释了「为什么不 include httplib」）。
+grep -rn "^[[:space:]]*#[[:space:]]*include.*httplib" \
+     src/remote_a2a/ include/hunterclaw/remote_a2a/ \
+  | grep -v "callback_route" || echo "(通过)"
+
+echo
+echo "--- 核心头文件不得 include gateway（应为空）---"
+# ★ runtime.h 通过 std::function 注入挂载器来避开 gateway 依赖 ——
+#   若哪天有人图省事直接 include gateway/http_gateway.h，这里会报出来。
+grep -rn "^[[:space:]]*#[[:space:]]*include.*gateway/" \
+     src/remote_a2a/ include/hunterclaw/remote_a2a/ \
   | grep -v "callback_route" || echo "(通过)"
 
 if [ -n "$FAILED_SUITES" ]; then

@@ -291,6 +291,11 @@ tools::ToolResult RemoteA2aAgentTool::execute(const core::JsonValue& params) {
     details["state"] = task_state_to_wire(r.state);
     details["yielded"] = r.yielded;
     details["completed"] = r.completed;
+    // ★ 挂起态（input-required / auth-required）单独标出，供程序化消费方
+    //   （二期的「二次确认」终端流程）判断是否需要拉起补输入的 UI。
+    //   ⚠ details 不进 prompt（react_engine.cc:1076-1088 只读 content），
+    //     所以模型看不到它 —— 模型所需的信息全在 r.render() 的文本里。
+    details["suspended"] = r.is_suspended();
     if (r.reason) details["terminalReason"] = terminal_reason_text(*r.reason);
 
     if (!r.success) {
@@ -304,8 +309,13 @@ tools::ToolResult RemoteA2aAgentTool::execute(const core::JsonValue& params) {
     //   让渡返回 error 会让模型认为工具坏了并重试 → 同一远端任务被起两遍。
     auto res = tools::tool_result::text(r.render());
     res.details = core::JsonValue(details);
-    // 远端明确失败时才置 success=false（让渡不算失败）
-    if (r.completed && !r.error_text.empty()) {
+    // 远端明确失败时才置 success=false（让渡不算失败）。
+    //
+    // ★★ 挂起态【绝不】置 success=false —— 即使 error_text 因某条路径
+    //   被意外填了值。input-required 不是失败，而是一次正常的往返中断；
+    //   置 false 会让模型认为工具坏了并重试，而重试用的是同样的输入，
+    //   于是远端上堆积一串永远等不到输入的僵尸任务（每个都占着配额）。
+    if (r.completed && !r.error_text.empty() && !r.is_suspended()) {
         res.success = false;
         res.error = r.error_text;
     }
@@ -389,9 +399,11 @@ tools::ToolResult RemoteA2aStatusTool::execute(const core::JsonValue& params) {
     nlohmann::json details;
     details["handle"] = handle;
     details["taskId"] = r.task_id;
+    details["contextId"] = r.context_id;
     details["state"] = task_state_to_wire(r.state);
     details["completed"] = r.completed;
     details["yielded"] = r.yielded;
+    details["suspended"] = r.is_suspended();
     if (r.reason) details["terminalReason"] = terminal_reason_text(*r.reason);
 
     if (!r.success) {
@@ -401,7 +413,10 @@ tools::ToolResult RemoteA2aStatusTool::execute(const core::JsonValue& params) {
     }
     auto res = tools::tool_result::text(r.render());
     res.details = core::JsonValue(details);
-    if (r.completed && !r.error_text.empty()) {
+    // ★★ 与发送工具一致：挂起态绝不置 success=false。
+    //   follow_up 恰恰是 input-required 最常见的入口（让渡后模型来取结果），
+    //   在这里误判失败的后果与发送路径相同 —— 模型重试 → 远端堆僵尸任务。
+    if (r.completed && !r.error_text.empty() && !r.is_suspended()) {
         res.success = false;
         res.error = r.error_text;
     }

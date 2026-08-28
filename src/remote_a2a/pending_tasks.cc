@@ -220,7 +220,8 @@ int PendingTaskStore::note_no_progress(const std::string& handle) {
 
 bool PendingTaskStore::update_terminal(const std::string& handle,
                                        TerminalReason reason, const std::string& text,
-                                       const std::string& error_text) {
+                                       const std::string& error_text,
+                                       std::optional<TaskState> remote_state) {
     bool changed = false;
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -241,7 +242,21 @@ bool PendingTaskStore::update_terminal(const std::string& handle,
         }
 
         t->reason = reason;
-        t->state = terminal_reason_to_task_state(reason);
+        // ★ 远端给了真实状态就【原样保留】，只有在没有远端状态时才由 reason 推导。
+        //
+        //   曾经这里无条件写 terminal_reason_to_task_state(reason)，
+        //   于是 input-required（归因为 Completed，因为它不是失败）
+        //   被写成 TaskState::Completed —— 远端"我还需要订单号"的事实
+        //   被抹成"任务成功了"，render() 把追问当最终答案输出，续接流程断裂。
+        //
+        // ⚠ 非终态一律忽略：一条 working 会把记录写成
+        //   "phase=Terminal 但 state=working" 的矛盾态，
+        //   后续 is_terminal(state) 判断会与 phase 不一致。
+        if (remote_state.has_value() && is_terminal(*remote_state)) {
+            t->state = *remote_state;
+        } else {
+            t->state = terminal_reason_to_task_state(reason);
+        }
         // Harvested 不回退到 Terminal（结果已被取走）
         if (t->phase == PendingPhase::Running) t->phase = PendingPhase::Terminal;
         if (!text.empty()) {

@@ -53,6 +53,28 @@ cc_library(
         "-I/usr/include/jsoncpp",
         "-I/usr/include/spdlog",
     ],
+    defines = [
+        # ★ 启用 HttpClient 的 HTTPS 支持。
+        #
+        # ⚠ 此前【只链了 -lssl -lcrypto 却没定义这个宏】，导致 http_client.cc
+        #   里 15 处 #ifdef HUNTERCLAW_ENABLE_SSL 全走 else 分支，任何 https://
+        #   请求都返回 "HTTPS not supported"。而 HttpClient 是唯一 HTTP 通路
+        #   （无 curl 后备），影响所有出网功能：MCP HTTP transport / web_search
+        #   / LLM provider / webhook / remote_a2a。
+        #
+        # ⚠ 打开后暴露出两个「从未被编译过」的缺陷，均已修：
+        #   ① http_client.cc  socket_result.value 是 std::optional<int>，
+        #      赋给 int 编译失败（应为 .get()）
+        #   ② 代码按 OpenSSL 1.1.0+ 编写，而 RHEL/CentOS 7 系是 1.0.2k。
+        #      已加 OPENSSL_VERSION_NUMBER 兼容层（见 http_client.cc 顶部），
+        #      TLS 版本下限仍是 1.2，安全性不降级。
+        #
+        # ★ 用 defines 而非 copts：defines 会传递给所有依赖方，保证
+        #   include http_client.h 的每个编译单元看到一致的 SSL 声明。
+        #   只写 copts 会让头文件里的 #ifdef 在依赖方走 else 分支，
+        #   造成 ODR 违规（同一个类在不同 TU 里成员布局不同）。
+        "HUNTERCLAW_ENABLE_SSL",
+    ],
     linkopts = [
         "-lpthread",
         "-lssl",
@@ -645,6 +667,70 @@ cc_library(
 )
 
 # ============================================================================
+# Remote A2A Library - 远端 A2A agent 客户端（消费远端，不暴露自身为服务）
+#
+# ★ 刻意拆成两个 target：
+#   hunterclaw_remote_a2a        核心，【不依赖 httplib / gateway】
+#   hunterclaw_remote_a2a_route  gateway 胶水，仅 callback_route.cc
+#
+# 这不只是为了构建整洁，而是把「核心不碰 httplib」这条边界变成【构建约束】：
+# 若哪天核心误引 httplib，本 target 会直接编译失败，而不是等到运行期
+# 才发现依赖膨胀。tests/run_remote_a2a_tests.sh 里的 LOW/HIGH 分层同理。
+#
+# ⚠ 与现有 tools/sessions_send_a2a.cc（会话间 A2A）完全独立、零耦合。
+# ============================================================================
+cc_library(
+    name = "hunterclaw_remote_a2a",
+    srcs = glob(
+        ["remote_a2a/*.cc"],
+        exclude = ["remote_a2a/callback_route.cc"],  # ★ 需要 httplib，见下一个 target
+    ),
+    deps = [
+        "//:hunterclaw_headers",
+        ":hunterclaw_infra",     # HttpClient（拉卡 / RPC / SSE）+ system_events（进度投递）
+        ":hunterclaw_tools",     # Tool / ToolManager / ToolParams / tool_result
+        "@nlohmann_json//:json",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+    copts = [
+        "-std=c++17",
+        "-Wall",
+        "-Wextra",
+        "-I/usr/include/jsoncpp",
+        "-I/usr/include/spdlog",
+    ],
+    linkopts = [
+        "-lpthread",
+    ],
+    linkstatic = False,
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "hunterclaw_remote_a2a_route",
+    srcs = ["remote_a2a/callback_route.cc"],
+    deps = [
+        "//:hunterclaw_headers",
+        "//third_party:httplib",
+        ":hunterclaw_remote_a2a",
+        ":hunterclaw_gateway",   # HttpGateway::register_route / add_auth_bypass_prefix
+        "@nlohmann_json//:json",
+    ],
+    copts = [
+        "-std=c++17",
+        "-Wall",
+        "-Wextra",
+        "-I/usr/include/spdlog",
+    ],
+    linkopts = [
+        "-lpthread",
+    ],
+    linkstatic = False,
+    visibility = ["//visibility:public"],
+)
+
+# ============================================================================
 # Tasks Library - Background Task Registry (对齐 OpenClaw tasks/)
 # ============================================================================
 cc_library(
@@ -684,6 +770,10 @@ cc_library(
         ":hunterclaw_tools",   # ✅ 添加 tools 依赖 (ToolManager::create)
         ":hunterclaw_react",   # ✅ 添加 react 依赖 (ReactEngine::create)
         ":hunterclaw_mcp",     # ✅ 添加 mcp 依赖 (AgentInstance 自动启用 MCP)
+        # ✅ remote_a2a: AgentInstance 把进程级 registry 的工具注册进本会话 ToolManager
+        #    ⚠ 只依赖核心 target（不含 callback_route）——
+        #      后者依赖 gateway，而 gateway 依赖 agents，会成环。
+        ":hunterclaw_remote_a2a",
         ":hunterclaw_hooks",   # ✅ 添加 hooks 依赖 (auto_reply/message_dispatcher.cc)
         ":hunterclaw_routing", # ✅ 添加 routing 依赖 (auto_reply/message_dispatcher.cc)
         ":hunterclaw_acp",     # ✅ 添加 acp 依赖 (auto_reply/message_dispatcher.cc)
