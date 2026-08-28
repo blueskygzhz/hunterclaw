@@ -306,6 +306,47 @@ core::Result<RemoteA2aConfig> parse_remote_a2a_config(const nlohmann::json& node
         rc.policy.requires_approval =
             jbool(a, "requiresApproval", false, "requires_approval");
         rc.policy.owner_only = jbool(a, "ownerOnly", false, "owner_only");
+
+        // 审批模式与可选决策集
+        {
+            auto it = a.find("approvalMode");
+            if (it == a.end()) it = a.find("approval_mode");
+            if (it != a.end() && it->is_string()) {
+                const std::string m = it->get<std::string>();
+                // ⚠ 只接受已知值。不认识的一律留空 → 回落宿主默认(Request)。
+                //   静默接受未知值会让"拼错的 defer"表现为 Request 阻塞,
+                //   而运维以为配的是不阻塞模式。
+                if (m == "request" || m == "report" || m == "deny" || m == "defer") {
+                    rc.policy.approval_mode = m;
+                } else if (!m.empty()) {
+                    cfg.warnings.push_back("远端 '" + rc.name + "' 的 approvalMode='" + m +
+                                      "' 不是已知值（request/report/deny/defer），已忽略");
+                }
+            }
+        }
+        {
+            auto it = a.find("approvalAllowedDecisions");
+            if (it == a.end()) it = a.find("approval_allowed_decisions");
+            if (it != a.end() && it->is_array()) {
+                std::vector<std::string> ds;
+                for (const auto& d : *it) {
+                    if (!d.is_string()) continue;
+                    const std::string s = d.get<std::string>();
+                    if (s == "allow-once" || s == "allow-always" || s == "deny") {
+                        ds.push_back(s);
+                    } else {
+                        cfg.warnings.push_back("远端 '" + rc.name +
+                                          "' 的 approvalAllowedDecisions 含未知项 '" +
+                                          s + "'，已忽略该项");
+                    }
+                }
+                // ⚠ 全部非法时【留空】而不是留一个空 vector 语义 ——
+                //   空 vector 在 Stage 1 表示"用默认全集"。若把非法配置
+                //   当成"只允许空集"，会让该远端的审批永远无法通过。
+                if (!ds.empty()) rc.policy.approval_allowed_decisions = std::move(ds);
+            }
+        }
+
         rc.policy.include_skills_in_description =
             jbool(a, "includeSkills", true, "include_skills");
         rc.policy.max_description_chars = static_cast<size_t>(clamp_positive(

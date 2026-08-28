@@ -55,47 +55,6 @@ struct ExecApprovalRequestPayload {
 };
 
 // ============================================================================
-// ExecApprovalRecord (对齐 OpenClaw ExecApprovalRecord)
-// ============================================================================
-struct ExecApprovalRecord {
-    std::string id;
-    ExecApprovalRequestPayload request;
-
-    // ★★ Plugin (工具) 审批的载荷。有值时本记录归属 plugin, 否则归属 exec。
-    //
-    //   对齐 OpenClaw 的【一个 store + 两类 payload】结构:
-    //   plugin-approvals.ts 直接 import ExecApprovalDecision, 两类审批
-    //   共用同一决策枚举与同一等待/解决机制, 只有请求载荷不同。
-    //
-    //   ⚠ 不另建一个 PluginApprovalManager: 那会产生两个待审列表,
-    //     而客户端只有一个 approval.resolve 入口 —— 决策打到哪个列表
-    //     取决于实现细节, 另一个列表的请求永远等不到决策 → 必然超时。
-    //     这正是"两套 manager"最危险的地方: 它表现为随机超时而非报错。
-    std::optional<PluginApprovalRequestPayload> plugin_request;
-
-    int64_t created_at_ms = 0;
-    int64_t expires_at_ms = 0;
-    // Caller metadata (best-effort)
-    std::optional<std::string> requested_by_conn_id;
-    std::optional<std::string> requested_by_device_id;
-    std::optional<std::string> requested_by_client_id;
-    // Resolution state
-    std::optional<int64_t> resolved_at_ms;
-    std::optional<ExecApprovalDecision> decision;
-    std::optional<std::string> resolved_by;
-
-    /// 本记录的归属。
-    /// ★ 由载荷【形状】决定 (plugin_request 是否有值), 不看 id 拼写 ——
-    ///   与 resolve_approval_request_kind() 同一原则。
-    ApprovalKind kind() const {
-        return plugin_request.has_value() ? ApprovalKind::Plugin : ApprovalKind::Exec;
-    }
-
-    /// 用于广播/快照的 request 字段 (按归属输出对应形状)。
-    json request_to_json() const;
-};
-
-// ============================================================================
 // PluginApprovalRequestPayload (对齐 OpenClaw PluginApprovalRequestPayload)
 //   src/infra/plugin-approvals.ts:17-33
 //
@@ -171,6 +130,47 @@ std::optional<ApprovalKind> approval_kind_from_wire(const std::string& s);
 //
 // @return nullopt 表示无法确定唯一归属 (调用方应视为错误)
 std::optional<ApprovalKind> resolve_approval_request_kind(const json& request);
+
+// ============================================================================
+// ExecApprovalRecord (对齐 OpenClaw ExecApprovalRecord)
+// ============================================================================
+struct ExecApprovalRecord {
+    std::string id;
+    ExecApprovalRequestPayload request;
+
+    // ★★ Plugin (工具) 审批的载荷。有值时本记录归属 plugin, 否则归属 exec。
+    //
+    //   对齐 OpenClaw 的【一个 store + 两类 payload】结构:
+    //   plugin-approvals.ts 直接 import ExecApprovalDecision, 两类审批
+    //   共用同一决策枚举与同一等待/解决机制, 只有请求载荷不同。
+    //
+    //   ⚠ 不另建一个 PluginApprovalManager: 那会产生两个待审列表,
+    //     而客户端只有一个 approval.resolve 入口 —— 决策打到哪个列表
+    //     取决于实现细节, 另一个列表的请求永远等不到决策 → 必然超时。
+    //     这正是"两套 manager"最危险的地方: 它表现为随机超时而非报错。
+    std::optional<PluginApprovalRequestPayload> plugin_request;
+
+    int64_t created_at_ms = 0;
+    int64_t expires_at_ms = 0;
+    // Caller metadata (best-effort)
+    std::optional<std::string> requested_by_conn_id;
+    std::optional<std::string> requested_by_device_id;
+    std::optional<std::string> requested_by_client_id;
+    // Resolution state
+    std::optional<int64_t> resolved_at_ms;
+    std::optional<ExecApprovalDecision> decision;
+    std::optional<std::string> resolved_by;
+
+    /// 本记录的归属。
+    /// ★ 由载荷【形状】决定 (plugin_request 是否有值), 不看 id 拼写 ——
+    ///   与 resolve_approval_request_kind() 同一原则。
+    ApprovalKind kind() const {
+        return plugin_request.has_value() ? ApprovalKind::Plugin : ApprovalKind::Exec;
+    }
+
+    /// 用于广播/快照的 request 字段 (按归属输出对应形状)。
+    json request_to_json() const;
+};
 
 // ============================================================================
 // ExecApprovalIdLookupResult (对齐 OpenClaw ExecApprovalIdLookupResult)

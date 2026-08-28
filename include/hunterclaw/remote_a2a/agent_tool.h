@@ -70,6 +70,17 @@ std::string safe_remote_a2a_tool_name(const std::string& agent_name,
 struct AgentToolPolicy {
     /// 是否需要审批。★ 只从本地配置读。
     bool requires_approval = false;
+    /// 审批模式："" / "request" / "report" / "deny" / "defer"
+    ///
+    /// ★ 空串 = 宿主默认（Request，会阻塞等决策）。
+    /// ★ "defer" 用于【收敛方不是本次调用】的场景 ——
+    ///   例如用户需要在企微页面上点确认。Request 会独占会话直到超时，
+    ///   Defer 则放行并把凭据交给 DeferredApprovalRegistry 稍后收敛。
+    std::string approval_mode;
+    /// 限定可选决策；空 = 默认全集。
+    /// ⚠ 高风险远端应设为 {"allow-once","deny"} —— 不允许 allow-always。
+    ///   一次误点永久授权会让后续所有该远端调用免审。
+    std::vector<std::string> approval_allowed_decisions;
     /// 是否仅 owner 可用
     bool owner_only = false;
     /// 是否把远端 skills 写进工具描述（省 context 时可关）
@@ -93,6 +104,10 @@ public:
     Schema parameters() const override;
     tools::ToolResult execute(const core::JsonValue& params) override;
     bool requires_approval() const override { return policy_.requires_approval; }
+    std::string approval_mode() const override { return policy_.approval_mode; }
+    std::vector<std::string> approval_allowed_decisions() const override {
+        return policy_.approval_allowed_decisions;
+    }
     bool owner_only() const override { return policy_.owner_only; }
 
     /// 预热：拉卡并缓存描述。失败不抛异常（工具仍可注册，调用时再报错）。

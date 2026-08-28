@@ -31,6 +31,7 @@
 #include "hunterclaw/tools/tool.h"
 
 #include <atomic>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -95,6 +96,13 @@ enum class ApprovalMode {
     Deny,     // 需审批即拒绝 -> veto{plugin-approval}
     Defer,    // 不阻塞放行, 携带 deferred 凭据
 };
+
+/// 解析 Tool::approval_mode() 返回的字符串。
+/// ★ 空串或无法识别 → Request（对齐 OpenClaw 的 fall-through 默认）。
+/// ⚠ 无法识别时【不能】回落到 Deny/Report ——
+///   一个拼错的配置值不该悄悄放宽审批强度。Request 是最严的等待型默认。
+ApprovalMode parse_approval_mode(const std::string& s);
+const char* approval_mode_to_wire(ApprovalMode m);
 
 // ── DeferredApproval ────────────────────────────────────────────────────────
 // Analog of OpenClaw DeferredPluginToolApproval (approval.ts:458).
@@ -245,11 +253,20 @@ struct BeforeToolCallContext {
     ApprovalMode approval_mode = ApprovalMode::Request;
 
     // ★★ 工具审批的传输通道 (plugin 形状载荷 + gateway 广播)。
-    //   为空时按【不可用】处理 -> failure{plugin-approval-unavailable},
+    //
+    // ⚠ 用 shared_ptr 而非裸指针: mode=Request 时策略链会持有它跨越一次
+    //   阻塞等待(可长达 120s)。若期间进程级单例被替换/清空,
+    //   裸指针就在访问已销毁对象。
+    //
+    // ★ 为空时按【不可用】处理 -> failure{plugin-approval-unavailable},
     //   【绝不】放行。对齐 OpenClaw
     //   resolveUnavailablePluginApprovalSurfaceReason()。
     //   ⚠ 放行是安全漏洞: 没配 broker 的部署会让所有需审批工具静默直通。
-    ToolApprovalBroker* approval_broker = nullptr;
+    //
+    // ★ 调用方一般不手填此字段 —— 留空时策略链会自动从
+    //   ToolApprovalRuntime::instance() 取(见 run_before_tool_call_policy)。
+    //   显式赋值仅用于单测注入 fake。
+    std::shared_ptr<ToolApprovalBroker> approval_broker;
 
     // 限定本次审批允许的决策集合; 为空用默认全集。
     // ★ 用途: 某些操作不该允许 allow-always

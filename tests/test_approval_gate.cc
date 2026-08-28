@@ -18,11 +18,13 @@
 // ============================================================================
 
 #include "hunterclaw/tools/before_tool_call_policy.h"
+#include "hunterclaw/tools/tool_approval_runtime.h"
 
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <set>
 #include <string>
@@ -127,6 +129,19 @@ private:
     int seq_ = 0;
 };
 
+// ── FakeHolder ──────────────────────────────────────────────────────────────
+// 把 FakeBroker 包成 shared_ptr 并保持 `holder.xxx()` 的调用手感。
+//
+// ⚠ BeforeToolCallContext::approval_broker 是 shared_ptr（不是裸指针）——
+//   mode=Request 时策略链会持有它跨越一次阻塞等待（可达 120s），
+//   裸指针在此期间若被替换/销毁就是悬垂访问。
+struct FakeHolder {
+    std::shared_ptr<FakeBroker> p = std::make_shared<FakeBroker>();
+
+    FakeBroker* operator->() const { return p.get(); }
+    std::shared_ptr<ToolApprovalBroker> as_broker() const { return p; }
+};
+
 BeforeToolCallContext base_ctx(const char* tool = "danger_tool") {
     BeforeToolCallContext c;
     c.tool_name = tool;
@@ -153,12 +168,12 @@ core::JsonValue empty_params() {
 static void test_no_approval_needed() {
     SECTION("不需要审批");
 
-    FakeBroker broker;
+    FakeHolder broker;
     auto ctx = base_ctx();
     // 两个来源都为 false
     ctx.tool_requires_approval = false;
     ctx.policy_requires_approval = false;
-    ctx.approval_broker = &broker;
+    ctx.approval_broker = broker.as_broker();
 
     auto out = run_before_tool_call_policy(ctx, empty_params());
     CHECK(out.kind == HookOutcomeKind::Pass, "无需审批 → Pass");
@@ -168,7 +183,7 @@ static void test_no_approval_needed() {
     CHECK(out.params.contains("x"), "参数原样透传");
     // ★ [不可回退] 无需审批时【不能】发起审批请求 ——
     //   否则每次工具调用都会给用户弹一次窗
-    CHECK(broker.request_count() == 0, "未发起审批请求 [不可回退]");
+    CHECK(broker->request_count() == 0, "未发起审批请求 [不可回退]");
 }
 
 // ============================================================================
@@ -213,11 +228,11 @@ static void test_broker_missing_refuses() {
 
     // ── 发起失败 → 同样不放行 ──────────────────────────────────────────
     {
-        FakeBroker broker;
-        broker.fail_create = true;
+        FakeHolder broker;
+        broker->fail_create = true;
         auto ctx = base_ctx();
         ctx.tool_requires_approval = true;
-        ctx.approval_broker = &broker;
+        ctx.approval_broker = broker.as_broker();
 
         auto out = run_before_tool_call_policy(ctx, empty_params());
         // ★ [不可回退] 发起失败绝不能当成"批准"。
@@ -236,11 +251,11 @@ static void test_broker_missing_refuses() {
 static void test_mode_deny() {
     SECTION("mode=Deny");
 
-    FakeBroker broker;
+    FakeHolder broker;
     auto ctx = base_ctx();
     ctx.tool_requires_approval = true;
     ctx.approval_mode = ApprovalMode::Deny;
-    ctx.approval_broker = &broker;
+    ctx.approval_broker = broker.as_broker();
 
     auto out = run_before_tool_call_policy(ctx, empty_params());
 
@@ -256,7 +271,7 @@ static void test_mode_deny() {
           "reason 逐字对齐 OpenClaw [不可回退]");
     CHECK(!out.disposition.has_value(), "Veto 不带 disposition");
     // ★ [不可回退] Deny 不该发起审批 —— 结论已定, 弹窗只会骚扰用户
-    CHECK(broker.request_count() == 0, "未发起审批请求 [不可回退]");
+    CHECK(broker->request_count() == 0, "未发起审批请求 [不可回退]");
 }
 
 // ============================================================================
@@ -265,11 +280,11 @@ static void test_mode_deny() {
 static void test_mode_report() {
     SECTION("mode=Report");
 
-    FakeBroker broker;
+    FakeHolder broker;
     auto ctx = base_ctx();
     ctx.tool_requires_approval = true;
     ctx.approval_mode = ApprovalMode::Report;
-    ctx.approval_broker = &broker;
+    ctx.approval_broker = broker.as_broker();
 
     const auto t0 = std::chrono::steady_clock::now();
     auto out = run_before_tool_call_policy(ctx, empty_params());
@@ -286,7 +301,7 @@ static void test_mode_report() {
     CHECK(ms < 500, "Report 不阻塞 [不可回退]");
     CHECK(out.blocked, "blocked=true (报回给模型/上层)");
     // ★ Report 不发起审批 —— 它只是报告
-    CHECK(broker.request_count() == 0, "未发起审批请求 [不可回退]");
+    CHECK(broker->request_count() == 0, "未发起审批请求 [不可回退]");
 }
 
 // ============================================================================
@@ -297,14 +312,14 @@ static void test_mode_request() {
 
     // ── ALLOW_ONCE → Pass + approval_resolution ────────────────────────
     {
-        FakeBroker broker;
+        FakeHolder broker;
         auto ctx = base_ctx();
         ctx.tool_requires_approval = true;
         ctx.approval_mode = ApprovalMode::Request;
-        ctx.approval_broker = &broker;
+        ctx.approval_broker = broker.as_broker();
         ctx.approval_timeout_ms = 5000;
 
-        std::thread approver([&broker]() { broker.decide_next("allow-once"); });
+        std::thread approver([&broker]() { broker->decide_next("allow-once"); });
         auto out = run_before_tool_call_policy(ctx, empty_params());
         approver.join();
 
@@ -318,7 +333,7 @@ static void test_mode_request() {
         // ★★ [不可回退] 请求载荷必须带上 tool_name / tool_call_id ——
         //   这两个字段是 PluginApprovalRequestPayload 的核心,
         //   缺了客户端 UI 无法告诉用户"在批什么工具"。
-        auto reqs = broker.requests();
+        auto reqs = broker->requests();
         CHECK(reqs.size() == 1, "发起了一次审批");
         if (!reqs.empty()) {
             CHECK(reqs[0].tool_name == "danger_tool", "载荷含 tool_name [不可回退]");
@@ -330,13 +345,13 @@ static void test_mode_request() {
 
     // ── ALLOW_ALWAYS → resolution 区分 ─────────────────────────────────
     {
-        FakeBroker broker;
+        FakeHolder broker;
         auto ctx = base_ctx();
         ctx.tool_requires_approval = true;
-        ctx.approval_broker = &broker;
+        ctx.approval_broker = broker.as_broker();
         ctx.approval_timeout_ms = 5000;
 
-        std::thread approver([&broker]() { broker.decide_next("allow-always"); });
+        std::thread approver([&broker]() { broker->decide_next("allow-always"); });
         auto out = run_before_tool_call_policy(ctx, empty_params());
         approver.join();
 
@@ -348,13 +363,13 @@ static void test_mode_request() {
 
     // ── 用户 DENY → Failure{blocked} (★ 不是 Veto) ─────────────────────
     {
-        FakeBroker broker;
+        FakeHolder broker;
         auto ctx = base_ctx();
         ctx.tool_requires_approval = true;
-        ctx.approval_broker = &broker;
+        ctx.approval_broker = broker.as_broker();
         ctx.approval_timeout_ms = 5000;
 
-        std::thread denier([&broker]() { broker.decide_next("deny"); });
+        std::thread denier([&broker]() { broker->decide_next("deny"); });
         auto out = run_before_tool_call_policy(ctx, empty_params());
         denier.join();
 
@@ -372,10 +387,10 @@ static void test_mode_request() {
 
     // ── TIMEOUT → Failure{timed_out} ───────────────────────────────────
     {
-        FakeBroker broker;
+        FakeHolder broker;
         auto ctx = base_ctx();
         ctx.tool_requires_approval = true;
-        ctx.approval_broker = &broker;
+        ctx.approval_broker = broker.as_broker();
         ctx.approval_timeout_ms = 150;   // 无人决策
 
         auto out = run_before_tool_call_policy(ctx, empty_params());
@@ -392,13 +407,13 @@ static void test_mode_request() {
 
     // ── 未知决策字符串 → 不放行 ────────────────────────────────────────
     {
-        FakeBroker broker;
+        FakeHolder broker;
         auto ctx = base_ctx();
         ctx.tool_requires_approval = true;
-        ctx.approval_broker = &broker;
+        ctx.approval_broker = broker.as_broker();
         ctx.approval_timeout_ms = 3000;
 
-        std::thread t([&broker]() { broker.decide_next("approve"); });  // 非法值
+        std::thread t([&broker]() { broker->decide_next("approve"); });  // 非法值
         auto out = run_before_tool_call_policy(ctx, empty_params());
         t.join();
 
@@ -413,20 +428,20 @@ static void test_mode_request() {
 
     // ── allowed_decisions 透传 ─────────────────────────────────────────
     {
-        FakeBroker broker;
+        FakeHolder broker;
         auto ctx = base_ctx();
         ctx.tool_requires_approval = true;
-        ctx.approval_broker = &broker;
+        ctx.approval_broker = broker.as_broker();
         ctx.approval_timeout_ms = 3000;
         // ★ 限定只允许一次性授权 —— 用于"确认转账"这类绝不能永久授权的操作
         ctx.allowed_decisions = {"allow-once", "deny"};
 
-        std::thread t([&broker]() { broker.decide_next("allow-once"); });
+        std::thread t([&broker]() { broker->decide_next("allow-once"); });
         auto out = run_before_tool_call_policy(ctx, empty_params());
         t.join();
 
         CHECK(out.kind == HookOutcomeKind::Pass, "限定决策集下仍可批准");
-        auto reqs = broker.requests();
+        auto reqs = broker->requests();
         CHECK(!reqs.empty() && reqs[0].allowed.size() == 2,
               "allowed_decisions 透传到载荷 [不可回退]");
     }
@@ -439,11 +454,11 @@ static void test_mode_defer() {
     SECTION("mode=Defer");
 
     {
-        FakeBroker broker;
+        FakeHolder broker;
         auto ctx = base_ctx();
         ctx.tool_requires_approval = true;
         ctx.approval_mode = ApprovalMode::Defer;
-        ctx.approval_broker = &broker;
+        ctx.approval_broker = broker.as_broker();
         ctx.approval_timeout_ms = 5000;
 
         const auto t0 = std::chrono::steady_clock::now();
@@ -464,7 +479,7 @@ static void test_mode_defer() {
             CHECK(out.deferred_approval->tool_call_id == "call-1", "凭据含 tool_call_id");
         }
         // ★ 审批确实已发起（可被后续收敛）
-        CHECK(broker.request_count() == 1, "审批已发起 [不可回退]");
+        CHECK(broker->request_count() == 1, "审批已发起 [不可回退]");
     }
 
     // ── Defer 但 broker 缺失 → 不能放行 ────────────────────────────────
@@ -491,13 +506,13 @@ static void test_mode_defer() {
 static void test_stage_order() {
     SECTION("Stage 顺序");
 
-    FakeBroker broker;
+    FakeHolder broker;
     auto ctx = base_ctx();
     ctx.sender_is_owner = false;        // 非 owner
     ctx.tool_is_owner_only = true;      // owner-only 工具
     ctx.tool_requires_approval = true;  // 同时也需审批
     ctx.approval_mode = ApprovalMode::Request;
-    ctx.approval_broker = &broker;
+    ctx.approval_broker = broker.as_broker();
     ctx.approval_timeout_ms = 300;
 
     const auto t0 = std::chrono::steady_clock::now();
@@ -512,7 +527,7 @@ static void test_stage_order() {
     CHECK(out.denied_reason.value_or("") == denied_reason::kOwnerOnly,
           "denied_reason=owner-only (不是 plugin-approval) [不可回退]");
     CHECK(ms < 200, "未发起审批(未等待) [不可回退]");
-    CHECK(broker.request_count() == 0, "没有产生审批请求 [不可回退]");
+    CHECK(broker->request_count() == 0, "没有产生审批请求 [不可回退]");
 }
 
 // ============================================================================
@@ -521,10 +536,10 @@ static void test_stage_order() {
 static void test_approval_not_bypass() {
     SECTION("批准不等于免检");
 
-    FakeBroker broker;
+    FakeHolder broker;
     auto ctx = base_ctx();
     ctx.tool_requires_approval = true;
-    ctx.approval_broker = &broker;
+    ctx.approval_broker = broker.as_broker();
     ctx.approval_timeout_ms = 5000;
 
     // 审批通过, 但随即置取消标志 → 应被最后的取消检查拦下
@@ -532,7 +547,7 @@ static void test_approval_not_bypass() {
     ctx.aborted = &aborted;
 
     std::thread approver([&broker, &aborted]() {
-        if (broker.decide_next("allow-once")) {
+        if (broker->decide_next("allow-once")) {
             aborted.store(true);
         }
     });
@@ -550,6 +565,110 @@ static void test_approval_not_bypass() {
 }
 
 // ============================================================================
+// 进程级单例回落 + 注入语义
+// ============================================================================
+static void test_runtime_singleton() {
+    SECTION("进程级单例");
+
+    auto& rt = ToolApprovalRuntime::instance();
+    rt.reset_for_testing();
+
+    // ── 未注入 → Stage 1 拒绝（fail-closed）─────────────────────────────
+    {
+        CHECK(!rt.has_broker(), "初始未注入");
+        auto ctx = base_ctx();
+        ctx.tool_requires_approval = true;
+        // ★ 刻意不设 ctx.approval_broker —— 走单例回落路径
+        auto out = run_before_tool_call_policy(ctx, empty_params());
+        // ★★ [不可回退] 单例未注入时必须拒绝, 【绝不】放行。
+        //   这正是 Tool::requires_approval() 零消费时代的缺口:
+        //   声明要审批的工具直接执行, 且无日志可查。
+        CHECK(out.kind == HookOutcomeKind::Failure,
+              "单例未注入 → 拒绝执行 [不可回退]");
+        CHECK(out.denied_reason.value_or("") == denied_reason::kPluginApprovalUnavail,
+              "denied_reason=plugin-approval-unavailable [不可回退]");
+    }
+
+    // ── 注入后 → 自动回落到单例（ctx 不填也能用）────────────────────────
+    {
+        auto fake = std::make_shared<FakeBroker>();
+        CHECK(rt.set_broker(fake), "首次注入成功");
+        CHECK(rt.has_broker(), "has_broker 为真");
+
+        auto ctx = base_ctx("tool_via_singleton");
+        ctx.tool_requires_approval = true;
+        ctx.approval_timeout_ms = 3000;
+        // ★ 仍然不设 ctx.approval_broker
+
+        std::thread approver([fake]() { fake->decide_next("allow-once"); });
+        auto out = run_before_tool_call_policy(ctx, empty_params());
+        approver.join();
+
+        // ★★ [不可回退] 这是整条接线的闭环: react_engine / tool_manager
+        //   都【不再】按会话注入 broker（那会产生 N 个待审列表），
+        //   而是靠这里的单例回落。若回落失效, 所有需审批工具会被拒绝,
+        //   表现为"审批配好了但工具全不可用"。
+        CHECK(out.kind == HookOutcomeKind::Pass,
+              "自动回落到单例并获批 [不可回退]");
+        CHECK(out.approval_resolution.value_or("") == "allow-once",
+              "决策带出");
+        auto reqs = fake->requests();
+        CHECK(!reqs.empty() && reqs[0].tool_name == "tool_via_singleton",
+              "审批确实经由单例 broker 发起 [不可回退]");
+    }
+
+    // ── 重复注入被拒 ────────────────────────────────────────────────────
+    {
+        auto other = std::make_shared<FakeBroker>();
+        // ★★ [不可回退] 重复注入会让先前已发起的审批变成孤儿:
+        //   等待方仍在旧 broker 上等, 新决策落到新 broker,
+        //   于是那批审批必然等满超时。
+        CHECK(!rt.set_broker(other), "重复注入被拒 [不可回退]");
+        CHECK(rt.has_broker(), "原 broker 仍在位");
+        // 验证生效的仍是第一个（新的没收到任何请求）
+        auto ctx = base_ctx();
+        ctx.tool_requires_approval = true;
+        ctx.approval_mode = ApprovalMode::Defer;   // 不阻塞
+        auto out = run_before_tool_call_policy(ctx, empty_params());
+        CHECK(out.kind == HookOutcomeKind::Pass, "Defer 放行");
+        CHECK(other->request_count() == 0,
+              "第二个 broker 未被使用 [不可回退]");
+    }
+
+    // ── 拒绝注入 null ───────────────────────────────────────────────────
+    {
+        rt.reset_for_testing();
+        // ★ null 与"未注入"无法区分, 却会占掉唯一的注入机会 ——
+        //   之后真正的 broker 就再也设不进来了。
+        CHECK(!rt.set_broker(nullptr), "拒绝注入 null [不可回退]");
+        CHECK(!rt.has_broker(), "仍视为未注入");
+        auto real = std::make_shared<FakeBroker>();
+        CHECK(rt.set_broker(real), "null 未占掉注入机会 [不可回退]");
+    }
+
+    // ── ctx 显式给的 broker 优先于单例 ──────────────────────────────────
+    {
+        rt.reset_for_testing();
+        auto singleton_broker = std::make_shared<FakeBroker>();
+        rt.set_broker(singleton_broker);
+
+        auto explicit_broker = std::make_shared<FakeBroker>();
+        auto ctx = base_ctx();
+        ctx.tool_requires_approval = true;
+        ctx.approval_mode = ApprovalMode::Defer;
+        ctx.approval_broker = explicit_broker;
+
+        auto out = run_before_tool_call_policy(ctx, empty_params());
+        CHECK(out.kind == HookOutcomeKind::Pass, "Defer 放行");
+        // ★ 显式注入优先 —— 这是单测能隔离运行的前提
+        CHECK(explicit_broker->request_count() == 1, "用了显式 broker");
+        CHECK(singleton_broker->request_count() == 0, "未用单例 broker");
+    }
+
+    rt.reset_for_testing();
+}
+
+// ============================================================================
 int main() {
     std::cout << "===== before_tool_call Stage 1 (approval gate) 测试 ====="
               << std::endl;
@@ -562,6 +681,7 @@ int main() {
     test_mode_defer();
     test_stage_order();
     test_approval_not_bypass();
+    test_runtime_singleton();
 
     std::cout << "-----------------------------------------" << std::endl;
     std::cout << "PASS: " << g_pass << "  FAIL: " << g_fail << std::endl;

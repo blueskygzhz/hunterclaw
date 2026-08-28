@@ -13,7 +13,8 @@
 // preflight_memory — 均在 dispatcher/外层调用
 #include "hunterclaw/tools/tool_manager.h"
 #include "hunterclaw/tools/tool_hooks.h"             // PluginHook* types + get_global_hook_manager()
-#include "hunterclaw/tools/before_tool_call_policy.h" // unified before_tool_call policy chain
+#include "hunterclaw/tools/before_tool_call_policy.h"
+#include "hunterclaw/tools/deferred_approval_registry.h"  // ✅ Defer 凭据收敛 // unified before_tool_call policy chain
 #include "hunterclaw/sessions/transcript_io.h"       // append_tool_result_to_transcript (tool_result_persist)
 #include "hunterclaw/observability/observability.h"  // ✅ Span, Tracer, SpanKind
 #include "hunterclaw/observability/diagnostic_events.h"  // ✅ 可观测性集成
@@ -2224,9 +2225,17 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                         //   声明要审批的工具(builtin_tools.cc:172/536 等)从不审批,
                         //   声明方以为受保护, 实际直通且无日志可查。
                         policy_ctx.tool_requires_approval = t->requires_approval();
+                        // ★ 工具可覆盖审批模式与可选决策集。
+                        //   空串 → Request（宿主默认，对齐 OpenClaw）。
+                        //   "defer" 用于"收敛方不是本次调用"的场景
+                        //   （如用户要在外部页面点确认）。
+                        policy_ctx.approval_mode =
+                            tools::parse_approval_mode(t->approval_mode());
+                        policy_ctx.allowed_decisions = t->approval_allowed_decisions();
                     }
-                    // ★ 为空时 Stage 1 按"审批面不可用"拒绝执行, 绝不放行。
-                    policy_ctx.approval_broker = tool_manager_->approval_broker();
+                    // ★ approval_broker 留空 —— 策略链自动从进程级
+                    //   ToolApprovalRuntime::instance() 取(对齐 OpenClaw
+                    //   approval-gateway-runtime-context.ts 的全局单例)。
                 }
 
                 auto outcome = tools::run_before_tool_call_policy(policy_ctx, tool_call.input);
@@ -2264,6 +2273,49 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                 }
                 // PASS: 使用（可能被 hook 改写的）最终参数
                 effective_params = std::move(outcome.params);
+
+                // ── Defer 审批凭据的登记与收敛 ────────────────────────────
+                // 🎯 对齐 OpenClaw native-hook-relay-permissions.ts:
+                //    setNativeHookRelayPreToolUseApproval + resolve...
+                //
+                // ★★ Defer 的语义是"审批已发起但不在 Stage 1 等"。
+                //   若发出去就不管, 后果是:
+                //     · 用户点了"拒绝"【没人看】⇒ 审批形同虚设
+                //     · 凭据无人收敛 ⇒ 一直挂到超时, 占着待审列表
+                //   所以这里必须收敛它。
+                //
+                // ⚠ 参数指纹: 用户批准的是【Stage 1 发起审批那一刻】的参数,
+                //   而 hook 可能在 Stage 3 改写过。沿用旧批准执行新参数
+                //   等于"拿批准 A 的授权执行 B" —— 权限提升。
+                //   OpenClaw 对此的处置是拒绝 (codec.ts:168-176)。
+                if (outcome.deferred_approval) {
+                    auto& reg = tools::DeferredApprovalRegistry::instance();
+                    // key 用 run_id + tool_call_id: 只用后者会让不同 run
+                    // 的同名 id 互相顶掉。
+                    const std::string key = callbacks.run_id + ":" + tool_call.id;
+                    reg.put(key, *outcome.deferred_approval,
+                            tools::params_fingerprint(tool_call.input));
+
+                    auto res = reg.resolve(
+                        key, tools::params_fingerprint(effective_params));
+                    if (!res.approved()) {
+                        // ⚠ 未获批一律【不执行】。ParamsRewritten / TimedOut /
+                        //   NotFound 都归此类 —— 未决 == 未获批。
+                        auto blocked = tools::build_blocked_tool_result(
+                            res.reason.empty() ? "deferred approval was not granted"
+                                               : res.reason,
+                            tools::denied_reason::kPluginApproval,
+                            tool_call.id);
+                        log()->warn("Tool '{}' deferred approval not granted ({}): {}",
+                                    tool_call.name,
+                                    tools::deferred_resolution_text(res.resolution),
+                                    blocked.error);
+                        results[tool_call.id] = blocked;
+                        if (callbacks.on_tool_end)
+                            callbacks.on_tool_end(tool_call.name, blocked);
+                        continue;
+                    }
+                }
             }
 
             // ✅ 对齐 OpenClaw handlers.tools.ts:314 — 记录工具启动时间
@@ -2483,9 +2535,17 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                         //   声明要审批的工具(builtin_tools.cc:172/536 等)从不审批,
                         //   声明方以为受保护, 实际直通且无日志可查。
                         policy_ctx.tool_requires_approval = t->requires_approval();
+                        // ★ 工具可覆盖审批模式与可选决策集。
+                        //   空串 → Request（宿主默认，对齐 OpenClaw）。
+                        //   "defer" 用于"收敛方不是本次调用"的场景
+                        //   （如用户要在外部页面点确认）。
+                        policy_ctx.approval_mode =
+                            tools::parse_approval_mode(t->approval_mode());
+                        policy_ctx.allowed_decisions = t->approval_allowed_decisions();
                     }
-                    // ★ 为空时 Stage 1 按"审批面不可用"拒绝执行, 绝不放行。
-                    policy_ctx.approval_broker = tool_manager_->approval_broker();
+                    // ★ approval_broker 留空 —— 策略链自动从进程级
+                    //   ToolApprovalRuntime::instance() 取(对齐 OpenClaw
+                    //   approval-gateway-runtime-context.ts 的全局单例)。
                 }
 
                 auto outcome = tools::run_before_tool_call_policy(policy_ctx, tool_call.input);
@@ -2524,6 +2584,40 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                 }
                 // PASS
                 parallel_effective_params = std::move(outcome.params);
+
+                // ── Defer 审批凭据的登记与收敛（并行路径）─────────────────
+                // ⚠ 与串行路径【必须一致】。若这里漏做, Defer 模式下
+                //   并行工具调用会绕过审批: 凭据发出去没人看,
+                //   用户点"拒绝"也照样执行 —— 而串行路径是拦住的,
+                //   于是"能否绕过审批"取决于模型是否并行发起, 极难发现。
+                if (outcome.deferred_approval) {
+                    auto& reg = tools::DeferredApprovalRegistry::instance();
+                    const std::string key = callbacks.run_id + ":" + tool_call.id;
+                    reg.put(key, *outcome.deferred_approval,
+                            tools::params_fingerprint(tool_call.input));
+
+                    auto res = reg.resolve(
+                        key, tools::params_fingerprint(parallel_effective_params));
+                    if (!res.approved()) {
+                        auto blocked = tools::build_blocked_tool_result(
+                            res.reason.empty() ? "deferred approval was not granted"
+                                               : res.reason,
+                            tools::denied_reason::kPluginApproval,
+                            tool_call.id);
+                        log()->warn("Tool '{}' deferred approval not granted "
+                                    "(parallel, {}): {}",
+                                    tool_call.name,
+                                    tools::deferred_resolution_text(res.resolution),
+                                    blocked.error);
+                        std::string tool_id = tool_call.id;
+                        auto f = std::async(std::launch::deferred,
+                            [tool_id, blocked]() -> ParallelToolResultOuter {
+                                return {tool_id, blocked, 0.0};
+                            });
+                        futures.push_back(std::move(f));
+                        continue;
+                    }
+                }
             }
             
             // ✅ 提交任务到全局线程池 (避免频繁创建/销毁线程)

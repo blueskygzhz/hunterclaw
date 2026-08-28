@@ -118,8 +118,34 @@ public:
     virtual ToolResult execute(const core::JsonValue& params) = 0;
     
     // 是否需要审批
+    // 🎯 对齐 OpenClaw needsApproval。
+    // ⚠ 此虚函数曾长期【零消费】—— 声明 true 的工具从不审批。
+    //   现由 before_tool_call 链的 Stage 1 消费
+    //   (before_tool_call_policy.cc 的 run_approval_gate)。
     virtual bool requires_approval() const { return false; }
-    
+
+    // 审批模式覆盖（"request" / "report" / "deny" / "defer"）。
+    //
+    // ★ 返回空串表示"用宿主默认"（当前默认 Request，对齐 OpenClaw
+    //   resolveBeforeToolCallApprovalOutcome 的 fall-through 分支）。
+    //
+    // ★ 需要 "defer" 的典型场景：审批的收敛方【不是】本次工具调用本身，
+    //   例如"用户要在外部页面上点确认"。Request 会独占会话直到超时，
+    //   Defer 则放行并把凭据交给登记表稍后收敛。
+    //
+    // ⚠ 用字符串而非 enum：tool.h 被极广泛包含，引入
+    //   before_tool_call_policy.h 的 enum 会把审批类型拖进所有工具的 TU。
+    //   字符串在 Stage 1 入口解析一次即可。
+    virtual std::string approval_mode() const { return {}; }
+
+    // 限定本次审批允许的决策集合（"allow-once" / "allow-always" / "deny"）。
+    //
+    // ★ 返回空表示用默认全集。
+    // ⚠ 用途：某些操作【不该】允许 allow-always ——
+    //   "确认转账 5000 元"可以批一次，永久授权绝不行。
+    //   若不限定，用户一次误点 allow-always 会让后续同类操作全部免审。
+    virtual std::vector<std::string> approval_allowed_decisions() const { return {}; }
+
     // 是否仅Owner可用
     virtual bool owner_only() const { return false; }
 };

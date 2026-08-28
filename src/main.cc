@@ -8,6 +8,8 @@
 #include "hunterclaw/channels/manager.h"
 #include "hunterclaw/agents/agent_instance.h"       // ✅ set_model_context_discovery_hook
 #include "hunterclaw/remote_a2a/runtime.h"          // ✅ RemoteA2aRuntime（进程级初始化）
+#include "hunterclaw/tools/tool_approval_runtime.h" // ✅ 工具审批通道（进程级）
+#include "hunterclaw/gateway/tool_approval_broker.h" // ✅ GatewayToolApprovalBroker
 #include "hunterclaw/llm/model_discovery.h"          // ✅ discover_and_apply_provider_context_windows
 #include "hunterclaw/infra/http_client.h"            // ✅ HttpClient
 #include "hunterclaw/agents/types.h"
@@ -462,6 +464,51 @@ int main(int argc, char** argv) {
     if (start_result.is_err()) {
         std::cerr << "Failed to start gateway: " << start_result.error << std::endl;
         return 1;
+    }
+
+    // ============================================================================
+    // 工具审批通道注入（进程级）
+    // ============================================================================
+    //   ★ 必须在 gateway->start() 【之后】: broker 要用 exec_approval_manager()
+    //     与 broadcast()，两者都由已启动的 server 提供。
+    //
+    //   ★ 必须在任何 AgentInstance 创建【之前】: before_tool_call 的 Stage 1
+    //     在通道缺失时会【拒绝执行】需审批的工具（fail-closed）。晚注入意味着
+    //     早期会话里那些工具全部不可用。
+    //
+    //   ⚠ 为什么是进程级单例而不是每会话注入（ToolManager 是每会话创建的）:
+    //     按会话持有会产生 N 个待审列表，而客户端只有一个 approval.resolve
+    //     入口 —— 决策落到哪个列表取决于实现细节，其余列表的请求永远等不到
+    //     决策，表现为随机超时而非报错。
+    //     对齐 OpenClaw approval-gateway-runtime-context.ts 的全局单例做法。
+    // ============================================================================
+    {
+        auto approval_mgr = gateway->exec_approval_manager();
+        if (approval_mgr) {
+            // ⚠ 捕获裸 gateway 会在 shutdown 后悬垂；用 weak_ptr 让
+            //   进程退出期的迟到广播安全降级为 no-op。
+            std::weak_ptr<gateway::GatewayServer> weak_gw = gateway;
+            auto broker = std::make_shared<gateway::GatewayToolApprovalBroker>(
+                approval_mgr,
+                [weak_gw](const std::string& ev, const nlohmann::json& payload) {
+                    auto gw = weak_gw.lock();
+                    if (!gw) return;
+                    core::EventFrame f;
+                    f.event = ev;
+                    f.payload = core::JsonValue(payload);
+                    gw->broadcast(f);
+                });
+            if (tools::ToolApprovalRuntime::instance().set_broker(broker)) {
+                std::cout << "  Tool approval: gateway channel ready" << std::endl;
+            }
+        } else {
+            // ⚠ 必须显式告警。没有通道 ⇒ 所有声明 requires_approval 的工具
+            //   会被 Stage 1 拒绝执行（这是正确的 fail-closed，但必须可见，
+            //   否则表现为"工具莫名不可用"且日志里一个字都没有）。
+            std::cerr << "  Warning: exec approval manager unavailable; tools that "
+                         "require approval will be refused (fail-closed)."
+                      << std::endl;
+        }
     }
     
     std::cout << "\n==================================" << std::endl;

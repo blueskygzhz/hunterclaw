@@ -8,6 +8,7 @@
 #include "hunterclaw/tools/before_tool_call_policy.h"
 
 #include "hunterclaw/tools/tool_hooks.h"
+#include "hunterclaw/tools/tool_approval_runtime.h"  // 进程级审批通道
 #include "hunterclaw/security/dangerous_tools.h"
 #include "hunterclaw/core/logger.h"
 
@@ -53,7 +54,7 @@ std::optional<HookOutcome> run_approval_gate(const BeforeToolCallContext& ctx,
 
     // ── mode=Report: 不等待, 把"需要审批"报回去 ─────────────────────────
     // OpenClaw approval.ts:515-525 → failure{blocked}。
-    // ★ 放在 broker 检查之前: Report 本就不发起审批, 不需要 broker。
+    // ★ 放在 broker 解析之前: Report 本就不发起审批, 不需要 broker。
     //   要求 broker 会让"无 UI 宿主"连报告都做不了。
     if (ctx.approval_mode == ApprovalMode::Report) {
         log()->info("Tool '{}' requires approval; reporting (mode=report)",
@@ -76,6 +77,19 @@ std::optional<HookOutcome> run_approval_gate(const BeforeToolCallContext& ctx,
                                  denied_reason::kPluginApproval, params);
     }
 
+    // ── 解析审批通道 ────────────────────────────────────────────────────
+    // ★★ 取【一次】并持有 shared_ptr 到本函数返回。
+    //   mode=Request 会在下面阻塞等待(可长达 120s), 期间进程级单例
+    //   可能被清空(如 shutdown)。若每次用时重新去单例取, 或持有裸指针,
+    //   等待中的调用就会访问已销毁对象。
+    //
+    // ★ ctx 显式给了就用它(单测注入 fake), 否则回落到进程级单例 ——
+    //   与 OpenClaw 从 AsyncLocalStorage/全局单例取 runtime 同构。
+    std::shared_ptr<ToolApprovalBroker> broker = ctx.approval_broker;
+    if (!broker) {
+        broker = ToolApprovalRuntime::instance().broker();
+    }
+
     // ── broker 缺失 → 不可用, 【绝不】放行 ──────────────────────────────
     // OpenClaw resolveUnavailablePluginApprovalSurfaceReason() (:260-272)
     // → failure{failed, plugin-approval-unavailable}。
@@ -86,7 +100,7 @@ std::optional<HookOutcome> run_approval_gate(const BeforeToolCallContext& ctx,
     //
     // ★ Defer 也要求 broker: 没有它 Defer 会退化成"放行且无凭据",
     //   那等于静默跳过审批 —— 正是我们要防的。
-    if (!ctx.approval_broker) {
+    if (!broker) {
         log()->error("Tool '{}' requires approval but no approval surface is "
                      "available; refusing to execute", ctx.tool_name);
         return HookOutcome::failure(
@@ -94,7 +108,7 @@ std::optional<HookOutcome> run_approval_gate(const BeforeToolCallContext& ctx,
             disposition::kFailed, denied_reason::kPluginApprovalUnavail, params);
     }
 
-    const std::string approval_id = ctx.approval_broker->request_tool_approval(
+    const std::string approval_id = broker->request_tool_approval(
         ctx.tool_name, ctx.tool_call_id, ctx.agent_id, ctx.session_key,
         ctx.approval_timeout_ms, ctx.allowed_decisions);
     if (approval_id.empty()) {
@@ -119,8 +133,7 @@ std::optional<HookOutcome> run_approval_gate(const BeforeToolCallContext& ctx,
 
     // ── mode=Request: 等待决策 ──────────────────────────────────────────
     log()->info("Tool '{}' waiting for approval (id={})", ctx.tool_name, approval_id);
-    auto decision = ctx.approval_broker->wait_tool_approval(approval_id,
-                                                           ctx.approval_timeout_ms);
+    auto decision = broker->wait_tool_approval(approval_id, ctx.approval_timeout_ms);
     if (!decision.has_value()) {
         // ⚠ 超时与"记录不存在"都落这里。两者都【不能放行】——
         //   未决 == 未获批。
@@ -157,6 +170,31 @@ std::optional<HookOutcome> run_approval_gate(const BeforeToolCallContext& ctx,
 }
 
 }  // namespace
+
+// ── parse_approval_mode ─────────────────────────────────────────────────────
+ApprovalMode parse_approval_mode(const std::string& s) {
+    if (s == "report") return ApprovalMode::Report;
+    if (s == "deny")   return ApprovalMode::Deny;
+    if (s == "defer")  return ApprovalMode::Defer;
+    // ⚠ 空串与【无法识别】都回落 Request。
+    //   不能回落到 Deny/Report —— 一个拼错的配置值不该悄悄放宽审批强度
+    //   (Report 会让工具在无人确认的情况下"报个错就算了", 而 Request
+    //    至少保证有人看过)。Request 是最严的等待型默认, 也对齐 OpenClaw。
+    if (!s.empty() && s != "request") {
+        log()->warn("unknown approval mode '{}'; falling back to 'request'", s);
+    }
+    return ApprovalMode::Request;
+}
+
+const char* approval_mode_to_wire(ApprovalMode m) {
+    switch (m) {
+        case ApprovalMode::Report: return "report";
+        case ApprovalMode::Deny:   return "deny";
+        case ApprovalMode::Defer:  return "defer";
+        case ApprovalMode::Request:
+        default:                   return "request";
+    }
+}
 
 // ── build_blocked_tool_result ───────────────────────────────────────────────
 ToolResult build_blocked_tool_result(const std::string& reason,

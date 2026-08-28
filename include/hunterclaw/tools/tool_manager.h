@@ -26,7 +26,6 @@ class ToolLoopDetector;
 class PolicyPipeline;
 class ResultProcessingPipeline;
 class ApprovalManager;
-class ToolApprovalBroker;
 
 struct ToolUpdate;
 using ToolUpdateCallback = std::function<void(const ToolUpdate&)>;
@@ -76,16 +75,15 @@ public:
     // Approval management
     void set_approval_manager(std::shared_ptr<ApprovalManager> manager);
 
-    /// 工具审批的传输通道（gateway 侧注入）。
-    ///
-    /// ★ 与 ApprovalManager 是两件事:
-    ///   · ApprovalManager  —— exec 命令审批的白名单/配置管理
-    ///   · ToolApprovalBroker —— 工具审批的发起+等待 (plugin 形状载荷)
-    ///
-    /// ⚠ 为空时 before_tool_call Stage 1 按「审批面不可用」拒绝执行，
-    ///   【不会】放行 —— 否则没配 broker 的部署会让所有需审批工具静默直通。
-    void set_approval_broker(std::shared_ptr<ToolApprovalBroker> broker);
-    ToolApprovalBroker* approval_broker() const { return approval_broker_.get(); }
+    // ⚠ 刻意【不提供】set_approval_broker / approval_broker():
+    //   ToolManager 是【每会话】创建的(agent_instance.cc), 若按会话持有
+    //   broker, N 个会话会各持一个 —— 产生 N 个待审列表, 而客户端只有
+    //   一个 approval.resolve 入口, 其余列表的请求永远等不到决策
+    //   (表现为随机超时而非报错)。
+    //
+    // ★ 审批通道是【进程级】的: 见 ToolApprovalRuntime::instance()。
+    //   策略链在 approval_broker 留空时自动从那里取。
+    //   对齐 OpenClaw approval-gateway-runtime-context.ts 的全局单例做法。
     
     // Hook management
     void set_hook_manager(std::shared_ptr<ToolHookManager> manager);
@@ -137,7 +135,6 @@ private:
     std::shared_ptr<PolicyPipeline> policy_pipeline_;
     std::shared_ptr<ResultProcessingPipeline> result_processor_;
     std::shared_ptr<ApprovalManager> approval_manager_;
-    std::shared_ptr<ToolApprovalBroker> approval_broker_;
     
     // MCP integration
     std::shared_ptr<mcp::McporterClient> mcp_client_;

@@ -236,8 +236,13 @@ ToolResult ToolManager::execute_tool(
         // ⚠ tool_requires_approval 此前【零消费】—— 声明要审批的工具从不审批。
         policy_ctx.tool_requires_approval = tool->requires_approval();
         policy_ctx.policy_requires_approval = policy_requires_approval;
-        // ★ 为空时 Stage 1 拒绝执行而非放行 (plugin-approval-unavailable)。
-        policy_ctx.approval_broker = approval_broker_.get();
+        // ★ 与 react_engine 一致: 工具可覆盖审批模式与可选决策集。
+        policy_ctx.approval_mode = parse_approval_mode(tool->approval_mode());
+        policy_ctx.allowed_decisions = tool->approval_allowed_decisions();
+        // ★ approval_broker 留空 —— 策略链会自动从进程级
+        //   ToolApprovalRuntime::instance() 取。
+        //   ⚠ 不在这里按会话注入: ToolManager 是每会话创建的,
+        //     按会话持有 broker 会产生 N 个待审列表(见 tool_manager.h 说明)。
         policy_ctx.hook_manager = hook_manager_ ? hook_manager_.get() : nullptr;
 
         auto outcome = run_before_tool_call_policy(policy_ctx, params);
@@ -593,10 +598,6 @@ void ToolManager::set_loop_detector(std::shared_ptr<ToolLoopDetector> detector) 
 
 void ToolManager::set_result_processor(std::shared_ptr<ResultProcessingPipeline> processor) {
     result_processor_ = processor;
-}
-
-void ToolManager::set_approval_broker(std::shared_ptr<ToolApprovalBroker> broker) {
-    approval_broker_ = std::move(broker);
 }
 
 void ToolManager::set_mcp_registry(std::shared_ptr<void> registry) {
