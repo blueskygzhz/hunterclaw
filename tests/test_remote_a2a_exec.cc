@@ -1213,6 +1213,124 @@ static void test_extract_confirm_signal() {
 }
 
 // ============================================================================
+// 二次确认声明：两个出口必须一致
+//
+// ⚠⚠ send 与 follow_up 是【两个不同的类】(RemoteA2aAgentTool /
+//   RemoteA2aStatusTool), 各自组装 ToolResult。此前只有 send 声明了
+//   postExecConfirm, follow_up 【漏了】—— 而 follow_up 恰恰是
+//   input-required 最常见的入口(让渡后模型来取结果),
+//   "跑着跑着远端才要求确认"几乎必然走这条路。
+//
+//   漏掉的后果与解析漏读同级: 模型看到 render() 的追问文本就代用户
+//   答"好的", 而 details.requiresUserAction 只有终端能看到
+//   (details 不进 prompt), 没有任何机制拦得住。
+//
+// ★ 本测试直接验证共享判据 maybe_attach_post_exec_confirm 的语义,
+//   任何新出口只要复用它就自动满足;若有人再内联一份, 这里会失守 ——
+//   所以断言里同时锁死"载荷内容"而不只是"有没有声明"。
+static void test_post_exec_confirm_declaration() {
+    SECTION("二次确认声明一致性");
+
+    auto build = [](TaskState st, bool requires_user,
+                    const std::vector<std::string>& tokens,
+                    const std::string& prompt) {
+        ExecutionResult r;
+        r.success = true;
+        r.state = st;
+        r.requires_user_action = requires_user;
+        r.pending_token_ids = tokens;
+        r.prompt_text = prompt;
+        return r;
+    };
+
+    // ── 挂起 + 必须用户确认 → 必须声明 ──────────────────────────────────
+    {
+        auto r = build(TaskState::InputRequired, true,
+                       {"tk_a", "tk_b"}, "将向 2 位客户发送确认邮件，请确认。");
+        tools::ToolResult res = tools::tool_result::text(r.render());
+        res.details = core::JsonValue(nlohmann::json::object());
+        maybe_attach_post_exec_confirm(res, r, "wecom-agent");
+
+        auto cr = tools::extract_post_exec_confirm(res.details);
+        CHECK(cr.has_value(), "挂起+必须用户确认 → 声明二次确认 [不可回退]");
+        if (cr) {
+            // ★ 必须 Request —— Defer 在这里等于"未确认就采信"
+            CHECK(cr->mode == "request", "mode=request [不可回退]");
+            // ★★ 禁用 allow-always: 一次误点永久授权会让该远端后续
+            //   所有需确认操作全部免确认 —— 这类操作恰恰最需要每次都问。
+            CHECK(cr->allowed_decisions.size() == 2, "只允许两种决策");
+            bool has_always = false;
+            for (const auto& d : cr->allowed_decisions) {
+                if (d == "allow-always") has_always = true;
+            }
+            CHECK(!has_always, "禁用 allow-always [不可回退]");
+            CHECK(cr->token_ids.size() == 2, "token 原样带出 [不可回退]");
+            // ★ 用远端的追问原文, 不要用兜底措辞覆盖它
+            CHECK(cr->description == "将向 2 位客户发送确认邮件，请确认。",
+                  "description 用远端追问原文 [不可回退]");
+        }
+    }
+
+    // auth-required 同样是挂起态
+    {
+        auto r = build(TaskState::AuthRequired, true, {"tk_c"}, "需要授权");
+        tools::ToolResult res = tools::tool_result::text(r.render());
+        res.details = core::JsonValue(nlohmann::json::object());
+        maybe_attach_post_exec_confirm(res, r, "a");
+        CHECK(tools::extract_post_exec_confirm(res.details).has_value(),
+              "auth-required 也声明 [不可回退]");
+    }
+
+    // ── 挂起但【不】要求用户确认 → 不声明 ───────────────────────────────
+    // ★ 普通 input-required(如"用哪种格式导出")模型可以代答,
+    //   弹卡片只是骚扰。区分"模型可代答"与"必须用户"是这套设计的核心。
+    {
+        auto r = build(TaskState::InputRequired, false, {}, "用哪种格式导出？");
+        tools::ToolResult res = tools::tool_result::text(r.render());
+        res.details = core::JsonValue(nlohmann::json::object());
+        maybe_attach_post_exec_confirm(res, r, "a");
+        CHECK(!tools::extract_post_exec_confirm(res.details).has_value(),
+              "普通追问不弹卡片 [不可回退]");
+    }
+
+    // ── 非挂起态 → 不声明 ───────────────────────────────────────────────
+    // ⚠ 防御 requires_user_action 被误置的情况: 任务都完成了就没什么可确认的。
+    {
+        auto r = build(TaskState::Completed, true, {"tk_x"}, "done");
+        tools::ToolResult res = tools::tool_result::text(r.render());
+        res.details = core::JsonValue(nlohmann::json::object());
+        maybe_attach_post_exec_confirm(res, r, "a");
+        CHECK(!tools::extract_post_exec_confirm(res.details).has_value(),
+              "非挂起态不声明 [不可回退]");
+    }
+
+    // ── prompt_text 为空时用兜底措辞（带 agent 名）─────────────────────
+    {
+        auto r = build(TaskState::InputRequired, true, {"tk_y"}, "");
+        tools::ToolResult res = tools::tool_result::text(r.render());
+        res.details = core::JsonValue(nlohmann::json::object());
+        maybe_attach_post_exec_confirm(res, r, "wecom-agent");
+        auto cr = tools::extract_post_exec_confirm(res.details);
+        CHECK(cr.has_value(), "仍然声明");
+        if (cr) {
+            CHECK(cr->description.find("wecom-agent") != std::string::npos,
+                  "兜底措辞含 agent 名");
+        }
+    }
+
+    // ── agent 名为空不崩（follow_up 取不到时的退化路径）─────────────────
+    // ★ StatusTool 是跨 agent 的, store_ 里查不到 handle 时 agent 名为空。
+    {
+        auto r = build(TaskState::InputRequired, true, {"tk_z"}, "请确认");
+        tools::ToolResult res = tools::tool_result::text(r.render());
+        res.details = core::JsonValue(nlohmann::json::object());
+        maybe_attach_post_exec_confirm(res, r, "");
+        CHECK(tools::extract_post_exec_confirm(res.details).has_value(),
+              "agent 名为空仍声明 [不可回退]");
+    }
+}
+
+// ============================================================================
 int main() {
     std::cout << "===== remote_a2a M7/M8 测试 =====" << std::endl;
 
