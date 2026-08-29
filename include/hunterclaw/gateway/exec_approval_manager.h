@@ -97,6 +97,17 @@ struct PluginApprovalRequestPayload {
 // 对齐 OpenClaw 常量 (plugin-approvals.ts:51-56)
 static constexpr int64_t DEFAULT_PLUGIN_APPROVAL_TIMEOUT_MS = 120000;
 static constexpr int64_t MAX_PLUGIN_APPROVAL_TIMEOUT_MS = 600000;
+
+// gateway 侧等待的额外宽限。
+// 🎯 对齐 OpenClaw resolvePluginToolApprovalGatewayTimeoutMs
+//    (agent-tools.before-tool-call.approval.ts:52-54):
+//      addTimerTimeoutGraceMs(timeoutMs, 10_000)
+//
+// ⚠ 等待方与审批记录【不能同时到期】。同时到期会形成竞态边界:
+//   用户最后一刻点击 → 等待方已返回 nullopt(报超时), 决策却写进了记录
+//   → 用户看到"已批准", agent 看到"超时"。
+// ★ 只加在等待侧, 不改 expires_at_ms —— 客户端倒计时仍以记录为准。
+static constexpr int64_t APPROVAL_GATEWAY_GRACE_MS = 10000;
 static constexpr size_t PLUGIN_APPROVAL_TITLE_MAX_LENGTH = 80;
 static constexpr size_t PLUGIN_APPROVAL_DESCRIPTION_MAX_LENGTH = 512;
 static constexpr size_t PLUGIN_APPROVAL_DETAIL_MAX_LENGTH = 16384;

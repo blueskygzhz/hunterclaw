@@ -381,7 +381,19 @@ static void test_no_broker() {
 
     // ★★ [不可回退] 【不能】当成批准 —— 未决 == 未获批。
     CHECK(!out.approved(), "无通道时不放行 [不可回退]");
-    CHECK(out.resolution == DeferredResolution::TimedOut, "归为 TimedOut");
+    // ★★ [不可回退] 归为 Unavailable 而非 TimedOut。
+    //
+    //   "审批面挂了"与"用户没响应"是两回事:
+    //     · Unavailable → 去查 broker 注入/gateway 状态
+    //     · TimedOut    → 去查用户为什么没点
+    //   压成同一个值会把排查引向错误方向。
+    //
+    //   ⚠ 这条断言此前锁的是 TimedOut —— 那是 do_wait 自己实现
+    //     create+wait 时留下的漂移: Stage 1 的 Request 路径同样场景
+    //     报的是 Failure{failed, plugin-approval-unavailable}。
+    //     收敛到 request_plugin_tool_approval 后两条路径必然一致。
+    CHECK(out.resolution == DeferredResolution::Unavailable,
+          "归为 Unavailable（与 Request 路径一致）[不可回退]");
     CHECK(reg.size() == 0, "凭据仍被移除（不泄漏）");
 
     reg.reset_for_testing();
@@ -508,6 +520,11 @@ static void test_abort_interrupts_resolve() {
     CHECK(elapsed < 2000, "abort 后迅速返回（实测 " +
                               std::to_string(elapsed) + "ms）[不可回退]");
     CHECK(!out.approved(), "abort 不放行 [不可回退]");
+    // ★★ [不可回退] 归为 Cancelled 而非 TimedOut ——
+    //   "用户主动放弃"与"等满超时"在审计上是不同事件。
+    //   与 Stage 1 Request 路径的 Failure{cancelled} 对应。
+    CHECK(out.resolution == DeferredResolution::Cancelled,
+          "abort 归为 Cancelled（与 Request 路径一致）[不可回退]");
 
     rt.reset_for_testing();
     reg.reset_for_testing();

@@ -414,7 +414,22 @@ std::optional<ExecApprovalDecision> ExecApprovalManager::await_decision(
 
     // Determine effective timeout
     int64_t effective_timeout = timeout_ms > 0 ? timeout_ms : entry->timeout_ms;
-    if (effective_timeout <= 0) effective_timeout = 120000;  // 2 min default
+    if (effective_timeout <= 0) effective_timeout = DEFAULT_PLUGIN_APPROVAL_TIMEOUT_MS;
+
+    // ── gateway 侧 grace ────────────────────────────────────────────────
+    // 🎯 对齐 OpenClaw resolvePluginToolApprovalGatewayTimeoutMs
+    //    (approval.ts:52-54): addTimerTimeoutGraceMs(timeoutMs, 10_000)
+    //    —— 等待方比审批记录本身【多等 10 秒】。
+    //
+    // ⚠⚠ 两侧用同一个值会让等待方与记录【同时到期】, 处于竞态边界:
+    //   用户在最后一刻点击, 可能等待方已经返回 nullopt(报"审批超时"),
+    //   而决策又成功写进了记录 —— 用户看到"已批准", agent 看到"超时",
+    //   两边各自都认为自己是对的, 且日志里看不出矛盾。
+    //
+    // ★ grace 只加在【等待】侧, 不改 expires_at_ms:
+    //   记录该什么时候过期就什么时候过期(客户端倒计时以它为准),
+    //   我们只是多等一会儿, 好让"刚好卡在线上"的决策能被收到。
+    effective_timeout += APPROVAL_GATEWAY_GRACE_MS;
 
     // ── 等待决策, 但 abort 能提前结束 ────────────────────────────────────
     // 🎯 对齐 OpenClaw approval.ts:340-341:
@@ -467,6 +482,25 @@ std::optional<ExecApprovalDecision> ExecApprovalManager::await_decision(
     }
 
     if (!entry->decided) return std::nullopt;
+
+    // ── 决策必须属于本次请求 ────────────────────────────────────────────
+    // 🎯 对齐 OpenClaw approval.ts:376 及其注释原文:
+    //      "Bind the verdict to the request that parked this call.
+    //       A stale or misrouted reply must never release a different tool gate."
+    //      decision = waitResult?.id === id ? waitResult.decision : undefined;
+    //
+    // ★ 我们按 record_id 查表并持有 entry, 正常路径下 id 必然相符。
+    //   但 entry->record 是可被 resolve_approval 改写的共享对象 ——
+    //   一条走错路由的决议若写进了这条记录, 这里是最后一道防线。
+    //
+    // ⚠ 不相符时返回 nullopt(按"无决策"处理), 而非采信:
+    //   放行一个属于【别的审批】的批准, 等于让 A 的授权解锁 B 的操作。
+    //   (本文件不引日志设施; 调用方 request_plugin_tool_approval 会把
+    //    nullopt 记为 "approval timed out or vanished"。)
+    if (entry->record.id != record_id) {
+        return std::nullopt;
+    }
+
     return entry->record.decision;  // may be nullopt (timeout/expire)
 }
 
