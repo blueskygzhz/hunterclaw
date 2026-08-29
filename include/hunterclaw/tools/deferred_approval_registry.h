@@ -21,6 +21,8 @@
 #include "hunterclaw/core/types.h"
 #include "hunterclaw/tools/before_tool_call_policy.h"
 
+#include <atomic>
+#include <future>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -32,8 +34,10 @@ namespace tools {
 /// 收敛结果
 enum class DeferredResolution {
     Approved,        // allow-once / allow-always
-    Denied,          // 用户拒绝
-    TimedOut,        // 无人决策
+    Denied,          // 用户拒绝（审批跑完了，结论是拒绝）
+    TimedOut,        // 无人决策 / 越权决策（OpenClaw 把越权归为 TIMEOUT）
+    Cancelled,       // 运行被 abort（用户主动放弃）
+    Unavailable,     // ★ 审批【面】不可用：broker 缺失 / 发起失败
     ParamsRewritten, // ★ 批准后参数被改写 → 视为拒绝（见下）
     NotFound,        // 无此凭据（已收敛过 / 已被淘汰 / 从未登记）
 };
@@ -80,17 +84,39 @@ public:
 
     /// 收敛一张凭据（阻塞等待决策）。
     ///
-    /// ★ 一次性: 无论结果如何, 返回前都会把凭据从表中移除 ——
-    ///   对齐 OpenClaw 的 `.finally(() => pending.delete(key))`。
-    ///   否则同一张凭据被收敛两次, 第二次会拿到已过期的结论。
+    /// ★★ 并发收敛【共享同一次等待】—— 逐字对齐 OpenClaw
+    ///   resolveNativeHookRelayDeferredToolApproval (permissions.ts:129):
+    ///     pendingApproval.resolutionPromise ??= resolve...(...).finally(delete)
+    ///
+    ///   即: 同键的第二个调用者【不会】再发起一次等待, 而是拿到与第一个
+    ///   调用者【相同的结论】。OpenClaw 的测试对此有硬断言
+    ///   (native-hook-relay.test.ts:2415-2434: requester 只被调 1 次,
+    ///    两个调用者都得到 approved-once)。
+    ///
+    ///   ⚠ 为什么必须共享而不能"第二个直接判失败":
+    ///     同键 = 同一次逻辑工具调用 (run_id:tool_call_id)。它可能被两条
+    ///     入站通道分别收敛(OpenClaw 里就是 hook 通道与 approval-bridge
+    ///     通道)。若第二个调用者拿到"拒绝", 那么"这次调用能否执行"就
+    ///     取决于哪条通道先到 —— 一个用户明确批准过的操作会随机失败。
+    ///
+    /// ★ 一次性: 等待完成后凭据从表中移除
+    ///   (对齐 OpenClaw 的 `.finally(() => pending.delete(key))`)。
+    ///   ⚠ 完成【之后】才移除, 而非进入时立刻移除 ——
+    ///     否则第二个调用者找不到它, 就退化成上面那个随机失败的情形。
     ///
     /// @param current_params_fingerprint 当前(可能被 hook 改写过的)参数指纹。
     ///        与登记时不一致 ⇒ 返回 ParamsRewritten（视为拒绝）。
     ///        传空表示跳过比对（调用方确认参数未变）。
+    ///        ★ 每个调用者【各自】比对自己的指纹, 不共享此判定 ——
+    ///          两条通道看到的参数可能不同, 各自都必须与批准时一致。
     /// @param wait_ms <=0 时沿用 broker 的默认超时
+    /// @param aborted 运行取消标志，非空且置位时立即结束等待
+    ///        (对齐 OpenClaw approval.ts:340-341 的 abortPromise race)。
+    ///        ⚠ 与 Stage 1 同理: 不透传会让 chat.abort 无法打断收敛等待。
     DeferredOutcome resolve(const std::string& key,
                            const std::string& current_params_fingerprint = "",
-                           int64_t wait_ms = 0);
+                           int64_t wait_ms = 0,
+                           const std::atomic<bool>* aborted = nullptr);
 
     /// 丢弃一张凭据（不等决策）。
     /// ⚠ 仅在"已经决定不执行这个工具"时调用。丢弃【不会】撤销远端审批,
@@ -123,7 +149,22 @@ private:
         std::string params_fingerprint;
         int64_t created_at_ms = 0;
         uint64_t seq = 0;   // 插入序，用于"最旧"判定
+
+        // ── 共享等待 (对齐 OpenClaw resolutionPromise) ───────────────────
+        // ★ 第一个 resolve 调用者创建 shared_future 并执行真正的等待;
+        //   并发的后续调用者【复用】它, 从而拿到相同结论。
+        //
+        // ⚠ 用 shared_future 而非 future: future::get() 只能调一次,
+        //   多个调用者共享时第二个会抛 std::future_error。
+        std::shared_future<DeferredOutcome> pending_wait;
+        bool wait_started = false;
     };
+
+    /// 真正的等待逻辑（不持锁执行）。
+    /// ★ 拆成独立函数是因为它会阻塞 120s —— 绝不能在持 mu_ 时执行,
+    ///   否则 put/discard/size 全部被卡死, 整张表在等待期间不可用。
+    static DeferredOutcome do_wait(const DeferredApproval& approval, int64_t wait_ms,
+                                   const std::atomic<bool>* aborted);
 
     mutable std::mutex mu_;
     std::map<std::string, Entry> entries_;

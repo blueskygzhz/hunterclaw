@@ -17,6 +17,7 @@
 #include "hunterclaw/tools/deferred_approval_registry.h"
 #include "hunterclaw/tools/tool_approval_runtime.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <iostream>
@@ -24,6 +25,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 using namespace hunterclaw;
 using namespace hunterclaw::tools;
@@ -53,18 +55,55 @@ public:
                                      const std::vector<std::string>&) override {
         std::lock_guard<std::mutex> lk(mu_);
         last_tool_ = tool_name;
-        return "appr-" + std::to_string(++seq_);
+        ++request_calls_;
+        // ★ 审批 id 在【收敛点】才生成 —— Defer 的 Stage 1 不再 create。
+        //   这里把 id 与 tool_name 绑定, 让测试能在 resolve 之前
+        //   用 tool_name 预设决策。
+        const std::string id = "appr-" + tool_name + "-" + std::to_string(++seq_);
+        // 若测试已按 tool_name 预设过决策, 立刻兑现到这个新 id 上。
+        auto pre = pre_decisions_.find(tool_name);
+        if (pre != pre_decisions_.end()) {
+            decisions_[id] = pre->second;
+            cv_.notify_all();
+        }
+        issued_ids_[tool_name] = id;
+        return id;
     }
 
     std::optional<std::string> wait_tool_approval(const std::string& id,
-                                                 int64_t timeout_ms) override {
+                                                 int64_t timeout_ms,
+                                                 const std::atomic<bool>* aborted
+                                                     = nullptr) override {
         std::unique_lock<std::mutex> lk(mu_);
         ++wait_calls_;
         const int64_t w = timeout_ms > 0 ? timeout_ms : 3000;
-        const bool got = cv_.wait_for(lk, std::chrono::milliseconds(w),
-                                     [&]() { return decisions_.count(id) > 0; });
-        if (!got) return std::nullopt;
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(w);
+        while (decisions_.count(id) == 0) {
+            if (aborted && aborted->load()) return std::nullopt;
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) return std::nullopt;
+            auto slice = std::chrono::milliseconds(20);
+            const auto remaining =
+                std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+            if (remaining < slice) slice = remaining;
+            if (!aborted) slice = remaining;
+            cv_.wait_for(lk, slice, [&]() { return decisions_.count(id) > 0; });
+        }
         return decisions_[id];
+    }
+
+    /// 按【工具名】预设决策 —— 在 resolve 之前调用。
+    /// ★ 因为 approval id 直到收敛点才生成, 测试无法预先知道它。
+    void set_decision_for_tool(const std::string& tool, const std::string& d) {
+        std::lock_guard<std::mutex> lk(mu_);
+        pre_decisions_[tool] = d;
+        // 若该工具的审批已经发起过, 直接兑现到已发的 id 上。
+        auto it = issued_ids_.find(tool);
+        if (it != issued_ids_.end()) {
+            decisions_[it->second] = d;
+        }
+        cv_.notify_all();
     }
 
     void set_decision(const std::string& id, const std::string& d) {
@@ -76,21 +115,32 @@ public:
         std::lock_guard<std::mutex> lk(mu_);
         return wait_calls_;
     }
+    int request_calls() {
+        std::lock_guard<std::mutex> lk(mu_);
+        return request_calls_;
+    }
 
 private:
     std::mutex mu_;
     std::condition_variable cv_;
-    std::map<std::string, std::string> decisions_;
+    std::map<std::string, std::string> decisions_;      // id -> decision
+    std::map<std::string, std::string> pre_decisions_;  // tool -> decision
+    std::map<std::string, std::string> issued_ids_;     // tool -> 已发的 id
     std::string last_tool_;
     int seq_ = 0;
     int wait_calls_ = 0;
+    int request_calls_ = 0;
 };
 
-DeferredApproval make_cred(const std::string& id) {
+/// 构造一张 Defer 凭据。
+/// ★ 参数是【工具名】而非 approval_id —— 凭据里已经没有 id 了
+///   (对齐 OpenClaw: DeferredPluginToolApproval 持 payload, 不持 id)。
+DeferredApproval make_cred(const std::string& tool) {
     DeferredApproval d;
-    d.approval_id = id;
-    d.tool_name = "t";
+    d.tool_name = tool;
     d.tool_call_id = "c";
+    d.agent_id = "a";
+    d.session_key = "sk";
     return d;
 }
 
@@ -146,11 +196,17 @@ static void test_put_and_resolve() {
     {
         CHECK(reg.put("run1:call1", make_cred("appr-1"), fp), "登记成功");
         CHECK(reg.size() == 1, "表内 1 条");
+        // ★★ [不可回退] 登记本身【不发起审批】——
+        //   审批在收敛点才 create(对齐 OpenClaw approval.ts:501-514)。
+        //   ⚠ 若 put 就发起, 卡片会在无人等待时弹给用户。
+        CHECK(broker->request_calls() == 0, "put 不发起审批 [不可回退]");
 
-        broker->set_decision("appr-1", "allow-once");
+        broker->set_decision_for_tool("appr-1", "allow-once");
         auto out = reg.resolve("run1:call1", fp);
         CHECK(out.approved(), "获批");
         CHECK(out.decision == "allow-once", "决策带出");
+        // ★★ [不可回退] 审批在【收敛点】发起。
+        CHECK(broker->request_calls() == 1, "收敛点发起审批 [不可回退]");
         // ★★ [不可回退] 一次性: 收敛后必须移除。
         //   不移除会让同一张凭据被收敛两次 —— 一次授权被用两次。
         CHECK(reg.size() == 0, "收敛后移除 [不可回退]");
@@ -165,7 +221,7 @@ static void test_put_and_resolve() {
     // ── 用户拒绝 ────────────────────────────────────────────────────────
     {
         reg.put("run1:call2", make_cred("appr-2"), fp);
-        broker->set_decision("appr-2", "deny");
+        broker->set_decision_for_tool("appr-2", "deny");
         auto out = reg.resolve("run1:call2", fp);
         CHECK(out.resolution == DeferredResolution::Denied, "拒绝");
         CHECK(!out.approved(), "不放行");
@@ -183,11 +239,16 @@ static void test_put_and_resolve() {
     // ── 未知决策字符串 → 不放行 ────────────────────────────────────────
     {
         reg.put("run1:call4", make_cred("appr-4"), fp);
-        broker->set_decision("appr-4", "approve");   // 非法值
+        broker->set_decision_for_tool("appr-4", "approve");   // 非法值
         auto out = reg.resolve("run1:call4", fp);
         // ★ "approve" 恰好是 plugin_approval.cc 曾经错误接受的值。
         //   若这里当成放行，一个老客户端就能绕过审批语义。
         CHECK(!out.approved(), "未知决策不放行 [不可回退]");
+        // ★ 归为 TimedOut 而非 Denied —— 对齐 OpenClaw
+        //   resolvePermittedPluginApprovalResolution 的 fall-through:
+        //   未知值既非批准也非明确拒绝, 语义上是"没拿到有效决策"。
+        CHECK(out.resolution == DeferredResolution::TimedOut,
+              "未知决策归为 TimedOut（对齐 OpenClaw）");
     }
 
     rt.reset_for_testing();
@@ -209,7 +270,7 @@ static void test_params_rewritten() {
     const std::string fp_new = params_fingerprint(params_of("rewritten"));
 
     reg.put("run2:call1", make_cred("appr-9"), fp_old);
-    broker->set_decision("appr-9", "allow-once");   // 用户【已批准】
+    broker->set_decision_for_tool("appr-9", "allow-once");   // 用户【已批准】
 
     auto out = reg.resolve("run2:call1", fp_new);   // 但参数变了
 
@@ -225,11 +286,16 @@ static void test_params_rewritten() {
     //   放在等待之后也能挡住，但会白等一次用户操作:
     //   用户点了同意却被告知拒绝，体验上无法解释。
     CHECK(broker->wait_calls() == 0, "未进入等待 [不可回退]");
+    // ★★ [不可回退] 连审批都【不该发起】——
+    //   收敛点发起审批后, 指纹不符意味着这张卡片本就不该存在。
+    //   ⚠ 旧实现(Stage 1 就 create)下卡片已经弹出去了, 只能事后作废;
+    //     现在能做到根本不打扰用户。
+    CHECK(broker->request_calls() == 0, "未发起审批（不打扰用户）[不可回退]");
 
     // 传空指纹 = 跳过比对
     {
         reg.put("run2:call2", make_cred("appr-10"), fp_old);
-        broker->set_decision("appr-10", "allow-once");
+        broker->set_decision_for_tool("appr-10", "allow-once");
         auto o2 = reg.resolve("run2:call2", "");
         CHECK(o2.approved(), "空指纹跳过比对");
     }
@@ -350,6 +416,159 @@ static void test_parse_mode() {
 }
 
 // ============================================================================
+// 并发收敛共享同一次等待
+//
+// 🎯 逐字对齐 OpenClaw permissions.ts:129 的 `resolutionPromise ??=`
+//    及其测试 native-hook-relay.test.ts:2415-2434:
+//      · requester 只被调用 1 次
+//      · 两个并发调用者【都】拿到 approved-once
+static void test_concurrent_resolve_shares_wait() {
+    SECTION("并发收敛共享等待");
+
+    auto& rt = ToolApprovalRuntime::instance();
+    auto& reg = DeferredApprovalRegistry::instance();
+    rt.reset_for_testing();
+    reg.reset_for_testing();
+    auto broker = std::make_shared<FakeBroker>();
+    rt.set_broker(broker);
+
+    const std::string fp = params_fingerprint(params_of("v"));
+    reg.put("runC:1", make_cred("appr-c"), fp);
+
+    // 两个线程同时收敛同一张凭据
+    std::vector<DeferredOutcome> results(2);
+    std::thread t1([&]() { results[0] = reg.resolve("runC:1", fp, 3000); });
+    std::thread t2([&]() { results[1] = reg.resolve("runC:1", fp, 3000); });
+
+    // 等两个线程都进入等待后再给决策
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    broker->set_decision_for_tool("appr-c", "allow-once");
+
+    t1.join();
+    t2.join();
+
+    // ★★ [不可回退] 两个调用者拿到【相同结论】。
+    //   若第二个拿到 NotFound/拒绝, 则"能否执行"取决于哪条入站通道先到 ——
+    //   用户明确批准过的操作会随机失败。
+    CHECK(results[0].approved(), "第一个收敛者获批 [不可回退]");
+    CHECK(results[1].approved(), "第二个收敛者【也】获批 [不可回退]");
+    CHECK(results[0].decision == results[1].decision, "结论一致 [不可回退]");
+
+    // ★★ [不可回退] 只发起一次等待 —— 对齐 OpenClaw 的
+    //   `toHaveBeenCalledTimes(1)`。发起两次意味着两个调用者各自等,
+    //   决策只能满足一个。
+    CHECK(broker->wait_calls() == 1, "只等待一次 [不可回退]");
+    // ★★ [不可回退] 也只 create 一次审批 —— 两张卡片会让用户困惑,
+    //   且其中一张永远不会被收敛。
+    CHECK(broker->request_calls() == 1, "只发起一次审批 [不可回退]");
+
+    // 完成后移除；此后的第三次收敛 → NotFound
+    CHECK(reg.size() == 0, "完成后移除");
+    auto third = reg.resolve("runC:1", fp);
+    CHECK(third.resolution == DeferredResolution::NotFound,
+          "决议后的第三次 → NotFound");
+
+    rt.reset_for_testing();
+    reg.reset_for_testing();
+}
+
+// ============================================================================
+// abort 必须能打断收敛等待
+//
+// ⚠⚠ 没有这条: 用户点 chat.abort 后等待仍挂满 timeout, 而该等待占着
+//   main lane 唯一槽位(command_queue.cc:54 max_concurrent=1) ——
+//   全 gateway 推理停摆, 用户无法自救。
+static void test_abort_interrupts_resolve() {
+    SECTION("abort 打断收敛等待");
+
+    auto& rt = ToolApprovalRuntime::instance();
+    auto& reg = DeferredApprovalRegistry::instance();
+    rt.reset_for_testing();
+    reg.reset_for_testing();
+    auto broker = std::make_shared<FakeBroker>();
+    rt.set_broker(broker);
+
+    const std::string fp = params_fingerprint(params_of("v"));
+    reg.put("runD:1", make_cred("appr-d"), fp);
+
+    std::atomic<bool> aborted{false};
+    const auto t0 = std::chrono::steady_clock::now();
+
+    DeferredOutcome out;
+    // 给一个很长的超时(10s), 但 100ms 后置位 abort
+    std::thread worker([&]() { out = reg.resolve("runD:1", fp, 10000, &aborted); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    aborted.store(true);
+    worker.join();
+
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+
+    // ★★ [不可回退] 必须【远早于】10s 返回。
+    CHECK(elapsed < 2000, "abort 后迅速返回（实测 " +
+                              std::to_string(elapsed) + "ms）[不可回退]");
+    CHECK(!out.approved(), "abort 不放行 [不可回退]");
+
+    rt.reset_for_testing();
+    reg.reset_for_testing();
+}
+
+// ============================================================================
+// 越权决策不放行
+//
+// ★★ 凭据必须带着 allowed_decisions 走。remote_a2a 的二次确认声明
+//   allowed={allow-once, deny} 正是为了禁掉 allow-always ——
+//   若 Defer 路径不校验, 换个模式就绕过了这个约束。
+static void test_disallowed_decision() {
+    SECTION("越权决策不放行");
+
+    auto& rt = ToolApprovalRuntime::instance();
+    auto& reg = DeferredApprovalRegistry::instance();
+    rt.reset_for_testing();
+    reg.reset_for_testing();
+    auto broker = std::make_shared<FakeBroker>();
+    rt.set_broker(broker);
+
+    const std::string fp = params_fingerprint(params_of("v"));
+
+    DeferredApproval cred = make_cred("appr-e");
+    cred.allowed_decisions = {"allow-once", "deny"};   // 禁用 allow-always
+    reg.put("runE:1", cred, fp);
+
+    broker->set_decision_for_tool("appr-e", "allow-always");    // 越权
+    auto out = reg.resolve("runE:1", fp);
+
+    // ★★ [不可回退] allow-always 被禁时【绝不能】当批准。
+    CHECK(!out.approved(), "越权的 allow-always 不放行 [不可回退]");
+    // 归为 TimedOut（OpenClaw 的 fall-through 就是 TIMEOUT）
+    CHECK(out.resolution == DeferredResolution::TimedOut,
+          "越权决策归为 TimedOut（对齐 OpenClaw）");
+
+    // 允许集内的决策正常通过
+    {
+        DeferredApproval c2 = make_cred("appr-f");
+        c2.allowed_decisions = {"allow-once", "deny"};
+        reg.put("runE:2", c2, fp);
+        broker->set_decision_for_tool("appr-f", "allow-once");
+        auto o2 = reg.resolve("runE:2", fp);
+        CHECK(o2.approved(), "允许集内的决策通过");
+    }
+
+    // 空允许集 = 默认全集（不限制）
+    // ⚠ 若把空集理解成"什么都不允许", 未配 allowedDecisions 的审批
+    //   将永远无法通过。
+    {
+        reg.put("runE:3", make_cred("appr-g"), fp);   // allowed 为空
+        broker->set_decision_for_tool("appr-g", "allow-always");
+        auto o3 = reg.resolve("runE:3", fp);
+        CHECK(o3.approved(), "空允许集 = 全集 [不可回退]");
+    }
+
+    rt.reset_for_testing();
+    reg.reset_for_testing();
+}
+
+// ============================================================================
 int main() {
     std::cout << "===== Defer 审批凭据 + 模式解析 测试 =====" << std::endl;
 
@@ -360,6 +579,9 @@ int main() {
     test_discard_prefix();
     test_no_broker();
     test_parse_mode();
+    test_concurrent_resolve_shares_wait();
+    test_abort_interrupts_resolve();
+    test_disallowed_decision();
 
     std::cout << "-----------------------------------------" << std::endl;
     std::cout << "PASS: " << g_pass << "  FAIL: " << g_fail << std::endl;

@@ -2298,7 +2298,8 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                             tools::params_fingerprint(tool_call.input));
 
                     auto res = reg.resolve(
-                        key, tools::params_fingerprint(effective_params));
+                        key, tools::params_fingerprint(effective_params),
+                        /*wait_ms=*/0, &cancelled_);
                     if (!res.approved()) {
                         // ⚠ 未获批一律【不执行】。ParamsRewritten / TimedOut /
                         //   NotFound 都归此类 —— 未决 == 未获批。
@@ -2637,7 +2638,8 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                             tools::params_fingerprint(tool_call.input));
 
                     auto res = reg.resolve(
-                        key, tools::params_fingerprint(parallel_effective_params));
+                        key, tools::params_fingerprint(parallel_effective_params),
+                        /*wait_ms=*/0, &cancelled_);
                     if (!res.approved()) {
                         auto blocked = tools::build_blocked_tool_result(
                             res.reason.empty() ? "deferred approval was not granted"

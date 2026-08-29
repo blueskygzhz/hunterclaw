@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <functional>
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <condition_variable>
@@ -188,6 +189,14 @@ struct ExecApprovalIdLookupResult {
 // Grace period to keep resolved entries for late awaitDecision calls
 static constexpr int64_t RESOLVED_ENTRY_GRACE_MS = 15000;
 
+// abort 轮询间隔。
+// ★ 取 50ms 是权衡: aborted 由外部 atomic 置位, 置位方不持本类 mutex
+//   因而无法 notify, 只能轮询。
+//   ⚠ 不能取太大(abort 响应迟钝, 失去意义), 也不必太小 ——
+//     50ms 的唤醒开销在一次最长 120s 的等待里可忽略,
+//     而对用户而言 50ms 已是"立即"。
+static constexpr int64_t kAbortPollIntervalMs = 50;
+
 class ExecApprovalManager {
 public:
     ExecApprovalManager() = default;
@@ -240,11 +249,25 @@ public:
 
     // ── await_decision() ──────────────────────────────────────────────────
     // 对齐 OpenClaw: awaitDecision(recordId)
-    // 阻塞等待决策，返回 decision 或 nullopt（超时/过期）
+    // 阻塞等待决策，返回 decision 或 nullopt（超时/过期/被取消）
     // 如果 ID 不存在，返回 nullopt
+    //
+    // @param aborted 运行取消标志。非空且被置位时【立即结束等待】。
+    //        🎯 对齐 OpenClaw approval.ts:340-341
+    //           `Promise.race([waitPromise, abortPromise])`。
+    //
+    // ⚠⚠ 没有这个参数时, chat.abort 之后等待方仍会挂满 timeout(默认 120s)。
+    //   而该等待运行在 main lane 的唯一 worker 上
+    //   (command_queue.cc:54 max_concurrent=1) —— 后果是全 gateway 的
+    //   推理排队两分钟, 且用户没有任何手段脱身。
+    //
+    // ★ 实现上用 cv.wait_for + 谓词轮询(kAbortPollIntervalMs) 而非
+    //   条件变量唤醒: aborted 是外部 atomic, 置位方(ReactEngine::cancel)
+    //   不持有本类的 mutex, 无法 notify。轮询是唯一不改调用方的做法。
     std::optional<ExecApprovalDecision> await_decision(
         const std::string& record_id,
-        int64_t timeout_ms = 0  // 0 = 使用注册时的超时
+        int64_t timeout_ms = 0,  // 0 = 使用注册时的超时
+        const std::atomic<bool>* aborted = nullptr
     );
 
     // ── get_snapshot() ────────────────────────────────────────────────────

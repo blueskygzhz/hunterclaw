@@ -173,7 +173,10 @@ struct ExecutionResult {
     /// 本轮是否处于「挂起等外部输入」状态（input-required / auth-required）。
     /// ★ 这不是失败 —— 是一次正常的往返中断，需要模型带 task_id 再调一次。
     bool is_suspended() const {
-        return state == TaskState::InputRequired || state == TaskState::AuthRequired;
+        // ★ 委派给 types.h 的公共判定, 不要在这里重写条件 ——
+        //   同一判据出现在多处时, 改一处漏一处就静默错
+        //   (update_terminal 当初就是这么错的)。
+        return is_suspended_state(state);
     }
 
     /// ★★ 必须由【用户】决定，模型不得代答。

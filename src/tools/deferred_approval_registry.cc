@@ -34,6 +34,8 @@ const char* deferred_resolution_text(DeferredResolution r) {
         case DeferredResolution::Approved:        return "approved";
         case DeferredResolution::Denied:          return "denied";
         case DeferredResolution::TimedOut:        return "timed_out";
+        case DeferredResolution::Cancelled:       return "cancelled";
+        case DeferredResolution::Unavailable:     return "unavailable";
         case DeferredResolution::ParamsRewritten: return "params_rewritten";
         case DeferredResolution::NotFound:        return "not_found";
     }
@@ -72,7 +74,7 @@ bool DeferredApprovalRegistry::put(const std::string& key,
     auto existing = entries_.find(key);
     if (existing != entries_.end()) {
         log()->warn("deferred approval registry: replacing pending approval "
-                    "(key={} old_id={})", key, existing->second.approval.approval_id);
+                    "(key={} tool={})", key, existing->second.approval.tool_name);
         entries_.erase(existing);
     }
 
@@ -94,99 +96,183 @@ bool DeferredApprovalRegistry::put(const std::string& key,
             if (it->second.seq < oldest->second.seq) oldest = it;
         }
         log()->warn("deferred approval registry full ({}); evicting oldest "
-                    "(key={} id={})", entries_.size(), oldest->first,
-                    oldest->second.approval.approval_id);
+                    "(key={} tool={})", entries_.size(), oldest->first,
+                    oldest->second.approval.tool_name);
         entries_.erase(oldest);
     }
     return true;
 }
 
-DeferredOutcome DeferredApprovalRegistry::resolve(
-    const std::string& key, const std::string& current_fingerprint,
-    int64_t wait_ms) {
+DeferredOutcome DeferredApprovalRegistry::do_wait(const DeferredApproval& approval,
+                                                  int64_t wait_ms,
+                                                  const std::atomic<bool>* aborted) {
     DeferredOutcome out;
 
-    // ── 取出并【立即移除】 ──────────────────────────────────────────────
-    // ★ 一次性语义 (对齐 OpenClaw 的 .finally(() => pending.delete(key)))。
-    //   ⚠ 先移除再等待, 而不是等完再移除: 等待可能长达 120s,
-    //     期间同键的第二次 resolve 会拿到同一张凭据并同时等待,
-    //     两者都会认为自己拿到了那次批准 —— 一次授权被用两次。
-    Entry entry;
+    // ── 薄包装 ──────────────────────────────────────────────────────────
+    // 🎯 逐字对齐 OpenClaw requestDeferredPluginToolApproval
+    //    (agent-tools.before-tool-call.approval.ts:457-471):
+    //      return requestPluginToolApproval({ ...deferred, signal });
+    //    —— 它【只是转发】, 不自己实现 create/wait/判定。
+    //
+    // ⚠⚠ 此前这里复制了一整套 create+wait+判定逻辑, 与 Stage 1 的
+    //   Request 分支并行维护。重复已经咬过两次(消费端 allowed_decisions
+    //   校验、aborted 透传都得改两个文件), 且行为已经漂移:
+    //     · broker 缺失   Request→Failure{unavailable}  Defer→TimedOut
+    //     · 越权决策       Request→Failure{timed_out}    Defer→TimedOut
+    //     · 被 abort      Request→Failure{cancelled}    Defer→TimedOut
+    //   三种不同原因被压成同一个 TimedOut, 使"审批面挂了"与"用户没响应"
+    //   在审计上无法区分 —— 而这正是 Stage 1 特意分开的东西。
+    //   收敛后不可能再漂移。
+    //
+    // ★ broker 在此解析后【按值传给】共享实现: 它内部会阻塞等待,
+    //   持 shared_ptr 保证等待期间对象不被 shutdown 销毁。
+    //   broker 为空时共享实现自己 fail-closed(不放行), 无需在这里预判。
+    auto broker = ToolApprovalRuntime::instance().broker();
+
+    // ★ 超时用凭据里记下的值(Stage 1 声明时的), 不用收敛点的 ——
+    //   用户看到的倒计时应与声明时一致。
+    const int64_t timeout_ms = wait_ms > 0 ? wait_ms : approval.timeout_ms;
+
+    HookOutcome o = request_plugin_tool_approval(
+        broker, approval.tool_name, approval.tool_call_id, approval.agent_id,
+        approval.session_key, timeout_ms, approval.allowed_decisions, aborted,
+        core::JsonValue::object());   // params 在此路径不参与判定
+
+    // ── HookOutcome → DeferredOutcome ───────────────────────────────────
+    // ★ 按 disposition 映射, 保住 Stage 1 已经分好的审计类别 ——
+    //   不再把三种原因压成 TimedOut。
+    if (o.kind == HookOutcomeKind::Pass) {
+        out.resolution = DeferredResolution::Approved;
+        out.decision = o.approval_resolution.value_or("allow-once");
+        return out;
+    }
+
+    const std::string disp = o.disposition.value_or("");
+    if (disp == disposition::kBlocked) {
+        // 审批跑完、结论是拒绝
+        out.resolution = DeferredResolution::Denied;
+    } else if (disp == disposition::kCancelled) {
+        out.resolution = DeferredResolution::Cancelled;
+    } else if (disp == disposition::kFailed) {
+        // broker 缺失 / 发起失败 —— 审批【面】不可用, 不是用户没响应
+        out.resolution = DeferredResolution::Unavailable;
+    } else {
+        // kTimedOut: 等满超时 / 越权决策(OpenClaw 归为 TIMEOUT)
+        out.resolution = DeferredResolution::TimedOut;
+    }
+    out.reason = o.reason.value_or("approval was not granted");
+    return out;
+}
+
+DeferredOutcome DeferredApprovalRegistry::resolve(
+    const std::string& key, const std::string& current_fingerprint,
+    int64_t wait_ms, const std::atomic<bool>* aborted) {
+    DeferredOutcome out;
+
+    std::shared_future<DeferredOutcome> shared;
+    std::promise<DeferredOutcome> promise;
+    DeferredApproval approval;
+    bool i_am_executor = false;
+    uint64_t my_seq = 0;   // 收尾时确认"删的是自己那条"
+
     {
         std::lock_guard<std::mutex> lk(mu_);
         auto it = entries_.find(key);
         if (it == entries_.end()) {
+            // 已收敛过 / 已被淘汰 / 从未登记。
+            // ⚠ OpenClaw 对"决议后的第三次调用"返回 undefined(未处理),
+            //   语义上等同这里的 NotFound —— 都表示"没有这张凭据"。
             out.resolution = DeferredResolution::NotFound;
             out.reason = "no pending deferred approval for this call";
             return out;
         }
-        entry = it->second;
-        entries_.erase(it);
+        Entry& e = it->second;
+
+        // ── 参数指纹比对 ────────────────────────────────────────────────
+        // ★★ 必须在等待之前做, 且【每个调用者各自比对】。
+        //   用户批准的是【登记时那份参数】。若参数已被 hook 改写,
+        //   这次批准就不该用于新参数 —— 那等于"拿着批准 A 的授权执行 B",
+        //   是权限提升。OpenClaw 同样是拒绝 (codec.ts:168-176 +
+        //   permissions.ts:158-167)。
+        //
+        // ★ 不共享此判定: 两条入站通道看到的参数可能不同,
+        //   各自都必须与批准时一致才行。
+        //
+        // ⚠ 放在等待之后也能挡住, 但会白等一次用户操作 ——
+        //   用户点了同意却被告知拒绝, 体验上无法解释。
+        if (!current_fingerprint.empty() &&
+            current_fingerprint != e.params_fingerprint) {
+            log()->warn("deferred approval params were rewritten; refusing "
+                        "(key={} tool={})", key, e.approval.tool_name);
+            out.resolution = DeferredResolution::ParamsRewritten;
+            out.reason = "tool params were rewritten after approval was requested; "
+                         "refusing the original request";
+            return out;
+        }
+
+        if (!e.wait_started) {
+            // ── 第一个收敛者: 发起真正的等待 ─────────────────────────────
+            // 🎯 对齐 OpenClaw permissions.ts:129
+            //      pendingApproval.resolutionPromise ??= resolve...(...)
+            e.wait_started = true;
+            shared = promise.get_future().share();
+            e.pending_wait = shared;
+            approval = e.approval;
+            // ★ 记下这一条的 seq 用于收尾时确认身份。
+            //   ⚠ 不能用 approval_id: Defer 在 Stage 1 已不再 create 审批,
+            //     凭据里没有 id(id 是收敛点才生成的)。seq 由 put 单调分配,
+            //     覆盖时会换新值, 正好能区分"同键但已被换过的新凭据"。
+            my_seq = e.seq;
+            i_am_executor = true;
+        } else {
+            // ── 并发的后续收敛者: 复用同一次等待 ─────────────────────────
+            // ★★ 拿到与第一个调用者【相同的结论】, 而不是"因为已被占用
+            //   所以失败"。同键 = 同一次逻辑工具调用, 它可能被两条入站
+            //   通道分别收敛; 若第二个拿到拒绝, 则"能否执行"取决于哪条
+            //   通道先到 —— 用户明确批准过的操作会随机失败。
+            //   OpenClaw 测试对此有硬断言
+            //   (native-hook-relay.test.ts:2415-2434)。
+            shared = e.pending_wait;
+        }
     }
 
-    // ── 参数指纹比对 ────────────────────────────────────────────────────
-    // ★★ 必须在【等待之前】做。
-    //   用户批准的是【登记时那份参数】。若参数已被 hook 改写,
-    //   这次批准就不该用于新参数 —— 那等于"拿着批准 A 的授权执行 B",
-    //   是权限提升。OpenClaw 的处置同样是【拒绝】(codec.ts:168-176 +
-    //   permissions.ts:158-167)。
-    //
-    // ⚠ 放在等待之后也能挡住, 但会白等一次用户操作 ——
-    //   用户点了同意却被告知拒绝, 体验上无法解释。
-    if (!current_fingerprint.empty() &&
-        current_fingerprint != entry.params_fingerprint) {
-        log()->warn("deferred approval params were rewritten; refusing "
-                    "(key={} id={})", key, entry.approval.approval_id);
-        out.resolution = DeferredResolution::ParamsRewritten;
-        out.reason = "tool params were rewritten after approval was requested; "
-                     "refusing the original request";
-        return out;
+    if (!i_am_executor) {
+        // ⚠ 不持锁等待。shared_future 允许多次 get(), 每次返回同一份值。
+        return shared.get();
     }
 
-    // ── 等待决策 ────────────────────────────────────────────────────────
-    auto broker = ToolApprovalRuntime::instance().broker();
-    if (!broker) {
-        // ⚠ 审批通道在 Defer 发起之后消失(如 shutdown)。
-        //   【不能】当成批准 —— 未决 == 未获批。
-        log()->error("deferred approval cannot be resolved: no approval surface "
-                     "(key={} id={})", key, entry.approval.approval_id);
-        out.resolution = DeferredResolution::TimedOut;
-        out.reason = "approval surface is no longer available";
-        return out;
-    }
+    // ⚠ 等待【不持锁】: 它可能长达 120s, 持锁会让 put/discard/size
+    //   在此期间全部卡死, 整张表不可用。
+    DeferredOutcome result = do_wait(approval, wait_ms, aborted);
+    promise.set_value(result);
 
-    auto decision = broker->wait_tool_approval(entry.approval.approval_id, wait_ms);
-    if (!decision.has_value()) {
-        out.resolution = DeferredResolution::TimedOut;
-        out.reason = "approval timed out";
-        return out;
+    // ── 完成后移除 ──────────────────────────────────────────────────────
+    // ★ 对齐 OpenClaw 的 `.finally(() => pending.delete(key))`。
+    //   ⚠ 是"完成之后"而非"进入时立刻" —— 立刻移除会让并发的第二个
+    //     收敛者找不到凭据, 退化成上面那个随机失败的情形。
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = entries_.find(key);
+        // 只删自己那条: 等待期间可能已被 put 覆盖成新凭据(seq 会换新值),
+        // 误删会把一张尚未收敛的新凭据丢掉。
+        if (it != entries_.end() && it->second.seq == my_seq) {
+            entries_.erase(it);
+        }
     }
-
-    const std::string& d = *decision;
-    if (d == "allow-once" || d == "allow-always") {
-        out.resolution = DeferredResolution::Approved;
-        out.decision = d;
-        return out;
-    }
-    if (d == "deny") {
-        out.resolution = DeferredResolution::Denied;
-        out.reason = "denied by user";
-        return out;
-    }
-
-    // ⚠ 未知决策字符串 —— 不当批准（与 Stage 1 的处理一致）。
-    log()->error("deferred approval returned unknown decision '{}' (key={})", d, key);
-    out.resolution = DeferredResolution::Denied;
-    out.reason = "approval returned an unknown decision";
-    return out;
+    return result;
 }
 
 bool DeferredApprovalRegistry::discard(const std::string& key) {
     std::lock_guard<std::mutex> lk(mu_);
     auto it = entries_.find(key);
     if (it == entries_.end()) return false;
-    log()->info("discarding deferred approval (key={} id={})", key,
-                it->second.approval.approval_id);
+    // ★ 丢弃未收敛的凭据【无需通知任何人】: Stage 1 不再 create 审批,
+    //   所以此刻 broker 里根本没有对应请求, 用户也没见过卡片。
+    //   ⚠ 这正是"收敛点才发起"带来的额外好处 —— 旧实现下 discard
+    //     必须额外去 broker 撤掉那条已广播的请求, 漏掉就留下一张
+    //     永远无人收敛的僵尸卡片。
+    log()->info("discarding deferred approval (key={} tool={})", key,
+                it->second.approval.tool_name);
     entries_.erase(it);
     return true;
 }

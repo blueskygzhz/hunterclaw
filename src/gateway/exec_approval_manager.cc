@@ -401,7 +401,8 @@ bool ExecApprovalManager::expire(
 // ============================================================================
 std::optional<ExecApprovalDecision> ExecApprovalManager::await_decision(
     const std::string& record_id,
-    int64_t timeout_ms
+    int64_t timeout_ms,
+    const std::atomic<bool>* aborted
 ) {
     std::shared_ptr<PendingEntry> entry;
     {
@@ -415,15 +416,42 @@ std::optional<ExecApprovalDecision> ExecApprovalManager::await_decision(
     int64_t effective_timeout = timeout_ms > 0 ? timeout_ms : entry->timeout_ms;
     if (effective_timeout <= 0) effective_timeout = 120000;  // 2 min default
 
-    // Wait for decision
+    // ── 等待决策, 但 abort 能提前结束 ────────────────────────────────────
+    // 🎯 对齐 OpenClaw approval.ts:340-341:
+    //      "Wait for the decision, but abort early if the agent run is
+    //       cancelled so the user isn't blocked for the full approval timeout."
+    //      const waitResult = await Promise.race([waitPromise, abortPromise]);
+    //
+    // ★ 分段等待而非一次性 wait_for(effective_timeout):
+    //   aborted 是【外部】atomic, 置位方 (ReactEngine::cancel) 不持有
+    //   本类的 mutex_, 因此无法 notify 我们的 cv。只能按 kAbortPollIntervalMs
+    //   分段醒来自查。
+    //
+    // ⚠ 总时长仍以 effective_timeout 为准 —— 用 deadline 而非
+    //   "循环 N 次 × 间隔": 后者会因每次 wait_for 的实际耗时略大于
+    //   间隔而累积漂移, 长等待下可能超出预期几秒,
+    //   与 create_plugin 钳出的 expires_at_ms 不一致。
     {
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(effective_timeout);
         std::unique_lock<std::mutex> lock(mutex_);
-        bool got_decision = entry->cv.wait_for(
-            lock,
-            std::chrono::milliseconds(effective_timeout),
-            [&entry]() { return entry->decided; }
-        );
-        (void)got_decision;
+        while (!entry->decided) {
+            // ★ 先查 abort 再等: 进入时就已取消的情况下不该白等一个间隔。
+            if (aborted && aborted->load()) break;
+
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) break;
+
+            auto slice = std::chrono::milliseconds(kAbortPollIntervalMs);
+            const auto remaining =
+                std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+            // 末段不要越过 deadline
+            if (remaining < slice) slice = remaining;
+            // aborted 为空时无需分段, 一次等到 deadline 即可(零轮询开销)。
+            if (!aborted) slice = remaining;
+
+            entry->cv.wait_for(lock, slice, [&entry]() { return entry->decided; });
+        }
     }
 
     // Cleanup after grace period (lazy)

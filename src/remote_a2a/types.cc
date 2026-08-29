@@ -149,8 +149,15 @@ bool is_terminal(TaskState s) {
     return false;
 }
 
-const char* task_state_to_wire(TaskState s) {
-    for (const auto& e : kWireTable) {
+bool is_suspended_state(TaskState s) {
+    // ★ 只有这两个 —— 不含 Completed / Failed / Canceled。
+    //   ⚠ 别把 Submitted / Working 算进来: 那是「还在跑」而非
+    //     「停下来等外部输入」, 两者的处置完全不同
+    //     (前者继续探测, 后者要把追问交给用户/模型)。
+    return s == TaskState::InputRequired || s == TaskState::AuthRequired;
+}
+
+const char* task_state_to_wire(TaskState s) {    for (const auto& e : kWireTable) {
         if (e.state == s) return e.wire;
     }
     return "working";  // 不可达（枚举已全覆盖）

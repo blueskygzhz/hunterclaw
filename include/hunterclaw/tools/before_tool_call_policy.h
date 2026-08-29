@@ -105,15 +105,48 @@ ApprovalMode parse_approval_mode(const std::string& s);
 const char* approval_mode_to_wire(ApprovalMode m);
 
 // ── DeferredApproval ────────────────────────────────────────────────────────
-// Analog of OpenClaw DeferredPluginToolApproval (approval.ts:458).
+// Analog of OpenClaw DeferredPluginToolApproval
+// (agent-tools.before-tool-call.types.ts:78-85)。
 //
-// ★ Defer 模式下审批【已发起但未决策】, 工具照常执行。
-//   调用方必须自己收敛这张凭据 (等决策 / 取消), 否则请求会一直挂在
-//   审批 broker 里直到 timeout_ms 到期。
+// ★★ 持有的是【发起审批所需的参数】, 而不是一个已发起的 approval_id。
+//
+//   🎯 对齐 OpenClaw approval.ts:501-514: defer 分支在
+//      `requestPluginToolApproval` 【之前】return, 只把 payload
+//      装进 deferredApproval; 真正的 create + wait 都发生在收敛点
+//      (requestDeferredPluginToolApproval → requestPluginToolApproval,
+//       approval.ts:457-471)。
+//
+//   ⚠⚠ 曾经这里存的是 Stage 1 就 create 出来的 approval_id。后果是
+//     卡片在 Stage 1 【立即弹给用户, 但此刻没有任何人在等他的答案】。
+//     当 put/resolve 紧邻时不暴露(间隔微秒), 一旦把收敛挪到别处
+//     ——而这正是 Defer 存在的理由—— 就会出现:
+//       · 用户看到卡片时工具可能已经跑完, 审批变成事后表演;
+//       · 若收敛路径始终没被调用, 请求在 broker 里挂到 timeout 才消失,
+//         期间一直占着待审列表。
+//     OpenClaw 的顺序保证【用户看到卡片时一定有人在等他】。
 struct DeferredApproval {
-    std::string approval_id;   // broker 中的请求 id
     std::string tool_name;
     std::string tool_call_id;
+    std::string agent_id;
+    std::string session_key;
+
+    /// 发起审批时使用的超时。<=0 表示由 broker 自行决定。
+    /// ★ 在 Stage 1 就固定下来, 不在收敛点重新取 ——
+    ///   收敛点可能处于另一个上下文, 那里的 timeout 配置未必相同,
+    ///   而用户看到的倒计时应当与声明时一致。
+    int64_t timeout_ms = 0;
+
+    /// 本次审批允许的决策集合（空 = 默认全集）。
+    ///
+    /// ★★ 必须随凭据一起带走。收敛可能发生在【另一条代码路径】,
+    ///   那里拿不到原始的 BeforeToolCallContext, 无从得知本次审批
+    ///   是否禁用了 allow-always。
+    ///
+    ///   ⚠ 不带这个字段的后果: remote_a2a 之类声明
+    ///     allowed={allow-once, deny} 的调用, 在 Defer 路径上会
+    ///     【无声地接受 allow-always】—— 禁用永久授权的约束只在
+    ///     Request 路径生效, 换个模式就绕过了。
+    std::vector<std::string> allowed_decisions;
 };
 
 // ── ToolApprovalBroker ──────────────────────────────────────────────────────
@@ -151,10 +184,44 @@ public:
         const std::vector<std::string>& allowed_decisions) = 0;
 
     /// 等待决策。
-    /// @return "allow-once" / "allow-always" / "deny"；nullopt = 超时/不存在
+    ///
+    /// @param aborted 运行取消标志。非空且被置位时【立即结束等待】并返回
+    ///        nullopt —— 逐字对齐 OpenClaw approval.ts:340-341 的
+    ///        `Promise.race([waitPromise, abortPromise])`, 其注释原文:
+    ///        "abort early if the agent run is cancelled so the user isn't
+    ///         blocked for the full approval timeout"。
+    ///
+    /// ⚠⚠ 这个参数【不是可选优化】。没有它, 用户点了 chat.abort 之后
+    ///   等待方仍会挂满 timeout(默认 120s), 而该等待占着 main lane 的
+    ///   唯一槽位(command_queue.cc:54 max_concurrent=1) ——
+    ///   等于【全 gateway 的推理吞吐归零两分钟, 且用户无法自救】。
+    ///   abort 是用户唯一的脱身手段, 它必须真的能打断。
+    ///
+    /// @return "allow-once" / "allow-always" / "deny"；
+    ///         nullopt = 超时 / 被取消 / 记录不存在
     virtual std::optional<std::string> wait_tool_approval(
-        const std::string& approval_id, int64_t timeout_ms) = 0;
+        const std::string& approval_id, int64_t timeout_ms,
+        const std::atomic<bool>* aborted = nullptr) = 0;
 };
+
+
+// ── resolve_permitted_approval_resolution ───────────────────────────────────
+// 逐字对齐 OpenClaw resolvePermittedPluginApprovalResolution
+// (approval.ts:102-115)。
+//
+// ★★ 为什么决策回来后还要再校验一次 allowed_decisions:
+//   载荷声明了"本次只允许 allow-once / deny"时, 一个 allow-always
+//   【绝不能】被当成批准。而 gateway 侧的校验不足以保证这点 ——
+//   决策入口有多个 (approval.resolve 与 plugin.approval.resolve 两条,
+//   见 methods_registry.cc:228/236), 任何一条漏了校验就整体绕过。
+//
+//   OpenClaw 的处置是把越权决策【降级为 TIMEOUT】而非报错:
+//   它既不是批准也不是明确拒绝, 语义上就是"没拿到有效决策"。
+//
+// @param allowed 为空表示默认全集(不限制)
+// @return 允许的决策原样返回; 越权/未知 → nullopt (调用方按超时处理)
+std::optional<std::string> resolve_permitted_approval_resolution(
+    const std::string& decision, const std::vector<std::string>& allowed);
 
 // ── HookOutcome ─────────────────────────────────────────────────────────────
 // Direct analog of OpenClaw's HookOutcome union, flattened into one struct.
@@ -212,6 +279,35 @@ struct HookOutcome {
         return o;
     }
 };
+
+// ── request_plugin_tool_approval ────────────────────────────────────────────
+// 🎯 逐字对齐 OpenClaw requestPluginToolApproval
+//    (agent-tools.before-tool-call.approval.ts:~250-455)。
+//
+// ★★ 这是【唯一】的"发起审批 + 等待决策 + 判定结论"实现。
+//   OpenClaw 全仓只有两个调用者:
+//     · :536  Request 模式当场调用
+//     · :462  requestDeferredPluginToolApproval —— Defer 收敛点的薄包装
+//   两者拿到的是【同一个函数返回的同一种 HookOutcome】。
+//
+// ⚠⚠ 为什么必须只有一份:
+//   此前 Request 分支(before_tool_call_policy.cc)与 Defer 收敛
+//   (deferred_approval_registry.cc do_wait)各写了一遍 create+wait+判定。
+//   重复已经咬过两次 —— "决策回来后校验 allowed_decisions"和"aborted 透传"
+//   都得改两个文件, 漏一处就是【静默的安全缺口】。
+//   而且两者行为已经漂移: Defer 把 broker 缺失/越权决策/被 abort
+//   三种不同原因全压成 TimedOut, 使"审批面挂了"与"用户没响应"
+//   在审计上无法区分。
+//
+// @param broker      审批通道（调用方已解析好；为空 ⇒ fail-closed）
+// @param aborted     运行取消标志，非空且置位时立即结束等待
+// @param params      失败时原样带回的参数快照
+HookOutcome request_plugin_tool_approval(
+    const std::shared_ptr<ToolApprovalBroker>& broker,
+    const std::string& tool_name, const std::string& tool_call_id,
+    const std::string& agent_id, const std::string& session_key,
+    int64_t timeout_ms, const std::vector<std::string>& allowed_decisions,
+    const std::atomic<bool>* aborted, const core::JsonValue& params);
 
 // ── BeforeToolCallContext ───────────────────────────────────────────────────
 // Minimal context needed by the policy chain (subset of OpenClaw HookContext).

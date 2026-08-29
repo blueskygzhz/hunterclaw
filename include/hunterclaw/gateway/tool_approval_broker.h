@@ -52,7 +52,8 @@ public:
         const std::vector<std::string>& allowed_decisions) override;
 
     std::optional<std::string> wait_tool_approval(
-        const std::string& approval_id, int64_t timeout_ms) override;
+        const std::string& approval_id, int64_t timeout_ms,
+        const std::atomic<bool>* aborted = nullptr) override;
 
 private:
     std::shared_ptr<ExecApprovalManager> manager_;

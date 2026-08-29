@@ -60,12 +60,24 @@ public:
     }
 
     std::optional<std::string> wait_tool_approval(const std::string& id,
-                                                 int64_t timeout_ms) override {
+                                                 int64_t timeout_ms,
+                                                 const std::atomic<bool>* aborted
+                                                     = nullptr) override {
         std::unique_lock<std::mutex> lk(mu_);
         const int64_t w = timeout_ms > 0 ? timeout_ms : 2000;
-        const bool got = cv_.wait_for(lk, std::chrono::milliseconds(w),
-                                     [&]() { return decisions_.count(id) > 0; });
-        if (!got) return std::nullopt;
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(w);
+        while (decisions_.count(id) == 0) {
+            if (aborted && aborted->load()) return std::nullopt;
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) return std::nullopt;
+            auto slice = std::chrono::milliseconds(20);
+            const auto remaining =
+                std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+            if (remaining < slice) slice = remaining;
+            if (!aborted) slice = remaining;
+            cv_.wait_for(lk, slice, [&]() { return decisions_.count(id) > 0; });
+        }
         return decisions_[id];
     }
 

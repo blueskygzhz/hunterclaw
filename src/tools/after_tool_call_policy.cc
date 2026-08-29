@@ -221,7 +221,11 @@ AfterToolCallOutcome run_after_tool_call_policy(const AfterToolCallContext& ctx,
     log()->info("tool '{}' waiting for post-exec confirmation (id={} tokens={})",
                 ctx.tool_name, approval_id, req->token_ids.size());
 
-    auto decision = broker->wait_tool_approval(approval_id, req->timeout_ms);
+    // ★ 传入 aborted —— 与 before 阶段一致 (OpenClaw approval.ts:340-341)。
+    //   ⚠ 原实现只在 wait 【返回后】查 aborted, 那时 120s 已经等完了,
+    //     检查形同虚设。abort 必须能真的打断等待。
+    auto decision = broker->wait_tool_approval(approval_id, req->timeout_ms,
+                                               ctx.aborted);
 
     // 取消检查：等待期间被中止
     if (ctx.aborted && ctx.aborted->load()) {
@@ -248,7 +252,29 @@ AfterToolCallOutcome run_after_tool_call_policy(const AfterToolCallContext& ctx,
         return out;
     }
 
-    const std::string& d = *decision;
+    // ── 决策合法性校验 ──────────────────────────────────────────────────
+    // 🎯 与 before 阶段同一函数 (OpenClaw resolvePermittedPluginApprovalResolution)。
+    //
+    // ⚠⚠ 这一步在本阶段比 before 阶段更关键: remote_a2a 的二次确认声明
+    //   allowed={allow-once, deny} 正是为了【禁掉 allow-always】——
+    //   一次误点永久授权会让该远端后续所有需确认操作全部免确认。
+    //   若不在此校验, 那个禁令就只是一句注释。
+    auto permitted =
+        resolve_permitted_approval_resolution(*decision, req->allowed_decisions);
+    if (!permitted.has_value()) {
+        const char* why = "confirmation returned a decision that is not permitted";
+        log()->error("tool '{}' post-exec confirmation decision '{}' outside "
+                     "allowed set", ctx.tool_name, *decision);
+        out.kind = AfterToolCallOutcomeKind::Rejected;
+        out.reason = why;
+        out.denied_reason = denied_reason::kPluginApproval;
+        out.result = make_unconfirmed_result(ctx.tool_name, why,
+                                            denied_reason::kPluginApproval,
+                                            result.details);
+        return out;
+    }
+
+    const std::string& d = *permitted;
     if (d == "allow-once" || d == "allow-always") {
         out.kind = AfterToolCallOutcomeKind::Confirmed;
         out.decision = d;
@@ -263,15 +289,9 @@ AfterToolCallOutcome run_after_tool_call_policy(const AfterToolCallContext& ctx,
         return out;
     }
 
-    // deny 或未知决策 —— 未知一律不当确认（与 before 阶段一致）。
-    const std::string why = (d == "deny") ? "confirmation denied by user"
-                                          : "confirmation returned an unknown decision";
-    if (d != "deny") {
-        log()->error("tool '{}' post-exec confirmation unknown decision '{}'",
-                     ctx.tool_name, d);
-    } else {
-        log()->info("tool '{}' post-exec confirmation denied", ctx.tool_name);
-    }
+    // ★ 只剩 "deny" —— 未知/越权已被 resolve_permitted_... 挡在上面。
+    const char* why = "confirmation denied by user";
+    log()->info("tool '{}' post-exec confirmation denied", ctx.tool_name);
     out.kind = AfterToolCallOutcomeKind::Rejected;
     out.reason = why;
     out.denied_reason = denied_reason::kPluginApproval;

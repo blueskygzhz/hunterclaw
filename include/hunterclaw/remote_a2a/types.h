@@ -117,6 +117,18 @@ enum class TaskState {
 ///   等外部回填后由新的 message 续接同一个 task。
 bool is_terminal(TaskState s);
 
+/// 挂起态集合：InputRequired / AuthRequired。
+///
+/// ★ 「挂起」是终态的【子集】：本轮结束了，但任务没结束 ——
+///   等外部回填后由新的 message 续接同一个 task。
+///
+/// ⚠ 抽成公共函数而非各处内联判断: 这个判定原先散落在
+///   ExecutionResult::is_suspended()、ingest_task 的 suspended 局部变量
+///   等多处。分散的后果是漏一处就静默错 ——
+///   PendingTaskStore::update_terminal 当初就漏了, 导致
+///   reason=Completed 把 InputRequired 抹成 Completed。
+bool is_suspended_state(TaskState s);
+
 struct TaskStatus {
     TaskState state = TaskState::Submitted;
     std::optional<Message> message;

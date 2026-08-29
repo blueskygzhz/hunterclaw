@@ -935,6 +935,284 @@ static void test_texts() {
 }
 
 // ============================================================================
+// 终态归因不得抹掉挂起态
+//
+// ⚠⚠ 这是【已两次踩到】的坑, 必须有回归保护:
+//   input-required 归因为 TerminalReason::Completed(它不是失败),
+//   若 update_terminal 由 reason 推导 state, InputRequired 会被写成
+//   Completed —— is_suspended() 变 false、render() 不输出 task_id、
+//   模型无法续接, 挂起任务永久卡死。
+//
+//   第一次: update_terminal 无条件写 terminal_reason_to_task_state。
+//   第二次: 加了 remote_state 第五参, 但它【依赖调用方记得传】,
+//           漏传就复现同一个 bug。
+//   现在: update_terminal 自保 —— 本地推导出的 Completed 没有资格
+//         否定远端刚声明的挂起态。
+static void test_terminal_must_not_erase_suspension() {
+    SECTION("终态归因不得抹掉挂起态");
+
+    auto store = PendingTaskStore::create();
+
+    // ── 不传 remote_state（第五参）也必须保住挂起态 ──────────────────────
+    {
+        auto h = store->register_task("s", "ta", "ca", "sk").get();
+        ProgressFingerprint fp;
+        fp.last_status_message_len = 6;
+        store->note_progress(h, fp, TaskState::InputRequired, "要订单号");
+        // ★ 故意【不传】第五参 —— 模拟调用方漏传
+        store->update_terminal(h, TerminalReason::Completed, "", "");
+
+        auto t = store->get(h);
+        CHECK(t->state == TaskState::InputRequired,
+              "漏传 remote_state 时挂起态仍保留 [不可回退]");
+        CHECK(t->reason.has_value() && *t->reason == TerminalReason::Completed,
+              "reason 仍记为 Completed（挂起不是失败）");
+        CHECK(t->phase == PendingPhase::Terminal, "phase 仍转 Terminal");
+    }
+
+    // auth-required 同构
+    {
+        auto h = store->register_task("s", "tb", "", "sk").get();
+        ProgressFingerprint fp;
+        fp.last_status_message_len = 4;
+        store->note_progress(h, fp, TaskState::AuthRequired, "要授权");
+        store->update_terminal(h, TerminalReason::Completed, "", "");
+        CHECK(store->get(h)->state == TaskState::AuthRequired,
+              "auth-required 同样不被抹掉 [不可回退]");
+    }
+
+    // ── 失败类 reason【必须】覆盖挂起态 ─────────────────────────────────
+    // ★★ 这是上面那条例外的边界。本地权威判定说"任务结束了",
+    //   不管远端此前说它在等什么 —— 否则一个超时的任务会永远
+    //   显示"等用户输入", 等不到任何人。
+    {
+        auto h = store->register_task("s", "tc", "", "sk").get();
+        ProgressFingerprint fp;
+        fp.last_status_message_len = 6;
+        store->note_progress(h, fp, TaskState::InputRequired, "要订单号");
+        store->update_terminal(h, TerminalReason::HardTimeout, "", "超时");
+        CHECK(store->get(h)->state == TaskState::Failed,
+              "HardTimeout 覆盖挂起态 [不可回退]");
+    }
+    {
+        auto h = store->register_task("s", "td", "", "sk").get();
+        ProgressFingerprint fp;
+        fp.last_status_message_len = 6;
+        store->note_progress(h, fp, TaskState::InputRequired, "要订单号");
+        store->update_terminal(h, TerminalReason::Canceled, "", "已取消");
+        CHECK(store->get(h)->state == TaskState::Canceled,
+              "Canceled 覆盖挂起态 [不可回退]");
+    }
+    {
+        auto h = store->register_task("s", "te", "", "sk").get();
+        ProgressFingerprint fp;
+        fp.last_status_message_len = 6;
+        store->note_progress(h, fp, TaskState::AuthRequired, "要授权");
+        store->update_terminal(h, TerminalReason::Zombie, "", "僵死");
+        CHECK(store->get(h)->state == TaskState::Failed,
+              "Zombie 覆盖挂起态 [不可回退]");
+    }
+
+    // ── 正常完成不受影响 ────────────────────────────────────────────────
+    // ⚠ 防止自保写过头: Working → Completed 必须照常生效。
+    {
+        auto h = store->register_task("s", "tf", "", "sk").get();
+        ProgressFingerprint fp;
+        fp.last_status_message_len = 3;
+        store->note_progress(h, fp, TaskState::Working, "跑着");
+        store->update_terminal(h, TerminalReason::Completed, "done", "");
+        auto t = store->get(h);
+        CHECK(t->state == TaskState::Completed, "非挂起态正常转 Completed [不可回退]");
+        CHECK(t->result_text == "done", "结果正常写入");
+    }
+
+    // ── 显式传入的 remote_state 仍然优先 ────────────────────────────────
+    {
+        auto h = store->register_task("s", "tg", "", "sk").get();
+        ProgressFingerprint fp;
+        fp.last_status_message_len = 6;
+        store->note_progress(h, fp, TaskState::InputRequired, "要订单号");
+        // 远端明确说它 Completed 了（追问已被满足）
+        store->update_terminal(h, TerminalReason::Completed, "ok", "",
+                              TaskState::Completed);
+        CHECK(store->get(h)->state == TaskState::Completed,
+              "显式 remote_state 优先于自保 [不可回退]");
+    }
+
+    // ── is_suspended_state 本身 ─────────────────────────────────────────
+    CHECK(is_suspended_state(TaskState::InputRequired), "InputRequired 是挂起");
+    CHECK(is_suspended_state(TaskState::AuthRequired), "AuthRequired 是挂起");
+    CHECK(!is_suspended_state(TaskState::Completed), "Completed 不是挂起");
+    CHECK(!is_suspended_state(TaskState::Failed), "Failed 不是挂起");
+    CHECK(!is_suspended_state(TaskState::Canceled), "Canceled 不是挂起");
+    // ⚠ Working/Submitted 是"还在跑"而非"停下来等输入", 处置完全不同
+    CHECK(!is_suspended_state(TaskState::Working), "Working 不是挂起 [不可回退]");
+    CHECK(!is_suspended_state(TaskState::Submitted), "Submitted 不是挂起 [不可回退]");
+}
+
+// ============================================================================
+// 二次确认信号解析
+//
+// ⚠⚠ 这个函数此前【零测试覆盖】, 而它一旦漏读, 后果不是"少一个字段"
+//   而是【整条二次确认链路静默失效】:
+//     token 空 → requires_user_action 保持配置默认(false)
+//     → 模型把"请确认"当普通追问、代用户答"好的"
+//     → 邮件/转账真的执行。
+//   这正是整条链路要防的事, 所以每一种报文形态都要锁死。
+static void test_extract_confirm_signal() {
+    SECTION("二次确认信号解析");
+
+    // ── 企微真实报文（token 在 data，键名 token_id_list）───────────────────
+    //
+    // ★★ 这是【实测报文】, 不是构造的假数据。
+    //   A2A 规范(a2a.proto:224-242) 里 Part 的 `data`(oneof content) 与
+    //   `metadata` 是两个独立字段, 都合法; 企微把 token 放 data、
+    //   只用 metadata.wecom_part_type 做分类。
+    //
+    //   ⚠ 曾经只扫 metadata 且 `!p.metadata.is_object()` 就 continue,
+    //     于是这种 part 被整个跳过 —— 二次确认静默不触发。
+    {
+        const char* kWecomPayload = R"({
+          "id": "NDA5ZjIxYTctMjMxNzQyODU3Nw",
+          "contextId": "b3f2d5a1-9c47-4e88-b1f0-7dabc4e5f612",
+          "status": {
+            "state": "TASK_STATE_INPUT_REQUIRED",
+            "timestamp": "2026-08-28T05:13:30Z",
+            "message": {
+              "messageId": "NDA5ZjIxYTctMjMxNzQyODU3Nw",
+              "role": "ROLE_AGENT",
+              "parts": [
+                { "text": "我查到后需要邮件通知客户确认。",
+                  "mediaType": "text/markdown",
+                  "metadata": { "wecom_part_type": "assistant" } },
+                { "data": { "description": "待办查询成功，命中 8 条待办" },
+                  "mediaType": "application/json",
+                  "metadata": { "wecom_part_type": "tool_call" } },
+                { "text": "将向 2 位客户发送确认邮件，请确认。",
+                  "mediaType": "text/markdown",
+                  "metadata": { "wecom_part_type": "assistant" } },
+                { "data": { "description": "邮件发送待用户确认（2 位收件人）" },
+                  "mediaType": "application/json",
+                  "metadata": { "wecom_part_type": "tool_call" } },
+                { "data": { "token_id_list": ["tk_2f9a8b1c4d3e5f60",
+                                              "tk_77abcd91e5f2a710"] },
+                  "mediaType": "application/json",
+                  "metadata": { "wecom_part_type": "approval" } }
+              ]
+            }
+          }
+        })";
+
+        Task t = task_from_json(nlohmann::json::parse(kWecomPayload));
+
+        // 前置: 状态必须先能认出来（protobuf 全名带 TASK_STATE_ 前缀）
+        CHECK(t.status.state == TaskState::InputRequired,
+              "TASK_STATE_INPUT_REQUIRED 可识别 [不可回退]");
+        CHECK(t.status.message.has_value(), "status.message 已解析");
+        CHECK(t.status.message->parts.size() == 5, "5 个 part 全部解析");
+
+        // ★★ 核心断言: token 在 data 里、键名 token_id_list，必须读到
+        ConfirmSignal sig = extract_confirm_signal(t, /*force=*/false);
+        CHECK(sig.token_ids.size() == 2,
+              "从 data.token_id_list 读到 2 个 token [不可回退]");
+        if (sig.token_ids.size() == 2) {
+            CHECK(sig.token_ids[0] == "tk_2f9a8b1c4d3e5f60", "token[0] 正确且保序");
+            CHECK(sig.token_ids[1] == "tk_77abcd91e5f2a710", "token[1] 正确且保序");
+        }
+        // ★★ 有 token 即隐含"必须用户确认" —— 报文里并没有
+        //   requiresUserAction 字段, 全靠这条推断。
+        //   ⚠ 不推断的后果: 那两个 token 永远没人去确认。
+        CHECK(sig.requires_user_action,
+              "有 token 即隐含 requires_user_action [不可回退]");
+    }
+
+    // ── 键名四种别名都认 ────────────────────────────────────────────────
+    // ⚠ 宁可多认几个别名, 也不能漏 —— 漏一个就是链路静默失效。
+    {
+        for (const char* key : {"tokenIds", "token_ids", "tokenIdList",
+                                "token_id_list"}) {
+            nlohmann::json j = {
+                {"status", {{"state", "input-required"},
+                            {"message", {{"messageId", "m"},
+                                         {"role", "agent"},
+                                         {"parts", {{{"data", {{key, {"tk_1"}}}}}}}}}}}};
+            Task t = task_from_json(j);
+            ConfirmSignal sig = extract_confirm_signal(t, false);
+            CHECK(sig.token_ids.size() == 1,
+                  std::string("键名 ") + key + " 可识别 [不可回退]");
+        }
+    }
+
+    // ── metadata 位置仍然兼容（不能因为支持 data 就丢了 metadata）────────
+    {
+        nlohmann::json j = {
+            {"status", {{"state", "input-required"},
+                        {"message", {{"messageId", "m"},
+                                     {"role", "agent"},
+                                     {"parts", {{{"text", "确认?"},
+                                                 {"metadata", {{"tokenIds", {"tk_m"}}}}}}}}}}}};
+        Task t = task_from_json(j);
+        ConfirmSignal sig = extract_confirm_signal(t, false);
+        CHECK(sig.token_ids.size() == 1, "metadata 位置仍兼容 [不可回退]");
+    }
+
+    // ── 本地配置能加严，远端不能放松 ────────────────────────────────────
+    // ★★ 与 requires_approval 绝不从卡读同一原则。
+    {
+        nlohmann::json j = {
+            {"status", {{"state", "input-required"},
+                        {"message", {{"messageId", "m"},
+                                     {"role", "agent"},
+                                     {"parts", {{{"text", "普通追问"}}}}}}}}};
+        Task t = task_from_json(j);
+
+        CHECK(!extract_confirm_signal(t, false).requires_user_action,
+              "无信号且未强制 → 模型可代答");
+        CHECK(extract_confirm_signal(t, true).requires_user_action,
+              "本地强制 → 必须用户确认 [不可回退]");
+
+        // 远端显式说 false，本地强制仍生效
+        nlohmann::json j2 = {
+            {"status", {{"state", "input-required"},
+                        {"message", {{"messageId", "m"},
+                                     {"role", "agent"},
+                                     {"parts", {{{"text", "x"},
+                                                 {"metadata", {{"requiresUserAction", false}}}}}}}}}}};
+        Task t2 = task_from_json(j2);
+        // ⚠ 若这里为 false, 远端只要声明 requiresUserAction=false
+        //   就能绕过本地的用户确认要求。
+        CHECK(extract_confirm_signal(t2, true).requires_user_action,
+              "远端 false 不能放松本地强制 [不可回退]");
+    }
+
+    // ── 脏数据防御 ──────────────────────────────────────────────────────
+    {
+        const std::string too_long(600, 'x');
+        nlohmann::json j = {
+            {"status", {{"state", "input-required"},
+                        {"message", {{"messageId", "m"},
+                                     {"role", "agent"},
+                                     {"parts", {{{"data", {{"token_id_list",
+                                        {"", too_long, "tk_ok", "tk_ok", 42, nullptr}}}}}}}}}}}};
+        Task t = task_from_json(j);
+        ConfirmSignal sig = extract_confirm_signal(t, false);
+        // 空串/超长/非字符串丢弃，重复去掉 → 只剩 tk_ok
+        CHECK(sig.token_ids.size() == 1, "脏 token 全部丢弃 [不可回退]");
+        if (sig.token_ids.size() == 1) {
+            CHECK(sig.token_ids[0] == "tk_ok", "保留合法 token");
+        }
+    }
+
+    // ── 无 status.message 不崩 ──────────────────────────────────────────
+    {
+        Task t;
+        t.status.state = TaskState::InputRequired;
+        ConfirmSignal sig = extract_confirm_signal(t, false);
+        CHECK(sig.token_ids.empty(), "无 message 时安全返回");
+    }
+}
+
+// ============================================================================
 int main() {
     std::cout << "===== remote_a2a M7/M8 测试 =====" << std::endl;
 
@@ -952,6 +1230,8 @@ int main() {
     test_engine_uninitialized();
     test_follow_up_cancel();
     test_input_required_field_ownership();
+    test_terminal_must_not_erase_suspension();
+    test_extract_confirm_signal();
     test_texts();
 
     std::cout << "\n===== 结果: " << g_pass << " 通过, " << g_fail << " 失败 ====="

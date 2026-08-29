@@ -279,6 +279,25 @@ bool PendingTaskStore::update_terminal(const std::string& handle,
         //   后续 is_terminal(state) 判断会与 phase 不一致。
         if (remote_state.has_value() && is_terminal(*remote_state)) {
             t->state = *remote_state;
+        } else if (reason == TerminalReason::Completed && is_suspended_state(t->state)) {
+            // ★★ 自保：挂起态不被"成功"抹掉。
+            //
+            //   上面那条 remote_state 分支要求【调用方记得传第五参】才生效。
+            //   漏传时 reason=Completed 会推导出 TaskState::Completed,
+            //   把 note_progress 刚写入的 InputRequired / AuthRequired 覆盖掉 ——
+            //   于是 is_suspended() 变 false、render() 不输出 task_id,
+            //   模型无法续接, 挂起的任务永久卡死。
+            //
+            //   ⚠ 为什么在这里兜而不是只靠调用方自觉:
+            //     "挂起"与"成功"是互斥事实, 由本地 reason 推导出的
+            //     Completed 【没有资格】否定远端刚刚声明的挂起状态。
+            //     这是数据一致性约束, 不该依赖每个调用点都不出错。
+            //
+            //   ★ 只对 Completed 设此例外。失败类 reason(HardTimeout /
+            //     Zombie / RemoteFailed / ConnLost / Canceled) 【必须】
+            //     覆盖挂起态 —— 那些是本地权威判定: 任务确实结束了,
+            //     不管远端此前说它在等什么。若也保留挂起态,
+            //     一个超时的任务会一直显示"等用户输入", 永远等不到。
         } else {
             t->state = terminal_reason_to_task_state(reason);
         }

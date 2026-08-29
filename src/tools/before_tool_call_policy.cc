@@ -14,6 +14,8 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>   // std::find (resolve_permitted_approval_resolution)
+
 namespace hunterclaw {
 namespace tools {
 
@@ -77,6 +79,41 @@ std::optional<HookOutcome> run_approval_gate(const BeforeToolCallContext& ctx,
                                  denied_reason::kPluginApproval, params);
     }
 
+    // ── mode=Defer: 不发起、不等待, 装好凭据放行 ────────────────────────
+    // 🎯 逐字对齐 OpenClaw approval.ts:501-514 —— defer 分支在
+    //    `requestPluginToolApproval` 【之前】return。
+    //
+    // ★★ 顺序是本质而非风格: 若在这里先 create + 广播,
+    //   卡片会【立即弹给用户, 而此刻没有任何人在等他的答案】。
+    //   put/resolve 紧邻时不暴露(间隔微秒), 一旦把收敛挪到别处
+    //   ——而这正是 Defer 存在的理由—— 就会出现"卡片先弹、无人等待",
+    //   用户点下时工具可能早已跑完, 审批变成事后表演。
+    //
+    //   OpenClaw 的顺序保证【用户看到卡片时一定有人在等他】。
+    //
+    // ★ broker 的可用性在【收敛点】检查(DeferredApprovalRegistry::do_wait)。
+    //   这里不检查是刻意的: 与 OpenClaw 一致 —— defer 分支根本不碰 broker。
+    //   收敛点拿不到 broker 时会 fail-closed(TimedOut), 不会放行。
+    if (ctx.approval_mode == ApprovalMode::Defer) {
+        HookOutcome o = HookOutcome::pass(params);
+        DeferredApproval d;
+        d.tool_name = ctx.tool_name;
+        d.tool_call_id = ctx.tool_call_id;
+        d.agent_id = ctx.agent_id;
+        d.session_key = ctx.session_key;
+        // ★ 超时在此固定, 不在收敛点重新取 —— 收敛点可能处于另一上下文,
+        //   那里的配置未必相同, 而用户看到的倒计时应与声明时一致。
+        d.timeout_ms = ctx.approval_timeout_ms;
+        // ★★ 必须随凭据带走 allowed_decisions:
+        //   收敛发生在另一条路径, 那里拿不到 ctx, 无从得知本次审批
+        //   是否禁用了 allow-always。不带 = Defer 路径静默接受永久授权,
+        //   而 Request 路径拒绝它 —— 换个模式就绕过了约束。
+        d.allowed_decisions = ctx.allowed_decisions;
+        o.deferred_approval = std::move(d);
+        log()->info("Tool '{}' approval deferred (not yet requested)", ctx.tool_name);
+        return o;
+    }
+
     // ── 解析审批通道 ────────────────────────────────────────────────────
     // ★★ 取【一次】并持有 shared_ptr 到本函数返回。
     //   mode=Request 会在下面阻塞等待(可长达 120s), 期间进程级单例
@@ -90,86 +127,161 @@ std::optional<HookOutcome> run_approval_gate(const BeforeToolCallContext& ctx,
         broker = ToolApprovalRuntime::instance().broker();
     }
 
+    // ── 发起审批 + 等待决策 + 判定结论 ──────────────────────────────────
+    // 🎯 委派给【唯一】实现 —— 与 Defer 收敛点共用同一个函数。
+    //   对齐 OpenClaw: requestPluginToolApproval 全仓只有两个调用者
+    //   (approval.ts:536 本处, :462 requestDeferredPluginToolApproval),
+    //   两者拿到同一种 HookOutcome。
+    //
+    // ⚠⚠ 此前这段逻辑在 Request 分支与 Defer 收敛点各写了一遍,
+    //   重复已经咬过两次(allowed_decisions 消费端校验、aborted 透传
+    //   都得改两个文件), 且行为已经漂移。收敛后不可能再漂移。
+    return request_plugin_tool_approval(
+        broker, ctx.tool_name, ctx.tool_call_id, ctx.agent_id, ctx.session_key,
+        ctx.approval_timeout_ms, ctx.allowed_decisions, ctx.aborted, params);
+}
+
+}  // namespace
+
+// ── request_plugin_tool_approval ────────────────────────────────────────────
+// 🎯 逐字对齐 OpenClaw requestPluginToolApproval (approval.ts:~250-455)。
+//
+// ★★ 唯一的"发起 + 等待 + 判定"实现。Request 模式与 Defer 收敛点都调它,
+//   因此两条路径的结论形状、审计分类、fail-closed 行为【必然一致】——
+//   而不是靠两处各自维护同样的逻辑再祈祷它们不漂移。
+HookOutcome request_plugin_tool_approval(
+    const std::shared_ptr<ToolApprovalBroker>& broker,
+    const std::string& tool_name, const std::string& tool_call_id,
+    const std::string& agent_id, const std::string& session_key,
+    int64_t timeout_ms, const std::vector<std::string>& allowed_decisions,
+    const std::atomic<bool>* aborted, const core::JsonValue& params) {
+
     // ── broker 缺失 → 不可用, 【绝不】放行 ──────────────────────────────
     // OpenClaw resolveUnavailablePluginApprovalSurfaceReason() (:260-272)
     // → failure{failed, plugin-approval-unavailable}。
     //
-    // ⚠⚠ 这条分支是本次修复的核心: 此前没有审批通道时需审批的工具会
-    //   【静默直通】(Tool::requires_approval() 零消费),
-    //   声明方以为受保护, 实际毫无防护且无日志可查。
+    // ⚠⚠ 此前没有审批通道时需审批的工具会【静默直通】
+    //   (Tool::requires_approval() 零消费), 声明方以为受保护,
+    //   实际毫无防护且无日志可查。
     //
-    // ★ Defer 也要求 broker: 没有它 Defer 会退化成"放行且无凭据",
-    //   那等于静默跳过审批 —— 正是我们要防的。
+    // ★ Defer 收敛点走到这里时同样 fail-closed —— 收敛拿不到 broker
+    //   不再压成 TimedOut, 而是与 Request 一样报 unavailable。
     if (!broker) {
         log()->error("Tool '{}' requires approval but no approval surface is "
-                     "available; refusing to execute", ctx.tool_name);
+                     "available; refusing to execute", tool_name);
         return HookOutcome::failure(
             "Approval required but no approval surface is available",
             disposition::kFailed, denied_reason::kPluginApprovalUnavail, params);
     }
 
     const std::string approval_id = broker->request_tool_approval(
-        ctx.tool_name, ctx.tool_call_id, ctx.agent_id, ctx.session_key,
-        ctx.approval_timeout_ms, ctx.allowed_decisions);
+        tool_name, tool_call_id, agent_id, session_key, timeout_ms,
+        allowed_decisions);
     if (approval_id.empty()) {
-        log()->error("Tool '{}' approval request failed", ctx.tool_name);
+        log()->error("Tool '{}' approval request failed", tool_name);
         return HookOutcome::failure(
             "Approval request could not be created",
             disposition::kFailed, denied_reason::kPluginApprovalUnavail, params);
     }
 
-    // ── mode=Defer: 不阻塞放行, 凭据交调用方收敛 ────────────────────────
-    // OpenClaw approval.ts:501-514。
-    if (ctx.approval_mode == ApprovalMode::Defer) {
-        HookOutcome o = HookOutcome::pass(params);
-        DeferredApproval d;
-        d.approval_id = approval_id;
-        d.tool_name = ctx.tool_name;
-        d.tool_call_id = ctx.tool_call_id;
-        o.deferred_approval = std::move(d);
-        log()->info("Tool '{}' approval deferred (id={})", ctx.tool_name, approval_id);
-        return o;
+    log()->info("Tool '{}' waiting for approval (id={})", tool_name, approval_id);
+    // ★ 传入 aborted —— 对齐 OpenClaw approval.ts:340-341 的 abortPromise race:
+    //   "Wait for the decision, but abort early if the agent run is cancelled
+    //    so the user isn't blocked for the full approval timeout."
+    //   ⚠ 不传会让 chat.abort 之后仍挂满 timeout, 而该等待占着 main lane
+    //     唯一的 WorkerThread → 全 gateway 推理停摆且用户无法自救。
+    auto decision = broker->wait_tool_approval(approval_id, timeout_ms, aborted);
+
+    // ── 取消优先于超时判定 ──────────────────────────────────────────────
+    // OpenClaw approval.ts:424-434: abortCancelled 时 reason 为
+    // "Approval cancelled (run aborted)"。
+    //
+    // ⚠ 必须先判 aborted 再判 !decision: 两者都会走到 nullopt,
+    //   但"被用户取消"与"等满超时"在审计上是完全不同的事件 ——
+    //   混成 timed_out 会让"用户主动放弃"看起来像"审批面没人响应",
+    //   进而误导排查方向(去查客户端为什么没收到卡片)。
+    if (aborted && aborted->load()) {
+        log()->info("Tool '{}' approval cancelled by run abort", tool_name);
+        return HookOutcome::failure(
+            "Approval cancelled (run aborted)",
+            disposition::kCancelled, denied_reason::kPluginApproval, params);
     }
 
-    // ── mode=Request: 等待决策 ──────────────────────────────────────────
-    log()->info("Tool '{}' waiting for approval (id={})", ctx.tool_name, approval_id);
-    auto decision = broker->wait_tool_approval(approval_id, ctx.approval_timeout_ms);
     if (!decision.has_value()) {
         // ⚠ 超时与"记录不存在"都落这里。两者都【不能放行】——
         //   未决 == 未获批。
-        log()->warn("Tool '{}' approval timed out or vanished", ctx.tool_name);
+        log()->warn("Tool '{}' approval timed out or vanished", tool_name);
         return HookOutcome::failure(
             "Approval timed out",
             disposition::kTimedOut, denied_reason::kPluginApproval, params);
     }
 
-    const std::string& d = *decision;
+    // ── 决策合法性校验 ──────────────────────────────────────────────────
+    // 🎯 对齐 OpenClaw resolvePermittedPluginApprovalResolution (approval.ts:378)。
+    //
+    // ★★ 必须在【消费端】再校验一次, 不能只靠 gateway 方法侧:
+    //   决策入口有两条 (approval.resolve 与 plugin.approval.resolve),
+    //   任何一条漏校验就整体绕过。而这里是唯一的汇聚点。
+    //
+    // ⚠ 越权决策降级为 nullopt → 按超时处理 (OpenClaw 归为 TIMEOUT),
+    //   【不是】当成拒绝: 它既非批准也非明确拒绝, 语义上就是"无有效决策"。
+    auto permitted = resolve_permitted_approval_resolution(*decision, allowed_decisions);
+    if (!permitted.has_value()) {
+        log()->error("Tool '{}' approval returned decision '{}' outside the "
+                     "allowed set; treating as no decision", tool_name, *decision);
+        return HookOutcome::failure(
+            "Approval returned a decision that is not permitted for this request",
+            disposition::kTimedOut, denied_reason::kPluginApproval, params);
+    }
+
+    const std::string& d = *permitted;
     if (d == "allow-once" || d == "allow-always") {
         HookOutcome o = HookOutcome::pass(params);
         // OpenClaw approvalResolution: "allow-once" / "allow-always"
         o.approval_resolution = d;
-        log()->info("Tool '{}' approved ({})", ctx.tool_name, d);
+        log()->info("Tool '{}' approved ({})", tool_name, d);
         return o;
     }
-    if (d == "deny") {
-        // ⚠ 是 Failure{blocked} 而非 Veto —— OpenClaw approval.ts:232-240。
-        //   审批流程跑完了, 结论是拒绝: 属事故性终止, 需带 disposition。
-        log()->warn("Tool '{}' denied by user", ctx.tool_name);
-        return HookOutcome::failure(
-            "Denied by user",
-            disposition::kBlocked, denied_reason::kPluginApproval, params);
-    }
-
-    // ⚠ 未知决策字符串 —— 【不放行】。broker 实现若返回了非法值,
-    //   宁可拒绝也不能当成批准。
-    log()->error("Tool '{}' approval returned unknown decision '{}'",
-                 ctx.tool_name, d);
+    // ⚠ 是 Failure{blocked} 而非 Veto —— OpenClaw approval.ts:390-399。
+    //   审批流程跑完了, 结论是拒绝: 属事故性终止, 需带 disposition。
+    //   (对比 mode=Deny → Veto: 那是根本没跑审批的策略否决。)
+    //
+    // ★ 此处不再有"未知决策"分支: resolve_permitted_approval_resolution
+    //   已把未知值挡在上面 (它只放行三个已知值)。剩下的必然是 "deny"。
+    log()->warn("Tool '{}' denied by user", tool_name);
     return HookOutcome::failure(
-        "Approval returned an unknown decision",
-        disposition::kFailed, denied_reason::kPluginApproval, params);
+        "Denied by user",
+        disposition::kBlocked, denied_reason::kPluginApproval, params);
 }
 
-}  // namespace
+// ── resolve_permitted_approval_resolution ───────────────────────────────────
+// 逐字对齐 OpenClaw resolvePermittedPluginApprovalResolution (approval.ts:102-115):
+//
+//   if ((decision === ALLOW_ONCE || decision === ALLOW_ALWAYS || decision === DENY)
+//       && allowedDecisions.includes(decision)) return decision;
+//   return TIMEOUT;
+//
+// ★ 两个条件【都要】满足: 既是已知决策, 又在允许集内。
+//   OpenClaw 用 && 串联, 这里保持同构。
+std::optional<std::string> resolve_permitted_approval_resolution(
+    const std::string& decision, const std::vector<std::string>& allowed) {
+    // ① 必须是三个已知决策之一。
+    //   ⚠ broker 实现返回了非法字符串时不能当批准 —— 宁可判为无决策。
+    const bool known = (decision == "allow-once" || decision == "allow-always" ||
+                        decision == "deny");
+    if (!known) return std::nullopt;
+
+    // ② 允许集为空 = 默认全集(不限制)。
+    //   ⚠ 空集【不能】理解成"什么都不允许": Stage 1 与配置侧都用
+    //     "空 = 用默认全集"这一约定 (config.cc:352-354 有同样的说明)。
+    //     若在这里反过来理解, 未配 allowedDecisions 的审批将永远无法通过。
+    if (allowed.empty()) return decision;
+
+    if (std::find(allowed.begin(), allowed.end(), decision) == allowed.end()) {
+        return std::nullopt;
+    }
+    return decision;
+}
 
 // ── parse_approval_mode ─────────────────────────────────────────────────────
 ApprovalMode parse_approval_mode(const std::string& s) {

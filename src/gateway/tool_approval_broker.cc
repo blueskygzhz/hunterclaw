@@ -105,13 +105,19 @@ std::string GatewayToolApprovalBroker::request_tool_approval(
 }
 
 std::optional<std::string> GatewayToolApprovalBroker::wait_tool_approval(
-    const std::string& approval_id, int64_t timeout_ms) {
+    const std::string& approval_id, int64_t timeout_ms,
+    const std::atomic<bool>* aborted) {
     if (!manager_) return std::nullopt;
     // ⚠ timeout_ms<=0 时传 0 给 await_decision, 由它沿用注册时的超时 ——
     //   不要在这里换成某个默认值, 否则会与 create_plugin 钳制出的
     //   实际过期时间不一致(等待比记录活得更久或更短, 两者都会造成
     //   "刚好在边界上"的随机失败)。
-    return manager_->await_decision(approval_id, timeout_ms > 0 ? timeout_ms : 0);
+    //
+    // ★ aborted 原样透传 —— 对齐 OpenClaw approval.ts:340-341 的
+    //   abortPromise race。不透传会让 chat.abort 无法打断审批等待,
+    //   而该等待占着 main lane 唯一槽位。
+    return manager_->await_decision(approval_id, timeout_ms > 0 ? timeout_ms : 0,
+                                    aborted);
 }
 
 }  // namespace gateway

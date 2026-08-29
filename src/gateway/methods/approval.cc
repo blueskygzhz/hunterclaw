@@ -8,6 +8,9 @@
 #include "hunterclaw/gateway/gateway.h"
 #include "hunterclaw/gateway/method_guard.h"
 #include "hunterclaw/gateway/exec_approval_manager.h"
+// ★ canonical approval.resolve 委派到 method_plugin_approval_resolve /
+//   method_exec_approval_resolve, 两者的声明都在 methods.h。
+#include "hunterclaw/gateway/methods.h"
 #include "hunterclaw/core/utils.h"
 #include <nlohmann/json.hpp>
 #include <filesystem>

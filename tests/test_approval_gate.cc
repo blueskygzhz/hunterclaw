@@ -91,13 +91,26 @@ public:
     }
 
     std::optional<std::string> wait_tool_approval(const std::string& approval_id,
-                                                 int64_t timeout_ms) override {
+                                                 int64_t timeout_ms,
+                                                 const std::atomic<bool>* aborted
+                                                     = nullptr) override {
         std::unique_lock<std::mutex> lk(mu_);
         const int64_t wait_ms = timeout_ms > 0 ? timeout_ms : 5000;
-        const bool got = cv_.wait_for(
-            lk, std::chrono::milliseconds(wait_ms),
-            [&]() { return decisions_.count(approval_id) > 0; });
-        if (!got) return std::nullopt;   // 模拟超时
+        // ★ 分段等待以便观测 abort —— 与真实 ExecApprovalManager 同构。
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(wait_ms);
+        while (decisions_.count(approval_id) == 0) {
+            if (aborted && aborted->load()) return std::nullopt;
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) return std::nullopt;   // 模拟超时
+            auto slice = std::chrono::milliseconds(20);
+            const auto remaining =
+                std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+            if (remaining < slice) slice = remaining;
+            if (!aborted) slice = remaining;
+            cv_.wait_for(lk, slice,
+                         [&]() { return decisions_.count(approval_id) > 0; });
+        }
         return decisions_[approval_id];
     }
 
@@ -474,15 +487,28 @@ static void test_mode_defer() {
         //   放行了、审批却没人收敛, 等于审批形同虚设。
         CHECK(out.deferred_approval.has_value(), "带出 deferred 凭据 [不可回退]");
         if (out.deferred_approval) {
-            CHECK(!out.deferred_approval->approval_id.empty(), "凭据含 approval_id");
-            CHECK(out.deferred_approval->tool_name == "danger_tool", "凭据含工具名");
-            CHECK(out.deferred_approval->tool_call_id == "call-1", "凭据含 tool_call_id");
+            const auto& d = *out.deferred_approval;
+            CHECK(d.tool_name == "danger_tool", "凭据含工具名");
+            CHECK(d.tool_call_id == "call-1", "凭据含 tool_call_id");
+            // ★ 凭据必须带齐【发起审批所需的全部参数】——
+            //   收敛点拿不到 ctx, 缺一个就发不出正确的审批请求。
+            CHECK(d.timeout_ms == 5000, "凭据含 timeout [不可回退]");
         }
-        // ★ 审批确实已发起（可被后续收敛）
-        CHECK(broker->request_count() == 1, "审批已发起 [不可回退]");
+        // ★★★ [不可回退] Stage 1 【绝不能】发起审批。
+        //
+        //   🎯 逐字对齐 OpenClaw approval.ts:501-514: defer 分支在
+        //      `requestPluginToolApproval` 之前 return; create + wait
+        //      都发生在收敛点 (requestDeferredPluginToolApproval)。
+        //
+        //   ⚠⚠ 若在 Stage 1 就 create, 卡片会立即弹给用户,
+        //     而此刻【没有任何人在等他的答案】。put/resolve 紧邻时
+        //     不暴露, 一旦把收敛挪到别处(这正是 Defer 存在的理由),
+        //     用户点下时工具可能早已跑完 —— 审批变成事后表演。
+        CHECK(broker->request_count() == 0,
+              "Stage 1 不发起审批（收敛点才发起）[不可回退]");
     }
 
-    // ── Defer 但 broker 缺失 → 不能放行 ────────────────────────────────
+    // ── Defer 不要求 broker（对齐 OpenClaw: defer 分支不碰 broker）──────
     {
         auto c2 = base_ctx();
         c2.tool_requires_approval = true;
@@ -490,13 +516,17 @@ static void test_mode_defer() {
         c2.approval_broker = nullptr;
 
         auto o2 = run_before_tool_call_policy(c2, empty_params());
-        // ★ [不可回退] 没有通道时 Defer 会退化成"放行且无凭据",
-        //   那等于静默跳过审批。必须落到不可用分支。
-        CHECK(o2.kind == HookOutcomeKind::Failure,
-              "Defer 无通道 → 不放行 [不可回退]");
-        CHECK(o2.denied_reason.value_or("") == denied_reason::kPluginApprovalUnavail,
-              "denied_reason=plugin-approval-unavailable");
-        CHECK(!o2.deferred_approval.has_value(), "无凭据");
+        // ★★ [不可回退] Defer 分支根本不解析 broker —— 与 OpenClaw 一致。
+        //   fail-closed 由【收敛点】承担(DeferredApprovalRegistry::do_wait
+        //   取不到 broker 时返回 TimedOut, 见 test_no_broker)。
+        //
+        //   ⚠ 这里【不能】因为"没有 broker"就拒绝: 那会让 Stage 1 承担
+        //     一个它已不再需要的依赖, 且与 OpenClaw 的分支顺序相反。
+        //     真正的安全保证在收敛点 —— 凭据没被收敛 = 工具不执行。
+        CHECK(o2.kind == HookOutcomeKind::Pass,
+              "Defer 无 broker 仍放行（不碰 broker）[不可回退]");
+        CHECK(o2.deferred_approval.has_value(),
+              "仍带出凭据（收敛点 fail-closed）[不可回退]");
     }
 }
 
@@ -655,11 +685,17 @@ static void test_runtime_singleton() {
         auto explicit_broker = std::make_shared<FakeBroker>();
         auto ctx = base_ctx();
         ctx.tool_requires_approval = true;
-        ctx.approval_mode = ApprovalMode::Defer;
+        // ★ 用 Request 而非 Defer 来验证这件事:
+        //   Defer 分支【根本不解析 broker】(对齐 OpenClaw approval.ts:501-514,
+        //   defer 在 requestPluginToolApproval 之前 return),
+        //   拿它测"哪个 broker 被用到"是无效的。
+        ctx.approval_mode = ApprovalMode::Request;
         ctx.approval_broker = explicit_broker;
+        ctx.approval_timeout_ms = 200;   // 让它快速超时返回
 
         auto out = run_before_tool_call_policy(ctx, empty_params());
-        CHECK(out.kind == HookOutcomeKind::Pass, "Defer 放行");
+        // 无人决策 → 超时 → Failure{timed_out}（此处只关心用了哪个 broker）
+        CHECK(out.kind == HookOutcomeKind::Failure, "无决策 → 超时");
         // ★ 显式注入优先 —— 这是单测能隔离运行的前提
         CHECK(explicit_broker->request_count() == 1, "用了显式 broker");
         CHECK(singleton_broker->request_count() == 0, "未用单例 broker");

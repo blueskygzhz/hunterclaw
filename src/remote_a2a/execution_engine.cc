@@ -58,6 +58,50 @@ int64_t ExecutionConfig::effective_yield_ms() const {
 
 // ── 二次确认信号解析（★ 全部集中在此，报文位置定了只改这里）─────────────────
 
+namespace {
+
+/// 从一个 JSON 对象里抽 requiresUserAction。
+/// ★ 抽成函数是因为要对 part.metadata 与 part.data 各扫一遍 ——
+///   两处都可能承载，见 scan_confirm_object 的调用点说明。
+void scan_user_action_flag(const nlohmann::json& obj, ConfirmSignal& sig) {
+    if (!obj.is_object()) return;
+    // 取「或」——任一处声明即为真
+    for (const char* k : {"requiresUserAction", "requires_user_action",
+                          "requireUserAction", "require_user_action"}) {
+        auto it = obj.find(k);
+        if (it != obj.end() && it->is_boolean() && it->get<bool>()) {
+            sig.requires_user_action = true;
+        }
+    }
+}
+
+/// 从一个 JSON 对象里抽 tokenIds。
+///
+/// ★ 键名兼容四种写法。实测企微用的是 `token_id_list`
+///   (status.message.parts[].data)，而最初只认 tokenIds/token_ids ——
+///   ⚠ 键名不匹配的后果不是"少一个字段"，而是【整条二次确认链路静默失效】:
+///     token 空 → requires_user_action 保持配置默认(false) →
+///     模型把"请确认"当普通追问代答"好的" → 邮件真的发出去。
+///     宁可多认几个别名，也不能漏。
+void scan_token_ids(const nlohmann::json& obj, ConfirmSignal& sig) {
+    if (!obj.is_object()) return;
+    for (const char* k : {"tokenIds", "token_ids", "tokenIdList", "token_id_list"}) {
+        auto it = obj.find(k);
+        if (it == obj.end() || !it->is_array()) continue;
+        for (const auto& v : *it) {
+            if (!v.is_string()) continue;
+            const std::string s = v.get<std::string>();
+            // ⚠ 空串与超长值一律丢弃：它们会原样进 details 供终端消费，
+            //   终端拿一个空 token 去拉页面只会失败；超长值可能是
+            //   远端把整段 JSON 塞进来（防御性截断上限 512）。
+            if (s.empty() || s.size() > 512) continue;
+            sig.token_ids.push_back(s);
+        }
+    }
+}
+
+}  // namespace
+
 ConfirmSignal extract_confirm_signal(const Task& t, bool force_user_action) {
     ConfirmSignal sig;
     // ★ 本地配置优先加严：远端【能加严不能放松】。
@@ -68,30 +112,30 @@ ConfirmSignal extract_confirm_signal(const Task& t, bool force_user_action) {
     if (!t.status.message.has_value()) return sig;
 
     for (const auto& p : t.status.message->parts) {
-        if (!p.metadata.is_object()) continue;
-
-        // requiresUserAction —— 取「或」，任一处声明即为真
-        for (const char* k : {"requiresUserAction", "requires_user_action"}) {
-            auto it = p.metadata.find(k);
-            if (it != p.metadata.end() && it->is_boolean() && it->get<bool>()) {
-                sig.requires_user_action = true;
-            }
-        }
-
-        // tokenIds
-        for (const char* k : {"tokenIds", "token_ids"}) {
-            auto it = p.metadata.find(k);
-            if (it == p.metadata.end() || !it->is_array()) continue;
-            for (const auto& v : *it) {
-                if (!v.is_string()) continue;
-                const std::string s = v.get<std::string>();
-                // ⚠ 空串与超长值一律丢弃：它们会原样进 details 供终端消费，
-                //   终端拿一个空 token 去拉页面只会失败；超长值可能是
-                //   远端把整段 JSON 塞进来（防御性截断上限 512）。
-                if (s.empty() || s.size() > 512) continue;
-                sig.token_ids.push_back(s);
-            }
-        }
+        // ── 同时扫 metadata 与 data ──────────────────────────────────────
+        // ★★ 两处都要扫，不能只扫一处。
+        //
+        //   A2A 规范(a2a.proto:224-242)里 Part 的 `data`(oneof content) 与
+        //   `metadata` 是【两个独立字段】，都合法。实测企微把 token 放在
+        //   `data` 里、只用 `metadata.wecom_part_type` 做分类:
+        //
+        //     { "data":     { "token_id_list": [...] },
+        //       "metadata": { "wecom_part_type": "approval" } }
+        //
+        //   ⚠⚠ 曾经这里只扫 metadata，且遇到 `!p.metadata.is_object()`
+        //     就 continue —— 那会把上面这种 part 整个跳过。后果是
+        //     【二次确认静默不触发】: 模型把"将向 2 位客户发送确认邮件，
+        //     请确认。"当成普通追问并代用户答"好的"，邮件真的发出去。
+        //     这正是整条链路要防的事。
+        //
+        //   ★ 不依赖 wecom_part_type=="approval" 来定位 part:
+        //     那是厂商私有约定(规范的正式扩展机制是 Message.extensions,
+        //     a2a.proto:274，企微并未声明)。按【字段名】扫全部 part
+        //     才能同时兼容其他实现。
+        scan_user_action_flag(p.metadata, sig);
+        scan_user_action_flag(p.data, sig);
+        scan_token_ids(p.metadata, sig);
+        scan_token_ids(p.data, sig);
     }
 
     // ⚠ 去重但【保序】：终端可能按顺序逐个确认，
@@ -317,8 +361,10 @@ void ExecutionEngine::ingest_task(const std::string& handle, const Task& t,
     //
     // ★ 只在挂起态解析 —— 其他状态带 metadata 也无意义,
     //   且能省掉绝大多数调用的遍历开销。
-    if (t.status.state == TaskState::InputRequired ||
-        t.status.state == TaskState::AuthRequired) {
+    //
+    // ★ 委派给 types.h 的公共判定, 不在这里重写条件 ——
+    //   同一判据散落多处时改一处漏一处就静默错。
+    if (is_suspended_state(t.status.state)) {
         ConfirmSignal sig = extract_confirm_signal(t, cfg_.require_user_confirm_on_input);
         if (sig.requires_user_action || !sig.token_ids.empty()) {
             store_->note_confirm_signal(handle, sig.requires_user_action, sig.token_ids);
@@ -623,8 +669,7 @@ ExecutionResult ExecutionEngine::execute_with_yield(const Message& msg,
                 //   ⚠ 顺序关键：note_progress 会拒绝已终结的记录
                 //     （pending_tasks.cc 的 phase != Running 检查），
                 //     所以必须在 update_terminal 【之前】写。
-                const bool suspended = (terminal_state == TaskState::InputRequired ||
-                                        terminal_state == TaskState::AuthRequired);
+                const bool suspended = is_suspended_state(terminal_state);
                 if (suspended && !terminal_text.empty()) {
                     // ⚠ ProgressFingerprint 没有 state 字段（它刻意只比对
                     //   「有没有新内容」，不比状态 —— 见 task_tracking.h）。
