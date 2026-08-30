@@ -1236,7 +1236,11 @@ int main() {
     test_input_required_field_ownership();
     test_terminal_must_not_erase_suspension();
     test_extract_confirm_signal();
-    test_post_exec_confirm_declaration();
+    // ⚠ test_post_exec_confirm_declaration 已随「postExecConfirm + exec.approval
+    //   审批卡片」方案一起废弃 —— 那条老路两头都不通（approval 接口丢弃
+    //   title/description/token_ids，details 也从不广播给客户端）。
+    //   二次确认现由 interrupt 通道承载，覆盖在
+    //   test_remote_a2a_tools / test_remote_a2a_runtime 两套里。
     test_texts();
 
     std::cout << "\n===== 结果: " << g_pass << " 通过, " << g_fail << " 失败 ====="

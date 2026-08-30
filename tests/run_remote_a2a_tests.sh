@@ -42,6 +42,7 @@ src/remote_a2a/agent_registry.cc
 src/remote_a2a/runtime.cc
 src/tools/before_tool_call_policy.cc
 src/tools/tool_approval_runtime.cc
+src/tools/interrupt_coordinator.cc
 "
 
 exists() {

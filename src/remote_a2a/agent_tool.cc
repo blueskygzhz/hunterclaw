@@ -639,6 +639,16 @@ void register_remote_a2a_resume_handler(std::shared_ptr<RemoteA2aRegistry> regis
                 return out;
             }
 
+            // ★★ lock() 成功【不等于】还能受理: RemoteA2aRuntime::shutdown()
+            //   刻意保留 registry_ 不清空（让在途回调走正常路径而非崩溃），
+            //   所以 weak_ptr 在 shutdown 之后依然 lock 得到。
+            //   ⚠ 没有这道闸，进程退出期间用户的一句"确认"仍会被发往远端 ——
+            //     把一个正在被放弃的流程实际提交出去（邮件真的发了）。
+            if (!reg->accepting()) {
+                out.error = "remote_a2a 正在停止受理，答复未提交给远端";
+                return out;
+            }
+
             const std::string& handle = interrupt.resume_token;
             if (handle.empty()) {
                 out.error = "中断缺少恢复凭据（handle），无法定位远端任务";

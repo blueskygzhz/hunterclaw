@@ -19,6 +19,7 @@
 #include <atomic>
 #include <chrono>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -343,6 +344,212 @@ static void test_end_to_end() {
     c.reset_for_testing();
 }
 
+// ── 多轮连续确认 ────────────────────────────────────────────────────────────
+//
+// ★★ 回归的是一个【已经发生过】的缺陷: handle_tool_interrupt 原先只跑一轮，
+//   resume 产出的 next_interrupt 被写回 result.interrupt 就返回，注释声称
+//   "交给下一轮循环"，但调用点 (react_engine.cc:2361/2689) 拿到 result 后
+//   直接存进 results，【没有任何代码再读 interrupt 字段】—— 只写不读。
+//
+// ⚠ 后果: 远端第二次返回 input-required 时，第二轮追问的文本混在结果里
+//   给了模型，但系统不再等答复 —— 模型当"已完成"继续往下，
+//   而远端永久卡在 input-required 直到超时。
+//
+// 本测试复刻修复后的迭代循环，验证「连续 N 次挂起」能逐轮问到用户。
+static void test_multi_round() {
+    SECTION("连续多次 input-required（多轮确认）");
+    auto& c = InterruptCoordinator::instance();
+    c.reset_for_testing();
+
+    // 远端行为: 前 3 轮都要求确认，第 4 轮才真正完成。
+    // ★ 每轮的 next_interrupt 都带 requires_user_action=true，
+    //   这是 ReactEngine 继续追问的判据。
+    std::atomic<int> remote_rounds{0};
+    c.register_resume_handler("remote_a2a.input_required",
+        [&remote_rounds](const ToolInterrupt& i, const std::string& text,
+                         const std::atomic<bool>*) -> ResumeOutcome {
+            const int n = remote_rounds.fetch_add(1) + 1;
+            ResumeOutcome o;
+            o.success = true;
+            o.text = "第" + std::to_string(n) + "轮答复: " +
+                     InterruptCoordinator::match_option(i, text);
+            if (n < 3) {
+                ToolInterrupt nxt;
+                nxt.kind = i.kind;
+                nxt.resume_token = i.resume_token;  // ★ 同一 handle 续接
+                nxt.prompt = "还需要确认第 " + std::to_string(n + 1) + " 项";
+                nxt.requires_user_action = true;
+                o.next_interrupt = nxt;
+            }
+            return o;
+        });
+
+    ToolInterrupt it;
+    it.kind = "remote_a2a.input_required";
+    it.resume_token = "ra2a-multi-1";
+    it.prompt = "确认第 1 项";
+    it.requires_user_action = true;
+
+    // ── 复刻 handle_tool_interrupt 修复后的迭代循环 ──────────────────────
+    std::atomic<bool> cancelled{false};
+    std::optional<ToolInterrupt> cur = it;
+    int user_answers = 0;
+    std::string last_text;
+
+    for (int round = 1; cur.has_value(); ++round) {
+        CHECK(round <= kMaxInterruptRounds, "轮次不超过上限");
+        if (round > kMaxInterruptRounds) break;
+
+        auto w = c.begin_wait("sess-multi");
+        // ★★ 每轮都必须能重新占到槽位 —— 上一轮 release() 之后槽位应为空。
+        //   ⚠ 若 release 漏做或 seq 比对写错，这里第 2 轮就会失败。
+        CHECK(w.valid(), "第 " + std::to_string(round) + " 轮占到槽位");
+        if (!w.valid()) break;
+
+        std::thread user([&c, &user_answers]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            if (c.claim_answer("sess-multi", "确认")) ++user_answers;
+        });
+        auto ans = w.wait(5000, &cancelled);
+        user.join();
+        CHECK(ans.has_value(), "第 " + std::to_string(round) + " 轮拿到答复");
+        if (!ans.has_value()) break;
+        w.release();
+
+        auto out = c.resume(*cur, *ans, &cancelled);
+        CHECK(out.success, "第 " + std::to_string(round) + " 轮恢复成功");
+        last_text = out.text;
+        cur = out.next_interrupt;
+        if (!out.success) break;
+        if (cur.has_value() && !cur->requires_user_action) break;
+    }
+
+    CHECK(remote_rounds.load() == 3, "远端被续接 3 次（连续挂起逐轮处理）[不可回退]");
+    CHECK(user_answers == 3, "用户被真正问了 3 次（而非只问 1 次）[不可回退]");
+    CHECK(last_text.find("第3轮") != std::string::npos, "最终拿到第 3 轮的结果");
+    CHECK(!c.has_pending("sess-multi"), "全部收束后槽位已释放");
+
+    c.reset_for_testing();
+}
+
+// ── 死循环防护 ──────────────────────────────────────────────────────────────
+//
+// ⚠ 远端若因 bug 每轮都回 input-required，无界循环会把用户钉死，
+//   且每轮都可能占 main lane 最长 900s。
+static void test_round_cap() {
+    SECTION("轮次上限（远端一直要求确认）");
+    auto& c = InterruptCoordinator::instance();
+    c.reset_for_testing();
+
+    // 恶意/故障远端: 永远返回下一轮确认
+    std::atomic<int> calls{0};
+    c.register_resume_handler("evil.always_ask",
+        [&calls](const ToolInterrupt& i, const std::string&,
+                 const std::atomic<bool>*) -> ResumeOutcome {
+            calls.fetch_add(1);
+            ResumeOutcome o;
+            o.success = true;
+            o.text = "又要确认";
+            ToolInterrupt nxt = i;
+            nxt.requires_user_action = true;
+            o.next_interrupt = nxt;  // ★ 永不收束
+            return o;
+        });
+
+    ToolInterrupt it;
+    it.kind = "evil.always_ask";
+    it.resume_token = "evil-1";
+    it.requires_user_action = true;
+
+    std::atomic<bool> cancelled{false};
+    std::optional<ToolInterrupt> cur = it;
+    bool capped = false;
+
+    for (int round = 1; cur.has_value(); ++round) {
+        if (round > kMaxInterruptRounds) { capped = true; break; }
+        auto w = c.begin_wait("sess-evil");
+        if (!w.valid()) break;
+        std::thread user([&c]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            c.claim_answer("sess-evil", "好");
+        });
+        auto ans = w.wait(3000, &cancelled);
+        user.join();
+        if (!ans.has_value()) break;
+        w.release();
+        auto out = c.resume(*cur, *ans, &cancelled);
+        cur = out.next_interrupt;
+    }
+
+    CHECK(capped, "触顶退出而非无限循环 [不可回退]");
+    CHECK(calls.load() == kMaxInterruptRounds,
+          "恰好调用上限次数后停止（" + std::to_string(kMaxInterruptRounds) + "）");
+
+    c.reset_for_testing();
+}
+
+// ── 多轮中途 abort ──────────────────────────────────────────────────────────
+//
+// ⚠ 用户在第 2 轮点了停止，【不该】再弹出第 3 轮追问。
+static void test_abort_mid_rounds() {
+    SECTION("多轮中途 abort");
+    auto& c = InterruptCoordinator::instance();
+    c.reset_for_testing();
+
+    std::atomic<bool> cancelled{false};
+    c.register_resume_handler("ra2a.multi",
+        [&cancelled](const ToolInterrupt& i, const std::string&,
+                     const std::atomic<bool>* ab) -> ResumeOutcome {
+            ResumeOutcome o;
+            // ★ handler 自己也要看 abort（remote_a2a 恢复函数就是这么做的）
+            if (ab && ab->load()) {
+                o.success = false;
+                o.error = "运行已中止，答复未提交给远端";
+                return o;
+            }
+            o.success = true;
+            o.text = "ok";
+            ToolInterrupt nxt = i;
+            nxt.requires_user_action = true;
+            o.next_interrupt = nxt;
+            // 第一轮结束后用户点停止
+            cancelled.store(true);
+            return o;
+        });
+
+    ToolInterrupt it;
+    it.kind = "ra2a.multi";
+    it.resume_token = "ra2a-abort-1";
+    it.requires_user_action = true;
+
+    std::optional<ToolInterrupt> cur = it;
+    int rounds_asked = 0;
+
+    for (int round = 1; cur.has_value(); ++round) {
+        if (round > kMaxInterruptRounds) break;
+        auto w = c.begin_wait("sess-abort");
+        if (!w.valid()) break;
+        ++rounds_asked;
+        std::thread user([&c]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            c.claim_answer("sess-abort", "好");
+        });
+        auto ans = w.wait(3000, &cancelled);
+        user.join();
+        if (!ans.has_value()) break;
+        w.release();
+        auto out = c.resume(*cur, *ans, &cancelled);
+        cur = out.next_interrupt;
+        if (!out.success) break;
+        // ★★ 每轮开头重新检查 abort —— 修复后的循环正是这么做的
+        if (cancelled.load()) break;
+    }
+
+    CHECK(rounds_asked == 1, "abort 后不再弹下一轮追问 [不可回退]");
+
+    c.reset_for_testing();
+}
+
 int main() {
     std::cout << "=== 工具中断（interrupt）闭环测试 ===" << std::endl;
     test_slots();
@@ -350,6 +557,9 @@ int main() {
     test_prompt_and_match();
     test_resume();
     test_end_to_end();
+    test_multi_round();
+    test_round_cap();
+    test_abort_mid_rounds();
     std::cout << "\n=== 结果: " << g_pass << " 通过, " << g_fail << " 失败 ===" << std::endl;
     return g_fail == 0 ? 0 : 1;
 }

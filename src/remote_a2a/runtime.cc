@@ -74,21 +74,41 @@ core::Result<int> RemoteA2aRuntime::init(const nlohmann::json& config_node) {
         return core::Result<int>::Err(built.error);
     }
 
-    // sweeper 只启动一次（进程级）
-    reg->start_sweeper();
-
-    std::lock_guard<std::mutex> lk(mu_);
-    // 双检：并发 init 时后到者放弃自己的成果
-    if (inited_) {
-        reg->stop_sweeper();  // ★ 必须停掉，否则泄漏一个线程
-        return core::Result<int>::Ok(enabled_ && registry_
-                                        ? static_cast<int>(registry_->agent_count())
-                                        : 0);
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        // 双检：并发 init 时后到者放弃自己的成果
+        if (inited_) {
+            // ★ 败者的 registry 直接丢弃即可 —— 它尚未 activate，
+            //   既没有后台线程也没有注册恢复路由，无需任何回滚。
+            return core::Result<int>::Ok(enabled_ && registry_
+                                            ? static_cast<int>(registry_->agent_count())
+                                            : 0);
+        }
+        registry_ = reg;
+        for (auto& w : reg->warnings()) warnings_.push_back(std::move(w));
+        inited_ = true;
+        enabled_ = true;
     }
-    registry_ = reg;
-    for (auto& w : reg->warnings()) warnings_.push_back(std::move(w));
-    inited_ = true;
-    enabled_ = true;
+
+    // ── 进程级接线 ──────────────────────────────────────────────────────
+    //
+    // ★★ 必须走 activate_remote_a2a_registry 这个【唯一】入口，
+    //   不要在这里内联它的步骤。曾经这里只调了 start_sweeper()，
+    //   漏掉 interrupt 恢复函数注册 —— 生产路径下所有远端 input-required
+    //   都被 ReactEngine fail-closed 成"未注册中断恢复处理器"，
+    //   ⚠ 而日志里只有一句工具报错，看不出是接线漏了。
+    //
+    // ★ 必须在双检【之后】: resume handler 无法反注册
+    //   （InterruptCoordinator 只保留先注册的）。若在双检前 activate，
+    //   并发 init 的败者可能先注册上，恢复路由就永久指向一个被丢弃的
+    //   registry —— 其 weak_ptr 失效后，用户每次确认都收到"注册表已不可用"。
+    //   sweeper 能 stop 回滚，handler 不能，所以整体后移。
+    //
+    // ⚠ 在锁外调用: start_sweeper 会起线程，register_resume_handler 会拿
+    //   InterruptCoordinator 的锁 —— 持本类锁做这些会扩大锁范围并有交叉
+    //   加锁风险。此时 registry_ 已发布，其他线程读到的就是它。
+    activate_remote_a2a_registry(reg);
+
     return built;
 }
 

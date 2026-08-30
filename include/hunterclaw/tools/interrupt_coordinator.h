@@ -54,6 +54,16 @@ constexpr int64_t kDefaultInterruptWaitMs = 900000;
 ///   只能轮询。50ms 在一次最长 900s 的等待里可忽略，对用户已是"立即"。
 constexpr int64_t kInterruptAbortPollMs = 50;
 
+/// 单次工具调用允许的最大连续确认轮数。
+///
+/// ★ 远端可以连续多次返回 input-required（先确认动作、再确认参数…），
+///   这是正常的；但必须有界。
+/// ⚠ 远端若因 bug 每轮都回 input-required，无界会把用户钉在无限确认循环里，
+///   且每轮都可能占住 main lane 最长 kDefaultInterruptWaitMs。
+/// ★ 取 8: 真实的多轮确认极少超过 2~3 轮，8 足够宽松；
+///   触顶按失败收口，绝不把仍在挂起的状态当成功交给模型。
+constexpr int kMaxInterruptRounds = 8;
+
 // ── ResumeOutcome ───────────────────────────────────────────────────────────
 struct ResumeOutcome {
     bool success = false;

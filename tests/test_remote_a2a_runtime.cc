@@ -10,6 +10,7 @@
 //   下面每个 case 都标注了它对全局状态的影响。
 // ============================================================================
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -17,6 +18,7 @@
 #include <string>
 
 #include "hunterclaw/remote_a2a/runtime.h"
+#include "hunterclaw/tools/interrupt_coordinator.h"
 
 using namespace hunterclaw::remote_a2a;
 using json = nlohmann::json;
@@ -262,6 +264,104 @@ static void test_callback_needed() {
 }
 
 // ============================================================================
+// ★★ 接线收敛点 —— 本套测试里最重要的一个 case
+//
+// 回归的是一个【已经发生过】的静默缺陷：接线序列曾被复制两份 ——
+//   · enable_remote_a2a（测试路径）  : register_resume_handler + start_sweeper
+//   · RemoteA2aRuntime::init（生产路径）: 只有 start_sweeper
+// 于是生产环境下工具照常产出 interrupt，但 ReactEngine 的前置检查
+// (has_resume_handler) 必然失败，所有远端 input-required 一律 fail-closed，
+// 二次确认闭环完全不通，而日志里只有一句工具报错。
+//
+// ⚠ 现在两条入口都必须经 activate_remote_a2a_registry()。
+//   任何新增的进程级接线步骤也只能加在那里。
+// ============================================================================
+static void test_activate_wires_resume_handler() {
+    SECTION("activate：恢复通道与 sweeper 成套就位");
+
+    auto& coord = hunterclaw::tools::InterruptCoordinator::instance();
+
+    // ★ 前置断言：本进程此前没有注册过，否则下面的"注册成功"无从验证。
+    //   （InterruptCoordinator 保留先注册的，重复注册会被静默拒绝。）
+    CHECK(!coord.has_resume_handler(kRemoteA2aInterruptKind),
+          "activate 之前无恢复处理器");
+
+    const std::string p = write_card("/tmp/hc_rt_act.json", "actx",
+                                    "https://actx.example.com/a2a");
+    json node;
+    node["enabled"] = true;
+    node["agents"] = json::array(
+        {json{{"name", "actx"}, {"card", p}, {"resolveDns", false}}});
+
+    auto parsed = parse_remote_a2a_config(node);
+    CHECK(parsed.is_ok(), "配置解析成功");
+    if (!parsed.is_ok()) {
+        std::remove(p.c_str());
+        return;
+    }
+
+    auto reg = RemoteA2aRegistry::create(parsed.get());
+    CHECK(reg->build().is_ok(), "构造成功");
+
+    // ★ 受理闸默认开着：build 期间就可能有交互进来
+    CHECK(reg->accepting(), "activate 前已受理");
+
+    activate_remote_a2a_registry(reg);
+
+    // ★★ [不可回退] 这一条就是缺陷本体
+    CHECK(coord.has_resume_handler(kRemoteA2aInterruptKind),
+          "activate 后恢复处理器已注册 [不可回退]");
+
+    // ── 恢复路径的失败分支必须"有话可说"而不是抛异常/崩 run ──────────────
+    hunterclaw::tools::ToolInterrupt it;
+    it.kind = kRemoteA2aInterruptKind;
+    it.prompt = "确认继续？";
+
+    // 空 handle：缺恢复凭据
+    {
+        auto out = coord.resume(it, "确认", nullptr);
+        CHECK(!out.success && !out.error.empty(),
+              "空 handle → 失败且有明确原因 [不可回退]");
+    }
+
+    // 不存在的 handle：反查不到引擎/记录
+    {
+        it.resume_token = "ra2a-nope-0";
+        auto out = coord.resume(it, "确认", nullptr);
+        CHECK(!out.success && !out.error.empty(), "未知 handle → 失败且有原因");
+    }
+
+    // ★★ abort 优先于一切: 用户点了停止，此时还往远端发"确认"
+    //   等于把取消动作执行成了提交动作。
+    {
+        std::atomic<bool> aborted{true};
+        auto out = coord.resume(it, "确认", &aborted);
+        CHECK(!out.success, "已 abort → 不提交给远端 [不可回退]");
+    }
+
+    // ── 受理闸：stop_sweeper 之后必须停止受理 ────────────────────────────
+    // ⚠ RemoteA2aRuntime::shutdown() 刻意保留 registry_ 不清空，
+    //   weak_ptr 仍 lock 得到 —— 单靠 lock() 判活会让进程退出期间
+    //   用户的一句"确认"把正在被放弃的流程真的提交出去。
+    reg->stop_sweeper();
+    CHECK(!reg->accepting(), "stop_sweeper 后停止受理 [不可回退]");
+    {
+        auto out = coord.resume(it, "确认", nullptr);
+        CHECK(!out.success, "停止受理后不提交给远端 [不可回退]");
+    }
+
+    // ★ 幂等：从未 start 过的 registry 也要能正确关闸
+    {
+        auto reg2 = RemoteA2aRegistry::create(parsed.get());
+        reg2->stop_sweeper();  // 未 start_sweeper 就 stop
+        CHECK(!reg2->accepting(),
+              "未 start 的 registry 也能关闸（闸门不藏在 sweeping_ 判断里）[不可回退]");
+    }
+
+    std::remove(p.c_str());
+}
+
+// ============================================================================
 int main() {
     std::cout << "===== remote_a2a runtime 接线测试 =====" << std::endl;
 
@@ -269,6 +369,9 @@ int main() {
     test_env_disable();
     test_uninitialized();
     test_init_disabled();
+    // ⚠ 必须在 test_registry_path 之前：它断言"此前无恢复处理器"，
+    //   而 InterruptCoordinator 的注册是进程级一次性的。
+    test_activate_wires_resume_handler();
     test_registry_path();
     test_callback_needed();
 

@@ -366,21 +366,31 @@ std::optional<TerminalReason> ExecutionEngine::evaluate(
 // ── Task 快照并入 ───────────────────────────────────────────────────────────
 
 void ExecutionEngine::ingest_task(const std::string& handle, const Task& t,
-                                  ProgressFn on_progress) {
+                                  ProgressFn on_progress, uint64_t epoch) {
     ProgressFingerprint fp = ProgressFingerprint::from_task(t);
 
     // 中间态文本：只走进度通道，★ 不进 result_text
     std::string progress;
     if (t.status.message) progress = concat_text_parts(t.status.message->parts);
 
-    const bool advanced = store_->note_progress(handle, fp, t.status.state, progress);
+    // ★★ 带代号写入: 若本线程已属上一代，store 会丢弃并返回 false。
+    //   ⚠ 必须区分"没推进"与"代号过期"两种情况 —— 前者要计 no_progress，
+    //     后者必须【立刻返回】，绝不能再往新一代记录上写任何东西。
+    //     所以推进与否由 out 参数带出，返回值专门表示代号有效性。
+    bool advanced = false;
+    if (!store_->note_progress_if_current(handle, epoch, fp, t.status.state, progress,
+                                          &advanced)) {
+        return;  // 代号过期或记录已不存在 → 这一代结束了
+    }
     if (advanced && on_progress && !progress.empty()) {
         // ★ is_heartbeat=true：中间态不该占满 system-event 的 20 条上限
         //   （system_events.cc:18 MAX_EVENTS = 20），否则真事件会被挤掉。
         on_progress(progress, true);
     }
     if (!advanced) {
-        store_->note_no_progress(handle);
+        // ★ 带代号计数: 两代线程各自 note_no_progress 会双倍推进计数，
+        //   把正常运行的任务误判成 Zombie 并杀掉。
+        if (!store_->note_no_progress_if_current(handle, epoch)) return;
     }
 
     if (!is_terminal(t.status.state)) return;
@@ -422,7 +432,7 @@ void ExecutionEngine::ingest_task(const std::string& handle, const Task& t,
                     t.status.message.has_value() ? &t.status.message->parts : nullptr,
                     // ★ 挂起时把 status.message 的文本当【追问】传入 ——
                     //   settle_terminal 会写进 progress_text 而非 result_text。
-                    suspended ? progress : std::string());
+                    suspended ? progress : std::string(), epoch);
 }
 
 // ── 挂起态主动通知 ──────────────────────────────────────────────────────────
@@ -479,8 +489,14 @@ void ExecutionEngine::settle_terminal(const std::string& handle, TerminalReason 
                                      const std::string& result_text,
                                      const std::string& error_text,
                                      const std::vector<Part>* parts,
-                                     const std::string& prompt_text) {
+                                     const std::string& prompt_text, uint64_t epoch) {
     const bool suspended = is_suspended_state(remote_state);
+
+    // ★★ 代号校验前置: 上一代线程不该把 confirm 信号写进新一代记录。
+    //   ⚠ 这里的 confirm 信号是【单调置位】的（note_confirm_signal 只
+    //     false→true），一旦被上一代污染，新一代会凭空要求用户确认，
+    //     而用户根本不知道在确认什么。
+    if (epoch != 0 && store_->current_epoch(handle) != epoch) return;
 
     // ① confirm 信号（必须最先 —— update_terminal 会 notify 等待方）
     if (suspended && parts != nullptr) {
@@ -499,11 +515,22 @@ void ExecutionEngine::settle_terminal(const std::string& handle, TerminalReason 
         //   确保 note_progress 认定"有推进"从而真的写入 progress_text。
         ProgressFingerprint fp;
         fp.last_status_message_len = prompt_text.size();
-        store_->note_progress(handle, fp, remote_state, prompt_text);
+        if (!store_->note_progress_if_current(handle, epoch, fp, remote_state,
+                                             prompt_text)) {
+            return;  // 代号过期 → 本次收敛全部作废
+        }
     }
 
     // ③ 落终态（带远端真实 state）
-    store_->update_terminal(handle, reason, result_text, error_text, remote_state);
+    // ★★ 最关键的一处代号校验: 上一代线程若把新一代记录写成终态，
+    //   正在进行的续接会直接"完成"，用户拿到上一轮的结果，
+    //   而真正的远端任务无人再管。
+    // ⚠ 返回 false 有两种原因（代号不符 / 粘性终态保护），两者都不该发通知:
+    //   前者是过期写入，后者说明记录已有更权威的终态（如用户取消）。
+    if (!store_->update_terminal_if_current(handle, epoch, reason, result_text,
+                                           error_text, remote_state)) {
+        return;
+    }
 
     // ④ 挂起通知（必须在 ③ 之后 —— resolver 会读快照）
     maybe_notify_suspended(handle);
@@ -605,12 +632,19 @@ ExecutionEngine::StreamRunResult ExecutionEngine::run_stream(
 
         // ★ artifact 增量只取本次 —— ADK 注释（remote_a2a_agent.py:1327-1331）：
         //   取归一化后的累积 Task 会把之前的分片重复发出，内容成倍重复。
+        // ★★ 写入带代号: 上面的 :596 校验与这里的写入之间存在窗口
+        //   （get / fp 计算都要时间），续接可能刚好插在中间。
         if (ev.kind == ParsedStreamEvent::Kind::ArtifactUpdate && !ev.text.empty()) {
-            store_->append_result(handle, ev.text);
-            store_->note_progress(handle, fp, ev.state, "");
+            if (!store_->append_result_if_current(handle, my_epoch, ev.text)) return false;
+            if (!store_->note_progress_if_current(handle, my_epoch, fp, ev.state, "")) {
+                return false;
+            }
         } else {
             // 中间态：只走进度通道
-            store_->note_progress(handle, fp, ev.state, ev.text);
+            if (!store_->note_progress_if_current(handle, my_epoch, fp, ev.state,
+                                                  ev.text)) {
+                return false;  // 代号过期 → 关闭这条 SSE
+            }
             if (on_progress && !ev.text.empty()) on_progress(ev.text, true);
         }
 
@@ -708,7 +742,7 @@ bool ExecutionEngine::run_probe(const std::string& handle, ExecutionResult* out,
             } else if (*reason == TerminalReason::ConnLost) {
                 err = "与远端连接不可恢复: " + last_err;
             }
-            store_->update_terminal(handle, *reason, "", err);
+            store_->update_terminal_if_current(handle, my_epoch, *reason, "", err);
             return true;
         }
 
@@ -735,24 +769,28 @@ bool ExecutionEngine::run_probe(const std::string& handle, ExecutionResult* out,
             last_err = t.error;
             // ★ TaskNotFound 是终态：远端已丢弃该任务，继续探测只会一直拿 -32001
             if (last_err.find("task_not_found") != std::string::npos) {
-                store_->update_terminal(handle, TerminalReason::RemoteFailed, "",
-                                       "远端已不存在该任务（TaskNotFound）");
+                // ★ 带代号: 这次 IO 期间可能已经续接（IO 本身耗时不可控），
+                //   ⚠ 无代号写入会把新一代记录判成 RemoteFailed，
+                //     用户看到"远端已不存在该任务"而实际上新任务跑得好好的。
+                store_->update_terminal_if_current(handle, my_epoch,
+                                                  TerminalReason::RemoteFailed, "",
+                                                  "远端已不存在该任务（TaskNotFound）");
                 return true;
             }
             // 可恢复错误 → 计一次无推进后继续；不可恢复 → 下一轮 evaluate 判 ConnLost
-            store_->note_no_progress(handle);
+            // ★ 代号不符即退出: 计数已被丢弃，继续循环只是空转。
+            if (!store_->note_no_progress_if_current(handle, my_epoch)) return false;
             ++attempt;
             continue;
         }
         last_err.clear();
 
-        const size_t before = store_->get(handle) ? store_->get(handle)->fp.history_count
-                                                 : 0;
-        (void)before;
-        ingest_task(handle, t.get(), on_progress);
+        ingest_task(handle, t.get(), on_progress, my_epoch);
 
         auto after = store_->get(handle);
         if (!after) return false;
+        // ★ 代号已变 → 本代结束（新一代自有它的探测线程）
+        if (after->epoch != my_epoch) return false;
         if (after->phase != PendingPhase::Running) return true;
 
         // 有推进 → 退避重置（対标 WorkingSubState::Stale 的"重置计时继续等"）
@@ -976,11 +1014,18 @@ bool ExecutionEngine::poll_once(const std::string& handle) {
     // 已终结 → 无需再拉（回调可能重复投递，远端在没收到 2xx 时会重试）
     if (cur->phase != PendingPhase::Running) return true;
 
+    // ★★ 回调分支也必须带代号。
+    //   ⚠ 这条路径此前【完全没有】epoch 校验，是最容易被忽略的一条:
+    //     回调由远端触发、在 HTTP 线程上执行，与续接后的新线程天然并发。
+    //     远端未收到 2xx 还会重投 —— 一条陈旧回调可能在续接之后才到达，
+    //     用上一轮的远端状态把新一代记录写成终态。
+    const uint64_t my_epoch = cur->epoch;
+
     if (!client_->capabilities().should_try_tasks_get()) {
         // 远端不支持 tasks/get 却配了回调 —— 无权威来源可用。
         // ⚠ 此时【不能】采信回调 payload 作为替代（那正是我们要防的），
         //   也不能判失败（任务可能真在跑）。只记一次无推进，交给 HardTimeout 兜底。
-        store_->note_no_progress(handle);
+        store_->note_no_progress_if_current(handle, my_epoch);
         return false;
     }
 
@@ -988,18 +1033,22 @@ bool ExecutionEngine::poll_once(const std::string& handle) {
     if (t.is_err()) {
         // ★ TaskNotFound 是终态：远端已丢弃该任务
         if (t.error.find("task_not_found") != std::string::npos) {
-            store_->update_terminal(handle, TerminalReason::RemoteFailed, "",
-                                   "远端已不存在该任务（TaskNotFound）");
+            store_->update_terminal_if_current(handle, my_epoch,
+                                              TerminalReason::RemoteFailed, "",
+                                              "远端已不存在该任务（TaskNotFound）");
             return true;
         }
-        store_->note_no_progress(handle);
+        store_->note_no_progress_if_current(handle, my_epoch);
         return false;
     }
 
-    ingest_task(handle, t.get(), nullptr);
+    ingest_task(handle, t.get(), nullptr, my_epoch);
 
     auto after = store_->get(handle);
     if (!after) return false;
+    // ★ 代号已变 → 这条回调属于上一轮，本次处理结束（返回 true 让远端拿到
+    //   2xx 而不再重投 —— 陈旧回调重投也不会有新效果）。
+    if (after->epoch != my_epoch) return true;
     if (after->phase != PendingPhase::Running) return true;
 
     // 未终结但要检查 HardTimeout / Zombie（回调分支没有探测循环兜底）
@@ -1011,7 +1060,7 @@ bool ExecutionEngine::poll_once(const std::string& handle) {
             err = "远端任务连续 " + std::to_string(cfg_.probe.max_no_progress) +
                   " 次无推进，判定为僵死";
         }
-        store_->update_terminal(handle, *reason, "", err);
+        store_->update_terminal_if_current(handle, my_epoch, *reason, "", err);
         return true;
     }
     return false;

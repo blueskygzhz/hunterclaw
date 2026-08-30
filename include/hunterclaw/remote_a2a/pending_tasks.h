@@ -183,6 +183,62 @@ public:
     /// @return 0 表示记录不存在（调用方应视为"我该退出了"）
     uint64_t current_epoch(const std::string& handle) const;
 
+    // ── 代号守卫（epoch-guarded 写入）★★ ───────────────────────────────────
+    //
+    // ★★ 为什么必须有这一组: 探测线程与 resume 新线程【会真实并发】。
+    //   resume 不等旧线程退出（旧线程可能正卡在 get_task 的网络 IO 里，
+    //   最长还会活到退避上限 60s）。安全性靠"旧线程的写入无效"来保证，
+    //   而不是靠"旧线程已退出"。
+    //
+    // ⚠ 只在调用方自己 current_epoch() 比对是【不够】的 —— 那是 TOCTOU:
+    //     if (current_epoch(h) == mine)   ← 锁放开
+    //         note_progress(h, ...)       ← 这之间续接可能已发生
+    //   校验必须与写入在【同一临界区】内完成，所以只能由 store 提供。
+    //
+    // ⚠ 更关键的是可维护性: run_probe / poll_once / run_stream 共有 5+ 个
+    //   写入点，靠每个调用点自觉补校验，将来新增探测通道必然漏。
+    //   这组接口让"漏校验"变成写不出来 —— 需要代号就用 *_if_current。
+    //
+    // @return false = 代号不符（本次写入已被丢弃，调用方应立即退出）
+    //         ★ 记录不存在也返回 false（视同过期）
+
+    /// 带代号校验的进度记录。
+    ///
+    /// ★★ 返回值语义与 note_progress 【不同】: 这里返回的是"代号是否有效"，
+    ///   而"是否有推进"由 out_advanced 带出。
+    ///   ⚠ 两者绝不能合并成一个 bool: 调用方必须区分
+    ///     「没推进」(要计 no_progress、继续探测) 与
+    ///     「代号过期」(必须立刻退出，不能再碰这条记录)。
+    ///     合并后上一代线程会把"过期"当成"没推进"，继续跑完整轮循环。
+    ///
+    /// @param epoch 调用方进入时取得的代号；0 = 不校验（等同旧行为）
+    /// @param out_advanced 非空时写入"是否确实推进"
+    /// @return false = 代号不符或记录不存在（调用方应立即退出）
+    bool note_progress_if_current(const std::string& handle, uint64_t epoch,
+                                  const ProgressFingerprint& fp, TaskState state,
+                                  const std::string& progress_text,
+                                  bool* out_advanced = nullptr);
+
+    /// 带代号校验的 artifact 追加。
+    /// @return false = 代号不符或记录不存在；true = 代号有效（含"记录已终结
+    ///         故未写入"的情况 —— 与 note_progress_if_current 语义一致）
+    bool append_result_if_current(const std::string& handle, uint64_t epoch,
+                                  const std::string& delta);
+
+    /// 带代号校验的无推进计数。
+    /// ⚠ 这个尤其重要: 两代线程各自 note_no_progress 会【双倍推进】
+    ///   consecutive_no_progress，把正常运行的任务误判成 Zombie 杀掉。
+    /// @return false = 代号不符（未计数）
+    bool note_no_progress_if_current(const std::string& handle, uint64_t epoch);
+
+    /// 带代号校验的终结。语义同 update_terminal。
+    /// ⚠ 最危险的一个: 上一代线程用过期状态把新一代记录写成终态，
+    ///   会让正在进行的续接直接"完成"，用户拿到上一轮的结果。
+    bool update_terminal_if_current(const std::string& handle, uint64_t epoch,
+                                    TerminalReason reason, const std::string& text,
+                                    const std::string& error_text,
+                                    std::optional<TaskState> remote_state = std::nullopt);
+
     /// 按远端 task_id 反查句柄（★ 回调只带 task_id，没有我们的句柄）
     std::optional<std::string> handle_of_task(const std::string& task_id) const;
 
@@ -287,6 +343,17 @@ private:
 
     PendingTask* find_locked(const std::string& handle);
     const PendingTask* find_locked(const std::string& handle) const;
+
+    // ── 带代号校验的写入实现（调用方必须已持锁）────────────────────────────
+    //
+    // ★ 有锁版与无锁版共用同一份实现，避免两套逻辑漂移。
+    //   epoch == 0 表示不校验（无代号的旧接口走这条）。
+    bool note_progress_locked(const std::string& handle, uint64_t epoch,
+                              const ProgressFingerprint& fp, TaskState state,
+                              const std::string& progress_text,
+                              bool* out_advanced);
+    bool append_result_locked(const std::string& handle, uint64_t epoch,
+                              const std::string& delta);
 
     PendingStoreConfig cfg_;
     mutable std::mutex mu_;

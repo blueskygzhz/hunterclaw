@@ -71,6 +71,36 @@ constexpr size_t TOOL_NAME_MAX_TOTAL = 64;
 std::string safe_remote_a2a_tool_name(const std::string& agent_name,
                                      std::vector<std::string>& reserved);
 
+// ── Message 构造 ────────────────────────────────────────────────────────────
+
+/// 构造一条发往远端的 user Message。
+///
+/// ★ messageId 由本函数生成且【全局唯一】（进程内单调计数）——
+///   ⚠ 不能用对象地址：栈地址会复用，两条不同消息可能撞 id，
+///     远端会把第二条当重复投递直接丢弃。
+///
+/// @param task_id     续接已有任务时必须传（远端 input-required 后补输入）。
+///                    ⚠ 漏传的后果不是"多问一次"，而是远端【新建一个 task】:
+///                      用户的"确认"落进全新上下文，副作用可能被再执行一次。
+/// @param context_id  续接同一会话上下文时传入
+Message build_user_message(const std::string& text, const std::string& task_id,
+                           const std::string& context_id);
+
+// ── 归属校验 ────────────────────────────────────────────────────────────────
+
+/// 校验 handle 是否属于指定会话。
+///
+/// ★★ handle 会出现在工具返回文本里，模型可能把它带到别的会话去。
+///   不校验则 A 会话能读走 B 会话的任务结果。
+///
+/// ★ 刻意【不】区分「不存在」与「属于别人」—— 区分开会变成一个
+///   "探测其他会话是否有某 handle"的探针。
+///
+/// @return 空串 = 通过；非空 = 拒绝原因（可直接作为工具错误文本）
+std::string check_handle_ownership(const PendingTaskStore& store,
+                                   const std::string& handle,
+                                   const std::string& session_key);
+
 // ── 进度投递 ────────────────────────────────────────────────────────────────
 
 /// 把远端进度/提示作为系统事件投给指定会话。

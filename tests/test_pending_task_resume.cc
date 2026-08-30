@@ -21,9 +21,11 @@
 // ============================================================================
 
 #include <chrono>
+#include <atomic>
 #include <iostream>
 #include <thread>
 #include <string>
+#include <vector>
 
 #include "hunterclaw/remote_a2a/pending_tasks.h"
 
@@ -253,6 +255,199 @@ static void test_turn_clock() {
           "turn_started_at_ms 已刷新（用户思考时间不算进远端执行时限）");
 }
 
+// ── 去重闸: 同一次挂起只推一条通知 ───────────────────────────────────────────
+//
+// ★★ 回归的是一个【已经发生过】的缺陷: try_claim_question() 有定义但
+//   零调用者 —— 去重闸是死代码，而 execution_engine.h:313 明确要求
+//   suspend_resolver 实现方必须用它保证幂等。
+//
+// 同一次挂起会被多条通道重复触发 settle_terminal → maybe_notify_suspended:
+//   · ingest_task (execution_engine.cc:421) —— 同步探测 / poll_once(:999) /
+//     background_loop→run_probe 都经由它，回调还会因远端未收到 2xx 而重投
+//   · run_stream  (execution_engine.cc:632) —— SSE 线程
+//
+// ⚠ 后果不只是噪音: 通知走 deliver_progress(hb=false)（正式事件，刻意不被
+//   心跳合并），而 system_events 只有 20 条上限 —— 重复推送会把真正的
+//   完成/失败事件挤出队列。
+static void test_question_claim_gate() {
+    SECTION("提问去重闸（跨线程跨通道单一闸门）");
+
+    PendingTaskStore store(PendingStoreConfig{});
+    auto h = store.register_task("agentX", "task-q", "", "sess-q").get();
+    drive_to_suspended(store, h);
+
+    // ★★ 首次抢到、后续全部失败 —— 这是 resolver 幂等的唯一依据
+    CHECK(store.try_claim_question(h), "首条通道抢到提问权");
+    CHECK(!store.try_claim_question(h),
+          "第二条通道被拒（否则用户为同一件事被推 2~5 条）[不可回退]");
+    CHECK(!store.try_claim_question(h), "第三条通道同样被拒 [不可回退]");
+
+    CHECK(!store.try_claim_question("no-such-handle"),
+          "不存在的 handle → 直接失败（不静默放行）");
+
+    // ── 并发: N 个线程同抢，有且只有一个成功 ─────────────────────────────
+    // ⚠ 读旧值+置新值若不在同一临界区，这里会出现多个成功者。
+    {
+        PendingTaskStore s2(PendingStoreConfig{});
+        auto h2 = s2.register_task("agentX", "task-race", "", "sess-r").get();
+        drive_to_suspended(s2, h2);
+
+        std::atomic<int> winners{0};
+        std::vector<std::thread> ts;
+        for (int i = 0; i < 8; ++i) {
+            ts.emplace_back([&s2, &h2, &winners]() {
+                if (s2.try_claim_question(h2)) winners.fetch_add(1);
+            });
+        }
+        for (auto& t : ts) t.join();
+        CHECK(winners.load() == 1,
+              "8 线程并发抢，有且只有一个成功（CAS 语义）[不可回退]");
+    }
+
+    // ── 多轮确认: 续接后闸门必须重置，否则第二轮再也问不出来 ──────────────
+    // ★ 与 test_reuse_on_suspended 的第 7 条呼应，但那条只验字段值；
+    //   这里验的是"重置之后 claim 真的能再次成功"这个可观测行为。
+    auto h3 = store.register_task("agentX", "task-q", "", "sess-q").get();
+    CHECK(h3 == h, "续接复用同一 handle");
+    CHECK(store.try_claim_question(h),
+          "续接后可再次抢到（多轮确认的第二轮仍能问）[不可回退]");
+}
+
+// ── 代号守卫: 上一代的写入必须被丢弃 ─────────────────────────────────────────
+//
+// ★★ 这是 epoch 机制真正的落点。原先只测了"epoch 会 +1"，
+//   但【没有】测"用旧 epoch 写入会被拒绝" —— 而后者才是安全性所在。
+//
+// 背景: resume 不等旧探测线程退出（旧线程可能正卡在 get_task 的网络 IO 里，
+//   最长还会活到退避上限 60s）。安全性靠"旧线程的写入无效"保证，
+//   而不是靠"旧线程已退出"。
+static void test_epoch_guarded_writes() {
+    SECTION("代号守卫（上一代写入被丢弃）");
+
+    PendingTaskStore store(PendingStoreConfig{});
+    auto h = store.register_task("agentX", "task-g", "", "sess-g").get();
+    const uint64_t e1 = store.current_epoch(h);
+
+    // 先让它挂起，再续接 → e2
+    drive_to_suspended(store, h);
+    (void)store.register_task("agentX", "task-g", "", "sess-g").get();
+    const uint64_t e2 = store.current_epoch(h);
+    CHECK(e2 == e1 + 1, "续接后代号 +1");
+
+    // ── ① 进度写入 ──────────────────────────────────────────────────────
+    ProgressFingerprint fp_old;
+    fp_old.last_status_message_len = 999;
+    bool advanced = true;
+    CHECK(!store.note_progress_if_current(h, e1, fp_old, TaskState::Working, "旧进度",
+                                          &advanced),
+          "旧代号写进度 → 拒绝 [不可回退]");
+    CHECK(!advanced, "被拒时 out_advanced 为 false");
+    auto s = store.get(h);
+    CHECK(s && s->progress_text != "旧进度",
+          "旧进度未落库（否则用户看到上一轮的追问）[不可回退]");
+
+    // 新代号可以正常写
+    ProgressFingerprint fp_new;
+    fp_new.last_status_message_len = 111;
+    CHECK(store.note_progress_if_current(h, e2, fp_new, TaskState::Working, "新进度",
+                                         &advanced),
+          "新代号写进度 → 接受");
+    CHECK(advanced, "确实推进");
+    s = store.get(h);
+    CHECK(s && s->progress_text == "新进度", "新进度已落库");
+
+    // ── ② 无推进计数（Zombie 误判的根源）────────────────────────────────
+    const int base = store.get(h)->consecutive_no_progress;
+    CHECK(!store.note_no_progress_if_current(h, e1),
+          "旧代号计 no_progress → 拒绝 [不可回退]");
+    CHECK(store.get(h)->consecutive_no_progress == base,
+          "计数未被双倍推进（否则正常任务被误判 Zombie 杀掉）[不可回退]");
+    CHECK(store.note_no_progress_if_current(h, e2), "新代号计数 → 接受");
+    CHECK(store.get(h)->consecutive_no_progress == base + 1, "新代号计数生效");
+
+    // ── ③ artifact 追加 ────────────────────────────────────────────────
+    CHECK(!store.append_result_if_current(h, e1, "旧结果"),
+          "旧代号追加结果 → 拒绝 [不可回退]");
+    s = store.get(h);
+    CHECK(s && s->result_text.find("旧结果") == std::string::npos,
+          "旧结果未混入（否则上一轮产出污染本轮）[不可回退]");
+
+    // ── ④ 落终态（最危险）──────────────────────────────────────────────
+    CHECK(!store.update_terminal_if_current(h, e1, TerminalReason::RemoteFailed, "",
+                                            "旧失败"),
+          "旧代号落终态 → 拒绝 [不可回退]");
+    s = store.get(h);
+    CHECK(s && s->phase == PendingPhase::Running,
+          "记录仍在运行（否则续接被上一代直接'完成'）[不可回退]");
+
+    // 新代号落终态正常
+    CHECK(store.update_terminal_if_current(h, e2, TerminalReason::Completed, "本轮结果",
+                                           ""),
+          "新代号落终态 → 接受");
+    CHECK(store.get(h)->phase == PendingPhase::Terminal, "已终结");
+
+    // ── ⑤ epoch=0 表示不校验（旧接口兼容）──────────────────────────────
+    auto h0 = store.register_task("agentY", "task-g0", "", "sess-g").get();
+    ProgressFingerprint f0;
+    f0.last_status_message_len = 7;
+    CHECK(store.note_progress_if_current(h0, 0, f0, TaskState::Working, "x", nullptr),
+          "epoch=0 → 不校验（等同旧行为）");
+
+    // ── ⑥ 不存在的 handle ──────────────────────────────────────────────
+    CHECK(!store.note_progress_if_current("nope", 1, f0, TaskState::Working, "", nullptr),
+          "记录不存在 → false（调用方据此退出）");
+}
+
+// ── 并发: 旧线程与 resume 新线程同时写 ───────────────────────────────────────
+//
+// ⚠ 这是真实时序: resume 在旧线程还活着的时候就发起新一轮。
+//   校验必须与写入在同一临界区（TOCTOU 防护），否则这里会漏。
+static void test_epoch_race() {
+    SECTION("并发（旧线程 vs 续接）");
+
+    PendingTaskStore store(PendingStoreConfig{});
+    auto h = store.register_task("agentZ", "task-r", "", "sess-r").get();
+    const uint64_t e1 = store.current_epoch(h);
+    drive_to_suspended(store, h);
+
+    std::atomic<bool> go{false};
+    std::atomic<int> old_accepted{0};
+
+    // 旧线程: 拿着 e1 疯狂写
+    std::thread old_thread([&]() {
+        while (!go.load()) std::this_thread::yield();
+        for (int i = 0; i < 2000; ++i) {
+            ProgressFingerprint fp;
+            fp.last_status_message_len = static_cast<size_t>(i);
+            if (store.note_progress_if_current(h, e1, fp, TaskState::Working, "old",
+                                               nullptr)) {
+                old_accepted.fetch_add(1);
+            }
+            if (store.note_no_progress_if_current(h, e1)) old_accepted.fetch_add(1);
+        }
+    });
+
+    // 主线程: 立刻续接（epoch 前进）
+    go.store(true);
+    (void)store.register_task("agentZ", "task-r", "", "sess-r").get();
+    const uint64_t e2 = store.current_epoch(h);
+    old_thread.join();
+
+    CHECK(e2 == e1 + 1, "续接推进代号");
+    // ★ 续接之前旧线程可能合法写入若干次（那时它还是当代），这是正常的。
+    //   关键是续接【之后】一次都不能成功 —— 用最终状态反证:
+    auto s = store.get(h);
+    CHECK(s.has_value(), "记录存在");
+    CHECK(s->epoch == e2, "记录代号为新一代");
+    // 续接后再写一次旧代号，必须失败
+    ProgressFingerprint fp;
+    fp.last_status_message_len = 4242;
+    CHECK(!store.note_progress_if_current(h, e1, fp, TaskState::Working, "late",
+                                          nullptr),
+          "续接后旧代号写入一律失败 [不可回退]");
+    CHECK(s->progress_text != "late", "迟到的旧写入未落库");
+}
+
 int main() {
     std::cout << "=== Remote A2A 续接（handle 复用）测试 ===" << std::endl;
 
@@ -261,7 +456,10 @@ int main() {
     test_no_reuse_cross_agent();
     test_context_id_fill();
     test_epoch_guard();
+    test_epoch_guarded_writes();
+    test_epoch_race();
     test_turn_clock();
+    test_question_claim_gate();
 
     std::cout << "\n===============================" << std::endl;
     std::cout << "PASS: " << g_pass << "  FAIL: " << g_fail << std::endl;

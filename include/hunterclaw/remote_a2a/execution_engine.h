@@ -410,11 +410,17 @@ private:
     //        harvest 取到一句提问。本函数不替调用方判断，因为"哪段文本是结果"
     //        只有调用方知道。
     // @param prompt_text 挂起时的追问文本（非挂起时忽略）
+    // @param epoch 调用方进入时取得的交互代号；0 = 不校验。
+    //        ★★ 非 0 时，代号不符的写入会被 store 全部丢弃 ——
+    //          这是"旧探测线程不能污染续接后的新一代记录"的强制保障。
+    //          ⚠ 别在这里自己比对 current_epoch 再调用无代号版本: 那是
+    //            TOCTOU，两次加锁之间续接可能发生。必须把 epoch 传下去，
+    //            由 store 在写入的同一临界区内校验。
     void settle_terminal(const std::string& handle, TerminalReason reason,
                          TaskState remote_state, const std::string& result_text,
                          const std::string& error_text,
                          const std::vector<Part>* parts,
-                         const std::string& prompt_text);
+                         const std::string& prompt_text, uint64_t epoch = 0);
 
     /// 由当前记录构造 TaskTracking 并交给 classify()。
     /// ★ 终态判定的唯一入口 —— 不要在别处重复实现。
@@ -422,7 +428,9 @@ private:
                                           const std::string& last_err) const;
 
     /// 把一次 Task 快照并入登记表（指纹、artifact 增量、终态）
-    void ingest_task(const std::string& handle, const Task& t, ProgressFn on_progress);
+    /// @param epoch 见 settle_terminal；0 = 不校验（用于无并发风险的调用点）
+    void ingest_task(const std::string& handle, const Task& t, ProgressFn on_progress,
+                     uint64_t epoch = 0);
 
     std::shared_ptr<RemoteAgentClient> client_;
     std::shared_ptr<PendingTaskStore> store_;

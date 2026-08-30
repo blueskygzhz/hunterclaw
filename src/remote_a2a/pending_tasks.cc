@@ -268,11 +268,37 @@ bool PendingTaskStore::note_progress(const std::string& handle,
                                      const ProgressFingerprint& fp, TaskState state,
                                      const std::string& progress_text) {
     std::lock_guard<std::mutex> lk(mu_);
+    bool advanced = false;
+    note_progress_locked(handle, 0, fp, state, progress_text, &advanced);
+    return advanced;
+}
+
+bool PendingTaskStore::note_progress_if_current(const std::string& handle,
+                                                uint64_t epoch,
+                                                const ProgressFingerprint& fp,
+                                                TaskState state,
+                                                const std::string& progress_text,
+                                                bool* out_advanced) {
+    std::lock_guard<std::mutex> lk(mu_);
+    return note_progress_locked(handle, epoch, fp, state, progress_text, out_advanced);
+}
+
+// ★ 校验与写入共处同一临界区 —— 这是这组接口存在的全部理由。
+//   调用方自己比对 current_epoch() 再写是 TOCTOU: 两次加锁之间续接可能发生。
+// @return 代号是否有效（true = 本次写入被接受，或记录处于非 Running 但代号正确）
+bool PendingTaskStore::note_progress_locked(const std::string& handle, uint64_t epoch,
+                                            const ProgressFingerprint& fp,
+                                            TaskState state,
+                                            const std::string& progress_text,
+                                            bool* out_advanced) {
+    if (out_advanced) *out_advanced = false;
     PendingTask* t = find_locked(handle);
     if (!t) return false;
+    if (epoch != 0 && t->epoch != epoch) return false;  // 上一代的写入，丢弃
     // ★ 已终结的记录不再接受进度更新 —— 否则「取消后远端继续推进度」
     //   会把 Canceled 的记录改回 running 的样子。
-    if (t->phase != PendingPhase::Running) return false;
+    // ⚠ 但这【不是】代号问题: 返回 true 让调用方知道"你没过期，只是记录终结了"。
+    if (t->phase != PendingPhase::Running) return true;
 
     const bool changed = (t->fp != fp);
     t->fp = fp;
@@ -286,20 +312,38 @@ bool PendingTaskStore::note_progress(const std::string& handle,
         t->last_event_ms = t->updated_at_ms;
         t->consecutive_no_progress = 0;
     }
-    return changed;
+    if (out_advanced) *out_advanced = changed;
+    return true;
 }
 
 void PendingTaskStore::append_result(const std::string& handle,
                                      const std::string& delta) {
     if (delta.empty()) return;
     std::lock_guard<std::mutex> lk(mu_);
+    (void)append_result_locked(handle, 0, delta);
+}
+
+bool PendingTaskStore::append_result_if_current(const std::string& handle,
+                                               uint64_t epoch,
+                                               const std::string& delta) {
+    if (delta.empty()) return true;  // 空增量不算失败
+    std::lock_guard<std::mutex> lk(mu_);
+    return append_result_locked(handle, epoch, delta);
+}
+
+bool PendingTaskStore::append_result_locked(const std::string& handle, uint64_t epoch,
+                                           const std::string& delta) {
     PendingTask* t = find_locked(handle);
-    if (!t) return;
-    if (t->phase != PendingPhase::Running) return;
+    if (!t) return false;
+    if (epoch != 0 && t->epoch != epoch) return false;
+    // ⚠ 已终结不是代号问题 —— 返回 true，让调用方区分"过期"与"记录终结"。
+    //   （与 note_progress_locked 保持一致的语义）
+    if (t->phase != PendingPhase::Running) return true;
     if (!t->result_text.empty()) t->result_text += "\n";
     t->result_text += delta;
     t->updated_at_ms = now_ms();
     t->last_event_ms = t->updated_at_ms;
+    return true;
 }
 
 int PendingTaskStore::note_no_progress(const std::string& handle) {
@@ -309,6 +353,20 @@ int PendingTaskStore::note_no_progress(const std::string& handle) {
     if (t->phase != PendingPhase::Running) return t->consecutive_no_progress;
     t->updated_at_ms = now_ms();
     return ++t->consecutive_no_progress;
+}
+
+bool PendingTaskStore::note_no_progress_if_current(const std::string& handle,
+                                                   uint64_t epoch) {
+    std::lock_guard<std::mutex> lk(mu_);
+    PendingTask* t = find_locked(handle);
+    if (!t) return false;
+    // ★★ 这个校验是防 Zombie 误判的关键: 两代线程各自计数会【双倍推进】
+    //   consecutive_no_progress，把正常运行的任务判成僵死并杀掉。
+    if (epoch != 0 && t->epoch != epoch) return false;
+    if (t->phase != PendingPhase::Running) return true;  // 已终结，无需计数
+    t->updated_at_ms = now_ms();
+    ++t->consecutive_no_progress;
+    return true;
 }
 
 // ── 终结 ────────────────────────────────────────────────────────────────────
@@ -359,11 +417,26 @@ bool PendingTaskStore::update_terminal(const std::string& handle,
                                        TerminalReason reason, const std::string& text,
                                        const std::string& error_text,
                                        std::optional<TaskState> remote_state) {
+    return update_terminal_if_current(handle, 0, reason, text, error_text, remote_state);
+}
+
+bool PendingTaskStore::update_terminal_if_current(const std::string& handle,
+                                                  uint64_t epoch,
+                                                  TerminalReason reason,
+                                                  const std::string& text,
+                                                  const std::string& error_text,
+                                                  std::optional<TaskState> remote_state) {
     bool changed = false;
     {
         std::lock_guard<std::mutex> lk(mu_);
         PendingTask* t = find_locked(handle);
         if (!t) return false;
+
+        // ★★ 代号校验必须在这里（锁内、粘性判定之前）。
+        //   ⚠ 这是最危险的一个写入: 上一代线程若用过期状态把新一代记录
+        //     写成终态，正在进行的续接会直接"完成"，用户拿到上一轮的结果，
+        //     而真正的远端任务无人再管。
+        if (epoch != 0 && t->epoch != epoch) return false;
 
         // ★ 粘性终态保护（対标 run_wait.h:105-108）：
         //   已经是 HardTimeout / Canceled 时，后到的普通终态不覆盖。

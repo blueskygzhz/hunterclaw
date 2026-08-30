@@ -3515,94 +3515,146 @@ ReactEngine::CompactionResult ReactEngine::trigger_compaction(
 void ReactEngine::handle_tool_interrupt(tools::ToolResult& result,
                                         const StreamCallbacks& callbacks) {
     if (!result.interrupt.has_value()) return;
-    const tools::ToolInterrupt it = *result.interrupt;
 
     auto& coord = tools::InterruptCoordinator::instance();
 
-    // ── 前置检查：没有恢复函数就别问 ──────────────────────────────────────
-    // ⚠ 先问再发现无法恢复 = 让用户白答一次，而且远端任务照样卡死。
-    //   ★ fail-closed: 把失败写进结果文本让模型知道"这一步没做成"，
-    //     而不是静默把挂起态当成功交给模型（那样模型会当已完成继续往下）。
-    if (!coord.has_resume_handler(it.kind)) {
-        result.success = false;
-        result.error = "无法向用户发起确认: 未注册中断恢复处理器 (" + it.kind + ")";
-        result.interrupt.reset();
-        return;
-    }
+    // ★★ 多轮确认用【迭代】。
+    //
+    //   远端可以连续多次返回 input-required（典型: 先问"确认发送吗"，
+    //   答"是"后再问"确认收件人吗"）。每一轮都必须真的问到用户。
+    //
+    //   ⚠ 曾经这里只跑一轮: resume 产出的 next_interrupt 写回
+    //     result.interrupt 就返回，注释声称"交给下一轮循环"，但调用点
+    //     (:2361/:2689) 拿到 result 后直接存进 results，【没有任何代码
+    //     再读 interrupt 字段】—— 那是个只写不读的字段。
+    //     后果: 第二轮追问的文本混在结果里给了模型，但系统不再等答复，
+    //     模型当"已完成"继续往下，远端则永久卡在 input-required 到超时。
+    //
+    //   ★ 迭代而非递归（沿用原注释的判断）: 递归会让单次工具调用无界占用
+    //     main lane 且栈深不可控；迭代每轮回到同一层，abort 检查与轮次
+    //     上限都能在一处收口。
+    for (int round = 1;; ++round) {
+        const tools::ToolInterrupt it = *result.interrupt;
 
-    // ── ① 占会话槽位 ────────────────────────────────────────────────────
-    std::string session_key;
-    if (tool_manager_) session_key = tool_manager_->context().session_key;
-    auto waiter = coord.begin_wait(session_key);
-    if (!waiter.valid()) {
-        // 该会话已有中断在等，或 session_key 为空（无法路由入站答复）。
-        // ⚠ 不能硬等: 入站消息只会被【先占到槽位】的那个中断认领，
-        //   这里等下去必然超时，白占 main lane 最长 900s。
-        result.success = false;
-        result.error = "无法向用户发起确认: 该会话已有待答确认，或缺少会话上下文";
-        result.interrupt.reset();
-        return;
-    }
+        // ── 前置检查：没有恢复函数就别问 ──────────────────────────────────
+        // ⚠ 先问再发现无法恢复 = 让用户白答一次，而且远端任务照样卡死。
+        //   ★ fail-closed: 把失败写进结果文本让模型知道"这一步没做成"，
+        //     而不是静默把挂起态当成功交给模型（那样模型会当已完成继续往下）。
+        if (!coord.has_resume_handler(it.kind)) {
+            result.success = false;
+            result.error = "无法向用户发起确认: 未注册中断恢复处理器 (" + it.kind + ")";
+            result.interrupt.reset();
+            return;
+        }
 
-    // ── ② 投递追问 ──────────────────────────────────────────────────────
-    // ★ 必须在占到槽位【之后】投递: 反过来的话用户可能在槽位就绪前就回复，
-    //   那条答复无处认领，会被当成新的用户指令注入对话。
-    const std::string prompt = tools::InterruptCoordinator::format_prompt(it);
-    if (callbacks.on_block_reply) {
-        callbacks.on_block_reply(prompt);
-        // ★ 立刻 flush —— 追问不 flush 就可能攒在缓冲里，
-        //   ⚠ 用户没看到问题却在被等待，必然超时。
-        if (callbacks.on_block_reply_flush) callbacks.on_block_reply_flush();
-    } else {
-        // 没有投递面 = 用户根本看不到这条追问 → 别等了。
-        result.success = false;
-        result.error = "无法向用户发起确认: 当前会话没有可用的消息投递通道";
-        result.interrupt.reset();
-        return;
-    }
+        // ── ⓪ 轮次上限 ──────────────────────────────────────────────────
+        // ⚠ 远端若因 bug 每轮都回 input-required，会把用户钉在无限确认循环里，
+        //   且每轮都可能占 main lane 最长 900s。必须有界。
+        //   ★ 触顶按失败收口: 不能把仍然挂起的状态当成功交给模型。
+        if (round > tools::kMaxInterruptRounds) {
+            result.success = false;
+            result.error = "连续确认次数超过上限 (" +
+                           std::to_string(tools::kMaxInterruptRounds) +
+                           ")，已停止；远端任务仍在等待输入";            result.interrupt.reset();
+            return;
+        }
 
-    // ── ③ 等答复（可被 chat.abort 打断）──────────────────────────────────
-    auto answer = waiter.wait(tools::kDefaultInterruptWaitMs, &cancelled_);
-    if (!answer.has_value()) {
-        const bool aborted = cancelled_.load();
-        result.success = false;
-        result.error = aborted ? "用户确认被取消（运行已中止）"
-                              : "等待用户确认超时，未做任何变更";
-        result.interrupt.reset();
-        return;
-    }
+        // ── ① 占会话槽位 ────────────────────────────────────────────────
+        std::string session_key;
+        if (tool_manager_) session_key = tool_manager_->context().session_key;
+        auto waiter = coord.begin_wait(session_key);
+        if (!waiter.valid()) {
+            // 该会话已有中断在等，或 session_key 为空（无法路由入站答复）。
+            // ⚠ 不能硬等: 入站消息只会被【先占到槽位】的那个中断认领，
+            //   这里等下去必然超时，白占 main lane 最长 900s。
+            result.success = false;
+            result.error = "无法向用户发起确认: 该会话已有待答确认，或缺少会话上下文";
+            result.interrupt.reset();
+            return;
+        }
 
-    // ── ④ 恢复子系统执行 ────────────────────────────────────────────────
-    // ★ 槽位在这里就可以放了: 答复已拿到，恢复期间该会话应当能接受
-    //   下一个中断（多轮确认场景）。
-    waiter.release();
+        // ── ② 投递追问 ──────────────────────────────────────────────────
+        // ★ 必须在占到槽位【之后】投递: 反过来的话用户可能在槽位就绪前就回复，
+        //   那条答复无处认领，会被当成新的用户指令注入对话。
+        const std::string prompt = tools::InterruptCoordinator::format_prompt(it);
+        if (callbacks.on_block_reply) {
+            callbacks.on_block_reply(prompt);
+            // ★ 立刻 flush —— 追问不 flush 就可能攒在缓冲里，
+            //   ⚠ 用户没看到问题却在被等待，必然超时。
+            if (callbacks.on_block_reply_flush) callbacks.on_block_reply_flush();
+        } else {
+            // 没有投递面 = 用户根本看不到这条追问 → 别等了。
+            result.success = false;
+            result.error = "无法向用户发起确认: 当前会话没有可用的消息投递通道";
+            result.interrupt.reset();
+            return;
+        }
 
-    auto outcome = coord.resume(it, *answer, &cancelled_);
+        // ── ③ 等答复（可被 chat.abort 打断）──────────────────────────────
+        auto answer = waiter.wait(tools::kDefaultInterruptWaitMs, &cancelled_);
+        if (!answer.has_value()) {
+            const bool aborted = cancelled_.load();
+            result.success = false;
+            result.error = aborted ? "用户确认被取消（运行已中止）"
+                                  : "等待用户确认超时，未做任何变更";
+            result.interrupt.reset();
+            return;
+        }
 
-    // ── ⑤ 用恢复结果替换 result ─────────────────────────────────────────
-    // ★ B1 决策: 用户答复只作为 tool result 内容进 transcript，
-    //   【不产生独立 user turn】—— 满足"恢复时不要重新发一条消息"。
-    result.content.clear();
-    if (outcome.success) {
-        result.success = true;
-        result.error.clear();
-        // ★ 用 tool_result::text() 而不是手工构造 ToolResultContent ——
-        //   后者的字段顺序/可选字段一变就静默错位。
-        result.content = tools::tool_result::text(outcome.text).content;
-    } else {
-        result.success = false;
-        result.error = outcome.error.empty() ? "恢复远端执行失败" : outcome.error;
-        // ⚠ 即使失败也要把已有文本带上: 里面含"用户答复了什么"，
-        //   否则模型完全不知道刚才发生过一次确认。
-        if (!outcome.text.empty()) {
+        // ── ④ 恢复子系统执行 ────────────────────────────────────────────
+        // ★ 槽位在这里就可以放了: 答复已拿到，恢复期间该会话应当能接受
+        //   下一个中断（多轮确认场景）。
+        waiter.release();
+
+        auto outcome = coord.resume(it, *answer, &cancelled_);
+
+        // ── ⑤ 用恢复结果替换 result ─────────────────────────────────────
+        // ★ B1 决策: 用户答复只作为 tool result 内容进 transcript，
+        //   【不产生独立 user turn】—— 满足"恢复时不要重新发一条消息"。
+        result.content.clear();
+        if (outcome.success) {
+            result.success = true;
+            result.error.clear();
+            // ★ 用 tool_result::text() 而不是手工构造 ToolResultContent ——
+            //   后者的字段顺序/可选字段一变就静默错位。
             result.content = tools::tool_result::text(outcome.text).content;
+        } else {
+            result.success = false;
+            result.error = outcome.error.empty() ? "恢复远端执行失败" : outcome.error;
+            // ⚠ 即使失败也要把已有文本带上: 里面含"用户答复了什么"，
+            //   否则模型完全不知道刚才发生过一次确认。
+            if (!outcome.text.empty()) {
+                result.content = tools::tool_result::text(outcome.text).content;
+            }
+        }
+
+        // ── ⑥ 还有下一轮吗 ──────────────────────────────────────────────
+        result.interrupt = outcome.next_interrupt;
+
+        // ★ 恢复失败就收手: 上一轮都没成功，继续追问只会在错误状态上
+        //   叠加更多确认，而用户无从判断自己在确认什么。
+        if (!outcome.success) {
+            result.interrupt.reset();
+            return;
+        }
+
+        if (!result.interrupt.has_value()) return;  // 正常收束
+
+        // ★ 判据必须与调用点 (:2361/:2689) 一致: 只有需要人判断的中断才继续
+        //   打扰用户；requires_user_action=false 的补充输入留在 result 上
+        //   交给模型自己接着做。
+        //   ⚠ 两处判据不一致，会让某类中断在入口被放行、在这里却被反复追问。
+        if (!result.interrupt->requires_user_action) return;
+
+        // ⚠ 每轮开头重新检查 abort: 用户可能在上一轮 resume 期间点了停止，
+        //   此时不该再弹下一轮追问。
+        if (cancelled_.load()) {
+            result.success = false;
+            result.error = "用户确认被取消（运行已中止）";
+            result.interrupt.reset();
+            return;
         }
     }
-
-    // ★ 恢复后【又一次】中断（多轮确认）→ 留在 result 上交给下一轮循环。
-    //   ⚠ 这里不递归: 递归会让单次工具调用无界占用 main lane，
-    //     且中间的 resume 调用无法被 abort 打断。
-    result.interrupt = outcome.next_interrupt;
 }
 
 

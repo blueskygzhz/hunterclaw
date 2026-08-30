@@ -87,6 +87,25 @@ core::Result<int> RemoteA2aRegistry::build() {
                     auto snap = store->get(handle);
                     if (!snap || snap->session_key.empty()) return;
 
+                    // ★★ 去重闸: 同一次挂起会被【多条通道重复触发】。
+                    //
+                    //   settle_terminal 是唯一落终态入口，但它自己被调用多次:
+                    //     · ingest_task    (execution_engine.cc:421) —— 同步探测
+                    //       ⚠ 而 poll_once(:999) 与 background_loop→run_probe
+                    //         都经由 ingest_task，回调还会因远端未收到 2xx 而重投
+                    //     · run_stream    (execution_engine.cc:632) —— SSE 线程
+                    //   每次都会走到 ④ maybe_notify_suspended。
+                    //
+                    //   ⚠ 没有这道闸，用户会为同一件事被推 2~5 条"远端在等你"。
+                    //     这不只是噪音: deliver_progress 传的是 hb=false（正式
+                    //     事件，刻意不被心跳合并），而 system_events 只有 20 条
+                    //     上限 —— 重复推送会把真正的完成/失败事件挤出队列。
+                    //
+                    //   ★ engine 刻意不替 resolver 去重（见 execution_engine.h:313）:
+                    //     闸门必须是【跨线程跨通道】唯一的，而 CAS 语义只能由
+                    //     store 提供。这里是契约要求的实现方。
+                    if (!store->try_claim_question(handle)) return;
+
                     // ★ 只推一条提示，告诉用户远端在等他。
                     //   ⚠ 不在这里问、不在这里等 —— 见上方说明。
                     std::string text = "远端任务需要你确认后才能继续";
@@ -306,6 +325,13 @@ void RemoteA2aRegistry::start_sweeper(int64_t interval_ms) {
 }
 
 void RemoteA2aRegistry::stop_sweeper() {
+    // ★★ 受理闸先关，且【无条件】关 —— 不能藏在下面的 sweeping_ 判断里。
+    //   sweeping_ 为 false 有两种情况: 从未 start（如测试或未 activate 的
+    //   registry）、或已 stop 过。前者若被提前 return 跳过，闸门就永远开着。
+    //   ⚠ 恢复路径靠这个闸判断"还能不能往远端发确认"，漏关会让进程退出
+    //     期间用户的一句"确认"把正在被放弃的流程真的提交出去。
+    accepting_.store(false);
+
     if (!sweeping_.exchange(false)) return;
     // ★ 用 cv 唤醒而不是等它自己 sleep 完 ——
     //   interval 是 60s，析构时等一分钟不可接受。
@@ -326,6 +352,34 @@ void RemoteA2aRegistry::sweeper_loop(int64_t interval_ms) {
         if (!sweeping_.load()) break;
         if (store_) store_->sweep();
     }
+}
+
+// ── 进程级接线 ──────────────────────────────────────────────────────────────
+
+void activate_remote_a2a_registry(const std::shared_ptr<RemoteA2aRegistry>& reg) {
+    if (!reg) return;
+
+    // ── ① 注册 interrupt 恢复函数 ────────────────────────────────────────
+    //
+    // ★★ 这是"用户输入后由 ReactEngine 传给 remote_a2a 恢复远端执行"的
+    //   remote_a2a 那一半。ReactEngine 拿到用户答复后按 kind
+    //   ("remote_a2a.input_required") 路由到这里。
+    //
+    // ⚠ 必须在【工具可能被调用之前】完成:
+    //   工具已经能产出 interrupt 了，恢复函数却还没注册的话，
+    //   ReactEngine 的前置检查会 fail-closed 成
+    //   "未注册中断恢复处理器" —— 用户白答一次，远端任务只能等超时。
+    //
+    // ★ 注册是【进程级一次性】的（InterruptCoordinator 拒绝重复注册同 kind），
+    //   多次调用时后面的会被拒绝并保留第一个 registry ——
+    //   ⚠ 这在热重载场景下会让恢复路由指向旧 registry。当前流程只调一次，
+    //     若将来支持热重载需要显式反注册。
+    register_remote_a2a_resume_handler(reg);
+
+    // ── ② 启动后台 sweeper ───────────────────────────────────────────────
+    // ★ 放在 handler 之后: sweeper 一起就可能判死在途任务并触发状态变更，
+    //   此时恢复通道应当已经就绪。
+    reg->start_sweeper();
 }
 
 // ── 便捷入口 ────────────────────────────────────────────────────────────────
@@ -355,24 +409,12 @@ core::Result<int> enable_remote_a2a(tools::ToolManager& manager,
         return core::Result<int>::Err(registered.error);
     }
 
-    // ── 注册 interrupt 恢复函数 ──────────────────────────────────────────
-    //
-    // ★★ 这是"用户输入后由 ReactEngine 传给 remote_a2a 恢复远端执行"的
-    //   remote_a2a 那一半。ReactEngine 拿到用户答复后按 kind
-    //   ("remote_a2a.input_required") 路由到这里。
-    //
-    // ⚠ 必须在 register_tools 之后、start_sweeper 之前:
-    //   工具已经能产出 interrupt 了，恢复函数却还没注册的话，
-    //   ReactEngine 会拿到 "没有为中断类型注册恢复处理器" ——
-    //   用户白答一次，且远端任务只能等超时。
-    //
-    // ★ 注册是【进程级一次性】的（InterruptCoordinator 拒绝重复注册同 kind），
-    //   多次调用 setup 时后面的会被拒绝并保留第一个 registry ——
-    //   ⚠ 这在热重载场景下会让恢复路由指向旧 registry。当前流程只调一次，
-    //     若将来支持热重载需要显式反注册。
-    register_remote_a2a_resume_handler(reg);
+    // ★ 接线序列收敛在 activate 里 —— 这里【不】重复它的步骤。
+    //   ⚠ 曾经这里内联了 register_resume_handler + start_sweeper，
+    //     而 RemoteA2aRuntime::init 只抄到了后者，于是生产路径静默缺失
+    //     恢复通道。见 activate_remote_a2a_registry 的说明。
+    activate_remote_a2a_registry(reg);
 
-    reg->start_sweeper();
     if (out_registry) *out_registry = reg;
     return registered;
 }
