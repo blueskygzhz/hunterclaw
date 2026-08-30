@@ -231,7 +231,20 @@ struct ExecutionResult {
 
 // ── 引擎 ────────────────────────────────────────────────────────────────────
 
-class ExecutionEngine {
+/// ★★ 必须经 create() 构造（enable_shared_from_this 的前提）。
+///
+/// ── 为什么继承 enable_shared_from_this ────────────────────────────────────
+/// 后台跟进线程是 detached 的（项目级约束: 不用 future/packaged_task），
+/// 它捕获 this 并在退出前会访问 store_ / cfg_ / stopping_。
+///
+/// ⚠ 曾经的做法是「shutdown() 里有界等待 3s」—— 那是尽力而为，不是保证:
+///   3s 后仍有线程存活就直接继续析构，detached 线程随后访问已释放的 this
+///   → use-after-free。而线程恰好卡在一次慢 get_task 上（HTTP 超时可达
+///   数十秒）是完全正常的情况，不是极端场景。
+///
+/// ★ 现在线程按值捕获一份 shared_ptr 自保活: this 一定活到最后一个线程
+///   退出之后。析构不再需要"等"，因为析构根本不会在线程还活着时发生。
+class ExecutionEngine : public std::enable_shared_from_this<ExecutionEngine> {
 public:
     static std::shared_ptr<ExecutionEngine> create(
         std::shared_ptr<RemoteAgentClient> client,
@@ -443,6 +456,13 @@ private:
     SuspendResolver suspend_resolver_;
 
     std::atomic<bool> stopping_{false};
+
+    /// 存活的后台跟进线程数。
+    ///
+    /// ★ 仅用于可观测/测试断言 —— 安全性【不依赖】它。
+    ///   线程持 shared_ptr 自保活，this 的生命周期由引用计数保证，
+    ///   ⚠ 不要在 shutdown() 里等它归零: 最后一份引用可能就在后台线程
+    ///     自己手里，那样是自等自锁。
     std::atomic<int> live_threads_{0};
 };
 

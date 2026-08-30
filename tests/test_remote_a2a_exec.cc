@@ -21,6 +21,8 @@
 #include <chrono>
 #include <iostream>
 #include <string>
+#include <atomic>
+#include <memory>
 #include <thread>
 
 #include "hunterclaw/remote_a2a/agent_tool.h"
@@ -1217,6 +1219,100 @@ static void test_extract_confirm_signal() {
 
 
 // ============================================================================
+// 后台线程自保活（use-after-free 回归）★★
+//
+// 回归的是一个真实的 UAF: 后台跟进线程原先是 detached + 捕获裸 this，
+// 而 shutdown() 只做「有界等待 3s」。3s 到点就继续析构 ——
+//   ⚠ 一次慢 get_task（HTTP 超时可达数十秒）就足以让线程在 engine 析构后
+//     仍访问 store_ / cfg_ / stopping_，全是已释放内存。
+//   这不是极端场景，而是网络抖动时的常态。
+//
+// ★ 现在线程按值捕获 shared_ptr 自保活: this 一定活到最后一个线程退出之后。
+//
+// ⚠ 本测试在 ASan 下才有完整意义（普通构建下 UAF 往往不崩）。
+//   run_remote_a2a_tests.sh 已带 -fsanitize=address。
+static void test_background_thread_keepalive() {
+    SECTION("后台线程自保活（UAF 回归）");
+
+    // ── ① 引擎引用计数可观测 ─────────────────────────────────────────────
+    // ⚠ 无卡时 execute 立即失败、不起后台线程 —— 那样测不到自保活，
+    //   所以这里只验基本约束，真正的并发验证在 ② 里做。
+    std::weak_ptr<ExecutionEngine> weak;
+    {
+        RemoteAgentClientConfig cc;
+        ExecutionConfig ec;
+        ec.background_follow_up = true;
+        ec.background = true;  // 立即让渡
+        ec.max_task_ms = 300;
+
+        auto store = PendingTaskStore::create();
+        auto e = ExecutionEngine::create(RemoteAgentClient::create(cc, nullptr), store,
+                                        ec);
+        weak = e;
+        CHECK(!weak.expired(), "引擎已创建");
+        (void)e->execute(Message{}, "sess-keepalive");
+    }
+    CHECK(weak.expired(), "无后台线程持引用时，出作用域即销毁");
+
+    // ── ② 线程持引用期间析构主引用 ──────────────────────────────────────
+    // ★ 直接验证 shared_from_this 的保活语义: 手工模拟 execute 尾部的做法。
+    {
+        RemoteAgentClientConfig cc;
+        auto store = PendingTaskStore::create();
+        auto e = ExecutionEngine::create(RemoteAgentClient::create(cc, nullptr), store,
+                                        ExecutionConfig{});
+        std::weak_ptr<ExecutionEngine> w = e;
+
+        std::atomic<bool> thread_done{false};
+        std::atomic<bool> alive_in_thread{false};
+        {
+            // 模拟后台线程: 捕获 shared_ptr
+            auto self = e;
+            std::thread th([self, &thread_done, &alive_in_thread]() {
+                std::this_thread::sleep_for(std::chrono::milliseconds(80));
+                // ★★ 此刻主引用已释放。若捕的是裸 this，这里就是 UAF。
+                //   访问成员以触发 ASan（若真的已释放）。
+                self->shutdown();  // 只是置标志 + notify，安全可重入
+                alive_in_thread.store(true);
+                thread_done.store(true);
+            });
+            th.detach();
+        }
+
+        e.reset();  // ★ 主动放弃主引用 —— 线程还在 sleep
+        CHECK(!w.expired(),
+              "线程持引用期间对象未销毁（自保活生效）[不可回退]");
+
+        // 等线程结束
+        const int64_t deadline_ms = 3000;
+        int64_t waited = 0;
+        while (!thread_done.load() && waited < deadline_ms) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            waited += 10;
+        }
+        CHECK(thread_done.load(), "线程正常结束");
+        CHECK(alive_in_thread.load(),
+              "线程内成员访问成功（非 UAF）[不可回退]");
+
+        // 线程退出后最后一份引用释放 → 对象销毁
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        CHECK(w.expired(), "最后一份引用释放后对象销毁（无泄漏）[不可回退]");
+    }
+
+    // ── ③ shutdown 可重入、且不自等自锁 ────────────────────────────────
+    // ⚠ 若 shutdown 里等 live_threads_ 归零，而最后一份引用握在后台线程
+    //   自己手里，~ExecutionEngine 就运行在那个线程上 → 自等自锁。
+    {
+        RemoteAgentClientConfig cc;
+        auto e = ExecutionEngine::create(RemoteAgentClient::create(cc, nullptr),
+                                        PendingTaskStore::create(), ExecutionConfig{});
+        e->shutdown();
+        e->shutdown();  // 幂等
+        CHECK(true, "shutdown 可重入且不阻塞");
+    }
+}
+
+// ============================================================================
 int main() {
     std::cout << "===== remote_a2a M7/M8 测试 =====" << std::endl;
 
@@ -1242,6 +1338,7 @@ int main() {
     //   二次确认现由 interrupt 通道承载，覆盖在
     //   test_remote_a2a_tools / test_remote_a2a_runtime 两套里。
     test_texts();
+    test_background_thread_keepalive();
 
     std::cout << "\n===== 结果: " << g_pass << " 通过, " << g_fail << " 失败 ====="
               << std::endl;

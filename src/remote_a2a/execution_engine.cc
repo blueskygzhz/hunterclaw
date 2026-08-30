@@ -320,13 +320,24 @@ ExecutionEngine::~ExecutionEngine() { shutdown(); }
 
 void ExecutionEngine::shutdown() {
     stopping_.store(true);
+    // ★ 唤醒所有卡在 cv 上的等待方（follow_up / run_probe 的退避）。
     if (store_) store_->notify_all();
-    // ⚠ 后台线程是 detached 的，这里只能等它们自己看到 stopping_ 后退出。
-    //   给一个有界的等待，避免析构时 detached 线程还在访问 this。
-    const int64_t deadline = now_ms() + 3000;
-    while (live_threads_.load() > 0 && now_ms() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    }
+
+    // ★★ 这里【不再等待】后台线程 —— 也【不需要】等。
+    //
+    //   后台线程持有一份 shared_ptr<ExecutionEngine> 自保活（见 execute 尾部），
+    //   所以 this 一定活到最后一个线程退出之后；析构不可能与线程访问交叠。
+    //
+    //   ⚠ 原先这里有一段「有界等待 3s」，那是 detached 线程捕裸 this 时代的
+    //     补救措施 —— 而且并不安全: 3s 到点就继续析构，慢 get_task 超过 3s
+    //     就是 use-after-free。
+    //
+    //   ⚠ 现在【绝不能】在这里等 live_threads_ 归零: 最后一份 shared_ptr
+    //     可能就握在后台线程自己手里，此时 ~ExecutionEngine 正运行在
+    //     【那个后台线程上】。等它自己退出 = 自等自锁，必然死等到超时。
+    //
+    //   stopping_ + notify_all 已足够让线程尽快收敛: run_probe 的
+    //   interruptible_sleep 会被立即打断，循环头与事件回调都查 stopping_。
 }
 
 // ── 终态判定（唯一入口）────────────────────────────────────────────────────
@@ -977,10 +988,21 @@ ExecutionResult ExecutionEngine::execute_with_yield(const Message& msg,
         // ★★ on_progress 必须传下去。原先是 nullptr —— 后台跟进期间的进度
         //   与挂起时那句"远端要求…"一个字都投递不出去，用户完全不知道
         //   远端在等他。⚠ 按值捕获: 让渡后本栈帧立刻销毁，捕引用必悬垂。
+        //
+        // ★★ self 自保活: 捕获 shared_ptr 而非裸 this。
+        //   ⚠ 捕裸 this 时，engine 若在本线程之前析构（shutdown 只等 3s，
+        //     而一次慢 get_task 就可能超过），background_loop 里对
+        //     store_ / cfg_ / stopping_ 的访问全是 use-after-free。
+        //   ★ shared_from_this 要求对象由 shared_ptr 管理 —— 已由
+        //     create() 保证（全项目无栈上构造，见头文件说明）。
         live_threads_.fetch_add(1);
-        std::thread([this, handle, on_progress]() {
-            background_loop(handle, on_progress);
-            live_threads_.fetch_sub(1);
+        auto self = shared_from_this();
+        std::thread([self, handle, on_progress]() {
+            self->background_loop(handle, on_progress);
+            self->live_threads_.fetch_sub(1);
+            // ⚠ self 在此析构 —— 若这是最后一份引用，engine 就在【本线程】
+            //   析构。~ExecutionEngine → shutdown() 只是置标志 + notify，
+            //   不 join 任何线程，因此不会自等自锁。
         }).detach();
     }
     return out;

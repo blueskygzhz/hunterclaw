@@ -4,6 +4,14 @@
 # 构建并运行 remote_a2a 全部测试套（离线，不发任何网络包）。
 #
 # 用法: cd HunterClaw && bash tests/run_remote_a2a_tests.sh
+#
+#   ASAN=1 bash tests/run_remote_a2a_tests.sh   # 带 AddressSanitizer 跑
+#
+# ★★ 为什么需要 ASAN 开关: 本子系统有 detached 后台线程 + 跨线程共享
+#   PendingTaskStore。这类问题（use-after-free / 数据竞争）在普通构建下
+#   【往往不崩】—— 测试全绿但内存已经错了。
+#   ⚠ 改动 execution_engine / pending_tasks 的线程或生命周期相关代码后，
+#     务必用 ASAN=1 跑一遍，否则等于没验证。
 # ============================================================================
 set -u
 
@@ -11,6 +19,26 @@ CXX="${CXX:-/usr/local/gcc-12.2.0/bin/g++}"
 INC="-Iinclude -Iexternal/json/single_include -Ithird_party"
 OUT="${OUT:-/tmp/hc_ra2a_tests}"
 mkdir -p "$OUT"
+
+# ── AddressSanitizer ────────────────────────────────────────────────────────
+ASAN="${ASAN:-0}"
+SAN_FLAGS=""
+ASAN_PRELOAD=""
+if [ "$ASAN" = "1" ]; then
+  # ★ -O1 而非 -O0: ASan 在 -O0 下慢得多，且 -O1 仍保留完整栈帧
+  SAN_FLAGS="-fsanitize=address -fno-omit-frame-pointer -g -O1"
+  # ⚠ 这套 gcc 装在非标准前缀（/usr/local/gcc-12.2.0），运行时找不到
+  #   libasan.so —— 必须显式 LD_PRELOAD，否则每个套件都"BUILD 成功但跑不起来"。
+  ASAN_PRELOAD="$($CXX -print-file-name=libasan.so 2>/dev/null)"
+  if [ ! -f "$ASAN_PRELOAD" ]; then
+    echo "!! 找不到 libasan.so，无法启用 ASan" >&2
+    exit 1
+  fi
+  # ⚠ detect_leaks=0: 测试里有意保留的单例/detached 线程会报大量"泄漏"，
+  #   那不是本脚本要查的问题（要查内存泄漏请单独跑 LSan）。
+  export ASAN_OPTIONS="detect_leaks=0:abort_on_error=0:print_stacktrace=1"
+  echo "[ASan] 已启用 (preload: $ASAN_PRELOAD)"
+fi
 
 # remote_a2a 源码分两层：
 #   LOW  —— 不依赖 tools::（Tool / ToolParams / tool_result）
@@ -70,16 +98,45 @@ run_suite() {
   local name="$1"; shift
   local extra="$*"
   printf "%-34s " "$name"
-  if ! $CXX -std=c++17 $INC "tests/$name.cc" $extra -lpthread -o "$OUT/$name" \
+  if ! $CXX -std=c++17 $SAN_FLAGS $INC "tests/$name.cc" $extra -lpthread -o "$OUT/$name" \
        > "$OUT/$name.build.log" 2>&1; then
     echo "BUILD FAILED (见 $OUT/$name.build.log)"
     FAILED_SUITES="$FAILED_SUITES $name(build)"
     return
   fi
-  local out
-  out="$("$OUT/$name" 2>&1)"
+  local out rc
+  if [ -n "$ASAN_PRELOAD" ]; then
+    out="$(LD_PRELOAD="$ASAN_PRELOAD" "$OUT/$name" 2>&1)"; rc=$?
+  else
+    out="$("$OUT/$name" 2>&1)"; rc=$?
+  fi
+
+  # ★★ 先查 sanitizer 报告，再看测试计数。
+  #   ⚠ 顺序不能反: ASan 在报错后可能仍让进程跑完并打出"0 失败"，
+  #     只看计数会把一个内存错误报成通过。
+  if echo "$out" | grep -q "ERROR: AddressSanitizer\|ERROR: LeakSanitizer\|runtime error:"; then
+    echo "SANITIZER ERROR"
+    FAILED_SUITES="$FAILED_SUITES $name(asan)"
+    TOTAL_FAIL=$((TOTAL_FAIL + 1))
+    echo "$out" | grep -A6 "ERROR: AddressSanitizer\|runtime error:" | head -14
+    echo "$out" > "$OUT/$name.run.log"
+    return
+  fi
+
   local line
   line="$(echo "$out" | grep -oE '结果: [0-9]+ 通过, [0-9]+ 失败|PASS: [0-9]+  FAIL: [0-9]+' | tail -1)"
+
+  # ⚠ 抓不到计数行 = 进程没跑到收尾（崩溃/信号中断），必须报失败。
+  #   原先这里会算成 0 通过 0 失败，静默计入"全绿"。
+  if [ -z "$line" ]; then
+    echo "NO RESULT (退出码 $rc，见 $OUT/$name.run.log)"
+    FAILED_SUITES="$FAILED_SUITES $name(crash)"
+    TOTAL_FAIL=$((TOTAL_FAIL + 1))
+    echo "$out" > "$OUT/$name.run.log"
+    echo "$out" | tail -6
+    return
+  fi
+
   local p f
   p="$(echo "$line" | grep -oE '[0-9]+' | head -1)"
   f="$(echo "$line" | grep -oE '[0-9]+' | tail -1)"
