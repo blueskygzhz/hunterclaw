@@ -3533,6 +3533,39 @@ void ReactEngine::handle_tool_interrupt(tools::ToolResult& result,
     //   ★ 迭代而非递归（沿用原注释的判断）: 递归会让单次工具调用无界占用
     //     main lane 且栈深不可控；迭代每轮回到同一层，abort 检查与轮次
     //     上限都能在一处收口。
+    //
+    // ── ★★ 并行工具调用下的行为（config_.parallel_tool_calls）─────────────
+    //   N 个远端 agent 同时挂起时，只有第一个能占到会话槽位，
+    //   其余 N-1 个在 ① 处 fail-closed 返回"该会话已有另一项待答确认"。
+    //   ⚠ 刻意【不】排队: 这些 lambda 跑在同一个线程池里（池大小 =
+    //     hardware_concurrency），排队会让 N 个工具各等最长 900s 并把池占满，
+    //     连不相关的工具也无法执行。
+    //   ⚠ 也刻意【不】用递归/无界轮次: 单个工具最长占用 = 上限轮数 × 900s，
+    //     这已经是一个 worker 的长期占用，无界会直接拖死整池。
+
+    // ★★ 多轮之间必须累积文本，不能只保留最后一轮。
+    //   ⚠ 第 2 轮起若中途失败（槽位被抢/超时/abort），前几轮已经真实发生的
+    //     远端产出会被 result.content.clear() 抹掉 —— 用户答过的确认、
+    //     远端已执行的动作，在 transcript 里查无此事。
+    //   ★ 用它保存"截至上一轮的完整叙述"，任何提前返回都要把它带上。
+    std::string accumulated;
+
+    // ★ 统一的提前返回: 保证「已完成轮次的产出」不因后续失败而丢失。
+    //   ⚠ 不要在各分支手写 result.error = ... ; return —— 那样每加一个
+    //     分支就多一处可能漏带 accumulated 的地方。
+    auto bail = [&result, &accumulated](const std::string& err) {
+        result.success = false;
+        result.error = err;
+        if (!accumulated.empty()) {
+            // ★ 把已完成部分与失败原因一起交给模型: 它需要知道
+            //   "哪几步已经生效了"，否则可能重做已执行的副作用。
+            result.content =
+                tools::tool_result::text(accumulated + "\n\n[本次未能继续] " + err)
+                    .content;
+        }
+        result.interrupt.reset();
+    };
+
     for (int round = 1;; ++round) {
         const tools::ToolInterrupt it = *result.interrupt;
 
@@ -3541,9 +3574,7 @@ void ReactEngine::handle_tool_interrupt(tools::ToolResult& result,
         //   ★ fail-closed: 把失败写进结果文本让模型知道"这一步没做成"，
         //     而不是静默把挂起态当成功交给模型（那样模型会当已完成继续往下）。
         if (!coord.has_resume_handler(it.kind)) {
-            result.success = false;
-            result.error = "无法向用户发起确认: 未注册中断恢复处理器 (" + it.kind + ")";
-            result.interrupt.reset();
+            bail("无法向用户发起确认: 未注册中断恢复处理器 (" + it.kind + ")");
             return;
         }
 
@@ -3552,10 +3583,9 @@ void ReactEngine::handle_tool_interrupt(tools::ToolResult& result,
         //   且每轮都可能占 main lane 最长 900s。必须有界。
         //   ★ 触顶按失败收口: 不能把仍然挂起的状态当成功交给模型。
         if (round > tools::kMaxInterruptRounds) {
-            result.success = false;
-            result.error = "连续确认次数超过上限 (" +
-                           std::to_string(tools::kMaxInterruptRounds) +
-                           ")，已停止；远端任务仍在等待输入";            result.interrupt.reset();
+            bail("连续确认次数超过上限 (" +
+                 std::to_string(tools::kMaxInterruptRounds) +
+                 ")，已停止；远端任务仍在等待输入");
             return;
         }
 
@@ -3567,11 +3597,25 @@ void ReactEngine::handle_tool_interrupt(tools::ToolResult& result,
             // 该会话已有中断在等，或 session_key 为空（无法路由入站答复）。
             // ⚠ 不能硬等: 入站消息只会被【先占到槽位】的那个中断认领，
             //   这里等下去必然超时，白占 main lane 最长 900s。
-            result.success = false;
-            result.error = "无法向用户发起确认: 该会话已有待答确认，或缺少会话上下文";
-            result.interrupt.reset();
+            //
+            // ★★ 并行工具调用下这是【常态路径】而非异常: N 个远端 agent
+            //   同时挂起时，只有第一个抢到槽位，其余 N-1 个都走到这里。
+            //   ⚠ 错误文本必须让模型知道"重试是有意义的、但要等" ——
+            //     若只说"失败"，模型可能改用别的方式绕过确认（比如换个
+            //     不需要确认的工具去做同一件事），那正是我们要防的。
+            bail(session_key.empty()
+                     ? "无法向用户发起确认: 缺少会话上下文（无法把答复路由回来）"
+                     : "无法向用户发起确认: 该会话已有另一项待答确认。"
+                       "请等用户答复完当前确认后，再重新调用本工具"
+                       "（远端任务仍在等待输入，未做任何变更）");
             return;
         }
+
+        // ★ 每轮都重新占槽位，所以这里要防"槽位在多轮之间被别的工具抢走"。
+        //   ⚠ 并行场景: 本工具第 1 轮 release 之后、第 2 轮 begin_wait 之前，
+        //     另一个并行工具可能刚好抢到槽位。那时本工具会走上面的分支
+        //     fail-closed —— 这是可接受的（用户确实在答另一个问题），
+        //     但【必须】保留已完成轮次的结果文本，否则前几轮的远端产出丢失。
 
         // ── ② 投递追问 ──────────────────────────────────────────────────
         // ★ 必须在占到槽位【之后】投递: 反过来的话用户可能在槽位就绪前就回复，
@@ -3584,9 +3628,7 @@ void ReactEngine::handle_tool_interrupt(tools::ToolResult& result,
             if (callbacks.on_block_reply_flush) callbacks.on_block_reply_flush();
         } else {
             // 没有投递面 = 用户根本看不到这条追问 → 别等了。
-            result.success = false;
-            result.error = "无法向用户发起确认: 当前会话没有可用的消息投递通道";
-            result.interrupt.reset();
+            bail("无法向用户发起确认: 当前会话没有可用的消息投递通道");
             return;
         }
 
@@ -3594,16 +3636,17 @@ void ReactEngine::handle_tool_interrupt(tools::ToolResult& result,
         auto answer = waiter.wait(tools::kDefaultInterruptWaitMs, &cancelled_);
         if (!answer.has_value()) {
             const bool aborted = cancelled_.load();
-            result.success = false;
-            result.error = aborted ? "用户确认被取消（运行已中止）"
-                                  : "等待用户确认超时，未做任何变更";
-            result.interrupt.reset();
+            bail(aborted ? "用户确认被取消（运行已中止）"
+                         : "等待用户确认超时，未做任何变更");
             return;
         }
 
         // ── ④ 恢复子系统执行 ────────────────────────────────────────────
         // ★ 槽位在这里就可以放了: 答复已拿到，恢复期间该会话应当能接受
         //   下一个中断（多轮确认场景）。
+        // ⚠ 并行场景下这也意味着: 本工具让出槽位后，另一个并行挂起的工具
+        //   可能立刻抢到 —— 那是【期望行为】（轮流问用户），代价是本工具
+        //   若还有下一轮会在 ① 处 fail-closed。已完成轮次靠 accumulated 保住。
         waiter.release();
 
         auto outcome = coord.resume(it, *answer, &cancelled_);
@@ -3611,20 +3654,31 @@ void ReactEngine::handle_tool_interrupt(tools::ToolResult& result,
         // ── ⑤ 用恢复结果替换 result ─────────────────────────────────────
         // ★ B1 决策: 用户答复只作为 tool result 内容进 transcript，
         //   【不产生独立 user turn】—— 满足"恢复时不要重新发一条消息"。
+        //
+        // ★★ 多轮累积: 每轮的产出都要留下。
+        //   ⚠ 只保留最后一轮会让前几轮"用户答过、远端执行过"的事实消失，
+        //     模型据此可能重做已生效的副作用（重复发邮件等）。
+        if (!outcome.text.empty()) {
+            if (!accumulated.empty()) accumulated += "\n\n";
+            accumulated += outcome.text;
+        }
+
         result.content.clear();
         if (outcome.success) {
             result.success = true;
             result.error.clear();
             // ★ 用 tool_result::text() 而不是手工构造 ToolResultContent ——
             //   后者的字段顺序/可选字段一变就静默错位。
-            result.content = tools::tool_result::text(outcome.text).content;
+            result.content = tools::tool_result::text(
+                                 accumulated.empty() ? outcome.text : accumulated)
+                                 .content;
         } else {
             result.success = false;
             result.error = outcome.error.empty() ? "恢复远端执行失败" : outcome.error;
             // ⚠ 即使失败也要把已有文本带上: 里面含"用户答复了什么"，
             //   否则模型完全不知道刚才发生过一次确认。
-            if (!outcome.text.empty()) {
-                result.content = tools::tool_result::text(outcome.text).content;
+            if (!accumulated.empty()) {
+                result.content = tools::tool_result::text(accumulated).content;
             }
         }
 
@@ -3648,10 +3702,10 @@ void ReactEngine::handle_tool_interrupt(tools::ToolResult& result,
 
         // ⚠ 每轮开头重新检查 abort: 用户可能在上一轮 resume 期间点了停止，
         //   此时不该再弹下一轮追问。
+        //   ★ 走 bail 以保住已完成轮次的产出 —— 用户中止的是"后续确认"，
+        //     不是"已经生效的前几轮"。
         if (cancelled_.load()) {
-            result.success = false;
-            result.error = "用户确认被取消（运行已中止）";
-            result.interrupt.reset();
+            bail("用户确认被取消（运行已中止）");
             return;
         }
     }

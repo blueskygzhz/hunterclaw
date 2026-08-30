@@ -22,6 +22,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 using namespace hunterclaw;
 using namespace hunterclaw::tools;
@@ -550,6 +551,123 @@ static void test_abort_mid_rounds() {
     c.reset_for_testing();
 }
 
+// ── 并行工具调用: N 个 a2a 同时中断 ─────────────────────────────────────────
+//
+// ★★ 这是 ReactEngine 并行路径 (react_engine.cc:2689) 的真实场景:
+//   模型一次发起 N 个 remote_a2a 工具，每个远端都返回 input-required。
+//   N 个 lambda 跑在【同一个线程池】上并发调用 handle_tool_interrupt。
+//
+// 设计取舍: 每会话只有一个槽位 —— 第一个抢到的真的问用户，
+//   其余 fail-closed 让模型重试。
+//   ⚠ 刻意不排队: 排队会让 N 个工具各等最长 900s 并占满线程池，
+//     连不相关的工具都无法执行。
+static void test_parallel_interrupts() {
+    SECTION("并行工具同时中断（每会话单槽位）");
+    auto& c = InterruptCoordinator::instance();
+    c.reset_for_testing();
+
+    c.register_resume_handler("ra2a.par",
+        [](const ToolInterrupt&, const std::string& t,
+           const std::atomic<bool>*) -> ResumeOutcome {
+            ResumeOutcome o;
+            o.success = true;
+            o.text = "远端已继续: " + t;
+            return o;
+        });
+
+    constexpr int kN = 6;
+    std::atomic<int> got_slot{0};      // 抢到槽位的工具数
+    std::atomic<int> rejected{0};      // fail-closed 的工具数
+    std::atomic<bool> cancelled{false};
+
+    std::vector<std::thread> tools;
+    for (int i = 0; i < kN; ++i) {
+        tools.emplace_back([&c, &got_slot, &rejected, &cancelled]() {
+            // 复刻 handle_tool_interrupt 的 ① 号步骤
+            auto w = c.begin_wait("sess-par");
+            if (!w.valid()) {
+                rejected.fetch_add(1);
+                return;  // fail-closed，交给模型重试
+            }
+            got_slot.fetch_add(1);
+            auto ans = w.wait(4000, &cancelled);
+            if (ans.has_value()) {
+                ToolInterrupt it;
+                it.kind = "ra2a.par";
+                it.resume_token = "tok";
+                (void)c.resume(it, *ans, &cancelled);
+            }
+            w.release();
+        });
+    }
+
+    // 等这批线程把槽位争完
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    // ★★ 有且只有一个占到槽位 —— 这是并行安全的核心断言
+    CHECK(got_slot.load() == 1, "并行 6 个中断只有 1 个占到槽位 [不可回退]");
+    CHECK(c.has_pending("sess-par"), "该会话确有待答确认");
+
+    // 用户答一次，只应喂给那一个
+    CHECK(c.claim_answer("sess-par", "确认"), "答复被唯一持槽者认领");
+    CHECK(!c.claim_answer("sess-par", "再确认"),
+          "同一槽位不重复认领（否则第二条静默消失）[不可回退]");
+
+    for (auto& t : tools) t.join();
+    CHECK(rejected.load() == kN - 1, "其余 5 个 fail-closed（未静默丢弃）[不可回退]");
+    CHECK(!c.has_pending("sess-par"), "收束后槽位释放");
+
+    // ── 槽位可被后来者复用（前一个已 release）────────────────────────────
+    // ⚠ 若 release 的 seq 比对写错，这里会拿不到槽位 ——
+    //   表现为"第一次并行确认之后，该会话再也无法发起任何确认"。
+    {
+        auto w2 = c.begin_wait("sess-par");
+        CHECK(w2.valid(), "前一轮释放后，新中断可占槽位 [不可回退]");
+        w2.release();
+    }
+
+    c.reset_for_testing();
+}
+
+// ── 并行 + 不同会话互不干扰 ─────────────────────────────────────────────────
+//
+// ⚠ 槽位按 session_key 分桶。若实现写成全局单槽，多用户并发时
+//   A 用户的确认会把 B 用户的顶掉 —— 这是跨会话串话，很严重。
+static void test_parallel_multi_session() {
+    SECTION("并行 + 多会话隔离");
+    auto& c = InterruptCoordinator::instance();
+    c.reset_for_testing();
+
+    constexpr int kSessions = 5;
+    std::atomic<int> ok{0};
+    std::atomic<bool> cancelled{false};
+    std::vector<std::thread> ts;
+
+    for (int s = 0; s < kSessions; ++s) {
+        ts.emplace_back([&c, &ok, &cancelled, s]() {
+            const std::string key = "sess-" + std::to_string(s);
+            auto w = c.begin_wait(key);
+            if (!w.valid()) return;
+            auto ans = w.wait(4000, &cancelled);
+            if (ans.has_value() && *ans == ("ans-" + std::to_string(s))) {
+                ok.fetch_add(1);  // ★ 收到的必须是【本会话】的答复
+            }
+            w.release();
+        });
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    for (int s = 0; s < kSessions; ++s) {
+        CHECK(c.claim_answer("sess-" + std::to_string(s), "ans-" + std::to_string(s)),
+              "会话 " + std::to_string(s) + " 独立认领");
+    }
+    for (auto& t : ts) t.join();
+
+    CHECK(ok.load() == kSessions,
+          "每个会话各自拿到自己的答复（无跨会话串话）[不可回退]");
+
+    c.reset_for_testing();
+}
+
 int main() {
     std::cout << "=== 工具中断（interrupt）闭环测试 ===" << std::endl;
     test_slots();
@@ -560,6 +678,8 @@ int main() {
     test_multi_round();
     test_round_cap();
     test_abort_mid_rounds();
+    test_parallel_interrupts();
+    test_parallel_multi_session();
     std::cout << "\n=== 结果: " << g_pass << " 通过, " << g_fail << " 失败 ===" << std::endl;
     return g_fail == 0 ? 0 : 1;
 }
