@@ -71,6 +71,24 @@ constexpr size_t TOOL_NAME_MAX_TOTAL = 64;
 std::string safe_remote_a2a_tool_name(const std::string& agent_name,
                                      std::vector<std::string>& reserved);
 
+// ── 进度投递 ────────────────────────────────────────────────────────────────
+
+/// 把远端进度/提示作为系统事件投给指定会话。
+///
+/// ★ 定义在 agent_tool.cc，但【不】只服务工具内部：
+///   agent_registry.cc 的挂起态主动通知（SSE/回调/后台跟进三条异步通道）
+///   同样要复用它 —— 那三条通道在别的线程上发现远端挂起，此时已没有
+///   tool_call 在等结果，只能靠这条推送让用户知道"远端在等你"。
+///
+/// @param session_key  目标会话。空 = 直接返回（无处可投）。
+/// @param agent_name   归属远端名，用于事件前缀 "[remote-a2a:<name>]"。
+/// @param text         投递文本；超过 300 字符会被截断（远端可控文本，
+///                     不能整段塞进 prompt）。
+/// @param is_heartbeat true = 心跳，会被 system_events 按 context_key 去重，
+///                     避免把真正的事件（完成/失败）挤出 20 条上限的队列。
+void deliver_progress(const std::string& session_key, const std::string& agent_name,
+                      const std::string& text, bool is_heartbeat);
+
 // ── 单个远端的策略（★ 全部来自本地配置，不从卡读）────────────────────────
 
 struct AgentToolPolicy {

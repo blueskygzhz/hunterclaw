@@ -576,5 +576,131 @@ tools::ToolResult RemoteA2aCancelTool::execute(const core::JsonValue& params,
     return res;
 }
 
+// ── interrupt 上抛（remote_a2a ←→ ReactEngine 的接缝）──────────────────────
+
+std::optional<tools::ToolInterrupt> build_interrupt_from_result(
+    const ExecutionResult& r, const std::string& agent_name) {
+    // ⚠ 缺恢复凭据（handle）时【绝不】产出 interrupt:
+    //   那只会让用户白答一次，而答复无处可去（resume 时反查不到任务）。
+    if (!r.is_suspended() || r.handle.empty()) return std::nullopt;
+
+    tools::ToolInterrupt it;
+    it.kind = kRemoteA2aInterruptKind;
+    // ★ resume_token = handle: InterruptCoordinator 只透传，含义由本子系统定义
+    it.resume_token = r.handle;
+
+    // ★ 必须自包含 —— 用户看到的就只有 prompt 这一段。
+    //   prompt_text 是远端 status.message 里的追问；text 是已完成的部分结果。
+    //   ⚠ 两者【不能】合并（见 ExecutionResult 的说明），只有在追问缺失时
+    //     才退而求其次用正文，再没有才用兜底文案。
+    std::string body = r.prompt_text;
+    if (body.empty()) body = r.text;
+    if (body.empty()) body = "远端 agent 需要你补充信息后才能继续";
+    it.prompt = "[remote-a2a:" + agent_name + "] " + body;
+
+    it.requires_user_action = r.requires_user_action;
+    // ★ 只透传，不解析含义（远端与终端之间的约定）
+    it.token_ids = r.pending_token_ids;
+    // options 刻意留空: 远端 input-required 给的是自由文本追问，
+    // 我们【不】替它编造选项 —— 编错等于替用户做决定。
+
+    return it;
+}
+
+// ── 恢复函数注册 ────────────────────────────────────────────────────────────
+
+void register_remote_a2a_resume_handler(std::shared_ptr<RemoteA2aRegistry> registry) {
+    if (!registry) return;
+
+    // ⚠ weak_ptr 捕获: InterruptCoordinator 是进程级单例，生命周期长于 registry。
+    //   捕 shared_ptr 会让第一个 registry 永不析构（连带它的 sweep 线程与全部
+    //   runtime），且恢复路由永远指向它。
+    std::weak_ptr<RemoteA2aRegistry> weak = registry;
+
+    // ★ 注册失败（同 kind 重复注册）是【预期内】的: 热重载/多次 setup 时
+    //   coordinator 会保留第一个。这里不报错也不覆盖 —— 覆盖会让已在等待的
+    //   中断恢复到另一个 registry 上。
+    tools::InterruptCoordinator::instance().register_resume_handler(
+        kRemoteA2aInterruptKind,
+        [weak](const tools::ToolInterrupt& interrupt, const std::string& user_text,
+               const std::atomic<bool>* aborted) -> tools::ResumeOutcome {
+            tools::ResumeOutcome out;
+
+            // ★ 先查 abort: 用户已经点了停止，此时还往远端发一条"确认"，
+            //   等于把取消动作执行成了提交动作。
+            if (aborted && aborted->load()) {
+                out.error = "运行已中止，答复未提交给远端";
+                return out;
+            }
+
+            auto reg = weak.lock();
+            if (!reg) {
+                out.error = "remote_a2a 注册表已不可用（进程正在关闭或配置已重载）";
+                return out;
+            }
+
+            const std::string& handle = interrupt.resume_token;
+            if (handle.empty()) {
+                out.error = "中断缺少恢复凭据（handle），无法定位远端任务";
+                return out;
+            }
+
+            // ★ 按 handle 反查引擎，而不是把引擎指针塞进 resume_token ——
+            //   token 会进 transcript，必须保持可序列化。
+            auto engine = reg->engine_for_handle(handle);
+            if (!engine) {
+                out.error = "未找到该远端任务对应的引擎（远端可能已从配置中移除）";
+                return out;
+            }
+
+            std::optional<PendingTask> snap;
+            if (auto store = reg->store()) snap = store->get(handle);
+            if (!snap) {
+                out.error = "远端任务记录已不存在（可能已被清理或进程已重启）";
+                return out;
+            }
+
+            const std::string answer =
+                tools::InterruptCoordinator::match_option(interrupt, user_text);
+            if (answer.empty()) {
+                out.error = "答复为空，未提交给远端";
+                return out;
+            }
+
+            // ★★ 必须带上 task_id / context_id —— 这是"续接"而不是"新开一单"。
+            //   ⚠ 漏掉 task_id 的后果不是"多问一次"，而是远端新建一个 task:
+            //   用户这句"确认"落进全新上下文，副作用（发邮件、下单等）
+            //   可能被再执行一次，二次确认的意义被彻底摧毁。
+            Message msg = build_user_message(answer, snap->task_id, snap->context_id);
+
+            // ⚠ agent 名从快照取: 恢复路径是【跨 agent】的（按 handle 定位），
+            //   空名字会让用户看到一条来源不明的进度。
+            const std::string agent_name = snap->agent_name;
+            const std::string sess = snap->session_key;
+            ProgressFn on_progress = [agent_name, sess](const std::string& text, bool hb) {
+                deliver_progress(sess, agent_name, text, hb);
+            };
+
+            ExecutionResult r = engine->execute(msg, snap->session_key, on_progress);
+
+            if (!r.success) {
+                out.error = r.error_text.empty() ? "远端 A2A 调用失败" : r.error_text;
+                return out;
+            }
+
+            out.success = true;
+            // ★ 复用工具出口的同一份渲染: 模型看到的就是工具正常返回时会看到
+            //   的那段文本（含 handle / 下一轮追问）。另起一套措辞会让同一件
+            //   事在 transcript 里出现两种说法，模型据此做决策会分叉。
+            out.text = r.render();
+
+            // ★ 多轮确认: 又挂起了就交回 ReactEngine 的下一轮循环处理。
+            //   ⚠ 这里【不递归】—— 递归会让单次工具调用无界占用 main lane，
+            //     且中间的 resume 无法被 abort 打断。
+            out.next_interrupt = build_interrupt_from_result(r, agent_name);
+            return out;
+        });
+}
+
 }  // namespace remote_a2a
 }  // namespace hunterclaw
