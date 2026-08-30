@@ -125,6 +125,23 @@ static int run_acp_stdio(int argc, char** argv) {
    } catch (...) { return false; }
   };
 
+    // ── sessions.patch：对齐 OC translator.ts:587-590 / 617-620 ─────────────────
+    // ⚠ 这里【刻意不吞异常】—— 与上面 approval 两个回调不同。
+    //   真源 :599-602 明确把 gateway 错误向上传播给客户端。
+    //   吞掉的后果: 客户端收到"设置成功"，但 thinking level 根本没变，
+    //   用户会反复切换并困惑为什么没有效果（静默失效）。
+    deps.session_patch = [gw](const std::string& session_key,
+                              const nlohmann::json& patch) {
+        nlohmann::json params = patch;
+        params["key"] = session_key;   // ★ 対齐真源 { key, ...patch }
+        auto rr = gw->request("sessions.patch", params);
+        if (!rr.ok) {
+            throw std::runtime_error(
+                "sessions.patch failed: " +
+                (rr.error.empty() ? std::string("gateway rejected") : rr.error));
+        }
+    };
+
     // 🎯 gateway 事件回流出参：serve_acp_stdio 内部创建 agent 后写入 forwarder，
     //   gopts.on_event 通过 event_forwarder 把事件回流到 translator。
     deps.event_forwarder = event_forwarder;

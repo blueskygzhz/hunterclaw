@@ -119,6 +119,7 @@ void serve_acp_stdio(const AcpServerOptions& opts, const AcpStdioServerDeps& dep
  if (deps.cancel_dispatch) agent->set_cancel_dispatch(deps.cancel_dispatch);
   if (deps.approval_details) agent->set_approval_details(deps.approval_details);
     if (deps.approval_resolve) agent->set_approval_resolve(deps.approval_resolve);
+    if (deps.session_patch) agent->set_session_patch(deps.session_patch);
 
     AcpGatewayAgent* ag = agent.get();
 

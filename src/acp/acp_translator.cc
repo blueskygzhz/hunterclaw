@@ -154,6 +154,8 @@ AcpStdioConnection* connection = nullptr;
     // 🎯 approval 中继回调（接 gateway exec.approval.get/resolve）
     ApprovalDetailsFn approval_details;
     ApprovalResolveFn approval_resolve;
+    // 🎯 sessions.patch 回调（接 gateway，对齐 OC translator.ts:587/617）
+    SessionPatchFn session_patch;
     // 🎯 对齐 OC approvalRelays（approvalId → relay）
     std::map<std::string, PendingApprovalRelay> approval_relays;
 };
@@ -252,6 +254,11 @@ void AcpGatewayAgent::set_approval_details(ApprovalDetailsFn fn) {
 void AcpGatewayAgent::set_approval_resolve(ApprovalResolveFn fn) {
  std::lock_guard<std::mutex> lk(impl_->mu);
     impl_->approval_resolve = std::move(fn);
+}
+
+void AcpGatewayAgent::set_session_patch(SessionPatchFn fn) {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    impl_->session_patch = std::move(fn);
 }
 
 // 🎯 对齐 OC: sessionUpdates.emit — 发 session/update notification
@@ -847,35 +854,138 @@ void AcpGatewayAgent::handle_gateway_disconnect(const std::string& /*reason*/) {
 }
 
 // ── handleSetSessionMode ─────────────────────────────────────────────────────
+// 🎯 严格対齐 OC translator.ts:578-604
+//
+// ⚠ 此前只做"查 session + 返回 default presentation"，
+//   【完全没有】把 mode_id 写到任何地方 —— 用户在编辑器里切 thinking level，
+//   接口返回成功，但 Gateway 侧毫无变化，presentation 里 current_mode_id
+//   永远是 "adaptive"。静默失效：客户端以为设置生效了。
+//
+// 真源三个动作，顺序不可换：
+//   ① modeId 为空 → 直接返回 {}（対齐:583-585，【不】发请求）
+//   ② sessions.patch { key, thinkingLevel }（対齐:587-590）
+//   ③ 用 override 重算 presentation 并 session/update 推送（対齐:592-598）
 SetSessionModeResponse AcpGatewayAgent::handle_set_session_mode(
     const SetSessionModeRequest& req) {
     auto session = impl_->session_store->get_session(req.session_id);
     if (!session)
         throw AcpRuntimeError(AcpErrorCode::ACP_SESSION_INIT_FAILED, "Session not found");
-    auto pres = build_session_presentation_default();
+
+    // ★ 対齐:583-585 —— 空 modeId 提前返回，且【不】发任何 gateway 请求。
+    //   ⚠ 不能当成错误抛出: 真源明确 resolves 成 {}（见
+    //     translator.set-session-mode.test.ts:86-92 "returns early for empty modeId"，
+    //     并断言 calls 为空）。
+    if (req.mode_id.empty()) return SetSessionModeResponse{};
+
+    SessionPatchFn patch_fn;
+    {
+        std::lock_guard<std::mutex> lk(impl_->mu);
+        patch_fn = impl_->session_patch;
+    }
+    // ⚠ 没有注入通道时必须报错，【不能】返回成功 ——
+    //   静默成功会让客户端以为已生效（这正是修复前的行为）。
+    if (!patch_fn)
+        throw AcpRuntimeError(AcpErrorCode::ACP_INVALID_RUNTIME_OPTION,
+                              "sessions.patch channel not wired: cannot apply session mode");
+
+    // ★ 対齐:587-590 —— thinkingLevel 就是 modeId 本身（不做映射）。
+    //   ⚠ 失败必须向上传播（対齐:599-602），吞掉等于谎报成功。
+    patch_fn(session->session_key, nlohmann::json{{"thinkingLevel", req.mode_id}});
+
+    // ★ 対齐:592-598 —— 带 override 重算 presentation 并推送 session/update。
+    //   ⚠ 用 override 而非再查一次 gateway: 真源传
+    //     { thinkingLevel: params.modeId } 作为 overrides，
+    //     因为 patch 刚生效、快照可能还是旧值（读己之写不保证）。
+    auto pres = build_session_presentation_override(req.mode_id);
+    send_session_presentation_update(session->session_id, pres);
+
     return SetSessionModeResponse{pres.modes, pres.config_options};
 }
 
 // ── handleSetSessionConfigOption ─────────────────────────────────────────────
+// 🎯 严格対齐 OC translator.ts:606-640 + resolveSessionConfigPatch(:1637-1700)
+//
+// ⚠ 此前同样只校验参数就返回 default presentation，设置从不落地。
 SetSessionConfigOptionResponse AcpGatewayAgent::handle_set_session_config_option(
     const SetSessionConfigOptionRequest& req) {
     auto session = impl_->session_store->get_session(req.session_id);
     if (!session)
         throw AcpRuntimeError(AcpErrorCode::ACP_SESSION_INIT_FAILED, "Session not found");
-    if (req.option_id != CFG_THOUGHT_LEVEL && req.option_id != CFG_FAST_MODE &&
-        req.option_id != CFG_VERBOSE_LEVEL && req.option_id != CFG_REASONING &&
-        req.option_id != CFG_USAGE && req.option_id != CFG_ELEVATED)
+
+    // ★ 対齐 resolveSessionConfigPatch —— configId → gateway 字段名的映射。
+    //   ⚠ 字段名【不等于】configId: thought_level → thinkingLevel、
+    //     verbose_level → verboseLevel …… 直接把 configId 当字段名发过去，
+    //     gateway 会静默忽略未知字段（又是一次"看起来成功"）。
+    nlohmann::json patch;
+    std::string override_thinking;
+    if (req.option_id == CFG_THOUGHT_LEVEL) {
+        patch["thinkingLevel"] = req.value;
+        override_thinking = req.value;
+    } else if (req.option_id == CFG_FAST_MODE) {
+        patch["fastMode"] = req.value;
+    } else if (req.option_id == CFG_VERBOSE_LEVEL) {
+        patch["verboseLevel"] = req.value;
+    } else if (req.option_id == CFG_REASONING) {
+        patch["reasoningLevel"] = req.value;
+    } else if (req.option_id == CFG_USAGE) {
+        // ★ 対齐:1680-1685 —— "inherit" 映射为 JSON null（清除覆盖），
+        //   ⚠ 不是字符串 "inherit"。发字符串过去会被存成字面值，
+        //     从此该会话的 usage 永远显示 "inherit" 而非继承全局设置。
+        if (req.value == "inherit") patch["responseUsage"] = nullptr;
+        else patch["responseUsage"] = req.value;
+    } else if (req.option_id == CFG_ELEVATED) {
+        patch["elevatedLevel"] = req.value;
+    } else {
+        // ★ 対齐:1697-1698 default 分支 —— 未知 configId 直接拒绝。
         throw AcpRuntimeError(AcpErrorCode::ACP_INVALID_RUNTIME_OPTION,
                               "Unknown config option: " + req.option_id);
-    auto pres = build_session_presentation_default();
+    }
+
+    SessionPatchFn patch_fn;
+    {
+        std::lock_guard<std::mutex> lk(impl_->mu);
+        patch_fn = impl_->session_patch;
+    }
+    if (!patch_fn)
+        throw AcpRuntimeError(AcpErrorCode::ACP_INVALID_RUNTIME_OPTION,
+                              "sessions.patch channel not wired: cannot apply config option");
+
+    // ★ 対齐:616-621 —— 仅当 patch 非空才发请求。
+    //   （真源里 timeout 类 configId 只有 overrides、没有 patch，故需此判断）
+    if (!patch.empty()) patch_fn(session->session_key, patch);
+
+    auto pres = override_thinking.empty()
+                    ? build_session_presentation_default()
+                    : build_session_presentation_override(override_thinking);
+    send_session_presentation_update(session->session_id, pres);
+
     return SetSessionConfigOptionResponse{pres.config_options, pres.modes};
 }
 
-// ── buildSessionPresentation (default, no gateway query) ─────────────────────
+// ── buildSessionPresentation ─────────────────────────────────────────────────
+// 🎯 対齐 OC getSessionSnapshot(sessionKey, overrides)
+//
+// ★ 単一実装 + override 参数，【不】复制两份 level 列表 ——
+//   复制会让"新增一个 thinking level"必须改两处，漏一处就出现
+//   "模式列表里有、但切过去 current_mode_id 对不上"的诡异现象。
 SessionPresentation AcpGatewayAgent::build_session_presentation_default() {
+    return build_session_presentation_override("");
+}
+
+SessionPresentation AcpGatewayAgent::build_session_presentation_override(
+    const std::string& thinking_override) {
     SessionPresentation p;
-    std::string cm = "adaptive";
     std::vector<std::string> lvls = {"adaptive","off","minimal","low","medium","high","xhigh"};
+
+    // ★ override 生效的前提是它确实在合法集合内 ——
+    //   ⚠ 不校验就直接采用，客户端传一个 "turbo" 会让 current_mode_id
+    //     指向一个 available_modes 里不存在的 id，编辑器 UI 会显示空选中态。
+    std::string cm = "adaptive";
+    if (!thinking_override.empty() &&
+        std::find(lvls.begin(), lvls.end(), thinking_override) != lvls.end()) {
+        cm = thinking_override;
+    }
+
     p.modes.current_mode_id = cm;
     for (auto& l : lvls) {
         SessionMode m;
@@ -898,6 +1008,38 @@ SessionPresentation AcpGatewayAgent::build_session_presentation_default() {
     p.config_options.push_back(build_select_config_option(CFG_ELEVATED,
         "Elevated actions", "", "Controls elevated execution.", "off", {"off","on","ask","full"}));
     return p;
+}
+
+// 🎯 対齐 OC sendSessionSnapshotUpdate(session, snapshot, {includeControls:true})
+//
+// ⚠ 真源在 setSessionMode / setSessionConfigOption 成功后【必须】推这条
+//   session/update —— 否则客户端界面上的选中态不会刷新，用户看到自己刚
+//   点的选项没被选中，会以为设置失败并反复点击。
+void AcpGatewayAgent::send_session_presentation_update(
+    const std::string& session_id, const SessionPresentation& pres) {
+    nlohmann::json modes = nlohmann::json::object();
+    modes["currentModeId"] = pres.modes.current_mode_id;
+    nlohmann::json avail = nlohmann::json::array();
+    for (const auto& m : pres.modes.available_modes) {
+        avail.push_back({{"id", m.id}, {"name", m.name}, {"description", m.description}});
+    }
+    modes["availableModes"] = std::move(avail);
+
+    nlohmann::json opts = nlohmann::json::array();
+    for (const auto& o : pres.config_options) {
+        nlohmann::json vals = nlohmann::json::array();
+        for (const auto& v : o.options) {
+            vals.push_back({{"value", v.value}, {"name", v.name}});
+        }
+        opts.push_back({{"type", o.type}, {"id", o.id}, {"name", o.name},
+                        {"category", o.category}, {"description", o.description},
+                        {"currentValue", o.current_value}, {"options", std::move(vals)}});
+    }
+
+    emit_session_update(session_id, nlohmann::json{
+        {"sessionUpdate", "current_mode_update"},
+        {"modes", std::move(modes)},
+        {"configOptions", std::move(opts)}});
 }
 
 SessionConfigOption AcpGatewayAgent::build_select_config_option(

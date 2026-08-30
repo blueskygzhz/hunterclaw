@@ -401,6 +401,21 @@ using ApprovalDetailsFn = std::function<nlohmann::json(const std::string& approv
 using ApprovalResolveFn = std::function<bool(
     const std::string& approval_id, const std::string& decision)>;
 
+// 🎯 会话补丁回调（注入式）：对齐 OC gateway.request("sessions.patch", {key, ...patch})。
+//
+// ⚠ 这条通道此前【完全缺失】—— handle_set_session_mode /
+//   handle_set_session_config_option 只做参数校验就返回 default presentation，
+//   用户在编辑器里切 thinking level 接口返回成功，但 Gateway 侧毫无变化，
+//   且 presentation 里 current_mode_id 永远是 "adaptive"。
+//   静默失效：客户端以为设置生效了，实际什么都没发生。
+//
+// 真源 translator.ts:587-590 / 617-620 都是 sessions.patch。
+// 入参：session_key + patch 对象（如 {"thinkingLevel":"high"}）。
+// @throws 实现方应在 gateway 拒绝时抛异常 —— 真源 :599-602 明确向上传播，
+//         不可吞掉（吞掉就等于告诉客户端"设置成功了"）。
+using SessionPatchFn = std::function<void(
+    const std::string& session_key, const nlohmann::json& patch)>;
+
 // ── AcpGatewayAgent ──────────────────────────────────────────────────────────
 
 class AcpGatewayAgent {
@@ -423,6 +438,11 @@ public:
     // 用于 session/request_permission 反向权限链路。
     void set_approval_details(ApprovalDetailsFn fn);
 void set_approval_resolve(ApprovalResolveFn fn);
+
+    // 🎯 注入 sessions.patch 回调（接 gateway）。
+    // ⚠ 未注入时 setSessionMode / setSessionConfigOption 会抛错而【不是】
+    //   静默返回成功 —— 后者会让客户端以为设置已生效（对齐真源的错误传播）。
+    void set_session_patch(SessionPatchFn fn);
 
     InitializeResponse handle_initialize(const InitializeRequest& req);
     AuthenticateResponse handle_authenticate(const AuthenticateRequest& req);
@@ -450,6 +470,20 @@ private:
     std::unique_ptr<Impl> impl_;
 
     SessionPresentation build_session_presentation_default();
+
+    // 🎯 対齐 OC getSessionSnapshot(sessionKey, { thinkingLevel })。
+    // thinking_override 为空或不在合法集合内时退回 "adaptive"。
+    // ⚠ 必须校验合法性: 未知值会让 current_mode_id 指向 available_modes
+    //   里不存在的 id，编辑器 UI 显示空选中态。
+    SessionPresentation build_session_presentation_override(
+        const std::string& thinking_override);
+
+    // 🎯 対齐 OC sendSessionSnapshotUpdate(..., {includeControls:true})。
+    // ⚠ setSessionMode / setSessionConfigOption 成功后必须推送，
+    //   否则客户端选中态不刷新，用户以为设置失败会反复点击。
+    void send_session_presentation_update(const std::string& session_id,
+                                         const SessionPresentation& pres);
+
     SessionConfigOption build_select_config_option(
         const std::string& id, const std::string& name, const std::string& category,
         const std::string& description, const std::string& current_value,

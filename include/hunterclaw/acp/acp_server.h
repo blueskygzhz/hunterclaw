@@ -31,6 +31,12 @@ struct AcpStdioServerDeps {
     ApprovalDetailsFn approval_details; // 可选：exec.approval.get
     ApprovalResolveFn approval_resolve; // 可选：exec.approval.resolve
 
+    // 🎯 sessions.patch（対齐 OC translator.ts:587-590 / 617-620）。
+    // ⚠ 不注入时 setSessionMode / setSessionConfigOption 会【报错】而不是
+    //   静默返回成功 —— 后者会让客户端以为 thinking level 已切换，
+    //   而 Gateway 侧毫无变化（修复前的行为）。
+    SessionPatchFn session_patch;       // 可选：sessions.patch
+
     // 🎯 gateway 事件回流出参：serve_acp_stdio 在内部创建 agent 后，
     //   会把一个"事件转发器"写入该 shared_ptr，供调用方在 gateway on_event
     //   回调中调用，从而把 chat 流 / approval 事件回流到 translator，

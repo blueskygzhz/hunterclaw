@@ -19,10 +19,14 @@
 // ============================================================================
 
 #include <iostream>
+#include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "hunterclaw/acp/acp_client.h"
 #include "hunterclaw/acp/acp_conversation_id.h"
+#include "hunterclaw/acp/acp_server.h"
 #include "hunterclaw/acp/acp_session_mapper.h"
 #include "hunterclaw/acp/acp_tool_status.h"
 #include "hunterclaw/acp/acp_translator.h"
@@ -636,6 +640,173 @@ int main() {
         // 未知 state 走 final 分支（真源的 if/else 结构隐含此兜底）
         CHECK(map_acp_stop_reason_for_state("delta", "max_tokens", "") == "max_tokens",
               "未知 state 按 final 语义处理");
+    }
+
+    // =======================================================================
+    // setSessionMode / setSessionConfigOption（対齐 translator.ts:578-640
+    //   + resolveSessionConfigPatch :1637-1700
+    //   + translator.set-session-mode.test.ts 的三个 case）
+    //
+    // ★★ 这两个接口此前【只校验参数就返回 default presentation】——
+    //   完全没有把 mode_id / value 写到任何地方。用户在编辑器里切
+    //   thinking level，接口返回成功，Gateway 侧毫无变化，
+    //   presentation 里 current_mode_id 永远是 "adaptive"。
+    //   ⚠ 静默失效: 客户端以为设置生效了，没有任何报错。
+    std::cout << "\n== setSessionMode / setSessionConfigOption（対齐 :578-640）==\n";
+    {
+        acp::AcpServerOptions opts;
+        auto store = acp::create_default_session_store();
+        acp::AcpGatewayAgent agent(nullptr, opts, store.get());
+
+        // 记录所有 sessions.patch 调用（対齐真源测试的 createRequestRecorder）
+        std::vector<std::pair<std::string, json>> patches;
+        bool fail_next = false;
+        agent.set_session_patch(
+            [&patches, &fail_next](const std::string& key, const json& p) {
+                patches.emplace_back(key, p);
+                if (fail_next) throw std::runtime_error("gateway rejected mode change");
+            });
+
+        auto sess = store->create_session("agent:main:main", "/tmp");
+
+        // ── case 1: 空 modeId 提前返回，且【不发任何请求】────────────────
+        // 対齐 set-session-mode.test.ts:86-92（断言 calls 为空）
+        {
+            acp::SetSessionModeRequest r;
+            r.session_id = sess.session_id;
+            r.mode_id = "";
+            agent.handle_set_session_mode(r);
+            CHECK(patches.empty(),
+                  "**关键**：空 modeId 不发 sessions.patch（対齐:583-585）");
+        }
+
+        // ── case 2: 正常切换 → sessions.patch{key,thinkingLevel} ─────────
+        // 対齐 set-session-mode.test.ts:60-84
+        {
+            acp::SetSessionModeRequest r;
+            r.session_id = sess.session_id;
+            r.mode_id = "low";
+            auto resp = agent.handle_set_session_mode(r);
+            CHECK(patches.size() == 1, "发出了一次 sessions.patch");
+            if (patches.size() == 1) {
+                CHECK(patches[0].first == "agent:main:main",
+                      "patch 带正确 session_key");
+                CHECK(patches[0].second.value("thinkingLevel", "") == "low",
+                      "**关键**：字段名是 thinkingLevel（不是 modeId/thought_level）");
+                CHECK(patches[0].second.value("key", "") == "agent:main:main",
+                      "patch 内含 key（対齐 { key, ...patch }）");
+            }
+            // ★★ presentation 必须反映新值 —— 修复前永远是 "adaptive"
+            CHECK(resp.modes.current_mode_id == "low",
+                  "**关键**：current_mode_id 反映新模式（修复前恒为 adaptive）");
+        }
+
+        // ── case 3: gateway 拒绝 → 异常向上传播 ─────────────────────────
+        // 対齐 set-session-mode.test.ts:40-58（rejects.toThrow）
+        {
+            patches.clear();
+            fail_next = true;
+            acp::SetSessionModeRequest r;
+            r.session_id = sess.session_id;
+            r.mode_id = "high";
+            bool threw = false;
+            try { agent.handle_set_session_mode(r); }
+            catch (const std::exception&) { threw = true; }
+            CHECK(threw,
+                  "**关键**：gateway 失败必须抛出，不能谎报成功（対齐:599-602）");
+            fail_next = false;
+        }
+
+        // ── case 4: config option 的字段名映射 ──────────────────────────
+        // 対齐 resolveSessionConfigPatch:1649-1691
+        {
+            struct Case { const char* cfg; const char* field; };
+            const Case cases[] = {
+                {"thought_level",   "thinkingLevel"},
+                {"fast_mode",       "fastMode"},
+                {"verbose_level",   "verboseLevel"},
+                {"reasoning_level", "reasoningLevel"},
+                {"elevated_level",  "elevatedLevel"},
+            };
+            for (const auto& c : cases) {
+                patches.clear();
+                acp::SetSessionConfigOptionRequest r;
+                r.session_id = sess.session_id;
+                r.option_id = c.cfg;
+                r.value = "on";
+                try { agent.handle_set_session_config_option(r); } catch (...) {}
+                if (patches.size() == 1) {
+                    CHECK(patches[0].second.contains(c.field),
+                          std::string("configId ") + c.cfg + " → 字段 " + c.field);
+                } else {
+                    CHECK(false, std::string("configId ") + c.cfg + " 未发出 patch");
+                }
+            }
+        }
+
+        // ── case 5: response_usage 的 "inherit" → JSON null ─────────────
+        // 対齐:1680-1685
+        // ⚠ 发字符串 "inherit" 会被存成字面值，该会话的 usage 永远显示
+        //   "inherit" 而非继承全局设置。
+        {
+            patches.clear();
+            acp::SetSessionConfigOptionRequest r;
+            r.session_id = sess.session_id;
+            r.option_id = "response_usage";
+            r.value = "inherit";
+            try { agent.handle_set_session_config_option(r); } catch (...) {}
+            if (patches.size() == 1) {
+                CHECK(patches[0].second["responseUsage"].is_null(),
+                      "**关键**：inherit → JSON null（不是字符串 \"inherit\"）");
+            } else {
+                CHECK(false, "response_usage 未发出 patch");
+            }
+        }
+
+        // ── case 6: 未知 configId 拒绝（対齐:1697-1698 default 分支）────
+        {
+            patches.clear();
+            acp::SetSessionConfigOptionRequest r;
+            r.session_id = sess.session_id;
+            r.option_id = "no_such_option";
+            r.value = "x";
+            bool threw = false;
+            try { agent.handle_set_session_config_option(r); }
+            catch (const std::exception&) { threw = true; }
+            CHECK(threw, "未知 configId 抛错");
+            CHECK(patches.empty(), "未知 configId 不发 patch");
+        }
+
+        // ── case 7: 未注入 patch 通道时必须报错，不能静默成功 ───────────
+        // ⚠ 静默返回成功正是修复前的行为 —— 客户端以为已生效。
+        {
+            acp::AcpGatewayAgent bare(nullptr, opts, store.get());
+            auto s2 = store->create_session("agent:main:bare", "/tmp");
+            acp::SetSessionModeRequest r;
+            r.session_id = s2.session_id;
+            r.mode_id = "high";
+            bool threw = false;
+            try { bare.handle_set_session_mode(r); }
+            catch (const std::exception&) { threw = true; }
+            CHECK(threw,
+                  "**关键**：未接通道时报错而非静默成功（修复前的缺陷本体）");
+        }
+
+        // ── case 8: 非法 override 不污染 current_mode_id ────────────────
+        // ⚠ 未知值会让 current_mode_id 指向 available_modes 里不存在的 id，
+        //   编辑器 UI 显示空选中态。
+        {
+            patches.clear();
+            acp::SetSessionModeRequest r;
+            r.session_id = sess.session_id;
+            r.mode_id = "turbo";  // 不在合法集合内
+            auto resp = agent.handle_set_session_mode(r);
+            bool found = false;
+            for (const auto& m : resp.modes.available_modes)
+                if (m.id == resp.modes.current_mode_id) { found = true; break; }
+            CHECK(found,
+                  "**关键**：current_mode_id 始终在 available_modes 内");
+        }
     }
 
     // =======================================================================
