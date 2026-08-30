@@ -1,10 +1,12 @@
 #pragma once
 
 #include "hunterclaw/core/types.h"
+#include <atomic>
 #include <string>
 #include <vector>
 #include <map>
 #include <memory>
+#include <optional>
 #include <functional>
 #include <variant>
 
@@ -50,12 +52,59 @@ struct ToolResultContent {
     std::string mime_type;  // type=Image时使用
 };
 
+// ── ToolInterrupt ───────────────────────────────────────────────────────────
+// 工具中断：工具执行到一半，需要【用户】给出输入才能继续。
+//
+// ★★ 语义与 error 截然不同，绝不能混:
+//   error   = 这次调用失败了，模型应该换个做法或报告失败
+//   interrupt = 这次调用【没结束】，在等人；等到了就继续，结果照样返回
+//
+// ⚠⚠ 为什么必须是 ToolResult 上的独立通道，而不是在工具内部自己问:
+//   工具内部提问意味着"问谁、怎么投递、怎么收答复"这套逻辑要在每个
+//   需要它的工具里各写一遍；而且工具拿不到 run 的投递面（on_block_reply）
+//   与入站消息路由 —— 那两样都在 ReactEngine 手里。
+//   把 interrupt 原样上抛，由 ReactEngine 统一处理，是唯一不重复实现的路。
+//
+// ⚠⚠ interrupt 有值时 ReactEngine【不会】把本次结果喂回 LLM 再转一圈。
+//   否则模型会立刻代用户答"好的，确认" —— 那正是整条链路要防的事。
+struct ToolInterrupt {
+    /// 中断类型，决定恢复时路由到哪个 handler。
+    /// 例: "remote_a2a.input_required"
+    std::string kind;
+
+    /// 恢复凭据。对 remote_a2a 就是 handle。
+    /// ★ 由产出 interrupt 的工具定义含义，ReactEngine 只做透传。
+    std::string resume_token;
+
+    /// 投递给用户的追问原文。
+    /// ⚠ 必须自包含（要问什么说清楚）—— 用户看到的就只有这一段。
+    std::string prompt;
+
+    /// true = 必须由【用户】答复，模型不得代答。
+    /// false = 普通补充输入，模型可以代答（此时 ReactEngine 不中断，
+    ///         直接把结果喂回 LLM 让它自己接着做）。
+    ///
+    /// ★ 这个区分是刻意保留的: 对每个普通追问都去打扰用户，会让用户
+    ///   很快学会无脑回"好的"，那时真正需要人判断的那次也就失效了。
+    bool requires_user_action = false;
+
+    /// 枚举型选项（可空）。非空时提示词会列出编号供用户选。
+    std::vector<std::string> options;
+
+    /// 待确认凭据（如企微 token_id_list）。仅透传，不解析含义。
+    std::vector<std::string> token_ids;
+};
+
 // Tool执行结果
 struct ToolResult {
     std::vector<ToolResultContent> content;
     core::JsonValue details;  // 结构化元数据
     bool success = true;
     std::string error;
+
+    /// 工具中断（等用户输入）。见 ToolInterrupt 说明。
+    /// ★ 绝大多数工具永不设置它 —— 检查成本是一次 has_value()。
+    std::optional<ToolInterrupt> interrupt;
 };
 
 // Tool参数辅助函数
@@ -116,6 +165,34 @@ public:
     
     // 执行Tool
     virtual ToolResult execute(const core::JsonValue& params) = 0;
+
+    // 执行Tool（带运行取消标志）
+    //
+    // 🎯 严格对齐 OpenClaw 的工具执行签名:
+    //      execute: async (toolCallId, args, signal) => { ... }
+    //    (ask-user-tool.ts:555, common.ts:40/50 —— signal 是每个工具
+    //     execute 的第三个参数，可选，工具自行决定是否使用)
+    //
+    // ★★ 为什么必须是"重载 + 默认转发"而不是改 1 参版签名:
+    //   1 参版是纯虚函数，改签名会让【仓库里每一个工具】都编译不过。
+    //   OpenClaw 的 signal 本身也是 optional —— 不关心取消的工具直接忽略。
+    //   这里的默认实现转发到 1 参版，语义完全一致。
+    //
+    // ⚠⚠ 只有【会长时间阻塞】的工具需要覆写。不覆写的后果不是编译错误，
+    //   而是 chat.abort 之后该工具仍然挂满自己的超时 ——
+    //   对 remote_a2a 的用户提问来说是 900s，且这段时间占着 main lane
+    //   的唯一槽位（command_queue.cc:60-64 固定 lane 单 WorkerThread，
+    //   max_concurrent 对固定 lane 无效）。用户点了停止却要等 15 分钟。
+    //
+    // @param aborted 运行取消标志。非空且被置位时工具应尽快返回。
+    //        ★ 用 `const std::atomic<bool>*` 而非 bool&:
+    //          调用方可能没有取消源（单测、后台线程），nullptr 表达
+    //          "本次调用不可取消"比传一个永远为 false 的引用更明确。
+    virtual ToolResult execute(const core::JsonValue& params,
+                               const std::atomic<bool>* aborted) {
+        (void)aborted;
+        return execute(params);
+    }
     
     // 是否需要审批
     // 🎯 对齐 OpenClaw needsApproval。

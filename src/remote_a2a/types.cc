@@ -360,6 +360,10 @@ ParsedStreamEvent parse_stream_event(const nlohmann::json& j) {
             if (t.status.message) {
                 e.text = concat_text_parts(t.status.message->parts);
                 e.function_calls = extract_function_calls(t.status.message->parts);
+                // ★ 原样保留整个 Message —— confirm 信号（parts[].data /
+                //   parts[].metadata）不在 text 也不在 function_calls 里。
+                //   见 ParsedStreamEvent::status_message 的说明。
+                e.status_message = t.status.message;
             }
             // 完整 Task 的 artifacts 计入指纹
             for (const auto& a : t.artifacts) e.artifact_part_count += a.parts.size();
@@ -381,6 +385,9 @@ ParsedStreamEvent parse_stream_event(const nlohmann::json& j) {
                         e.has_status_message = true;
                         e.text = concat_text_parts(m.parts);
                         e.function_calls = extract_function_calls(m.parts);
+                        // ★ 同 Kind::Task —— StatusUpdate 才是 input-required
+                        //   在流式下最常见的载体，这里漏了就等于没修。
+                        e.status_message = std::move(m);
                     }
                 }
             }

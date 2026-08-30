@@ -63,6 +63,19 @@ public:
     ///   execute_tool 必须自带完整门禁 —— 安全默认值不能是"跳过检查"。
     struct ExecuteOptions {
         bool before_tool_call_applied = false;
+
+        /// 运行取消标志，透传给 Tool::execute(params, aborted)。
+        ///
+        /// 🎯 严格对齐 OpenClaw: signal 是每个工具 execute 的第三参数
+        ///   (ask-user-tool.ts:555 `execute: async (toolCallId, args, signal)`)。
+        ///
+        /// ★ 放进 ExecuteOptions 而不是再加一个重载: execute_tool 已经有
+        ///   三个重载了，第四个会让调用点更难看清自己走的是哪条路。
+        ///
+        /// ⚠⚠ 不传（nullptr）的后果不是编译错误，而是 chat.abort 之后
+        ///   长阻塞工具仍会挂满自己的超时。对 remote_a2a 的用户提问是 900s，
+        ///   且这段时间占着 main lane 的唯一槽位 —— 用户点了停止要等 15 分钟。
+        const std::atomic<bool>* aborted = nullptr;
     };
 
     ToolResult execute_tool(const std::string& name, const core::JsonValue& params,

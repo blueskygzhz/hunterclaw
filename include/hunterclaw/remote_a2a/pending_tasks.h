@@ -92,6 +92,46 @@ struct PendingTask {
     /// 远端侧的待确认凭据（透传给终端，我们不解析其含义）
     std::vector<std::string> pending_token_ids;
 
+    /// 是否已经为本任务向用户发起过提问。
+    ///
+    /// ★★ 这是【去重闸】。同一个挂起态可能被多条通道同时发现:
+    ///     · SSE  run_stream::on_event
+    ///     · 探测 run_probe → ingest_task
+    ///     · 回调 poll_once → ingest_task
+    ///     · 后台 background_loop → run_probe → ingest_task
+    ///     · 工具线程 try_resolve_input_required_via_question
+    ///   没有这个闸，用户会为同一件事被问 2~5 次；而 PendingQuestionRegistry
+    ///   每会话只允许一个 pending question，后来者全部注册失败并降级为
+    ///   "仅终端"，于是纯文本认领这条路对谁都不生效。
+    ///
+    /// ⚠ 只能通过 try_claim_question() 置位（CAS 语义），不要直接写。
+    bool question_raised = false;
+
+    /// 交互代号（每次续接 +1）。
+    ///
+    /// ★★ 解决「僵尸线程复活」: background_loop / run_probe 的退出判定
+    ///   发生在 interruptible_sleep 之后（退避最长 60s）。挂起时 phase 变
+    ///   Terminal，但线程可能正睡着；等它醒来时用户已经答复、续接已把
+    ///   phase 拉回 Running —— 于是老线程判定"任务还在跑"而继续探测，
+    ///   与新一轮抢同一条记录。
+    ///
+    ///   ⚠ 双线程同时探测的后果不是"慢一点"，而是:
+    ///     · consecutive_no_progress 被双倍推进 → 提前触顶 →
+    ///       【误判 Zombie 把正常任务杀掉】
+    ///     · fp 比较基准互相覆盖 → 推进判定错乱
+    ///     · live_threads_ 虚高 → shutdown 白等 grace
+    ///
+    /// ★ 线程启动时记下自己那一代，每轮循环校验 epoch 是否仍相符；
+    ///   不符即"我这一代已经结束了"，立刻退出。
+    uint64_t epoch = 0;
+
+    /// 本轮交互的起始时刻（每次续接刷新）。
+    ///
+    /// ⚠ 与 created_at_ms 分开: HardTimeout 必须按【本轮】计时。
+    ///   沿用 created_at_ms 会让多轮确认的任务在第二轮就被判超时 ——
+    ///   用户花 3 分钟考虑，这 3 分钟被算进远端的执行时限里。
+    int64_t turn_started_at_ms = 0;
+
     ProgressFingerprint fp;
     int consecutive_no_progress = 0;
 
@@ -134,6 +174,15 @@ public:
     /// 按句柄读取快照
     std::optional<PendingTask> get(const std::string& handle) const;
 
+    /// 取当前交互代号。
+    ///
+    /// ★ 供 background_loop / run_probe 在【每轮循环】校验自己是否已过期。
+    ///   ⚠ 不要用 get()->epoch 代替: get() 拷贝整条记录（含两个 vector
+    ///     与多个 string），而这个校验在退避循环里每轮都做。
+    ///
+    /// @return 0 表示记录不存在（调用方应视为"我该退出了"）
+    uint64_t current_epoch(const std::string& handle) const;
+
     /// 按远端 task_id 反查句柄（★ 回调只带 task_id，没有我们的句柄）
     std::optional<std::string> handle_of_task(const std::string& task_id) const;
 
@@ -159,6 +208,20 @@ public:
     ///   token_ids 为空时不覆盖已有值，同理。
     bool note_confirm_signal(const std::string& handle, bool requires_user_action,
                             const std::vector<std::string>& token_ids);
+
+    /// 抢占「为本任务发起提问」的权利（CAS 语义）。
+    ///
+    /// @return true = 抢到了，调用方负责发起提问；false = 别人已经在做
+    ///
+    /// ★★ 必须在【持锁】的同一临界区内完成"读旧值 + 置新值"。
+    ///   ⚠ 拆成 get() 判断 + 单独 set 会留下竞态窗口: SSE 线程与探测线程
+    ///     可能同时看到 false 然后都去提问 —— 而 PendingQuestionRegistry
+    ///     每会话只收一个，第二个静默降级成"仅终端"，纯文本认领对谁都不灵。
+    ///
+    /// ⚠ 抢到之后【不回滚】。提问失败也不重置 —— 重置会让下一次探测
+    ///   再问一遍，在无人应答的部署里变成每轮探测都推一次卡片。
+    ///   失败信息应通过工具结果文本告知模型，而不是靠重试提问。
+    bool try_claim_question(const std::string& handle);
 
     /// 标记终结。
     ///

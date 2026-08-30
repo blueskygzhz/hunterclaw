@@ -32,6 +32,11 @@
 #include "hunterclaw/queue/lanes.h"            // ✅ ResolveSessionLane, ResolveGlobalLane
 #include "hunterclaw/outbound/deliver.h"
 #include "hunterclaw/tools/tool_manager.h"
+// ✅ 方案 C: 把入站纯文本认领为 pending question 的答复
+//   （对齐 OpenClaw attempt.queue-message.ts 对 gateway-question 的引用）
+#include "hunterclaw/tools/pending_question_registry.h"
+// ✅ 工具中断答复认领（interrupt 主路径）
+#include "hunterclaw/tools/interrupt_coordinator.h"
 #include "hunterclaw/llm/llm_client.h"
 #include "hunterclaw/core/utils.h"
 #include "hunterclaw/tools/tool_hooks.h"    // 🎯 message_received hook
@@ -1489,6 +1494,37 @@ bool MessageDispatcher::steer_embedded_session(
     const std::string& session_key,
     const std::string& message
 ) {
+    // ── ① 先尝试把这条消息认领为「工具中断的答复」─────────────────────────
+    //
+    // ★★ 这是整条 interrupt 链路的枢纽。没有这一步，用户对远端
+    //   input-required 的回复只会变成一条【新的 user turn】注入对话，
+    //   而正在 run 内等答复的 ReactEngine 永远等不到东西 ——
+    //   表现为"用户明明答了，agent 还在转圈直到超时"，
+    //   而且那条回复会以"新指令"的身份被模型解读，行为完全走偏。
+    //
+    // ⚠ 必须在 session_state_mutex_ 【之外】做:
+    //   claim_answer 会 notify 正在等待的 ReactEngine 线程，而那个线程
+    //   醒来后可能反过来要 session_state_mutex_（收尾时更新会话状态）
+    //   —— 那就是一个真实的死锁环。
+    //
+    // ⚠ 认领失败（无中断在等 / 已答过 / 无会话上下文）时【继续往下走
+    //   正常 steer】—— 绝不能把消息吞掉。
+    if (tools::InterruptCoordinator::instance().claim_answer(session_key, message)) {
+        log()->info("steer_embedded_session: claimed as tool-interrupt answer session={}",
+                    session_key);
+        return true;
+    }
+
+    // ── ② 兼容路径：question 通道的纯文本认领 ─────────────────────────────
+    // ★ question.* 通道已降级为可选增强（它需要客户端实现 question.resolve，
+    //   目前无实现）。保留认领是为了配了该通道的部署仍然可用。
+    //   ⚠ 顺序不能反: interrupt 是主路径，必须先给它认领的机会。
+    if (tools::PendingQuestionRegistry::instance().claim_answer(session_key, message)) {
+        log()->info("steer_embedded_session: message claimed as question answer session={}",
+                    session_key);
+        return true;
+    }
+
     std::lock_guard<std::mutex> lock(session_state_mutex_);
     // Aligned with openclaw: queueEmbeddedPiMessage returns false if no active streaming run
     if (streaming_sessions_.count(session_key) == 0) {

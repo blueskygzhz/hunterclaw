@@ -273,7 +273,9 @@ ToolResult ToolManager::execute_tool(
     ToolResult result;
     std::string error_msg;
     try {
-        result = tool->execute(effective_params);
+        // ★ 透传 aborted —— 对齐 OpenClaw 的 execute(toolCallId, args, signal)。
+        //   ⚠ 不覆写 2 参版的工具会走 Tool 基类的默认转发，行为不变。
+        result = tool->execute(effective_params, options.aborted);
     } catch (const std::exception& e) {
         error_msg = std::string("Tool execution failed: ") + e.what();
         result = tool_result::error(error_msg);

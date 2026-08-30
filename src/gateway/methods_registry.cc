@@ -236,6 +236,21 @@ create_method_handler(std::shared_ptr<GatewayServer> server) {
         {"plugin.approval.resolve",         methods::method_plugin_approval_resolve},
         {"plugin.approval.waitDecision",    methods::method_plugin_approval_wait_decision},
 
+        // ── Question (questions.ts) ─────────────────────────────────────────
+        // 🎯 OpenClaw 对齐: question.request / waitAnswer / resolve / get / list
+        //
+        // ★★ question.resolve 是【唯一】的答复回流入口 —— 终端点按钮走它。
+        //   ⚠ 漏注册的后果与当年 plugin.approval.* 一模一样: agent 侧
+        //     run_gateway_question() 会正常登记并广播、终端能看到卡片，
+        //     但用户点了按钮拿到 "unknown method"，于是提问必然等满超时
+        //     （ask_user 默认 900s）。而日志里只有一条"没有收到答复"。
+        {"question.request",                methods::method_question_request},
+        {"question.waitAnswer",             methods::method_question_wait_answer},
+        {"question.resolve",                methods::method_question_resolve},
+        {"question.get",                    methods::method_question_get},
+        {"question.list",                   methods::method_question_list},
+
+
         // ── Exec Approvals (exec-approvals.ts) ──────────────────────────────
         // 🎯 OpenClaw 对齐: execApprovalsHandlers
         {"exec.approvals.get",              methods::method_exec_approvals_get},

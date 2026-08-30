@@ -41,6 +41,7 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include "hunterclaw/core/types.h"
@@ -131,9 +132,30 @@ struct ConfirmSignal {
     std::vector<std::string> token_ids;
 };
 
+/// 从一组 Part 中提取二次确认信号。
+///
+/// ★★ 这是【唯一】的解析实现。Task 版与流式版都委派到这里。
+///
+/// ⚠⚠ 曾经只有 Task 版，于是 SSE 路径（run_stream::on_event）完全没有
+///   confirm 提取 —— 远端通过流式推 input-required + token_id_list 时，
+///   requires_user_action 始终为 false，方案 C 的提问与方案 A 的审批
+///   【两道闸门同时失效】，模型会代用户答"确认"。
+///   同一判据散落/缺失的代价在这里是"决定权被悄悄拿走"，不是少个字段。
+///
+/// @param force_user_action 本地配置强制要求用户确认（取「或」）
+ConfirmSignal extract_confirm_signal_from_parts(const std::vector<Part>& parts,
+                                               bool force_user_action);
+
 /// 从远端 Task 中提取二次确认信号。
 /// @param force_user_action 本地配置强制要求用户确认（取「或」）
 ConfirmSignal extract_confirm_signal(const Task& t, bool force_user_action);
+
+/// 从流式事件中提取二次确认信号。
+///
+/// ★ 依赖 ParsedStreamEvent::status_message —— 那个字段就是为本函数补的。
+///   在它存在之前，流式事件里的 data/metadata 在 parse_stream_event
+///   就被丢弃了，任何下游都不可能再拿到。
+ConfirmSignal extract_confirm_signal(const ParsedStreamEvent& ev, bool force_user_action);
 
 // ── 执行结果 ────────────────────────────────────────────────────────────────
 
@@ -260,15 +282,78 @@ public:
     ///   因此本地【立即】标记 Canceled（粘性），不等远端确认。
     core::Result<bool> cancel(const std::string& handle);
 
+    /// 登记表访问器。
+    ///
+    /// ★ 供工具层做去重闸（try_claim_question）用。
+    ///   ⚠ 刻意返回 engine 自己持有的那一份，而不是让调用方另传一个 ——
+    ///     去重闸必须作用在【同一个】store 上。发送工具本身不持有 store，
+    ///     若让它另传，很容易传进一个不同实例，那样 CAS 形同虚设:
+    ///     每条通道都能抢到锁，用户被问 5 遍。
+    const std::shared_ptr<PendingTaskStore>& store() const { return store_; }
+
     /// 请求所有后台线程退出（析构时自动调用）
     void shutdown();
 
+    // ── 挂起态主动通知（SSE / 回调 / 后台跟进 三条通道共用）────────────────
+    //
+    // ★★ 解决的问题: 「远端要求用户确认」这件事原先【只能在模型主动调工具
+    //   的那一刻被发现】。三条异步通道各自在自己的线程里把状态写进 store，
+    //   然后就静默了 ——
+    //     · run_stream::on_event      （SSE 线程）
+    //     · poll_once                  （回调 HTTP 线程）
+    //     · background_loop → run_probe（detached 后台线程）
+    //   模型若判断"已让渡，等下轮再看"或直接收尾，用户【永远不会被问到】，
+    //   远端任务一直挂到 HardTimeout。
+    //
+    // ★ 用回调注入而非让 engine 直接依赖提问模块:
+    //   remote_a2a 是 tools 的下游，不能反向依赖 question 编排层；
+    //   而且"怎么问、怎么续接"是工具层的知识（它知道 session_key、
+    //   agent 名、进度通道），engine 只负责"什么时候该问"。
+    //
+    // ⚠ 实现方必须自己保证幂等 —— 用 store_->try_claim_question(handle)。
+    //   engine 不替它去重: 工具线程里的同步路径也会走同一个 claim，
+    //   去重必须是【跨线程跨通道】的单一闸门。
+    using SuspendResolver = std::function<void(const std::string& handle)>;
+
+    /// 注入挂起解析器。
+    ///
+    /// ⚠ 只允许设置一次（与 QuestionRuntime 同理）。后设的会让先前
+    ///   已在飞的挂起任务的通知落到旧回调上，那批任务再也不会被处理。
+    bool set_suspend_resolver(SuspendResolver resolver);
+
 private:
     // ── 分支实现 ────────────────────────────────────────────────────────
-    /// ② SSE。返回是否已取得终态。
-    bool run_stream(const Message& msg, const std::string& handle,
-                    ExecutionResult* out, ProgressFn on_progress,
-                    int64_t deadline_ms);
+
+    /// SSE 流的处理结果。
+    struct StreamRunResult {
+        /// 是否已取得终态（含挂起态）
+        bool terminal = false;
+        /// 登记后的 handle（首事件拿到 task_id 时惰性登记）
+        std::string handle;
+        std::string task_id;
+        std::string context_id;
+        /// 流本身是否成功建立（false → 调用方应降级到 send + 探测）
+        bool stream_ok = false;
+        std::string error;
+    };
+
+    /// ② SSE：**一次** message/stream 走完全程。
+    ///
+    /// ⚠⚠ 历史 bug：曾经把它拆成"先开一条流探 task_id、关掉、再开第二条流
+    ///   读全程"，导致【同一条 msg 被 message/stream 发送两次】：
+    ///     · 首次调用（msg 无 task_id）→ 远端创建【两个 task】，我们只跟踪
+    ///       第一个，第二个成为孤儿继续跑 —— 资源泄漏 + 副作用执行两次
+    ///     · 续接（msg 带 task_id）→ 同一条"确认，请继续"被投递两次 ——
+    ///       远端可能把邮件发两遍，二次确认的意义被彻底摧毁
+    ///
+    /// ★ 正确做法是单次流 + 惰性登记：第一个带 task_id 的事件到达时就地
+    ///   register_task，后续事件正常处理。既消除重复发送，也省掉一次 RPC。
+    ///
+    /// ★ 不用 tasks/resubscribe：那需要先知道 task_id（鸡生蛋），而且多一次
+    ///   往返。单次流天然没有这个问题。
+    StreamRunResult run_stream(const Message& msg, const std::string& session_key,
+                              ExecutionResult* out, ProgressFn on_progress,
+                              int64_t deadline_ms);
 
     /// ① 退避探测。返回是否已取得终态。
     bool run_probe(const std::string& handle, ExecutionResult* out,
@@ -277,8 +362,59 @@ private:
     /// ③ 注册回调（失败不阻断，只降级）
     void try_register_callback(const std::string& handle, const std::string& task_id);
 
-    /// 让渡后的后台跟进线程体
-    void background_loop(std::string handle);
+    /// 让渡后的后台跟进线程体。
+    /// ⚠ on_progress 必须按值传: 让渡后调用方栈帧立刻销毁。
+    ///   原先这里不带进度通道，后台期间用户看不到任何输出。
+    void background_loop(std::string handle, ProgressFn on_progress);
+
+    /// 挂起态收敛后的统一通知点。
+    ///
+    /// ★★ 只允许从【两处】调用: ingest_task 与 run_stream::on_event。
+    ///   前者覆盖 探测/回调/后台 三条（它们都经 ingest_task），
+    ///   后者覆盖 SSE（它不经 ingest_task —— 这正是当初 SSE 漏掉
+    ///   confirm 提取的同一个原因）。
+    ///
+    /// ⚠ 必须在 update_terminal 【之后】调用: resolver 会去读快照，
+    ///   状态没落定就读会拿到 Running。
+    void maybe_notify_suspended(const std::string& handle);
+
+    // ── 终态收敛的【唯一】入口 ──────────────────────────────────────────
+    //
+    // ★★ 这个函数存在的唯一理由: "落终态" 这件事需要严格按序做四步，
+    //   而这四步曾经在【三个地方】各写一遍，结果漏了三次:
+    //     ① ingest_task            —— 最早只有这一处有 confirm 提取
+    //     ② run_stream::on_event   —— 漏了 confirm 提取（SSE 二次确认全废）
+    //     ③ execute 的 SSE 首事件即终态 —— 同样漏了 confirm 提取 + 通知
+    //
+    //   ⚠⚠ 漏掉的后果全部是【静默放行】: requires_user_action 恒 false →
+    //     interrupt 不产生 → 模型代用户答"确认" → 邮件真的发出去。
+    //     流程走通、不报错、只是决定权被悄悄拿走 —— 最难发现的一类缺陷。
+    //
+    // ── 四步的顺序都有硬理由，不可调换 ────────────────────────────────
+    //   ① 提 confirm 信号 → note_confirm_signal
+    //        必须最先: update_terminal 会 notify 等待方，先落终态会让
+    //        等待方读到 requires_user_action=false 的快照。
+    //   ② 挂起时把追问写进 progress_text（note_progress）
+    //        必须在 ③ 之前: note_progress 会拒绝已终结的记录
+    //        （pending_tasks 的 phase != Running 检查）。
+    //   ③ update_terminal（带远端【真实 state】）
+    //        不传 state 会让 input-required 被 reason(Completed) 推导覆盖成
+    //        Completed —— 追问变成"最终答案"。
+    //   ④ maybe_notify_suspended
+    //        必须在 ③ 之后: resolver 会读快照，状态没落定会拿到 Running。
+    //
+    // @param parts 用于提取 confirm 信号的 status.message.parts。
+    //        ★ 传 nullptr 表示"本次没有 status.message"（例如纯 error 收敛）。
+    // @param result_text 结果文本。⚠ 挂起时【调用方应传空】——
+    //        挂起态的 status.message 是追问不是结果，写进 result_text 会让
+    //        harvest 取到一句提问。本函数不替调用方判断，因为"哪段文本是结果"
+    //        只有调用方知道。
+    // @param prompt_text 挂起时的追问文本（非挂起时忽略）
+    void settle_terminal(const std::string& handle, TerminalReason reason,
+                         TaskState remote_state, const std::string& result_text,
+                         const std::string& error_text,
+                         const std::vector<Part>* parts,
+                         const std::string& prompt_text);
 
     /// 由当前记录构造 TaskTracking 并交给 classify()。
     /// ★ 终态判定的唯一入口 —— 不要在别处重复实现。
@@ -291,6 +427,12 @@ private:
     std::shared_ptr<RemoteAgentClient> client_;
     std::shared_ptr<PendingTaskStore> store_;
     ExecutionConfig cfg_;
+
+    /// ★ 用 mutex 而非 atomic: SuspendResolver 是 std::function，
+    ///   拷贝不是原子的。读取时先在锁内拷一份再出锁调用 ——
+    ///   ⚠ 持锁调用 resolver 会死锁: resolver 里会 engine->execute() 续接。
+    mutable std::mutex resolver_mu_;
+    SuspendResolver suspend_resolver_;
 
     std::atomic<bool> stopping_{false};
     std::atomic<int> live_threads_{0};

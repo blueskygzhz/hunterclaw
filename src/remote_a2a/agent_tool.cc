@@ -4,9 +4,13 @@
 // ============================================================================
 
 #include "hunterclaw/remote_a2a/agent_tool.h"
-#include "hunterclaw/tools/after_tool_call_policy.h"  // PostExecConfirmRequest
+// ✅ 方案 C: 向用户提问并拿回结构化答案（对齐 OpenClaw ask_user 通道）
+#include "hunterclaw/tools/interrupt_coordinator.h"  // ✅ interrupt 等待/恢复中枢
+#include "hunterclaw/remote_a2a/agent_registry.h"      // ✅ 恢复函数需要按 agent 取 engine
+#include "hunterclaw/tools/question_broker.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <sstream>
 
@@ -48,50 +52,9 @@ std::string sanitize_fragment(const std::string& raw, const std::string& fallbac
     return folded.empty() ? fallback : folded;
 }
 
-// ── maybe_attach_post_exec_confirm ──────────────────────────────────────────
-// 挂起且必须用户确认时，在结果上声明"执行后二次确认"。
-//
-// ★★ 这次确认【买到的是什么】：确保那个"确认"来自用户而不是模型的猜测。
-//   它不代替续接 —— 用户确认后，模型仍需带 task_id 把答复发回远端
-//   （远端正停在 input-required 等消息）。
-//   若没有这道确认，模型完全可能自己填"确认"并发回远端，
-//   而流程照样走通、结果照样返回，只是决定权被悄悄拿走了。
-//
-// ⚠⚠ 抽成共享函数而非各出口自己写:
-//   此前只有 send 出口声明了它, follow_up 出口【漏了】—— 而
-//   follow_up 恰恰是 input-required 最常见的入口(让渡后模型来取结果)。
-//   后果与解析漏读同级: 模型看到 render() 的追问文本就代用户答"好的",
-//   details.requiresUserAction 只有终端能看到(details 不进 prompt),
-//   没有任何机制拦得住。
-//   ★ 同一判据散落多处时改一处漏一处 —— 与 is_suspended_state 抽取同理。
-void maybe_attach_post_exec_confirm(tools::ToolResult& res,
-                                    const ExecutionResult& r,
-                                    const std::string& agent_name) {
-    // ⚠ 只在 requires_user_action 时声明。普通 input-required
-    //   （如"用哪种格式导出"）模型可以代答，弹确认卡片只是骚扰。
-    //   区分"模型可代答"与"必须用户"正是这套设计的核心。
-    if (!r.is_suspended() || !r.requires_user_action) return;
-
-    tools::PostExecConfirmRequest cr;
-    cr.title = "远端任务需要确认";
-    cr.description = r.prompt_text.empty()
-                         ? ("远端 agent '" + agent_name + "' 需要你确认后才能继续")
-                         : r.prompt_text;
-    cr.token_ids = r.pending_token_ids;
-    // ★ 必须 Request（等到答复才采信）。Defer 在这里等于"未确认就放行"，
-    //   after_tool_call_policy 会把它降级为 Request 并记 warn。
-    cr.mode = "request";
-    // ⚠ 不允许 allow-always：一次误点永久授权会让该远端后续所有
-    //   需确认操作全部免确认 —— 而这类操作恰恰是最需要每次都问的。
-    //   （这条约束现在真的生效: 决策回来后会在消费端对照 allowed_decisions。）
-    cr.allowed_decisions = {"allow-once", "deny"};
-
-    core::JsonValue d = res.details;
-    tools::attach_post_exec_confirm(d, cr);
-    res.details = std::move(d);
-}
-
 }  // namespace
+
+
 
 // ── 工具名 ──────────────────────────────────────────────────────────────────
 
@@ -273,7 +236,15 @@ tools::Tool::Schema RemoteA2aAgentTool::parameters() const {
     return s;
 }
 
+// ★ 1 参版薄壳：转发给带 aborted 的实现。
+//   ⚠ 保留它是为了兼容不经 ToolManager 的直接调用点（单测/内部工具链）。
+//     删掉会让那些调用点静默走到基类默认转发，从而永远拿不到 aborted。
 tools::ToolResult RemoteA2aAgentTool::execute(const core::JsonValue& params) {
+    return execute(params, nullptr);
+}
+
+tools::ToolResult RemoteA2aAgentTool::execute(const core::JsonValue& params,
+                                                  const std::atomic<bool>* aborted) {
     if (!client_ || !engine_) {
         return tools::tool_result::error("remote_a2a 工具未正确初始化");
     }
@@ -360,10 +331,24 @@ tools::ToolResult RemoteA2aAgentTool::execute(const core::JsonValue& params) {
     auto res = tools::tool_result::text(r.render());
     res.details = core::JsonValue(details);
 
-    // ── 挂起且必须用户确认 → 声明执行后二次确认 ──────────────────────────
-    // ★ 委派给共享实现 —— 与 follow_up 出口共用同一份判据与载荷。
-    //   ⚠ 不要在这里内联: 两个出口各写一遍必然漂移(此前 follow_up 就漏了)。
-    maybe_attach_post_exec_confirm(res, r, agent_name_);
+    // ── 挂起 → 产出 interrupt 并【原样上抛】给 ReactEngine ────────────────
+    //
+    // ★★ 工具在这里就结束了。它不提问、不阻塞、不续接 ——
+    //   ReactEngine 收到 interrupt 后负责: 投追问给用户 → 等答复 →
+    //   调 InterruptCoordinator::resume() 让 remote_a2a 恢复远端执行。
+    //
+    // ⚠ 刻意【不】在这里做任何"审批卡片"式的声明:
+    //   那条老路（details.postExecConfirm + exec.approval 通道）两头都不通 ——
+    //   request_tool_approval 接口把 title/description/token_ids 全丢了，
+    //   用户看到的只有工具名；而 ToolResult.details 本身也从不广播给客户端。
+    //   interrupt 走 ReactEngine 的投递面，是唯一到得了用户的路。
+    res.interrupt = build_interrupt_from_result(r, agent_name_);
+    if (res.interrupt.has_value()) {
+        details["interruptKind"] = res.interrupt->kind;
+        details["interruptResumeToken"] = res.interrupt->resume_token;
+        details["requiresUserAction"] = res.interrupt->requires_user_action;
+        res.details = core::JsonValue(details);
+    }
 
     // 远端明确失败时才置 success=false（让渡不算失败）。
     //
@@ -407,7 +392,15 @@ tools::Tool::Schema RemoteA2aStatusTool::parameters() const {
     return s;
 }
 
+// ★ 1 参版薄壳：转发给带 aborted 的实现。
+//   ⚠ 保留它是为了兼容不经 ToolManager 的直接调用点（单测/内部工具链）。
+//     删掉会让那些调用点静默走到基类默认转发，从而永远拿不到 aborted。
 tools::ToolResult RemoteA2aStatusTool::execute(const core::JsonValue& params) {
+    return execute(params, nullptr);
+}
+
+tools::ToolResult RemoteA2aStatusTool::execute(const core::JsonValue& params,
+                                                   const std::atomic<bool>* aborted) {
     if (!store_) return tools::tool_result::error("remote_a2a 未启用");
 
     tools::ToolParams p(params);
@@ -452,6 +445,26 @@ tools::ToolResult RemoteA2aStatusTool::execute(const core::JsonValue& params) {
 
     ExecutionResult r = engine->follow_up(handle, wait_ms);
 
+    // ── 方案 C: input-required 且必须用户确认 → 直接问用户并续接 ──────────
+    //
+    // ★★ follow_up 是 input-required 【最常见】的入口（让渡后模型来取结果，
+    //   "跑着跑着远端才要求确认"几乎必然走这条路），所以这里比 send 出口
+    //   更要紧 —— 历史上这个出口漏过一次同类逻辑，教训同源:
+    //   两个出口必须共用同一份判据与同一份实现。
+    //
+    // ★ agent 名从 store_ 取: StatusTool 是【跨 agent】的（按 handle 跟进
+    //   任意远端任务），不像发送工具那样持有单一 agent_name_。
+    std::string q_agent_name;
+    if (auto qt = store_->get(handle)) q_agent_name = qt->agent_name;
+
+    // ⚠ 提示词投递必须用【本 handle 对应的 agent 名】而不是空串:
+    //   deliver_progress 用它做事件归属，空名字会让用户看到一条
+    //   来源不明的提问。
+    ProgressFn fu_progress = [sess = session_key_, q_agent_name](const std::string& text,
+                                                                bool hb) {
+        deliver_progress(sess, q_agent_name, text, hb);
+    };
+
     nlohmann::json details;
     details["handle"] = handle;
     details["taskId"] = r.task_id;
@@ -476,30 +489,19 @@ tools::ToolResult RemoteA2aStatusTool::execute(const core::JsonValue& params) {
     auto res = tools::tool_result::text(r.render());
     res.details = core::JsonValue(details);
 
-    // ── 挂起且必须用户确认 → 声明执行后二次确认 ──────────────────────────
-    // ★★ 与发送工具【共用同一份实现】。
+    // ── 挂起 → 产出 interrupt 并【原样上抛】给 ReactEngine ────────────────
     //
-    //   ⚠⚠ 此前这里【漏了】这段, 而 follow_up 恰恰是 input-required
-    //     最常见的入口(让渡后模型来取结果, 见下方注释) ——
-    //     "跑着跑着远端才要求确认"几乎必然走这条路。
-    //     漏掉的后果与解析漏读同级: 模型看到 render() 的追问文本就
-    //     代用户答"好的", 而 details.requiresUserAction 只有终端能看到
-    //     (details 不进 prompt), 没有任何机制拦得住。
+    // ★★ follow_up 是 input-required 【最常见】的入口 —— 让渡后模型来取
+    //   结果，"跑着跑着远端才要求确认"几乎必然走这条路。此前这里漏过一次
+    //   同类逻辑，教训同源: 两个出口必须共用同一份判据与同一份实现。
     //
-    // ★ agent 名从 store_ 取: StatusTool 是【跨 agent】的(按 handle 跟进
-    //   任意远端任务), 不像发送工具那样持有单一 agent_name_。
-    //   取不到时留空 —— 共享实现里 prompt_text 非空就不会用到它,
-    //   而挂起态几乎总是带 prompt_text。
-    std::string fu_agent_name;
-    if (auto ft = store_->get(handle)) fu_agent_name = ft->agent_name;
-    maybe_attach_post_exec_confirm(res, r, fu_agent_name);
-
-    // ★★ 与发送工具一致：挂起态绝不置 success=false。
-    //   follow_up 恰恰是 input-required 最常见的入口（让渡后模型来取结果），
-    //   在这里误判失败的后果与发送路径相同 —— 模型重试 → 远端堆僵尸任务。
-    if (r.completed && !r.error_text.empty() && !r.is_suspended()) {
-        res.success = false;
-        res.error = r.error_text;
+    // ★ agent 名从 store_ 取: StatusTool 是【跨 agent】的（按 handle 跟进
+    //   任意远端任务），不像发送工具那样持有单一 agent_name_。
+    res.interrupt = build_interrupt_from_result(r, q_agent_name);
+    if (res.interrupt.has_value()) {
+        details["interruptKind"] = res.interrupt->kind;
+        details["interruptResumeToken"] = res.interrupt->resume_token;
+        res.details = core::JsonValue(details);
     }
     return res;
 }
@@ -532,7 +534,15 @@ tools::Tool::Schema RemoteA2aCancelTool::parameters() const {
     return s;
 }
 
+// ★ 1 参版薄壳：转发给带 aborted 的实现。
+//   ⚠ 保留它是为了兼容不经 ToolManager 的直接调用点（单测/内部工具链）。
+//     删掉会让那些调用点静默走到基类默认转发，从而永远拿不到 aborted。
 tools::ToolResult RemoteA2aCancelTool::execute(const core::JsonValue& params) {
+    return execute(params, nullptr);
+}
+
+tools::ToolResult RemoteA2aCancelTool::execute(const core::JsonValue& params,
+                                                   const std::atomic<bool>* aborted) {
     if (!store_) return tools::tool_result::error("remote_a2a 未启用");
 
     tools::ToolParams p(params);

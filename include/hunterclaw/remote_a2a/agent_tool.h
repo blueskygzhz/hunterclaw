@@ -28,7 +28,9 @@
 // 若从卡读，远端只要声明 requires_approval=false 就绕过了本地审批。
 // ============================================================================
 
+#include <atomic>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -40,6 +42,10 @@
 
 namespace hunterclaw {
 namespace remote_a2a {
+
+// 前向声明 —— 恢复函数注册需要它，但不要在此 include agent_registry.h
+// ⚠ agent_registry.h 会反向 include 本文件（它要用工具类），成环。
+class RemoteA2aRegistry;
 
 // ── 工具名 ──────────────────────────────────────────────────────────────────
 
@@ -103,6 +109,13 @@ public:
     std::string description() const override;
     Schema parameters() const override;
     tools::ToolResult execute(const core::JsonValue& params) override;
+
+    // 🎯 对齐 OpenClaw `execute: async (toolCallId, args, signal)` 的第三参数。
+    // ⚠⚠ 本工具【必须】覆写: 它内部可能因 input-required 发起用户提问并
+    //   阻塞最长 900s，且占着 main lane 的唯一槽位。不覆写会让 chat.abort
+    //   之后用户仍要等 15 分钟。
+    tools::ToolResult execute(const core::JsonValue& params,
+                              const std::atomic<bool>* aborted) override;
     bool requires_approval() const override { return policy_.requires_approval; }
     std::string approval_mode() const override { return policy_.approval_mode; }
     std::vector<std::string> approval_allowed_decisions() const override {
@@ -147,6 +160,13 @@ public:
     Schema parameters() const override;
     tools::ToolResult execute(const core::JsonValue& params) override;
 
+    // 🎯 对齐 OpenClaw `execute: async (toolCallId, args, signal)` 的第三参数。
+    // ⚠⚠ 本工具【必须】覆写: 它内部可能因 input-required 发起用户提问并
+    //   阻塞最长 900s，且占着 main lane 的唯一槽位。不覆写会让 chat.abort
+    //   之后用户仍要等 15 分钟。
+    tools::ToolResult execute(const core::JsonValue& params,
+                              const std::atomic<bool>* aborted) override;
+
 private:
     std::shared_ptr<PendingTaskStore> store_;
     EngineLookupFn lookup_;
@@ -162,6 +182,13 @@ public:
     std::string description() const override;
     Schema parameters() const override;
     tools::ToolResult execute(const core::JsonValue& params) override;
+
+    // 🎯 对齐 OpenClaw `execute: async (toolCallId, args, signal)` 的第三参数。
+    // ⚠⚠ 本工具【必须】覆写: 它内部可能因 input-required 发起用户提问并
+    //   阻塞最长 900s，且占着 main lane 的唯一槽位。不覆写会让 chat.abort
+    //   之后用户仍要等 15 分钟。
+    tools::ToolResult execute(const core::JsonValue& params,
+                              const std::atomic<bool>* aborted) override;
     bool requires_approval() const override { return requires_approval_; }
 
 private:
@@ -171,31 +198,35 @@ private:
     bool requires_approval_ = false;
 };
 
-// ── 辅助 ────────────────────────────────────────────────────────────────────
 
-/// 由用户文本构造 A2A Message。
-/// @param task_id    续接已有任务时传入（input-required 回填场景）
-/// @param context_id 续接同一上下文
-Message build_user_message(const std::string& text, const std::string& task_id,
-                          const std::string& context_id);
+// ── interrupt 上抛（remote_a2a ←→ ReactEngine 的接缝）──────────────────────
+//
+// 🎯 设计: remote_a2a 只把远端挂起态翻译成 ToolInterrupt 上抛，
+//   由 ReactEngine 负责"投追问给用户 → 等答复 → 调恢复函数"。
+//
+// ★★ 为什么不在工具内部提问（上一版的做法，已推翻）:
+//   ① 工具拿不到 run 的投递面（on_block_reply）与入站消息路由，
+//      那两样都在 ReactEngine 手里；
+//   ② 每个需要提问的工具都得重写一遍这套逻辑；
+//   ③ 被迫另造 question.* 协议面 —— 而它没有任何客户端实现，
+//      等满 900s 后会把远端任务 cancel 掉，比不做更糟。
 
-/// ★ 会话归属校验：handle 必须属于当前会话。
+/// 本子系统的中断类型标识。ReactEngine 按它路由到下面注册的恢复函数。
+inline constexpr const char* kRemoteA2aInterruptKind = "remote_a2a.input_required";
+
+/// 把远端挂起态翻译成 ToolInterrupt。
 ///
-/// 这是【必需】的而非防御性的：handle 是半公开的（出现在工具返回文本里，
-/// 模型可能把它写进别的会话）。不校验则 A 会话能读走 B 会话的任务结果。
-/// @return 空串表示通过；否则为拒绝原因
-std::string check_handle_ownership(const PendingTaskStore& store,
-                                  const std::string& handle,
-                                  const std::string& session_key);
+/// @return 无值 = 不是挂起态，或缺 task_id/handle 无法恢复
+///   ⚠ 缺恢复凭据时【绝不】产出 interrupt: 那只会让用户白答一次，
+///     而答复无处可去。
+std::optional<tools::ToolInterrupt> build_interrupt_from_result(
+    const ExecutionResult& r, const std::string& agent_name);
 
-/// 把中间态进度投递到 system-event 通道。
+/// 注册 remote_a2a 的恢复函数（进程启动时一次）。
 ///
-/// ⚠ `chat.progress` 【不存在】—— 全仓 grep 只有 chat.send/abort/history/inject。
-///   实际用 infra::enqueue_system_event（exec 同通道）。
-/// ⚠ 中间态必须带 context_key 走"心跳"语义，否则会把 MAX_EVENTS=20
-///   （system_events.cc:18）的队列刷满，把真正的事件挤掉。
-void deliver_progress(const std::string& session_key, const std::string& agent_name,
-                     const std::string& text, bool is_heartbeat);
+/// ★ 这是"用户输入后由 ReactEngine 传给 remote_a2a 恢复远端执行"里
+///   remote_a2a 那一半。ReactEngine 不认识 A2A 协议，只调 resume()。
+void register_remote_a2a_resume_handler(std::shared_ptr<RemoteA2aRegistry> registry);
 
 }  // namespace remote_a2a
 }  // namespace hunterclaw

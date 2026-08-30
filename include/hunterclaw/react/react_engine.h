@@ -434,6 +434,30 @@ public:
     );
     
 private:
+    // ── 工具中断处理 ────────────────────────────────────────────────────
+    //
+    // 🎯 设计: 工具把远端的"需要用户输入"表达成 ToolResult::interrupt
+    //   原样上抛，由本函数负责整条闭环:
+    //     ① 占会话槽位（每会话只允许一个中断在等）
+    //     ② 通过 on_block_reply 把追问投给用户
+    //     ③ 阻塞等用户答复（带 cancelled_，chat.abort 可打断）
+    //     ④ 调 InterruptCoordinator::resume() 让产出中断的子系统恢复执行
+    //     ⑤ 用恢复后的结果【替换】result 的内容
+    //
+    // ★★ 为什么放在 ReactEngine 而不是工具内部:
+    //   只有这里同时握有【投递面】(on_block_reply) 与【入站消息路由】——
+    //   工具两样都拿不到。放在工具里就被迫另造一条协议面来绕，
+    //   而那条路上任何一环没有客户端实现都会静默等到超时。
+    //
+    // ⚠ result 被【原地修改】。所有失败路径都 fail-closed:
+    //   拿不到用户答复时绝不伪造"已确认"，而是把失败写进结果文本让模型知道。
+    //
+    // ⚠ 等待期间占着 main lane 的槽位。这与 OpenClaw 的 ask_user 同构
+    //   （它也在 run 内 await），是已知且可接受的代价 —— 前提是 aborted
+    //   必须能打断，否则用户点停止要等满 900s。
+    void handle_tool_interrupt(tools::ToolResult& result,
+                               const StreamCallbacks& callbacks);
+
     ReactEngine(
         std::shared_ptr<tools::ToolManager> tool_manager,
         std::shared_ptr<llm::LLMClient> llm_client,

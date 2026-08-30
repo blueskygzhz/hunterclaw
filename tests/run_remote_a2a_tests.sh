@@ -40,7 +40,6 @@ src/remote_a2a/agent_tool.cc
 src/remote_a2a/config.cc
 src/remote_a2a/agent_registry.cc
 src/remote_a2a/runtime.cc
-src/tools/after_tool_call_policy.cc
 src/tools/before_tool_call_policy.cc
 src/tools/tool_approval_runtime.cc
 "
@@ -58,7 +57,7 @@ HIGH="$(exists "$HIGH_SRCS")"
 INFRA="src/infra/http_client.cc src/infra/system_events.cc"
 # ⚠ test_stub_approval_deps.cc 提供 core::get_logger / core::utils /
 #   security::is_gateway_owner_only_core_tool / ToolHookManager 的占位实现 ——
-#   before/after_tool_call_policy 依赖它们, 而链真实实现会拖入
+#   before_tool_call_policy 依赖它们, 而链真实实现会拖入
 #   llm/sessions/memory 一大串。
 STUBS="tests/test_stub_tool_result.cc tests/test_stub_tool_manager.cc tests/test_stub_approval_deps.cc"
 
@@ -105,8 +104,9 @@ run_suite test_remote_a2a_auth \
   src/remote_a2a/auth.cc src/remote_a2a/credential_resolver.cc
 
 run_suite test_remote_a2a_rpc          $LOW $INFRA
-run_suite test_remote_a2a_exec         $LOW $INFRA
+run_suite test_remote_a2a_exec         $LOW $HIGH $INFRA $STUBS
 run_suite test_remote_a2a_callback     $LOW $INFRA
+run_suite test_pending_task_resume     $LOW $INFRA
 run_suite test_remote_a2a_tools        $LOW $HIGH $INFRA $STUBS
 run_suite test_remote_a2a_registry     $LOW $HIGH $INFRA $STUBS
 run_suite test_remote_a2a_runtime      $LOW $HIGH $INFRA $STUBS

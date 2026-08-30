@@ -14,7 +14,7 @@
 #include "hunterclaw/tools/tool_manager.h"
 #include "hunterclaw/tools/tool_hooks.h"             // PluginHook* types + get_global_hook_manager()
 #include "hunterclaw/tools/before_tool_call_policy.h"
-#include "hunterclaw/tools/after_tool_call_policy.h"      // ✅ 执行后二次确认
+#include "hunterclaw/tools/interrupt_coordinator.h"  // ✅ 工具中断等待/恢复      // ✅ 执行后二次确认
 #include "hunterclaw/tools/deferred_approval_registry.h"  // ✅ Defer 凭据收敛 // unified before_tool_call policy chain
 #include "hunterclaw/sessions/transcript_io.h"       // append_tool_result_to_transcript (tool_result_persist)
 #include "hunterclaw/observability/observability.h"  // ✅ Span, Tracer, SpanKind
@@ -2336,45 +2336,31 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                 //   用户会被【问两遍】同一个审批, hook 副作用也会重复。
                 tools::ToolManager::ExecuteOptions exec_opts;
                 exec_opts.before_tool_call_applied = true;
+                // ★ 透传运行取消标志 —— 对齐 OpenClaw 把 run 的 AbortSignal
+                //   作为 execute 第三参数传给工具 (ask-user-tool.ts:555)。
+                //   ⚠ 不传的后果: chat.abort 后长阻塞工具（remote_a2a 的用户
+                //     提问最长 900s）仍会挂满超时，且占着 main lane 唯一槽位。
+                exec_opts.aborted = &cancelled_;
                 auto result = tool_manager_->execute_tool(tool_call.name, effective_params,
                                                           nullptr, exec_opts);
 
-                // ── after_tool_call POLICY：执行后二次确认 ─────────────────
+                // ── 工具中断：投追问给用户 → 等答复 → 恢复子系统执行 ──────
                 // ★★ 位置关键：必须在 results[] 写入、on_tool_end 回调、
-                //   AgentEvent 发出【之前】。
+                //   AgentEvent 发出【之前】。恢复之后 result 的内容会被整体
+                //   替换，放到后面会让 transcript 里留下"还在等确认"的过期文本。
                 //
                 //   ⚠ 与下方 after_tool_call HOOK 是两件事：
-                //     · 本阶段：同步、可改结果、可拦截（fail-closed）
+                //     · 本阶段：同步、可改结果、可阻塞等用户
                 //     · 下方 hook：fire-and-forget、纯观测、改不了结果
-                //   把确认放到 hook 里会得到"确认还在等，结果已进 transcript"。
+                //   放到 hook 里会得到"确认还在等，结果已进 transcript"。
                 //
-                // ★ 绝大多数工具不声明 postExecConfirm，这里只是一次 has_key。
-                {
-                    tools::AfterToolCallContext post_ctx;
-                    post_ctx.tool_name = tool_call.name;
-                    post_ctx.tool_call_id = tool_call.id;
-                    post_ctx.run_id = callbacks.run_id;
-                    post_ctx.session_id = callbacks.session_id;
-                    post_ctx.aborted = &cancelled_;
-                    if (tool_manager_) {
-                        post_ctx.agent_id = tool_manager_->context().agent_id;
-                        post_ctx.session_key = tool_manager_->context().session_key;
-                    }
-                    auto post = tools::run_after_tool_call_policy(post_ctx, result);
-                    if (post.kind != tools::AfterToolCallOutcomeKind::Unchanged) {
-                        // ★ 无论 Confirmed 还是 Rejected 都改用加工后的结果:
-                        //   Confirmed 会在 details 标注决策(供审计),
-                        //   Rejected 则把结果整体替换为 blocked。
-                        result = std::move(post.result);
-                        if (post.needs_compensation()) {
-                            // ⚠ 补偿由【工具侧】完成而非这里 —— 策略层不知道
-                            //   这是个 remote_a2a 任务, 也不该知道。
-                            //   工具通过 details.postExecConfirmed=false 得知
-                            //   需要回收远端任务（否则留下僵尸任务占配额）。
-                            log()->warn("Tool '{}' post-exec confirmation rejected: {}",
-                                        tool_call.name, post.reason.value_or(""));
-                        }
-                    }
+                // ★ 只处理 requires_user_action 的中断。普通补充输入
+                //   （requires_user_action=false）直接把结果交给模型自己接着做
+                //   —— 对每个追问都打扰用户，用户会很快学会无脑回"好的"，
+                //   那时真正需要人判断的那次也就失效了。
+                if (result.interrupt.has_value() &&
+                    result.interrupt->requires_user_action) {
+                    handle_tool_interrupt(result, callbacks);
                 }
 
                 if (span) span->set_status(result.success, result.error);
@@ -2684,8 +2670,26 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                     // ⚠ 同串行路径: 链已跑过, 避免审批问两遍 / hook 重复触发。
                     tools::ToolManager::ExecuteOptions exec_opts;
                     exec_opts.before_tool_call_applied = true;
+                    // ★ 与串行路径【必须一致】。漏了这一行，"abort 能不能生效"
+                    //   就取决于模型是否并行发起工具 —— 非确定性缺陷。
+                    exec_opts.aborted = &cancelled_;
                     auto result = tool_manager_->execute_tool(tool_call.name, args,
                                                               nullptr, exec_opts);
+
+                    // ── 工具中断：与串行路径【必须一致】────────────────────
+                    // ⚠ 漏了这一行，"远端要求确认能否到达用户"就取决于模型
+                    //   是否并行发起工具 —— 非确定性缺陷，最难复现。
+                    //
+                    // ★ 并行下多个工具同时中断时，只有第一个能占到会话槽位
+                    //   （InterruptCoordinator 每会话仅允许一个）。后来者
+                    //   handle_tool_interrupt 会 fail-closed 返回
+                    //   "该会话已有待答确认"，模型据此重试即可。
+                    //   ⚠ 刻意【不】排队等: 排队会让 N 个工具串行等 N×900s，
+                    //     而这些 lambda 跑在同一个线程池里，会把池占满。
+                    if (result.interrupt.has_value() &&
+                        result.interrupt->requires_user_action) {
+                        handle_tool_interrupt(result, callbacks);
+                    }
 
                     // ── after_tool_call POLICY（并行路径）─────────────────
                     // ⚠ 与串行路径【必须一致】。若这里漏做，并行调用的结果
@@ -2698,22 +2702,6 @@ std::map<std::string, tools::ToolResult> ReactEngine::execute_tools(
                     //   主动发起的交互（不是后台批量）。
                     //   ★ 真正不可接受的是"不等就采信"：那份未确认的结果会
                     //     进 transcript 并进入下一轮 prompt。
-                    {
-                        tools::AfterToolCallContext post_ctx;
-                        post_ctx.tool_name = tool_call.name;
-                        post_ctx.tool_call_id = tool_call.id;
-                        post_ctx.run_id = callbacks.run_id;
-                        post_ctx.session_id = callbacks.session_id;
-                        post_ctx.aborted = &cancelled_;
-                        if (tool_manager_) {
-                            post_ctx.agent_id = tool_manager_->context().agent_id;
-                            post_ctx.session_key = tool_manager_->context().session_key;
-                        }
-                        auto post = tools::run_after_tool_call_policy(post_ctx, result);
-                        if (post.kind != tools::AfterToolCallOutcomeKind::Unchanged) {
-                            result = std::move(post.result);
-                        }
-                    }
 
                     if (span) span->set_status(result.success, result.error);
                     auto dur = std::chrono::steady_clock::now() - start;
@@ -3518,6 +3506,105 @@ ReactEngine::CompactionResult ReactEngine::trigger_compaction(
 
     return result;
 }
+
+
+// ============================================================================
+// handle_tool_interrupt —— 工具中断的完整闭环
+// 见 react_engine.h 的设计说明。
+// ============================================================================
+void ReactEngine::handle_tool_interrupt(tools::ToolResult& result,
+                                        const StreamCallbacks& callbacks) {
+    if (!result.interrupt.has_value()) return;
+    const tools::ToolInterrupt it = *result.interrupt;
+
+    auto& coord = tools::InterruptCoordinator::instance();
+
+    // ── 前置检查：没有恢复函数就别问 ──────────────────────────────────────
+    // ⚠ 先问再发现无法恢复 = 让用户白答一次，而且远端任务照样卡死。
+    //   ★ fail-closed: 把失败写进结果文本让模型知道"这一步没做成"，
+    //     而不是静默把挂起态当成功交给模型（那样模型会当已完成继续往下）。
+    if (!coord.has_resume_handler(it.kind)) {
+        result.success = false;
+        result.error = "无法向用户发起确认: 未注册中断恢复处理器 (" + it.kind + ")";
+        result.interrupt.reset();
+        return;
+    }
+
+    // ── ① 占会话槽位 ────────────────────────────────────────────────────
+    std::string session_key;
+    if (tool_manager_) session_key = tool_manager_->context().session_key;
+    auto waiter = coord.begin_wait(session_key);
+    if (!waiter.valid()) {
+        // 该会话已有中断在等，或 session_key 为空（无法路由入站答复）。
+        // ⚠ 不能硬等: 入站消息只会被【先占到槽位】的那个中断认领，
+        //   这里等下去必然超时，白占 main lane 最长 900s。
+        result.success = false;
+        result.error = "无法向用户发起确认: 该会话已有待答确认，或缺少会话上下文";
+        result.interrupt.reset();
+        return;
+    }
+
+    // ── ② 投递追问 ──────────────────────────────────────────────────────
+    // ★ 必须在占到槽位【之后】投递: 反过来的话用户可能在槽位就绪前就回复，
+    //   那条答复无处认领，会被当成新的用户指令注入对话。
+    const std::string prompt = tools::InterruptCoordinator::format_prompt(it);
+    if (callbacks.on_block_reply) {
+        callbacks.on_block_reply(prompt);
+        // ★ 立刻 flush —— 追问不 flush 就可能攒在缓冲里，
+        //   ⚠ 用户没看到问题却在被等待，必然超时。
+        if (callbacks.on_block_reply_flush) callbacks.on_block_reply_flush();
+    } else {
+        // 没有投递面 = 用户根本看不到这条追问 → 别等了。
+        result.success = false;
+        result.error = "无法向用户发起确认: 当前会话没有可用的消息投递通道";
+        result.interrupt.reset();
+        return;
+    }
+
+    // ── ③ 等答复（可被 chat.abort 打断）──────────────────────────────────
+    auto answer = waiter.wait(tools::kDefaultInterruptWaitMs, &cancelled_);
+    if (!answer.has_value()) {
+        const bool aborted = cancelled_.load();
+        result.success = false;
+        result.error = aborted ? "用户确认被取消（运行已中止）"
+                              : "等待用户确认超时，未做任何变更";
+        result.interrupt.reset();
+        return;
+    }
+
+    // ── ④ 恢复子系统执行 ────────────────────────────────────────────────
+    // ★ 槽位在这里就可以放了: 答复已拿到，恢复期间该会话应当能接受
+    //   下一个中断（多轮确认场景）。
+    waiter.release();
+
+    auto outcome = coord.resume(it, *answer, &cancelled_);
+
+    // ── ⑤ 用恢复结果替换 result ─────────────────────────────────────────
+    // ★ B1 决策: 用户答复只作为 tool result 内容进 transcript，
+    //   【不产生独立 user turn】—— 满足"恢复时不要重新发一条消息"。
+    result.content.clear();
+    if (outcome.success) {
+        result.success = true;
+        result.error.clear();
+        // ★ 用 tool_result::text() 而不是手工构造 ToolResultContent ——
+        //   后者的字段顺序/可选字段一变就静默错位。
+        result.content = tools::tool_result::text(outcome.text).content;
+    } else {
+        result.success = false;
+        result.error = outcome.error.empty() ? "恢复远端执行失败" : outcome.error;
+        // ⚠ 即使失败也要把已有文本带上: 里面含"用户答复了什么"，
+        //   否则模型完全不知道刚才发生过一次确认。
+        if (!outcome.text.empty()) {
+            result.content = tools::tool_result::text(outcome.text).content;
+        }
+    }
+
+    // ★ 恢复后【又一次】中断（多轮确认）→ 留在 result 上交给下一轮循环。
+    //   ⚠ 这里不递归: 递归会让单次工具调用无界占用 main lane，
+    //     且中间的 resume 调用无法被 abort 打断。
+    result.interrupt = outcome.next_interrupt;
+}
+
 
 } // namespace react
 } // namespace hunterclaw

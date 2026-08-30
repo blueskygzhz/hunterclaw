@@ -691,6 +691,27 @@ core::Result<json> method_plugin_approval_resolve(std::shared_ptr<GatewayServer>
 core::Result<json> method_plugin_approval_wait_decision(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
 
 // ============================================================================
+// Question Methods (question.cc)
+// 🎯 严格对齐 OpenClaw question server methods
+//    (packages/gateway-protocol/src/schema/questions.ts)
+//
+// ★★ 与 approval 的分工，别混:
+//     approval.* → 回值是 allow-once / allow-always / deny 三选一（布尔门）
+//     question.* → 回值是 Record<questionId, string[]> 结构化答案（内容）
+//   把提问塞进审批通道会得到"用 allow-once 表示用户回了 PDF"这种语义崩塌。
+//
+// ⚠ question.resolve 是【唯一】的答复回流入口。除它之外还有一条
+//   "纯文本认领"路径（PendingQuestionRegistry::claim_answer），但那条
+//   最终也调到同一个 QuestionManager::resolve —— 一个 store、一个收敛点。
+// ============================================================================
+core::Result<json> method_question_request(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
+core::Result<json> method_question_wait_answer(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
+core::Result<json> method_question_resolve(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
+core::Result<json> method_question_get(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
+core::Result<json> method_question_list(std::shared_ptr<GatewayServer>, std::shared_ptr<MethodGuard>, const ClientContext&, const json&);
+
+
+// ============================================================================
 // Exec Approvals Methods (stubs.cc)
 // 🎯 OpenClaw 严格对齐: server-methods/exec-approvals.ts execApprovalsHandlers
 // ============================================================================

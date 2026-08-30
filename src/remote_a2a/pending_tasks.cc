@@ -124,6 +124,89 @@ core::Result<std::string> PendingTaskStore::register_task(
 
     std::lock_guard<std::mutex> lk(mu_);
 
+    // ── 续接：同一 task_id 的挂起记录【复用同一个 handle】────────────────────
+    //
+    // ★★ A2A 的续接语义是「在同一个 task_id 上再发一次 message/send 或
+    //   message/stream」。因此本地必须复用同一条记录，而不是新建。
+    //
+    // ⚠⚠ 新建 handle 会造成四个真实故障，且全部是静默的:
+    //   ① 回调失联 —— push config 注册的 URL 里带的是【旧 handle】。新建
+    //      handle 后远端仍往旧 URL 推，而旧记录已 Harvested，回调被丢弃，
+    //      于是续接后的这一轮只能靠退避探测，回调形同虚设。
+    //   ② 去重闸失效方向反了 —— question_raised 挂在 handle 上。新 handle
+    //      恰好让多轮确认能继续问（看似正常），但这是【巧合】: 一旦哪天
+    //      按 task_id 复用就会把第二轮确认吃掉。语义应当由"复用 + 显式重置"
+    //      表达，而不是靠新建绕过。
+    //   ③ 容量泄漏 —— 多轮确认的长任务在 store 里留下 N 条 Harvested 记录，
+    //      各自占 max_entries 额度直到 TTL 到。
+    //   ④ 结果碎片化 —— 前几轮的 result_text 留在旧记录里，新记录从零开始，
+    //      调用方按新 handle 取结果会丢掉之前的产出。
+    //
+    // ★ 只在【挂起态】复用。已 Completed/Failed/Canceled 的 task 不能再
+    //   续接（A2A 里终结的 task 不接受新 message），此时新建是正确的 ——
+    //   那是"复用了同一个 task_id 起新交互"，语义上确实是另一条记录。
+    auto idx = by_task_id_.find(task_id);
+    if (idx != by_task_id_.end()) {
+        auto existing = tasks_.find(idx->second);
+        if (existing != tasks_.end() && existing->second.agent_name == agent_name &&
+            is_suspended_state(existing->second.state)) {
+            PendingTask& t = existing->second;
+            const int64_t rnow = now_ms();
+
+            // ── 拉回运行态 ──────────────────────────────────────────────
+            // ⚠ phase 可能是 Terminal 也可能是 Harvested（execute 末尾会
+            //   harvest）。两者都要拉回 Running，否则 run_probe 第一次
+            //   evaluate 就看到 phase != Running 而立刻返回"已终态"，
+            //   本轮一次远端调用都不会发生。
+            t.phase = PendingPhase::Running;
+            t.reason.reset();
+            // ★ state 必须离开挂起态: 留着 InputRequired 会让 is_terminal()
+            //   立刻为真，同上，本轮直接空转结束。
+            t.state = TaskState::Submitted;
+
+            // ── 清掉上一轮的挂起痕迹 ────────────────────────────────────
+            // ⚠ progress_text 存的是上一轮那句追问（"还需要订单号"）。
+            //   不清会让本轮 render() 把【已经答过的追问】再输出一遍，
+            //   模型会以为远端又在问同一件事。
+            t.progress_text.clear();
+            t.error_text.clear();
+            // ⚠ token 已经确认过了。留着会让下一次 build_interrupt 把旧
+            //   token 再列一遍，用户被要求确认自己刚确认过的东西。
+            t.pending_token_ids.clear();
+            // ★ requires_user_action 在 note_confirm_signal 里是【单调置位】
+            //   （远端能加严不能放松）。这里可以重置，因为这是一次【新的
+            //   A2A 交互】—— 旧交互的加严不该延续，否则一旦某轮要求过人工
+            //   确认，之后每一轮都会被判定需要确认，永远问不完。
+            t.requires_user_action = false;
+            // ★ 去重闸随之重置: 新一轮若再挂起，必须能再问一次。
+            t.question_raised = false;
+            t.consecutive_no_progress = 0;
+
+            // ── 显式保留的东西 ──────────────────────────────────────────
+            // · result_text  ：前几轮的产出，续接后要能一起交付
+            // · fp           ：指纹按远端 history/artifact 计数推进，续接后
+            //                  history 会增长 —— 保留旧值才能正确检测推进；
+            //                  清零会让第一次 ingest 误判为"大幅推进"
+            // · callback_token / created_at_ms ：见下方回调说明
+            // ★★ 交互代号 +1 —— 让上一代的 background/probe 线程在下次
+            //   循环校验时立刻退出，不会与本轮抢同一条记录。
+            //   ⚠ 没有这一步，老线程醒来看到 phase==Running 会继续探测，
+            //     两个线程双倍推进 consecutive_no_progress → 误判 Zombie
+            //     把正常任务杀掉。
+            ++t.epoch;
+            // ★ HardTimeout 必须按【本轮】计时。沿用 created_at_ms 会让
+            //   用户思考的那几分钟被算进远端执行时限，第二轮直接判超时。
+            t.turn_started_at_ms = rnow;
+            t.updated_at_ms = rnow;
+            t.last_event_ms = rnow;
+            // context_id 可能在续接时才由远端给出，非空就更新
+            if (!context_id.empty()) t.context_id = context_id;
+            if (!session_key.empty()) t.session_key = session_key;
+
+            return core::Result<std::string>::Ok(t.handle);
+        }
+    }
+
     if (tasks_.size() >= cfg_.max_entries) {
         if (!evict_one_locked()) {
             return core::Result<std::string>::Err(
@@ -135,6 +218,7 @@ core::Result<std::string> PendingTaskStore::register_task(
     const int64_t now = now_ms();
     PendingTask t;
     t.handle = make_pending_handle(++seq_);
+    t.epoch = 1;  // ★ 从 1 起：0 保留给 current_epoch() 的"记录不存在"
     t.agent_name = agent_name;
     t.task_id = task_id;
     t.context_id = context_id;
@@ -142,6 +226,9 @@ core::Result<std::string> PendingTaskStore::register_task(
     t.phase = PendingPhase::Running;
     t.state = TaskState::Submitted;
     t.created_at_ms = now;
+    // ⚠ 必须在 created_at_ms 赋值【之后】，否则拿到的是 0，
+    //   HardTimeout 会用 1970 做基准 → 首次 evaluate 立刻判超时。
+    t.turn_started_at_ms = now;
     t.updated_at_ms = now;
     t.last_event_ms = now;
 
@@ -157,6 +244,14 @@ std::optional<PendingTask> PendingTaskStore::get(const std::string& handle) cons
     const PendingTask* t = find_locked(handle);
     if (!t) return std::nullopt;
     return *t;
+}
+
+uint64_t PendingTaskStore::current_epoch(const std::string& handle) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = tasks_.find(handle);
+    // ★ 记录不存在 → 0。调用方（退避循环）应视为"我该退出了"。
+    if (it == tasks_.end()) return 0;
+    return it->second.epoch;
 }
 
 std::optional<std::string> PendingTaskStore::handle_of_task(
@@ -241,6 +336,23 @@ bool PendingTaskStore::note_confirm_signal(const std::string& handle,
     }
     if (changed) t->updated_at_ms = now_ms();
     return changed;
+}
+
+bool PendingTaskStore::try_claim_question(const std::string& handle) {
+    std::lock_guard<std::mutex> lk(mu_);
+    PendingTask* t = find_locked(handle);
+    if (!t) return false;
+
+    // ★★ 读旧值 + 置新值必须在【同一临界区】内完成。
+    //   ⚠ 拆成 get() 判断 + 单独 set 会留下竞态窗口: SSE 线程与探测线程
+    //     可能同时读到 false 然后都去提问。而 PendingQuestionRegistry
+    //     每会话只收一个 pending question，第二个会静默降级成"仅终端"，
+    //     于是"回一句话就能答"这条路对谁都不生效 —— 用户以为答了，
+    //     agent 还在等。
+    if (t->question_raised) return false;
+    t->question_raised = true;
+    t->updated_at_ms = now_ms();
+    return true;
 }
 
 bool PendingTaskStore::update_terminal(const std::string& handle,

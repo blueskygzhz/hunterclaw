@@ -10,6 +10,9 @@
 #include "hunterclaw/remote_a2a/runtime.h"          // ✅ RemoteA2aRuntime（进程级初始化）
 #include "hunterclaw/tools/tool_approval_runtime.h" // ✅ 工具审批通道（进程级）
 #include "hunterclaw/gateway/tool_approval_broker.h" // ✅ GatewayToolApprovalBroker
+#include "hunterclaw/tools/question_broker.h"        // ✅ 用户提问通道（进程级）
+#include "hunterclaw/gateway/question_broker_impl.h"  // ✅ GatewayQuestionBroker
+#include "hunterclaw/gateway/question_manager.h"      // ✅ question_manager_instance()
 #include "hunterclaw/llm/model_discovery.h"          // ✅ discover_and_apply_provider_context_windows
 #include "hunterclaw/infra/http_client.h"            // ✅ HttpClient
 #include "hunterclaw/agents/types.h"
@@ -508,6 +511,63 @@ int main(int argc, char** argv) {
             std::cerr << "  Warning: exec approval manager unavailable; tools that "
                          "require approval will be refused (fail-closed)."
                       << std::endl;
+        }
+    }
+
+    // ============================================================================
+    // 用户提问通道注入（进程级）—— 方案 C 的落地点
+    // ============================================================================
+    //   🎯 严格对齐 OpenClaw: harness 通过 question.request / waitAnswer /
+    //     resolve 三个 gateway 方法向用户提问。HunterClaw 同进程，故用
+    //     GatewayQuestionBroker 直连 QuestionManager（见其头文件说明）。
+    //
+    //   ★ 时序要求与审批通道【完全相同】:
+    //     · 必须在 gateway->start() 之后（要用 broadcast 与 runtime_state）
+    //     · 必须在任何 AgentInstance 创建之前（run_gateway_question 在通道
+    //       缺失时 fail-closed，晚注入意味着早期会话里 ask_user 与
+    //       remote_a2a 的 input-required 全部不可用）
+    //
+    //   ⚠ 与审批通道【并列而非合并】: 审批回值是三选一决策，提问回值是
+    //     结构化答案。合并会得到"用 allow-once 表示用户回了 PDF"。
+    // ============================================================================
+    {
+        auto question_mgr = gateway::question_manager_instance();
+        std::weak_ptr<gateway::GatewayServer> weak_gw = gateway;
+        auto q_broker = std::make_shared<gateway::GatewayQuestionBroker>(
+            question_mgr,
+            // ⚠ 捕获裸 gateway 会在 shutdown 后悬垂；用 weak_ptr 让
+            //   进程退出期的迟到广播安全降级为 no-op。
+            [weak_gw](const std::string& ev, const nlohmann::json& payload) {
+                auto gw = weak_gw.lock();
+                if (!gw) return;
+                core::EventFrame f;
+                f.event = ev;
+                f.payload = core::JsonValue(payload);
+                gw->broadcast(f);
+            },
+            // has_clients：是否存在能应答提问的客户端。
+            //
+            // ★ 判据【刻意比审批宽】: 审批面要求 operator.admin /
+            //   operator.approvals，因为批命令是特权动作。而提问是
+            //   "问用户一句话"，答复方就是普通聊天端 —— 用审批的 scope
+            //   去要求它，会让正常聊天路径上的 ask_user 永远起不来。
+            //
+            // ⚠ 但也不能恒返回 true: 没有任何连接时必须立刻失败，
+            //   否则 ask_user 的默认 900s 会把 main lane 占死 15 分钟
+            //   （对齐 approval 侧 no-approval-route 的立即 expire）。
+            [weak_gw]() -> bool {
+                auto gw = weak_gw.lock();
+                if (!gw) return false;
+                auto runtime = gw->runtime_state();
+                if (!runtime) return false;
+                for (const auto& [cid, client_ptr] : runtime->clients) {
+                    (void)cid;
+                    if (client_ptr) return true;
+                }
+                return false;
+            });
+        if (tools::QuestionRuntime::instance().set_broker(q_broker)) {
+            std::cout << "  User question: gateway channel ready" << std::endl;
         }
     }
     

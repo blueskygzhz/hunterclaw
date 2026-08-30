@@ -199,6 +199,27 @@ struct ParsedStreamEvent {
     std::string artifact_id;
     size_t artifact_part_count = 0;
     bool has_status_message = false;
+
+    /// status.message 原样保留（含每个 Part 的 data 与 metadata）。
+    ///
+    /// ★★ 为什么必须保留【整个 Message】而不是只抽 text:
+    ///   二次确认信号藏在 `parts[].data.token_id_list` 与
+    ///   `parts[].metadata.requiresUserAction` 里。原先本结构只有
+    ///   `text`（concat_text_parts）与 `function_calls`
+    ///   （只认 hc_type==function_call 的 DataPart），这两条通道都会
+    ///   把上述字段【整块丢弃】。
+    ///
+    ///   ⚠⚠ 丢弃的后果不是"少个字段"，而是【SSE 路径上二次确认彻底失效】:
+    ///     requires_user_action 恒为 false →
+    ///     方案 C 的提问与方案 A 的审批【两道闸门同时不触发】→
+    ///     render() 走"需要补充输入"分支（拿不到"不得代答"的警告）→
+    ///     模型代用户答"确认" → 邮件真的发出去。
+    ///     流程走通、不报错、只是决定权被悄悄拿走 —— 最难发现的一类。
+    ///
+    /// ★ 只在 Kind::Task / Kind::StatusUpdate 时有值（这两种才带 status）。
+    ///   ⚠ 不要为了"统一"给 Message/ArtifactUpdate 也填 —— 那两种事件的
+    ///     parts 是产出内容而非待办声明，按 confirm 判据扫会误报。
+    std::optional<Message> status_message;
 };
 
 ParsedStreamEvent parse_stream_event(const nlohmann::json&);

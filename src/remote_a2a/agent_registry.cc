@@ -59,6 +59,48 @@ core::Result<int> RemoteA2aRegistry::build() {
         ec.callback_base_url = cfg_.callback_base_url;
         rt.engine = ExecutionEngine::create(rt.client, store_, ec);
 
+        // ── 挂起态主动通知（SSE / 回调 / 后台跟进 三条异步通道）──────────────
+        //
+        // ★★ 这三条通道在【别的线程】发现远端挂起，此时可能已经没有任何
+        //   tool_call 在等结果（尤其 background_follow_up: 模型早就让渡了）。
+        //   没有这段注入，"远端要求用户确认"只能等模型下次主动 poll 才被
+        //   发现 —— 模型若判断"已让渡，等下轮"或直接收尾，用户永远不会
+        //   被问到，远端任务挂到 HardTimeout。
+        //
+        // ★ 这里【只做推送通知】，不发起等待:
+        //   ⚠ 异步线程上没有 run 上下文，不能占 InterruptCoordinator 的
+        //     会话槽位 —— 占了会让真正在 run 内的 interrupt 注册失败。
+        //   真正的"问 + 等 + 恢复"仍由 ReactEngine 在下一次工具调用时完成
+        //   （follow_up 会拿到挂起态并上抛 interrupt）。
+        //
+        // ⚠ 用 weak_ptr 捕获 engine: resolver 存在 engine 内部，
+        //   捕 shared_ptr 会形成 engine→resolver→engine 强引用环，
+        //   engine 永不析构，detached 后台线程也永不退出。
+        {
+            std::weak_ptr<ExecutionEngine> weak_engine = rt.engine;
+            auto store = store_;
+            const std::string agent_name = ac.name;
+            rt.engine->set_suspend_resolver(
+                [weak_engine, store, agent_name](const std::string& handle) {
+                    auto engine = weak_engine.lock();
+                    if (!engine || !store) return;
+                    auto snap = store->get(handle);
+                    if (!snap || snap->session_key.empty()) return;
+
+                    // ★ 只推一条提示，告诉用户远端在等他。
+                    //   ⚠ 不在这里问、不在这里等 —— 见上方说明。
+                    std::string text = "远端任务需要你确认后才能继续";
+                    if (!snap->progress_text.empty()) text = snap->progress_text;
+                    if (!snap->pending_token_ids.empty()) {
+                        text += "（待确认 " +
+                                std::to_string(snap->pending_token_ids.size()) + " 项）";
+                    }
+                    // hb=false: 这是必须让用户看到的正式事件，
+                    // ⚠ 传 true 会被当心跳合并掉，用户可能永远看不到。
+                    deliver_progress(snap->session_key, agent_name, text, false);
+                });
+        }
+
         // ★ 预热拉卡：失败【不】跳过该远端。
         //   対标 tool_manager.cc:667-671 —— 远端离线时工具仍注册，
         //   否则远端重启期间启动 HunterClaw 会导致工具永久缺失。
@@ -312,6 +354,23 @@ core::Result<int> enable_remote_a2a(tools::ToolManager& manager,
     if (registered.is_err()) {
         return core::Result<int>::Err(registered.error);
     }
+
+    // ── 注册 interrupt 恢复函数 ──────────────────────────────────────────
+    //
+    // ★★ 这是"用户输入后由 ReactEngine 传给 remote_a2a 恢复远端执行"的
+    //   remote_a2a 那一半。ReactEngine 拿到用户答复后按 kind
+    //   ("remote_a2a.input_required") 路由到这里。
+    //
+    // ⚠ 必须在 register_tools 之后、start_sweeper 之前:
+    //   工具已经能产出 interrupt 了，恢复函数却还没注册的话，
+    //   ReactEngine 会拿到 "没有为中断类型注册恢复处理器" ——
+    //   用户白答一次，且远端任务只能等超时。
+    //
+    // ★ 注册是【进程级一次性】的（InterruptCoordinator 拒绝重复注册同 kind），
+    //   多次调用 setup 时后面的会被拒绝并保留第一个 registry ——
+    //   ⚠ 这在热重载场景下会让恢复路由指向旧 registry。当前流程只调一次，
+    //     若将来支持热重载需要显式反注册。
+    register_remote_a2a_resume_handler(reg);
 
     reg->start_sweeper();
     if (out_registry) *out_registry = reg;
