@@ -163,7 +163,7 @@ AcpStdioConnection* connection = nullptr;
 AcpGatewayAgent::AcpGatewayAgent(gateway::GatewayClient* /*gw*/,
    const AcpServerOptions& opts,
       AcpSessionStore* store)
-    : impl_(std::make_unique<Impl>()) {
+    : impl_(std::make_shared<Impl>()) {
     impl_->opts = opts;
     impl_->session_store = store;
     int mr = opts.session_create_rate_limit_max_requests > 0
@@ -730,22 +730,37 @@ if (pe.session_key != session_key) continue;
     GatewayApprovalEvent correlated = event;
     correlated.title = title;
     // 在独立线程运行中继（send_request 会阻塞等待 client 响应）。
-    std::thread([this, target_sid, correlated]() {
- run_approval_relay(target_sid, correlated.approval_id, correlated);
+    //
+    // ★★ 捕获 impl_ 的 shared_ptr 自保活，并把它【作为参数】传进去 ——
+    //   ⚠ 只捕 this 是不够的: run_approval_relay 内部若访问 this->impl_，
+    //     那个 shared_ptr 成员本身随对象析构，读它就是 UAF。
+    //     必须让 relay 全程使用局部 shared_ptr，不碰 this。
+    //   ⚠ send_request 在 stdin EOF 时会被 conn.stop() 唤醒并返回
+    //     "connection closed"，紧接着 serve_acp_stdio 就析构 agent，
+    //     而 relay 后半段（isApprovalRelayActive 与 finally 标记）必然
+    //     还要访问 impl_->mu —— 这是每次 EOF 都会走到的路径，不是窄竞态。
+    auto keep = impl_;
+    std::thread([keep, target_sid, correlated]() {
+        run_approval_relay_impl(keep, target_sid, correlated.approval_id, correlated);
     }).detach();
 }
 
-void AcpGatewayAgent::run_approval_relay(const std::string& session_id,
-     const std::string& approval_id,
-     const GatewayApprovalEvent& event) {
+// ★★ 静态实现: 全程只用传入的 impl，【不】接触 this ——
+//   这是 UAF 防线的核心。见 start_approval_relay 处的说明。
+// ⚠ 新增任何步骤时都不要引入 this/成员访问，否则防线失效。
+void AcpGatewayAgent::run_approval_relay_impl(
+        const std::shared_ptr<Impl>& impl,
+        const std::string& session_id,
+        const std::string& approval_id,
+        const GatewayApprovalEvent& event) {
     ApprovalDetailsFn details_fn;
     ApprovalResolveFn resolve_fn;
     AcpStdioConnection* conn = nullptr;
     {
-        std::lock_guard<std::mutex> lk(impl_->mu);
-      details_fn = impl_->approval_details;
-      resolve_fn = impl_->approval_resolve;
-        conn = impl_->connection;
+        std::lock_guard<std::mutex> lk(impl->mu);
+      details_fn = impl->approval_details;
+      resolve_fn = impl->approval_resolve;
+        conn = impl->connection;
 }
 
     // 1) 查询 approval 详情（对齐 OC getGatewayApprovalDetails: exec.approval.get）。
@@ -821,9 +836,9 @@ void AcpGatewayAgent::run_approval_relay(const std::string& session_id,
     // 6) 中继仍活跃才采用 client 决策，否则 deny（对齐 OC isApprovalRelayActive）。
 bool still_active = false;
     {
-        std::lock_guard<std::mutex> lk(impl_->mu);
-  auto it = impl_->approval_relays.find(approval_id);
-      still_active = (it != impl_->approval_relays.end() && it->second.active);
+        std::lock_guard<std::mutex> lk(impl->mu);
+  auto it = impl->approval_relays.find(approval_id);
+      still_active = (it != impl->approval_relays.end() && it->second.active);
     }
     std::string final_decision = still_active ? decision : "deny";
 
@@ -834,9 +849,9 @@ bool still_active = false;
 
     // 8) 标记完成（保留至 prompt 清理，作为去重哨兵；对齐 OC finally）。
     {
-        std::lock_guard<std::mutex> lk(impl_->mu);
-        auto it = impl_->approval_relays.find(approval_id);
-        if (it != impl_->approval_relays.end()) it->second.active = false;
+        std::lock_guard<std::mutex> lk(impl->mu);
+        auto it = impl->approval_relays.find(approval_id);
+        if (it != impl->approval_relays.end()) it->second.active = false;
     }
 }
 

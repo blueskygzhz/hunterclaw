@@ -18,9 +18,12 @@
 //     src/acp/acp_conversation_id.cc src/acp/acp_session_mapper.cc ...
 // ============================================================================
 
+#include <atomic>
+#include <chrono>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -693,8 +696,12 @@ int main() {
                       "patch 带正确 session_key");
                 CHECK(patches[0].second.value("thinkingLevel", "") == "low",
                       "**关键**：字段名是 thinkingLevel（不是 modeId/thought_level）");
-                CHECK(patches[0].second.value("key", "") == "agent:main:main",
-                      "patch 内含 key（対齐 { key, ...patch }）");
+                // ★ key 走独立参数而非塞进 patch —— 合并成
+                //   { key, ...patch } 是装配层（main.cc）的职责。
+                //   ⚠ 若在此处合并，patch 里就会多一个 "key" 字段，
+                //     未来若 gateway 新增同名配置项会撞车。
+                CHECK(!patches[0].second.contains("key"),
+                      "patch 体只含配置字段，key 由装配层合并");
             }
             // ★★ presentation 必须反映新值 —— 修复前永远是 "adaptive"
             CHECK(resp.modes.current_mode_id == "low",
@@ -807,6 +814,104 @@ int main() {
             CHECK(found,
                   "**关键**：current_mode_id 始终在 available_modes 内");
         }
+    }
+
+    // =======================================================================
+    // approval relay 生命周期（use-after-free 回归）★★
+    //
+    // 复刻真实时序: relay 线程阻塞等用户点击期间，stdin EOF 导致
+    //   conn.stop() → 唤醒 send_request → wait_closed() 返回
+    //   → ~AcpGatewayAgent
+    // relay 线程醒来后【必然】继续访问 impl_->mu（第 6 步
+    // isApprovalRelayActive、第 8 步 finally 标记）。
+    //
+    // ⚠ 修复前 Impl 是 unique_ptr 且线程只捕 this —— 那两处访问是
+    //   已释放内存。这不是窄竞态，而是每次 EOF 都会走到的路径。
+    // ★ 现在 Impl 由 shared_ptr 持有，relay 线程捕一份自保活，
+    //   且 run_approval_relay_impl 全程不碰 this。
+    //
+    // ⚠ 本 case 在 ASan 下才有完整意义（普通构建下 UAF 常常不崩）。
+    std::cout << "\n== approval relay 生命周期（UAF 回归）==\n";
+    {
+        auto store = acp::create_default_session_store();
+        acp::AcpServerOptions opts;
+
+        std::atomic<bool> relay_entered{false};
+        std::atomic<bool> relay_finished{false};
+        std::atomic<bool> resolve_called{false};
+
+        {
+            acp::AcpGatewayAgent agent(nullptr, opts, store.get());
+            auto sess = store->create_session("agent:main:uaf", "/tmp");
+
+            // details 回调里阻塞，模拟"等用户点击"
+            agent.set_approval_details(
+                [&relay_entered](const std::string&) -> nlohmann::json {
+                    relay_entered.store(true);
+                    // ★ 让主线程有机会析构 agent
+                    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+                    return nlohmann::json::object();
+                });
+            // resolve 与 finally 都在阻塞【之后】—— 正是 UAF 触发点
+            agent.set_approval_resolve(
+                [&resolve_called, &relay_finished](const std::string&,
+                                                  const std::string& d) -> bool {
+                    resolve_called.store(true);
+                    // 默认拒绝（対齐 OC: 无 connection 时 deny）
+                    if (d == "deny") relay_finished.store(true);
+                    return true;
+                });
+
+            // 必须有 pending prompt，relay 才会启动（findPendingForApproval）
+            // ★ sessionKey 必须在 payload 内 —— 归一化后从 payload 读
+            //   （acp_translator.cc:531-536：有 payload 时 evt 被整体替换）。
+            // ★ phase/kind/status 也必需（legacy_ok 判据）。
+            nlohmann::json start_evt{
+                {"event", "exec.approval.requested"},
+                {"payload", {{"sessionKey", "agent:main:uaf"},
+                             {"type", "exec.approval.requested"},
+                             {"phase", "requested"},
+                             {"kind", "exec"},
+                             {"status", "pending"},
+                             {"approvalId", "ap-uaf-1"},
+                             {"command", "rm -rf /tmp/x"},
+                             {"toolCallId", "tc-uaf"}}}};
+
+            // 用 prompt 注册 pending：dispatch 内部触发 approval 事件
+            agent.set_prompt_dispatch(
+                [&agent, &start_evt](const std::string&, const std::string&,
+                                     const nlohmann::json&,
+                                     const std::string&) -> acp::ChatResult {
+                    // ★ 在 pending 存活期间投事件 —— 这样 relay 能找到 target_sid
+                    agent.handle_gateway_event(start_evt);
+                    acp::ChatResult r;
+                    r.run_id = "run-uaf";
+                    r.stop_reason = "end_turn";
+                    return r;
+                });
+
+            acp::PromptRequest pr;
+            pr.session_id = sess.session_id;
+            pr.text = "delete it";
+            try { agent.handle_prompt(pr); } catch (...) {}
+
+            // 等 relay 线程真正进入阻塞段
+            for (int i = 0; i < 200 && !relay_entered.load(); ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            CHECK(relay_entered.load(), "relay 线程已进入（前提成立）");
+            // ★★ 此处 agent 出作用域析构 —— relay 仍在阻塞中
+        }
+
+        // ★★ 关键: relay 醒来后访问 impl->mu。修复前是 UAF。
+        for (int i = 0; i < 400 && !relay_finished.load(); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+        CHECK(resolve_called.load(),
+              "**关键**：agent 析构后 relay 仍能安全走完（无 UAF）");
+        CHECK(relay_finished.load(),
+              "**关键**：连接已断时决策落到 deny（fail-closed）");
+        // 给 relay 线程留出退出时间，避免 store 先析构
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
     }
 
     // =======================================================================

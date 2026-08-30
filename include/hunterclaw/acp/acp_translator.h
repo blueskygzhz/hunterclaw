@@ -467,7 +467,27 @@ void handle_gateway_disconnect(const std::string& reason);
 
 private:
     struct Impl;
-    std::unique_ptr<Impl> impl_;
+
+    // ★★ shared_ptr 而非 unique_ptr —— approval relay 线程要持一份自保活。
+    //
+    // ── 为什么必须这样 ────────────────────────────────────────────────────
+    // run_approval_relay 跑在 detached 线程上，中途 send_request 会【阻塞等
+    // 用户点击】（可能几十秒）。而 serve_acp_stdio 的退出条件是 stdin EOF:
+    //   EOF → conn.stop() → 唤醒所有 send_request（返回 "connection closed"）
+    //       → wait_closed() 返回 → ~AcpGatewayAgent
+    // ⚠ relay 线程被唤醒后【必然】继续访问 impl_->mu（第 6、8 步的
+    //   isApprovalRelayActive 与 finally 标记），此时 Impl 已析构 →
+    //   use-after-free。这不是窄竞态，而是每次 EOF 都会走到的路径。
+    //
+    // ★ 只保活 Impl 而非整个 AcpGatewayAgent: 后者需要
+    //   enable_shared_from_this，会禁止栈上构造（测试与 serve_acp_stdio
+    //   都是栈上/unique_ptr 持有），改动面大得多且收益相同 ——
+    //   relay 线程访问的成员全在 Impl 里。
+    //
+    // ⚠ 不要退回"析构前有界等待 relay 归零": 等待方自己也要碰 impl_，
+    //   且用户可能永不点击，超时后照样 UAF（与 ExecutionEngine 那段
+    //   已被移除的 3s 等待是同一个错误）。
+    std::shared_ptr<Impl> impl_;
 
     SessionPresentation build_session_presentation_default();
 
@@ -518,9 +538,19 @@ private:
     void start_approval_relay(const std::string& session_key,
  const std::string& run_id,
         const GatewayApprovalEvent& event);
-    void run_approval_relay(const std::string& session_id,
-   const std::string& approval_id,
-   const GatewayApprovalEvent& event);
+
+    // 🎯 中继主体。★★ static + 显式传入 Impl 的 shared_ptr。
+    //
+    // ⚠ 刻意【不是】成员函数: 它跑在 detached 线程上并阻塞等用户点击，
+    //   期间 AcpGatewayAgent 可能已析构（stdin EOF → wait_closed 返回 →
+    //   ~AcpGatewayAgent）。做成成员函数就会隐式依赖 this，
+    //   而 this->impl_ 这个 shared_ptr 成员本身随对象一起消失 ——
+    //   读它就是 use-after-free。
+    // ★ 全程只用参数 impl，函数体内不得出现 this 或成员访问。
+    static void run_approval_relay_impl(const std::shared_ptr<Impl>& impl,
+                                       const std::string& session_id,
+                                       const std::string& approval_id,
+                                       const GatewayApprovalEvent& event);
 };
 
 // ── Available Commands (✅ 委托给 acp_commands.h) ─────────────────────────
