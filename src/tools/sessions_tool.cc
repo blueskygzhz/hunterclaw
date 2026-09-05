@@ -1549,6 +1549,9 @@ public:
             acp_cfg.acp_default_agent = ctx_.acp_default_agent;
             acp_cfg.acp_allowed_agents = ctx_.acp_allowed_agents;
             acp_cfg.acp_max_concurrent_sessions = ctx_.acp_max_concurrent_sessions;
+            // Aligned with openclaw: relay 需要完整 cfg 解析
+            // streaming.progressCommentary 与 acp.projection.tagVisibility
+            acp_cfg.raw_config = ctx_.raw_config;
 
             auto acp_result = agents::spawn_acp_direct(acp_params, acp_ctx, gw_, acp_cfg);
 

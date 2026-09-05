@@ -141,6 +141,11 @@ struct AcpRuntimeEvent {
     std::optional<std::string> stop_reason;
     std::optional<std::string> message;    // error message
     std::optional<std::string> code;       // error code
+    // Backend-specific structured failure code on error events.
+    // Aligned with openclaw: AcpRuntimeEvent["error"].detailCode
+    // 超时判定（TURN_TIMEOUT）与 resume 重试（SESSION_RESUME_REQUIRED）都靠它，
+    // 不能只靠解析 message 文本。
+    std::optional<std::string> detail_code;
     std::optional<bool> retryable;
     std::optional<int> used;               // usage
     std::optional<int> size;               // usage

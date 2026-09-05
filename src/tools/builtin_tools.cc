@@ -924,6 +924,32 @@ void BuiltinTools::register_all(ToolManager& manager, const ToolContext& context
         sess_ctx.agent_session_key = context.session_key;
         sess_ctx.session_id        = context.session_id;
         sess_ctx.workspace_dir     = context.workspace_dir;
+        // Aligned with openclaw: 透传配置原文，供 ACP spawn 的父流 relay 解析
+        // streaming.progressCommentary 与 acp.projection.tagVisibility
+        sess_ctx.raw_config        = context.raw_config;
+        // Aligned with openclaw: cfg.acp.* — 此前这些字段从未被填充，
+        // 导致 allowedAgents / defaultAgent / maxConcurrentSessions 配置全部失效。
+        if (context.raw_config.is_object()) {
+            const auto acp = context.raw_config.value("acp", nlohmann::json::object());
+            if (acp.is_object()) {
+                if (acp.contains("enabled") && acp["enabled"].is_boolean())
+                    sess_ctx.acp_enabled = acp["enabled"].get<bool>();
+                if (acp.contains("defaultAgent") && acp["defaultAgent"].is_string())
+                    sess_ctx.acp_default_agent = acp["defaultAgent"].get<std::string>();
+                if (acp.contains("allowedAgents") && acp["allowedAgents"].is_array()) {
+                    std::vector<std::string> allowed;
+                    for (const auto& a : acp["allowedAgents"]) {
+                        if (a.is_string()) allowed.push_back(a.get<std::string>());
+                    }
+                    sess_ctx.acp_allowed_agents = std::move(allowed);
+                }
+                if (acp.contains("maxConcurrentSessions") &&
+                    acp["maxConcurrentSessions"].is_number_integer()) {
+                    sess_ctx.acp_max_concurrent_sessions =
+                        acp["maxConcurrentSessions"].get<int>();
+                }
+            }
+        }
         auto sess_tools = create_sessions_tools(context.gateway_client, sess_ctx);
         for (auto& t : sess_tools) manager.register_tool(t);
     }

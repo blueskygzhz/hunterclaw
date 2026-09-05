@@ -6,10 +6,26 @@
 #include "hunterclaw/infra/heartbeat_events_filter.h"
 #include "hunterclaw/auto_reply/tokens.h"
 #include <algorithm>
+#include <regex>
 #include <sstream>
 
 namespace hunterclaw {
 namespace infra {
+
+// ── Constants ────────────────────────────────────────────────────────────────
+
+// Aligned with openclaw: const MAX_EXEC_EVENT_PROMPT_CHARS = 8_000
+static constexpr size_t MAX_EXEC_EVENT_PROMPT_CHARS = 8000;
+
+// Aligned with openclaw: STRUCTURED_EXEC_COMPLETION_EVENT_RE
+//   /^exec (completed|failed) \(([a-z0-9_-]{1,64}), (code -?\d+|signal [^)]+)\)(?: :: ([\s\S]*))?$/i
+// C++ std::regex 无 /s 标志，用 [\s\S] 等价写法覆盖换行。
+static const std::regex& structured_exec_completion_re() {
+    static const std::regex re(
+        R"(^exec (completed|failed) \(([a-z0-9_-]{1,64}), (code -?\d+|signal [^)]+)\)(?: :: ([\s\S]*))?$)",
+        std::regex::icase);
+    return re;
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -54,11 +70,66 @@ static bool is_heartbeat_noise_event(const std::string& evt) {
         || lower.find("heartbeat wake") != std::string::npos;
 }
 
+// ── StructuredExecCompletionEvent ────────────────────────────────────────────
+// Aligned with openclaw: type StructuredExecCompletionEvent + parseStructuredExecCompletionEvent
+
+struct StructuredExecCompletionEvent {
+    std::string raw;
+    std::string action;
+    std::string id;
+    std::string result;
+    std::string output;
+    bool succeeded = false;
+};
+
+// Aligned with openclaw: parseStructuredExecCompletionEvent (heartbeat-events-filter.ts:20-36)
+static std::optional<StructuredExecCompletionEvent>
+parse_structured_exec_completion_event(const std::string& evt) {
+    const std::string trimmed = trim_str(evt);
+    std::smatch m;
+    if (!std::regex_match(trimmed, m, structured_exec_completion_re())) {
+        return std::nullopt;
+    }
+    StructuredExecCompletionEvent parsed;
+    parsed.raw = trimmed;
+    parsed.action = m[1].matched ? m[1].str() : "";
+    parsed.id = m[2].matched ? m[2].str() : "";
+    parsed.result = m[3].matched ? m[3].str() : "";
+    parsed.output = trim_str(m[4].matched ? m[4].str() : "");
+    // Aligned with openclaw: action==="completed" && result==="code 0"
+    parsed.succeeded =
+        to_lower(parsed.action) == "completed" && to_lower(parsed.result) == "code 0";
+    return parsed;
+}
+
 // ── is_exec_completion_event ─────────────────────────────────────────────────
-// Aligned with openclaw: isExecCompletionEvent
+// Aligned with openclaw: isExecCompletionEvent (heartbeat-events-filter.ts:204-211)
+//   /^exec finished(?::|\s*\()/.test(normalized) || STRUCTURED_EXEC_COMPLETION_EVENT_RE.test(trimmed)
+//
+// 旧实现只做 find("exec finished") 子串匹配：既漏掉结构化事件
+// （"exec completed (id, code 0)"），又会把正文里偶然出现该短语的
+// 普通事件误判为 exec 完成。
 
 bool is_exec_completion_event(const std::string& evt) {
-    return to_lower(evt).find("exec finished") != std::string::npos;
+    // trimStart 语义：仅去头部空白
+    size_t start = evt.find_first_not_of(" \t\n\r");
+    const std::string trimmed_start = (start == std::string::npos) ? "" : evt.substr(start);
+    const std::string normalized = to_lower(trimmed_start);
+
+    static const std::regex exec_finished_re(R"(^exec finished(?::|\s*\())");
+    if (std::regex_search(normalized, exec_finished_re)) return true;
+
+    return std::regex_match(trim_str(evt), structured_exec_completion_re());
+}
+
+// ── is_relayable_exec_completion_event ───────────────────────────────────────
+// Aligned with openclaw: isRelayableExecCompletionEvent (heartbeat-events-filter.ts:38-47)
+
+bool is_relayable_exec_completion_event(const std::string& evt) {
+    auto parsed = parse_structured_exec_completion_event(evt);
+    if (!parsed) return is_exec_completion_event(evt);
+    if (!parsed->output.empty()) return true;
+    return !parsed->succeeded;
 }
 
 // ── is_cron_system_event ─────────────────────────────────────────────────────
@@ -113,14 +184,92 @@ std::string build_cron_event_prompt(
 // ── build_exec_event_prompt ──────────────────────────────────────────────────
 // Aligned with openclaw: buildExecEventPrompt
 
-std::string build_exec_event_prompt(bool deliver_to_user) {
-    if (!deliver_to_user) {
-        return "An async command you ran earlier has completed. The result is shown in the system messages above. "
-               "Handle the result internally. Do not relay it to the user unless explicitly requested.";
+// Aligned with openclaw: formatExecEventPromptText (heartbeat-events-filter.ts:49-72)
+// 返回 {text, has_missing_output_failure}
+static void format_exec_event_prompt_text(
+    const std::vector<std::string>& pending_events,
+    std::string& out_text,
+    bool& out_has_missing_output_failure
+) {
+    out_has_missing_output_failure = false;
+    std::vector<std::string> lines;
+    for (const auto& event : pending_events) {
+        auto parsed = parse_structured_exec_completion_event(event);
+        if (!parsed) {
+            // 非结构化事件：原样保留（去空白后非空才收）
+            const std::string trimmed = trim_str(event);
+            if (!trimmed.empty()) lines.push_back(trimmed);
+            continue;
+        }
+        if (!parsed->output.empty()) {
+            lines.push_back(parsed->raw);
+            continue;
+        }
+        if (parsed->succeeded) {
+            // 成功且无输出 → 无需惊动模型，整条丢弃
+            continue;
+        }
+        out_has_missing_output_failure = true;
+        lines.push_back("Exec " + parsed->action + " (" + parsed->id + ", " + parsed->result +
+                        ") without captured stdout/stderr.");
     }
-    return "An async command you ran earlier has completed. The result is shown in the system messages above. "
-           "Please relay the command output to the user in a helpful way. If the command succeeded, share the relevant output. "
-           "If it failed, explain what went wrong.";
+    std::string joined;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        if (i > 0) joined += "\n";
+        joined += lines[i];
+    }
+    out_text = trim_str(joined);
+}
+
+// Aligned with openclaw: buildExecEventPrompt (heartbeat-events-filter.ts:119-172)
+//
+// ⚠ 旧实现只收 deliver_to_user，文案写 "The result is shown in the system messages
+//   above" —— 但系统事件队列从不注入 LLM 上下文，模型实际看不到任何结果。
+//   真源在 buildCronEventPrompt 的注释里明确否决了这种写法：
+//     "This ensures the model sees the reminder text directly instead of relying on
+//      'shown in the system messages above' which may not be visible in context."
+//   现改为把事件文本直接嵌入 prompt。
+std::string build_exec_event_prompt(
+    const std::vector<std::string>& pending_events,
+    bool deliver_to_user
+) {
+    std::string raw_event_text;
+    bool has_missing_output_failure = false;
+    format_exec_event_prompt_text(pending_events, raw_event_text, has_missing_output_failure);
+
+    // Aligned with openclaw: truncateUtf16Safe + "\n\n[truncated]"
+    std::string event_text = raw_event_text;
+    if (event_text.size() > MAX_EXEC_EVENT_PROMPT_CHARS) {
+        size_t cut = MAX_EXEC_EVENT_PROMPT_CHARS;
+        // 不在 UTF-8 continuation byte (10xxxxxx) 中间切断
+        while (cut > 0 && (static_cast<unsigned char>(event_text[cut]) & 0xC0) == 0x80) {
+            --cut;
+        }
+        event_text = event_text.substr(0, cut) + "\n\n[truncated]";
+    }
+
+    if (event_text.empty()) {
+        return "An async command completion event was triggered, but no command output was found. "
+               "Reply HEARTBEAT_OK only. Do not mention, summarize, or reuse output from any earlier run.";
+    }
+
+    if (!deliver_to_user) {
+        return "An async command completion event was triggered, but user delivery is disabled for this run. "
+               "Handle the result internally and reply HEARTBEAT_OK only. "
+               "Do not mention, summarize, or reuse command output.";
+    }
+
+    if (has_missing_output_failure) {
+        return "An async command you ran earlier completed without captured stdout/stderr. "
+               "The completion details are:\n\n" + event_text + "\n\n" +
+               "Tell the user the command completed without captured output and include the exit status or signal. "
+               "Do not ask the user to provide missing logs, and do not try to retrieve logs from an exec/session id.";
+    }
+
+    return "An async command you ran earlier has completed. The command completion details are:\n\n" +
+           event_text + "\n\n" +
+           "Please relay the command output to the user in a helpful way. "
+           "If the command succeeded, share the relevant output. If it failed, explain what went wrong.";
 }
 
 } // namespace infra

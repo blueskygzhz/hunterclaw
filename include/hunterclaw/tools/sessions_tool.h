@@ -106,6 +106,12 @@ struct SessionsToolContext {
     std::string acp_default_agent;                    // acp.defaultAgent
     std::vector<std::string> acp_allowed_agents;      // acp.allowedAgents (empty = all allowed)
     int acp_max_concurrent_sessions = 10;             // acp.maxConcurrentSessions
+
+    /// Aligned with openclaw: 完整 cfg 原文，透传至 AcpSpawnConfig::raw_config，
+    /// 最终供 startAcpSpawnParentStreamRelay 解析
+    /// streaming.progressCommentary 与 acp.projection.tagVisibility。
+    /// 为空时 relay 使用真源默认值（旁白开启 + ACP_TAG_VISIBILITY_DEFAULTS）。
+    nlohmann::json raw_config;
 };
 
 /**

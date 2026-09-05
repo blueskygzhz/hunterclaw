@@ -648,6 +648,9 @@ cc_library(
     srcs = glob(["acp/*.cc"]),
     deps = [
         "//:hunterclaw_headers",
+        # acp_background_task.cc 把子会话 turn 镜像成 detached task
+        # （对齐 OC manager.background-task.ts），需要 TaskExecutor
+        ":hunterclaw_tasks",
         "@ixwebsocket//:ixwebsocket",  # 新增: acp_session_mapper.cc 引用 gateway/client.h
         "@nlohmann_json//:json",
     ],

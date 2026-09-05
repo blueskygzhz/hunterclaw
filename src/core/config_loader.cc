@@ -141,6 +141,29 @@ Result<Config> ConfigLoader::LoadFromFile(const std::string& path) {
     }
 }
 
+nlohmann::json ConfigLoader::LoadRawJson(const std::string& path) {
+    const std::string target = path.empty()
+        ? utils::expand_path("~/.hunterclaw/config.json")
+        : utils::expand_path(path);
+
+    if (!utils::file_exists(target)) {
+        return nlohmann::json::object();
+    }
+    try {
+        std::ifstream file(target);
+        if (!file.is_open()) return nlohmann::json::object();
+        nlohmann::json raw;
+        file >> raw;
+        // 顶层必须是 object，否则调用方的 value("acp", ...) 取值会抛
+        if (!raw.is_object()) return nlohmann::json::object();
+        return raw;
+    } catch (...) {
+        // 配置原文仅用于可选特性（progressCommentary / tagVisibility），
+        // 解析失败时静默退回空 object，让调用方走默认值。
+        return nlohmann::json::object();
+    }
+}
+
 Result<void> ConfigLoader::SaveToFile(const Config& config, const std::string& path) {
     auto expanded_path = utils::expand_path(path);
     

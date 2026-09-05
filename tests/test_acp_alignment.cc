@@ -21,6 +21,7 @@
 #include <atomic>
 #include <chrono>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -33,6 +34,8 @@
 #include "hunterclaw/acp/acp_session_mapper.h"
 #include "hunterclaw/acp/acp_tool_status.h"
 #include "hunterclaw/acp/acp_translator.h"
+#include "hunterclaw/acp/acp_background_task.h"
+#include "hunterclaw/tasks/task_completion_contract.h"
 
 using nlohmann::json;
 
@@ -51,6 +54,7 @@ static int g_fail = 0;
 
 namespace hc = hunterclaw;
 namespace acp = hunterclaw::acp;
+namespace tasks = hunterclaw::tasks;
 
 int main() {
     // =======================================================================
@@ -912,6 +916,234 @@ int main() {
               "**关键**：连接已断时决策落到 deny（fail-closed）");
         // 给 relay 线程留出退出时间，避免 store 先析构
         std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    }
+
+    // =======================================================================
+    // approval 事件被丢弃时必须留痕 ★★
+    //
+    // ⚠ 这是整条链路上最容易"静默失效"的地方: 事件确实到了，但因某个字段
+    //   与 gateway 侧不一致而被丢弃 —— 用户永远等不到审批弹窗、命令永不
+    //   执行，而日志里一个字都没有，排查时看不出事件已经来过。
+    //
+    // ★ 本测试断言"具体缺了什么"被打出来，而非笼统一句"解析失败":
+    //   实测构造事件时踩过两个真实约束（sessionKey 必须在 payload 内、
+    //   phase/kind/status 三者缺一不可），只打"invalid" 的话这两点都要
+    //   靠读源码定位。
+    std::cout << "\n== approval 事件丢弃诊断（verbose）==\n";
+    {
+        auto store = acp::create_default_session_store();
+        acp::AcpServerOptions opts;
+        opts.verbose = true;   // ★ 诊断只在 verbose 下输出
+
+        acp::AcpGatewayAgent agent(nullptr, opts, store.get());
+
+        // 捕获 stderr —— ⚠ 诊断必须走 stderr，stdout 只能放 ndjson
+        std::ostringstream cap;
+        auto* old_buf = std::cerr.rdbuf(cap.rdbuf());
+
+        // ① 缺 phase/kind/status
+        agent.handle_gateway_event(nlohmann::json{
+            {"event", "exec.approval.requested"},
+            {"payload", {{"sessionKey", "k1"},
+                         {"type", "exec.approval.requested"},
+                         {"approvalId", "ap-1"}}}});
+
+        // ② 缺 approvalId
+        agent.handle_gateway_event(nlohmann::json{
+            {"event", "exec.approval.requested"},
+            {"payload", {{"sessionKey", "k1"},
+                         {"type", "exec.approval.requested"},
+                         {"phase", "requested"}, {"kind", "exec"},
+                         {"status", "pending"}}}});
+
+        // ③ 字段合格但无匹配 pending（第二个静默丢弃点）
+        agent.handle_gateway_event(nlohmann::json{
+            {"event", "exec.approval.requested"},
+            {"payload", {{"sessionKey", "no-such-session"},
+                         {"type", "exec.approval.requested"},
+                         {"phase", "requested"}, {"kind", "exec"},
+                         {"status", "pending"}, {"approvalId", "ap-3"}}}});
+
+        std::cerr.rdbuf(old_buf);
+        const std::string logged = cap.str();
+
+        CHECK(logged.find("phase") != std::string::npos &&
+              logged.find("期望 requested") != std::string::npos,
+              "**关键**：指出 phase 不符及期望值（而非笼统\"解析失败\"）");
+        CHECK(logged.find("approvalId 缺失") != std::string::npos,
+              "**关键**：指出 approvalId 缺失");
+        CHECK(logged.find("无匹配 pending prompt") != std::string::npos,
+              "**关键**：字段合格但无 pending 时也留痕（第二个丢弃点）");
+        CHECK(logged.find("当前 pending 数=") != std::string::npos,
+              "带上 pending 数量，便于判断是时序问题还是 key 不一致");
+
+        // ── verbose=false 时必须完全静默 ─────────────────────────────────
+        // ⚠ 这条路径可能被高频触发（gateway 广播本进程不关心的形态），
+        //   无条件输出会淹没日志。
+        {
+            acp::AcpServerOptions quiet;
+            quiet.verbose = false;
+            acp::AcpGatewayAgent q(nullptr, quiet, store.get());
+            std::ostringstream cap2;
+            auto* ob2 = std::cerr.rdbuf(cap2.rdbuf());
+            q.handle_gateway_event(nlohmann::json{
+                {"event", "exec.approval.requested"},
+                {"payload", {{"sessionKey", "k1"},
+                             {"type", "exec.approval.requested"},
+                             {"approvalId", "ap-q"}}}});
+            std::cerr.rdbuf(ob2);
+            CHECK(cap2.str().empty(), "verbose=false 时不输出（避免淹没日志）");
+        }
+    }
+
+    // =======================================================================
+    // manager.background-task.ts → acp_background_task
+    // ACP 子会话不进 SubagentRegistry，父侧只能靠 detached task 镜像感知结果，
+    // 因此这些边界值/推断规则必须与真源逐条一致。
+    // =======================================================================
+    {
+        std::cout << "\n[background-task] 对齐 OC manager.background-task.ts\n";
+
+        // ── summarizeBackgroundTaskText ──────────────────────────────────
+        CHECK(acp::summarize_background_task_text("  ") == "ACP background task",
+              "空白文本回落固定占位串（对齐 OC ?? \"ACP background task\"）");
+        CHECK(acp::summarize_background_task_text("  refactor foo  ") == "refactor foo",
+              "normalizeText 先 trim");
+        {
+            const std::string long_text(300, 'x');
+            const std::string out = acp::summarize_background_task_text(long_text);
+            // OC: truncateUtf16Safe(s, MAX-1) + "…"，故字节数 = 159 + 3(U+2026)
+            CHECK(out.size() == acp::ACP_BACKGROUND_TASK_TEXT_MAX_LENGTH - 1 + 3,
+                  "超长按 MAX-1 截断再补省略号");
+            CHECK(out.substr(out.size() - 3) == "\xE2\x80\xA6",
+                  "省略号是 U+2026 而非三个点");
+        }
+        {
+            // ⚠ 关键：截断点落在多字节字符中间时不得产生非法 UTF-8
+            const std::string cjk_text = std::string(158, 'a') + "中文尾巴";
+            const std::string out = acp::summarize_background_task_text(cjk_text);
+            CHECK(out.size() <= acp::ACP_BACKGROUND_TASK_TEXT_MAX_LENGTH - 1 + 3,
+                  "CJK 截断不超过上限");
+            bool valid = true;
+            for (size_t i = 0; i < out.size();) {
+                const unsigned char c = static_cast<unsigned char>(out[i]);
+                size_t len = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3
+                           : (c >> 3) == 0x1E ? 4 : 0;
+                if (len == 0 || i + len > out.size()) { valid = false; break; }
+                for (size_t k = 1; k < len; ++k) {
+                    if ((static_cast<unsigned char>(out[i + k]) & 0xC0) != 0x80) {
+                        valid = false;
+                        break;
+                    }
+                }
+                if (!valid) break;
+                i += len;
+            }
+            CHECK(valid, "**关键**：截断不切断 UTF-8 多字节序列（否则日志/DB 出现乱码）");
+        }
+
+        // ── appendBackgroundTaskProgressSummary ──────────────────────────
+        // ⚠ 真源第 50 行 combined 末尾**没有** .trim()，只做 \s+ 折叠。
+        //   所以纯空白 chunk 会折叠成单空格并追加，尾部空白也会保留。
+        //   起初我按"直觉"写成 trim 后的期望值，3 条断言全红 —— 实现才是对的。
+        CHECK(acp::append_background_task_progress_summary("abc", "   ") == "abc ",
+              "纯空白 chunk 折叠为单空格后仍会追加（真源不 trim 尾部）");
+        CHECK(acp::append_background_task_progress_summary("", "  hello  ") == "hello ",
+              "首段 trimStart 去前导空白，但尾部空白保留");
+        CHECK(acp::append_background_task_progress_summary("hello", " world") == "hello world",
+              "续接段保留前导空格以保住词边界");
+        CHECK(acp::append_background_task_progress_summary("a", "b\n\nc") == "ab c",
+              "换行折叠为单空格；current 与 chunk 之间不额外插空格");
+        {
+            const std::string base(238, 'y');
+            const std::string out = acp::append_background_task_progress_summary(base, "zzzzz");
+            CHECK(out.size() == acp::ACP_BACKGROUND_TASK_PROGRESS_MAX_LENGTH - 1 + 3,
+                  "进度摘要按 240-1 截断再补省略号");
+        }
+
+        // ── resolveBackgroundTaskFailureStatus ───────────────────────────
+        {
+            acp::AcpRuntimeError timeout_err(
+                acp::AcpErrorCode::ACP_TURN_FAILED, "turn timed out",
+                std::string(acp::ACP_TURN_TIMEOUT_DETAIL_CODE));
+            CHECK(acp::resolve_background_task_failure_status(timeout_err) ==
+                      tasks::TaskStatus::TIMED_OUT,
+                  "detailCode==TURN_TIMEOUT → timed_out");
+
+            acp::AcpRuntimeError other_err(acp::AcpErrorCode::ACP_TURN_FAILED, "boom");
+            CHECK(acp::resolve_background_task_failure_status(other_err) ==
+                      tasks::TaskStatus::FAILED,
+                  "无 detailCode → failed（而非 timed_out）");
+
+            acp::AcpRuntimeError resume_err(
+                acp::AcpErrorCode::ACP_SESSION_INIT_FAILED, "need resume",
+                std::string("SESSION_RESUME_REQUIRED"));
+            CHECK(acp::resolve_background_task_failure_status(resume_err) ==
+                      tasks::TaskStatus::FAILED,
+                  "**关键**：其他 detailCode 不得误判成超时");
+        }
+
+        // ── resolveBackgroundTaskTerminalResult ──────────────────────────
+        {
+            auto r = acp::resolve_background_task_terminal_result("");
+            CHECK(r.terminal_outcome.has_value() &&
+                      *r.terminal_outcome == tasks::TaskTerminalOutcome::BLOCKED,
+                  "空进度摘要 → blocked（没产出可交付物）");
+
+            r = acp::resolve_background_task_terminal_result("I'll check the logs");
+            CHECK(r.terminal_outcome.has_value() &&
+                      *r.terminal_outcome == tasks::TaskTerminalOutcome::BLOCKED,
+                  "progress-only 文本 → blocked（只报意图不算完成）");
+
+            r = acp::resolve_background_task_terminal_result(
+                "Refactored 7 call sites and added 3 unit tests.");
+            CHECK(!r.terminal_outcome.has_value(), "真实交付物描述 → 不标 blocked");
+
+            r = acp::resolve_background_task_terminal_result(
+                "write failed: permission denied for /etc/hosts.");
+            CHECK(r.terminal_outcome.has_value() &&
+                      *r.terminal_outcome == tasks::TaskTerminalOutcome::BLOCKED,
+                  "permission denied → blocked");
+            CHECK(r.terminal_summary.has_value() &&
+                      *r.terminal_summary == "Permission denied for /etc/hosts.",
+                  "**关键**：提取路径且剥掉尾部标点（便于父侧直接展示）");
+
+            r = acp::resolve_background_task_terminal_result("Permission denied");
+            CHECK(r.terminal_summary.has_value() && *r.terminal_summary == "Permission denied.",
+                  "无路径时用通用文案");
+
+            const char* writable_probes[] = {"I need a writable session to continue",
+                                             "filesystem authorization missing",
+                                             "please use `apply_patch` instead"};
+            for (const char* probe : writable_probes) {
+                r = acp::resolve_background_task_terminal_result(probe);
+                CHECK(r.terminal_outcome.has_value() &&
+                          *r.terminal_outcome == tasks::TaskTerminalOutcome::BLOCKED,
+                      std::string("writable-session 判据命中: ") + probe);
+                CHECK(r.terminal_summary.has_value() &&
+                          *r.terminal_summary ==
+                              "Writable session or apply_patch authorization required.",
+                      "统一 writable-session 文案");
+            }
+        }
+
+        // ── task-completion-contract（真源依赖） ─────────────────────────
+        {
+            CHECK(tasks::is_progress_only_completion_text("Let me run the tests"),
+                  "\"Let me run\" 属 progress-only");
+            CHECK(tasks::is_progress_only_completion_text("Checking the config"),
+                  "裸动名词开头（Checking）属 progress-only");
+            CHECK(tasks::is_progress_only_completion_text("Next, I'll review the diff"),
+                  "剥掉 follow-up 前缀后仍是 progress-only");
+            CHECK(!tasks::is_progress_only_completion_text(
+                      "I'll check the logs. Found the root cause in parser.cc line 42."),
+                  "**关键**：后接实质结论的句子不算 progress-only（否则成功也被判 blocked）");
+            CHECK(!tasks::is_progress_only_completion_text("Fixed the parser bug"),
+                  "完成态描述不属 progress-only");
+            CHECK(tasks::normalize_completion_text("  a \n\t b  ") == "a b", "空白折叠 + trim");
+            CHECK(tasks::truncate_utf8_safe("中文", 4) == "中",
+                  "**关键**：UTF-8 安全截断退回字符边界");
+        }
     }
 
     // =======================================================================

@@ -57,6 +57,22 @@ std::vector<SystemEvent> drain_system_event_entries(const std::string& session_k
 
 std::vector<std::string> drain_system_events(const std::string& session_key);
 
+// ── consume_selected_system_event_entries ────────────────────────────────────
+// Aligned with openclaw: consumeSelectedSystemEventEntries (system-events.ts:268)
+//
+// 精确移除「本轮已被消费」的事件，而不是整队清空。用于 peek → 送入 prompt →
+// turn 真正跑完后回收这条链路：turn 短路（未真正执行）时不得消费，否则事件
+// 会被白白吃掉。
+//
+// 匹配语义对齐真源 areSystemEventsEqual：text + ts + context_key 三项全等。
+// （真源还比 deliveryContext，HunterClaw 的 SystemEvent 无该字段。）
+// 返回实际被移除的事件。
+
+std::vector<SystemEvent> consume_selected_system_event_entries(
+    const std::string& session_key,
+    const std::vector<SystemEvent>& consumed_entries
+);
+
 // ── peek_system_event_entries ────────────────────────────────────────────────
 // Aligned with openclaw: peekSystemEventEntries
 // Returns a copy of all events without clearing.

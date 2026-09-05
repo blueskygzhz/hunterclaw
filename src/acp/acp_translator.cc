@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <iostream>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -691,6 +692,36 @@ void AcpGatewayAgent::handle_gateway_event(const nlohmann::json& evt_in) {
      ae.tool_call_id = data->value("toolCallId", "");
        std::string run_id = evt.value("runId", "");
       start_approval_relay(sk, run_id, ae);
+        } else if (impl_->opts.verbose) {
+            // ★★ 命中 approval 事件但字段不合格 —— 必须留痕。
+            //
+            // ⚠ 这是整条链路上最容易"静默失效"的地方: 事件确实到了，
+            //   但因某个字段名/取值与 gateway 侧不一致而被直接丢弃，
+            //   结果是【用户永远等不到审批弹窗，命令永远不执行】，
+            //   而日志里一个字都没有 —— 排查时根本看不出事件已经来过。
+            //
+            // ★ 必须打出【具体缺了什么】而非笼统一句"解析失败":
+            //   实测构造这个事件时踩过两个真实约束 ——
+            //     · sessionKey 必须在 payload 内（归一化时 evt 被 payload
+            //       整体替换，放顶层读不到）
+            //     · phase/kind/status 三者缺一不可
+            //   只打"invalid event"的话，这两点都要靠读源码才能定位。
+            //
+            // ⚠ 只在 verbose 下输出: 这条路径可能被高频触发（如 gateway
+            //   广播了本进程不关心的 approval 形态），无条件打会淹没日志。
+            std::string why;
+            if (approval_id.empty()) why += "approvalId 缺失; ";
+            if (!evt.contains("request")) {
+                if (phase != "requested") why += "phase=\"" + phase + "\"(期望 requested); ";
+                if (kind != "exec") why += "kind=\"" + kind + "\"(期望 exec); ";
+                if (status != "pending") why += "status=\"" + status + "\"(期望 pending); ";
+            }
+            if (sk.empty()) why += "sessionKey 缺失(须在 payload 内); ";
+            if (why.empty()) why = "未知原因";
+            // ⚠ stdout 只能放 ndjson —— 诊断信息必须走 stderr，
+            //   否则会污染协议帧让客户端解析失败（见 acp_stdio_transport.cc）。
+            std::cerr << "[acp] 丢弃 approval 事件 (type=\"" << type
+                      << "\" stream=\"" << stream << "\"): " << why << "\n";
         }
         }
     }
@@ -703,11 +734,15 @@ void AcpGatewayAgent::start_approval_relay(const std::string& session_key,
    const GatewayApprovalEvent& event) {
     std::string target_sid;
     std::string title = event.title;
+    bool dup = false;
+    size_t pending_count = 0;
     {
       std::lock_guard<std::mutex> lk(impl_->mu);
         // 去重：同一 approvalId 只中继一次（对齐 OC approvalRelays.has）。
-if (impl_->approval_relays.count(event.approval_id)) return;
+if (impl_->approval_relays.count(event.approval_id)) dup = true;
+        if (!dup) {
         // 找到匹配该 session_key 的 pending prompt（对齐 OC findPendingForApproval）。
+        pending_count = impl_->pending.size();
         for (auto& [sid, pe] : impl_->pending) {
 if (pe.session_key != session_key) continue;
        target_sid = sid;
@@ -719,7 +754,24 @@ if (pe.session_key != session_key) continue;
    }
     break;
   }
-   if (target_sid.empty()) return;  // 无匹配 pending，忽略（对齐 OC）。
+        }
+   if (dup || target_sid.empty()) {
+            // ★★ 第二个静默丢弃点 —— 与字段不合格是【同样的用户可见症状】:
+            //   审批弹窗永不出现、命令永不执行，日志里却什么都没有。
+            //
+            // ⚠ 两种原因必须分开说:
+            //   · dup: 正常去重（gateway 未收到 2xx 会重投），不是问题
+            //   · 无匹配 pending: 事件到得太早/太晚，或 sessionKey 与
+            //     prompt 侧不一致 —— 这才是真正需要排查的
+            //   合并成一句"忽略"会让人分不清哪种，白查半天。
+            if (impl_->opts.verbose && !dup) {
+                std::cerr << "[acp] approval " << event.approval_id
+                          << " 无匹配 pending prompt (sessionKey=\"" << session_key
+                          << "\", 当前 pending 数=" << pending_count
+                          << ") —— 审批弹窗不会出现\n";
+            }
+            return;
+        }
         PendingApprovalRelay relay;
    relay.approval_id = event.approval_id;
         relay.session_id = target_sid;

@@ -121,6 +121,62 @@ std::vector<std::string> drain_system_events(const std::string& session_key) {
     return result;
 }
 
+// ── consume_selected_system_event_entries ────────────────────────────────────
+// Aligned with openclaw: consumeSelectedSystemEventEntries (system-events.ts:268-290)
+
+namespace {
+
+// Aligned with openclaw: areSystemEventsEqual (system-events.ts:218-225)
+// 真源还比 deliveryContext；HunterClaw 的 SystemEvent 无该字段，故只比三项。
+bool are_system_events_equal(const SystemEvent& left, const SystemEvent& right) {
+    if (left.text != right.text) return false;
+    if (left.ts != right.ts) return false;
+    const bool left_has = left.context_key.has_value();
+    const bool right_has = right.context_key.has_value();
+    if (left_has != right_has) return false;
+    if (left_has && *left.context_key != *right.context_key) return false;
+    return true;
+}
+
+// Aligned with openclaw: resetQueueState (system-events.ts:227-232)
+// 队列空了要连 last_context_key 一起清掉并移除整个 entry，否则残留的
+// last_text/last_context_key 会让后续同文本事件被误判为连续重复而丢弃。
+// 调用方必须已持有 g_mutex。
+void reset_queue_state_locked(const std::string& key) {
+    auto it = g_queues.find(key);
+    if (it == g_queues.end()) return;
+    if (it->second.queue.empty()) {
+        g_queues.erase(it);
+    }
+}
+
+} // namespace
+
+std::vector<SystemEvent> consume_selected_system_event_entries(
+    const std::string& session_key,
+    const std::vector<SystemEvent>& consumed_entries
+) {
+    const std::string key = require_session_key(session_key);
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_queues.find(key);
+    if (it == g_queues.end() || it->second.queue.empty() || consumed_entries.empty()) {
+        return {};
+    }
+    auto& queue = it->second.queue;
+    std::vector<SystemEvent> removed;
+    removed.reserve(consumed_entries.size());
+    for (const auto& consumed : consumed_entries) {
+        auto found = std::find_if(
+            queue.begin(), queue.end(),
+            [&consumed](const SystemEvent& e) { return are_system_events_equal(e, consumed); });
+        if (found == queue.end()) continue;   // 已被别处消费/挤出，跳过
+        removed.push_back(*found);
+        queue.erase(found);
+    }
+    reset_queue_state_locked(key);
+    return removed;
+}
+
 // ── peek_system_event_entries ────────────────────────────────────────────────
 // Aligned with openclaw: peekSystemEventEntries
 

@@ -40,6 +40,17 @@ public:
     
     // 从文件加载
     static Result<Config> LoadFromFile(const std::string& path);
+
+    /// 加载配置原文（未经结构化裁剪的 JSON）
+    ///
+    /// Aligned with openclaw: 真源各模块直接接收完整 `OpenClawConfig`，
+    /// 因此像 `streaming.progressCommentary`、`acp.projection.tagVisibility`
+    /// 这类未被 `Config` 结构覆盖的字段仍可读取。HunterClaw 的 `Config`
+    /// 是窄化结构，需要额外提供原文通道。
+    ///
+    /// @param path 空表示 ~/.hunterclaw/config.json
+    /// @return 文件不存在或解析失败时返回空 object（不抛异常）
+    static nlohmann::json LoadRawJson(const std::string& path = "");
     
     // 保存到文件
     static Result<void> SaveToFile(const Config& config, const std::string& path);

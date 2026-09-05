@@ -3,6 +3,8 @@
 #include "hunterclaw/gateway/server_lanes.h"  // 对齐 OpenClaw: applyGatewayLaneConcurrency
 #include "hunterclaw/agents/agent_pool.h"
 #include "hunterclaw/agents/agent_instance.h"
+#include "hunterclaw/agents/agent_scope.h"   // ✅ ACP lineage loader: parse_agent_session_key
+#include "hunterclaw/agents/agent_paths.h"   // ✅ ACP lineage loader: resolve_state_dir
 #include "hunterclaw/memory/memory_index_manager.h"  // ✅ Memory startup (对齐 server-startup-memory.ts)
 #include "hunterclaw/cron/service.h"
 #include "hunterclaw/core/utils.h"
@@ -2955,8 +2957,85 @@ core::Result<bool> GatewayServer::start() {
                         std::move(read_meta),
                         std::move(write_meta)
                     );
-                    acp::AcpSessionManager::set_instance(acp_mgr);
 
+                    // ── Session lineage loader ────────────────────────────────
+                    // Aligned with openclaw: AcpSessionManagerDeps.loadSessionEntry
+                    // ACP 子会话不进 SubagentRegistry，父侧只能靠 detached task 镜像
+                    // 感知结果；这里提供血缘（spawnedBy）与投递上下文的读取通道。
+                    // 直接读 sessions.json —— 与 subagent_capabilities.cc 同一份存储。
+                    acp_mgr->set_session_lineage_loader(
+                        [](const std::string& session_key) -> std::optional<acp::AcpSessionLineage> {
+                            auto parsed = agents::AgentScopeManager::parse_agent_session_key(session_key);
+                            if (!parsed.has_value() || parsed->agent_id.empty()) {
+                                return std::nullopt;
+                            }
+                            const std::string store_path =
+                                agents::resolve_state_dir() + "/agents/" +
+                                parsed->agent_id + "/sessions.json";
+                            try {
+                                if (!std::filesystem::exists(store_path)) return std::nullopt;
+                                std::ifstream ifs(store_path);
+                                if (!ifs.good()) return std::nullopt;
+                                std::string content((std::istreambuf_iterator<char>(ifs)),
+                                                    std::istreambuf_iterator<char>());
+                                auto parsed_json = nlohmann::json::parse(content, nullptr, false);
+                                if (parsed_json.is_discarded() || !parsed_json.is_object()) {
+                                    return std::nullopt;
+                                }
+                                if (!parsed_json.contains(session_key) ||
+                                    !parsed_json[session_key].is_object()) {
+                                    return std::nullopt;
+                                }
+                                const auto& e = parsed_json[session_key];
+                                acp::AcpSessionLineage lineage;
+                                auto str = [&e](const char* k) -> std::optional<std::string> {
+                                    if (e.contains(k) && e[k].is_string()) {
+                                        return e[k].get<std::string>();
+                                    }
+                                    return std::nullopt;
+                                };
+                                lineage.spawned_by         = str("spawnedBy");
+                                lineage.parent_session_key = str("parentSessionKey");
+                                lineage.label              = str("label");
+                                lineage.last_channel       = str("lastChannel");
+                                lineage.last_to            = str("lastTo");
+                                lineage.last_account_id    = str("lastAccountId");
+                                lineage.last_thread_id     = str("lastThreadId");
+                                return lineage;
+                            } catch (...) {
+                                // 读不到血缘只会关闭 background task 镜像，不影响 turn 执行
+                                return std::nullopt;
+                            }
+                        });
+
+                    // ── Backend failover config ───────────────────────────────
+                    // Aligned with openclaw: cfg.acp.backend / cfg.acp.fallbacks
+                    // （manager.turn-runner.ts:110-112）
+                    // 两项都缺省时候选只剩一项空串（＝registry 自选默认 backend），
+                    // failover 循环退化为单次执行，行为与对齐前完全一致。
+                    {
+                        std::string configured_backend;
+                        std::vector<std::string> fallback_backends;
+                        // acp_cfg 的作用域只到上面的 if 块，这里从 data 重新取
+                        if (data.contains("acp") && data["acp"].is_object()) {
+                            const auto& acp_node = data["acp"];
+                            if (acp_node.contains("backend") && acp_node["backend"].is_string()) {
+                                configured_backend = acp_node["backend"].get<std::string>();
+                            }
+                            if (acp_node.contains("fallbacks") &&
+                                acp_node["fallbacks"].is_array()) {
+                                for (const auto& item : acp_node["fallbacks"]) {
+                                    if (item.is_string()) {
+                                        fallback_backends.push_back(item.get<std::string>());
+                                    }
+                                }
+                            }
+                        }
+                        acp_mgr->set_backend_failover_config(configured_backend,
+                                                             fallback_backends);
+                    }
+
+                    acp::AcpSessionManager::set_instance(acp_mgr);
                     auto log = spdlog::get("default");
                     if (log) log->info("[gateway] AcpSessionManager initialized");
                 }

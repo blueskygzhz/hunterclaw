@@ -53,6 +53,13 @@ struct AcpSpawnConfig {
     std::string acp_gateway_url;                // e.g. "ws://127.0.0.1:18789"
     std::string acp_gateway_token;              // auth token for remote gateway
     std::string acp_gateway_instance_id;        // instance id for remote gateway
+
+    /// Aligned with openclaw: params.cfg (完整 OpenClawConfig)
+    /// 真源把整份 cfg 传给 startAcpSpawnParentStreamRelay，用于解析
+    /// streaming.progressCommentary 与 acp.projection.tagVisibility。
+    /// HunterClaw 的 AcpSpawnConfig 是窄化结构，这里保留配置原文以对齐该语义。
+    /// 为空时 relay 走真源默认值（旁白开启 + ACP_TAG_VISIBILITY_DEFAULTS）。
+    nlohmann::json raw_config;
 };
 
 // ============================================================================
@@ -195,7 +202,11 @@ AcpSpawnParentRelayHandle start_acp_spawn_parent_stream_relay(
     /// Represented as JSON object (channel/to/threadId/accountId fields)
     const std::optional<nlohmann::json>& delivery_context = std::nullopt,
     /// Aligned with openclaw: surfaceUpdates — if false, log only (no system events / heartbeat wake)
-    bool surface_updates = true
+    bool surface_updates = true,
+    /// Aligned with openclaw: params.cfg — drives resolveParentProgressCommentary
+    /// (streaming.progressCommentary, default true) and resolveAcpProjectionSettings
+    /// (acp.projection.tagVisibility overrides for ACP status relay).
+    const std::optional<nlohmann::json>& cfg = std::nullopt
 );
 
 // ============================================================================

@@ -12,6 +12,8 @@
 #include "hunterclaw/infra/heartbeat_reason.h"
 #include "hunterclaw/infra/heartbeat_events_filter.h"
 #include "hunterclaw/infra/system_events.h"
+// 定向唤醒时用 session_key 反解 agent_id（对齐 resolveAgentIdFromSessionKey）
+#include "hunterclaw/routing/resolver.h"
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -265,8 +267,16 @@ HeartbeatRunResult run_heartbeat_once(
 
     // Build the prompt for this heartbeat run.
     // Aligned with openclaw: resolveHeartbeatRunPrompt
+    //   shouldInspectPendingEvents = isExecEventWake || isCronWake
+    //                              || shouldInspectWakePendingEvents || hasTaggedCronEvents
+    // (heartbeat-runner-prompt.ts:374-378)
+    //
+    // is_wake_reason 覆盖 Wake / Hook 两类，其中 Wake 包含 `acp:spawn:*`
+    // (heartbeat_reason.cc:38)。缺这一项时 ACP relay 投进队列的子会话进度
+    // 会被完全忽略，父会话虽被唤醒却只拿到通用心跳 prompt。
     const bool should_inspect_pending =
-        is_exec_event_reason || is_cron_event_reason || has_tagged_cron_events;
+        is_exec_event_reason || is_cron_event_reason || is_wake_reason
+        || has_tagged_cron_events;
 
     std::vector<std::string> pending_texts;
     if (should_inspect_pending) {
@@ -286,8 +296,17 @@ HeartbeatRunResult run_heartbeat_once(
         pending_texts.begin(), pending_texts.end(), is_exec_completion_event);
     const bool has_cron_events = !cron_events.empty();
 
+    // Aligned with openclaw: buildExecEventPrompt(execEvents, { deliverToUser })
+    // 只把 exec 完成类事件送进 exec prompt（对齐 prompt.ts:279-283 的 filter）。
+    std::vector<std::string> exec_events;
+    if (should_inspect_pending) {
+        for (const auto& t : pending_texts) {
+            if (is_exec_completion_event(t)) exec_events.push_back(t);
+        }
+    }
+
     const std::string prompt = has_exec_completion
-        ? build_exec_event_prompt(show_alerts)
+        ? build_exec_event_prompt(exec_events, show_alerts)
         : has_cron_events
             ? build_cron_event_prompt(cron_events, show_alerts)
             : agent.prompt.value_or("");
@@ -357,6 +376,18 @@ HeartbeatRunResult run_heartbeat_once(
     }
 
     const int64_t duration_ms = static_cast<int64_t>(default_now_ms() - started_at);
+
+    // ── Consume inspected system events ──────────────────────────────────────
+    // Aligned with openclaw: heartbeat-runner-delivery.ts:515-516
+    //   if (shouldInspectPendingEvents && inspectedSystemEventsToConsume.length)
+    //     consumeSelectedSystemEventEntries(sessionKey, inspectedSystemEventsToConsume)
+    //
+    // 位置必须在 reply_fn 成功返回之后：turn 短路（异常/未执行）时不得消费，
+    // 否则事件被白白吃掉（对齐 execution.ts:490-493 的 shouldConsumeInspectedEvents）。
+    // 只回收本轮真正 inspect 过的那些条目，不整队清空——期间可能有新事件入队。
+    if (should_inspect_pending && !session_key.empty() && !pending_events.empty()) {
+        consume_selected_system_event_entries(session_key, pending_events);
+    }
 
     // ── ok-empty: reply has no text and no media ──────────────────────────────
     // Aligned with openclaw: !replyPayload || (!text && !mediaUrl && !mediaUrls)
@@ -595,8 +626,20 @@ public:
         bool ran = false;
 
         // Aligned with openclaw: targeted run (requestedAgentId or requestedSessionKey)
+        //   requestedTargetAgentId = requestedAgentId
+        //     ?? (requestedSessionKey ? resolveAgentIdFromSessionKey(requestedSessionKey) : undefined)
+        // (heartbeat-runner-scheduler.ts:292-294)
+        //
+        // 缺这个回退时，只带 session_key 的唤醒（ACP relay / 部分 cron 路径）
+        // 会用空串查 agents_（键为 agent_id，见 :557），必然失配 → Skipped/disabled，
+        // 定向唤醒整条链路失效。
         if (params.agent_id.has_value() || params.session_key.has_value()) {
             std::string target_agent_id = params.agent_id.value_or("");
+            if (target_agent_id.empty() && params.session_key.has_value()
+                && !params.session_key->empty()) {
+                target_agent_id =
+                    ::hunterclaw::routing::resolve_agent_id_from_session_key(*params.session_key);
+            }
             auto it = agents_.find(target_agent_id);
             if (it == agents_.end()) {
                 schedule_next_locked();

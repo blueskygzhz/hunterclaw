@@ -14,6 +14,7 @@
 #include "hunterclaw/acp/runtime_cache.h"
 #include "hunterclaw/acp/runtime_options.h"
 #include "hunterclaw/acp/session_actor_queue.h"
+#include "hunterclaw/acp/acp_background_task.h"
 #include <string>
 #include <map>
 #include <memory>
@@ -88,6 +89,22 @@ struct ActiveTurnState {
 // These decouple AcpSessionManager from the storage layer.
 using ReadSessionMetaFn = std::function<std::optional<AcpSessionMeta>(const std::string& session_key)>;
 using WriteSessionMetaFn = std::function<void(const std::string& session_key, const std::optional<AcpSessionMeta>& meta)>;
+
+// ── Session lineage lookup ───────────────────────────────────────────────────
+// Aligned with openclaw: AcpSessionManagerDeps.loadSessionEntry —— 只取
+// background-task 镜像需要的血缘/投递字段，避免 acp 模块反向依赖 sessions 模块。
+struct AcpSessionLineage {
+    std::optional<std::string> spawned_by;          // OC: entry.spawnedBy
+    std::optional<std::string> parent_session_key;  // OC: entry.parentSessionKey
+    std::optional<std::string> label;              // OC: entry.label
+    // OC: deliveryContextFromSession(entry)
+    std::optional<std::string> last_channel;
+    std::optional<std::string> last_to;
+    std::optional<std::string> last_account_id;
+    std::optional<std::string> last_thread_id;
+};
+using LoadSessionLineageFn =
+    std::function<std::optional<AcpSessionLineage>(const std::string& session_key)>;
 
 // ── AcpSessionManager ────────────────────────────────────────────────────────
 // Aligned with openclaw: class AcpSessionManager (manager.core.ts)
@@ -164,9 +181,45 @@ public:
     // ── resetSessionRuntimeOptions ───────────────────────────────────────
     AcpSessionRuntimeOptions reset_session_runtime_options(const std::string& session_key);
 
+    // ── Session lineage injection ────────────────────────────────────────
+    // Aligned with openclaw: AcpSessionManagerDeps.loadSessionEntry
+    // 用于把子会话 turn 镜像成父侧可见的 detached task（background task）。
+    // 未注入时 background task 镜像整体关闭（对齐 OC：拿不到 requester 就
+    // resolveBackgroundTaskContext 返回 null，不建 task）。
+    void set_session_lineage_loader(LoadSessionLineageFn loader) {
+        session_lineage_loader_ = std::move(loader);
+    }
+
+    // ── Backend failover configuration ───────────────────────────────────
+    // Aligned with openclaw: cfg.acp.backend / cfg.acp.fallbacks
+    // （manager.turn-runner.ts:110-112 传给 resolveBackendCandidatePlan）
+    // 未配置时候选只有一项空串，即"registry 自选默认 backend"，行为与
+    // 对齐前完全一致 —— 故此项为纯增量，不改变既有部署。
+    void set_backend_failover_config(const std::string& configured_backend,
+                                     const std::vector<std::string>& fallback_backends) {
+        configured_backend_ = configured_backend;
+        fallback_backends_ = fallback_backends;
+    }
+
 private:
     ReadSessionMetaFn read_meta_;
     WriteSessionMetaFn write_meta_;
+    LoadSessionLineageFn session_lineage_loader_;
+    std::string configured_backend_;
+    std::vector<std::string> fallback_backends_;
+
+    // Clears persisted resume identifiers so the next ensure rebuilds the backend session.
+    // Aligned with openclaw: clearPersistedRuntimeResumeState
+    // 返回 false 表示无法清理（调用方须放弃 fresh-handle 重试）。
+    bool clear_persisted_resume_state(const std::string& session_key);
+
+    // Resolves the requester task context for a spawned child ACP session.
+    // Aligned with openclaw: resolveBackgroundTaskContext
+    std::optional<AcpBackgroundTaskContext> resolve_background_task_context(
+        const std::string& session_key,
+        const std::string& request_id,
+        const std::string& text);
+
 
     SessionActorQueue actor_queue_;
     RuntimeCache runtime_cache_;

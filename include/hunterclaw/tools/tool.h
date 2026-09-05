@@ -9,6 +9,7 @@
 #include <optional>
 #include <functional>
 #include <variant>
+#include <nlohmann/json.hpp>
 
 // Forward declarations for MCP types
 namespace hunterclaw {
@@ -271,6 +272,15 @@ struct ToolContext {
     // 非 owner 调用 owner_only 工具时, before_tool_call 门禁会 veto。
     // 默认 false (最小权限); 由gateway/agent 上下文按 scope 显式置位。
     bool sender_is_owner = false;
+
+    /// 配置原文（未被上面窄化字段覆盖的部分仍可读取）
+    ///
+    /// Aligned with openclaw: 真源工具直接持有完整 `OpenClawConfig`。
+    /// HunterClaw 把配置拆成了具名字段，导致 `streaming.progressCommentary`、
+    /// `acp.projection.tagVisibility` 这类字段无处可取。此字段用于透传原文，
+    /// 目前由 sessions_tool → AcpSpawnConfig::raw_config → ACP 父流 relay 消费。
+    /// 为空时下游走各自默认值。
+    nlohmann::json raw_config;
 
     // ===== 依赖注入 (用于工具注册) =====
     std::shared_ptr<infra::HttpClient>    http_client;

@@ -13,6 +13,7 @@
 #include "hunterclaw/acp/acp_session_manager.h" // ✅ AcpSessionManager::run_turn (ACP subagent path)
 #include "hunterclaw/acp/acp_reply_projector.h" // ✅ AcpReplyProjector (event → channel delivery)
 #include "hunterclaw/acp/runtime_errors.h"      // ✅ AcpRuntimeError, format_acp_runtime_error_text
+#include "hunterclaw/infra/agent_events.h"      // ✅ emit_agent_event (ACP → AgentEvent 总线桥接)
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 #include <thread>
@@ -20,6 +21,106 @@
 #include <filesystem>
 
 using json = nlohmann::json;
+
+namespace {
+
+// ── sanitize_acp_diagnostic_text ─────────────────────────────────────────────
+// Aligned with openclaw: sanitizeAcpDiagnosticText (attempt-execution.ts:1564)
+//   truncateUtf16Safe(redactSensitiveText(value).replace(/\s+/g, " ").trim(), 240)
+std::string sanitize_acp_diagnostic_text(const std::string& value) {
+    // 折叠所有连续空白为单空格
+    std::string collapsed;
+    collapsed.reserve(value.size());
+    bool in_ws = false;
+    for (char c : value) {
+        const bool is_ws = (c == ' ' || c == '\t' || c == '\n' || c == '\r');
+        if (is_ws) {
+            in_ws = true;
+            continue;
+        }
+        if (in_ws && !collapsed.empty()) collapsed += ' ';
+        in_ws = false;
+        collapsed += c;
+    }
+    // 截断到 240，且不切断 UTF-8 continuation byte
+    constexpr size_t kMax = 240;
+    if (collapsed.size() <= kMax) return collapsed;
+    size_t cut = kMax;
+    while (cut > 0 && (static_cast<unsigned char>(collapsed[cut]) & 0xC0) == 0x80) --cut;
+    return collapsed.substr(0, cut);
+}
+
+// ── acp_runtime_event_diagnostics ────────────────────────────────────────────
+// Aligned with openclaw: acpRuntimeEventDiagnostics (attempt-execution.ts:1568-1605)
+json acp_runtime_event_diagnostics(const hunterclaw::acp::AcpRuntimeEvent& ev) {
+    using Type = hunterclaw::acp::AcpRuntimeEvent::Type;
+    json out = json::object();
+    switch (ev.type) {
+        case Type::Status:
+            out["eventType"] = "status";
+            out["text"] = sanitize_acp_diagnostic_text(ev.text);
+            if (ev.tag) out["tag"] = *ev.tag;
+            return out;
+        case Type::ToolCall:
+            out["eventType"] = "tool_call";
+            out["text"] = sanitize_acp_diagnostic_text(ev.text);
+            if (ev.tag)          out["tag"] = *ev.tag;
+            if (ev.status)       out["status"] = sanitize_acp_diagnostic_text(*ev.status);
+            if (ev.title)        out["title"] = sanitize_acp_diagnostic_text(*ev.title);
+            if (ev.tool_call_id) out["toolCallId"] = sanitize_acp_diagnostic_text(*ev.tool_call_id);
+            return out;
+        case Type::Error:
+            out["eventType"] = "error";
+            out["message"] = sanitize_acp_diagnostic_text(ev.message.value_or(ev.text));
+            if (ev.code)      out["code"] = sanitize_acp_diagnostic_text(*ev.code);
+            if (ev.retryable) out["retryable"] = *ev.retryable;
+            return out;
+        case Type::Done:
+            out["eventType"] = "done";
+            if (ev.status)      out["status"] = *ev.status;
+            if (ev.stop_reason) out["stopReason"] = sanitize_acp_diagnostic_text(*ev.stop_reason);
+            return out;
+        case Type::TextDelta:
+        default:
+            out["eventType"] = "text_delta";
+            out["stream"] = ev.stream.value_or("output");
+            return out;
+    }
+}
+
+// ── emit_acp_runtime_event ───────────────────────────────────────────────────
+// Aligned with openclaw: emitAcpRuntimeEvent (attempt-execution.ts:1620-1651)
+//   emitAgentEvent({ runId, stream: "acp", data: { phase: "runtime_event", ...diagnostics } })
+//
+// 这是 ACP 路径唯一的 AgentEvent 事件源。缺它时 ParentStreamRelay 订阅了
+// 全局总线但永远收不到 ACP 子会话事件，父会话只会在 60s 后收到 stall 告警。
+void emit_acp_runtime_event(const std::string& run_id,
+                            const hunterclaw::acp::AcpRuntimeEvent& ev) {
+    if (run_id.empty()) return;
+    hunterclaw::infra::AgentEvent bus_event;
+    bus_event.run_id = run_id;
+    bus_event.stream = "acp";
+    json data = acp_runtime_event_diagnostics(ev);
+    data["phase"] = "runtime_event";
+    bus_event.data = std::move(data);
+    hunterclaw::infra::emit_agent_event(bus_event);
+}
+
+// ── emit_acp_prompt_submitted ────────────────────────────────────────────────
+// Aligned with openclaw: emitAcpPromptSubmitted (attempt-execution.ts:1607-1618)
+void emit_acp_prompt_submitted(const std::string& run_id, int64_t at_ms) {
+    if (run_id.empty()) return;
+    hunterclaw::infra::AgentEvent bus_event;
+    bus_event.run_id = run_id;
+    bus_event.stream = "acp";
+    bus_event.data = json{
+        {"phase", "prompt_submitted"},
+        {"at", at_ms},
+    };
+    hunterclaw::infra::emit_agent_event(bus_event);
+}
+
+} // namespace
 
 namespace hunterclaw {
 namespace gateway {
@@ -326,9 +427,18 @@ core::Result<json> method_agent(
                         turn_input.text        = captured_message;
                         turn_input.mode        = acp::AcpRuntimePromptMode::Prompt;
                         turn_input.request_id  = captured_session_key + ":" + std::to_string(started_at);
-                        turn_input.on_event = [projector](const acp::AcpRuntimeEvent& ev) {
-                            projector->on_event(ev);
-                        };
+                        // Aligned with openclaw: dispatch-acp.ts:935-951
+                        //   onEvent → emitAcpRuntimeEvent(...) 然后 projector.onEvent(event)
+                        // 两件事都要做：桥接到 AgentEvent 总线（供 ParentStreamRelay 感知
+                        // 子会话进度）+ 投递到 channel（projector）。
+                        turn_input.on_event =
+                            [projector, captured_run_id](const acp::AcpRuntimeEvent& ev) {
+                                emit_acp_runtime_event(captured_run_id, ev);
+                                projector->on_event(ev);
+                            };
+
+                        // Aligned with openclaw: emitAcpPromptSubmitted before runtime turn
+                        emit_acp_prompt_submitted(captured_run_id, started_at);
 
                         acp::get_acp_session_manager().run_turn(turn_input);
                         projector->flush(true);

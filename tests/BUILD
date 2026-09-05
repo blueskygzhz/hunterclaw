@@ -62,8 +62,22 @@ cc_test(
         "-Iexternal/json/single_include",
         "-Ithird_party",
     ],
+    # hunterclaw_acp 默认编成 .so，其 stdlib 符号未被解析；
+    # 静态链接可避免 undefined reference to std::filesystem/std::string 等。
+    linkstatic = True,
+    # 本仓库工具链未默认注入 C++ 标准库（主目标 //src:hunterclaw-gateway
+    # 同样显式带 -lstdc++ / -lstdc++fs，见 src/BUILD:933-936）。
+    # 缺这两项会报 undefined reference to std::runtime_error / std::filesystem。
+    linkopts = [
+        "-lstdc++",
+        "-lstdc++fs",  # C++17 filesystem
+        "-lpthread",   # await_turn_with_timeout / actor queue 用 std::thread
+    ],
     deps = [
         "//:hunterclaw_headers",
         "//src:hunterclaw_acp",
+        # background-task 镜像用到 TaskStatus / TaskTerminalOutcome 与
+        # task-completion-contract（对齐 OC manager.background-task.ts 的依赖）
+        "//src:hunterclaw_tasks",
     ],
 )

@@ -3,6 +3,7 @@
 #include "hunterclaw/memory/memory_index_manager.h"  // MemoryIndexManager (openclaw manager.ts)
 #include "hunterclaw/core/utils.h"
 #include "hunterclaw/core/logging.h"
+#include "hunterclaw/core/config_loader.h"  // ✅ ConfigLoader::LoadRawJson (cfg 原文透传)
 #include "hunterclaw/infra/agent_events.h"  // ✅ 对齐 OpenClaw: infra/agent-events.ts
 #include "hunterclaw/react/react_engine.h"  // ✅ ReactEngine
 #include "hunterclaw/context/context_pruning.h"  // ✅ 对齐 OC: pi-hooks/context-pruning
@@ -180,7 +181,15 @@ AgentInstance::AgentInstance(
         // (senderIsOwner:true)。owner-only 工具(cron/gateway/sessions/nodes等)
         // 的门禁仅用于降级"跨 gateway HTTP 面的非 owner 调用者"。
         tool_context.sender_is_owner = true;
-        
+        // Aligned with openclaw: 工具侧持有完整 cfg。
+        // 透传配置原文，供 sessions_tool → ACP spawn → 父流 relay 读取
+        // streaming.progressCommentary 与 acp.projection.tagVisibility。
+        try {
+            tool_context.raw_config = core::ConfigLoader::LoadRawJson();
+        } catch (...) {
+            // 配置原文仅驱动可选特性，失败时留空走默认值
+        }
+
         auto tool_mgr = tools::ToolManager::create(tool_context);
         
         // ============================================================================

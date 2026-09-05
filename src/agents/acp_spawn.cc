@@ -23,6 +23,9 @@
 #include <algorithm>
 #include <fstream>
 #include <filesystem>
+#include <map>
+#include <set>
+#include <vector>
 
 using json = nlohmann::json;
 
@@ -30,6 +33,111 @@ namespace hunterclaw {
 namespace agents {
 
 namespace {
+
+// ── ACP tag visibility ───────────────────────────────────────────────────────
+// Aligned with openclaw: ACP_TAG_VISIBILITY_DEFAULTS (acp-stream-settings.ts:15-26)
+// 只有 agent_message_chunk 默认可见；其余 session-update tag 默认不投递到父会话。
+const std::map<std::string, bool>& acp_tag_visibility_defaults() {
+    static const std::map<std::string, bool> kDefaults = {
+        {"agent_message_chunk",        true},
+        {"tool_call",                  false},
+        {"tool_call_update",           false},
+        {"usage_update",               false},
+        {"available_commands_update",  false},
+        {"current_mode_update",        false},
+        {"config_option_update",       false},
+        {"session_info_update",        false},
+        {"plan",                       false},
+        {"agent_thought_chunk",        false},
+    };
+    return kDefaults;
+}
+
+// Aligned with openclaw: isAcpSessionUpdateTag (acp-stream-settings.ts:28-30)
+bool is_acp_session_update_tag(const std::string& tag) {
+    return acp_tag_visibility_defaults().count(tag) > 0;
+}
+
+// ── RelayProjectionSettings ──────────────────────────────────────────────────
+// relay 只需要 tagVisibility 覆盖表；其余 projection 字段（deliveryMode 等）
+// 由 AcpReplyProjector 使用，与 relay 无关。
+struct RelayProjectionSettings {
+    std::map<std::string, bool> tag_visibility;  // 显式覆盖（缺省走 defaults 表）
+};
+
+// Aligned with openclaw: resolveAcpProjectionSettings — 取 acp.projection.tagVisibility
+RelayProjectionSettings resolve_relay_projection_settings(const std::optional<json>& cfg) {
+    RelayProjectionSettings settings;
+    if (!cfg.has_value() || !cfg->is_object()) return settings;
+    const json acp = cfg->value("acp", json::object());
+    if (!acp.is_object()) return settings;
+    const json projection = acp.value("projection", json::object());
+    if (!projection.is_object()) return settings;
+    const json tag_vis = projection.value("tagVisibility", json::object());
+    if (!tag_vis.is_object()) return settings;
+    for (auto it = tag_vis.begin(); it != tag_vis.end(); ++it) {
+        if (it.value().is_boolean()) settings.tag_visibility[it.key()] = it.value().get<bool>();
+    }
+    return settings;
+}
+
+// Aligned with openclaw: isAcpTagVisible (acp-stream-settings.ts:118-134)
+//   1. 无 tag              → 可见
+//   2. 非 session-update tag → 可见
+//   3. 有显式覆盖          → 用覆盖值
+//   4. 否则                → 查默认表
+bool is_acp_tag_visible(const RelayProjectionSettings& settings, const std::string& tag) {
+    if (tag.empty()) return true;
+    if (!is_acp_session_update_tag(tag)) return true;
+    auto override_it = settings.tag_visibility.find(tag);
+    if (override_it != settings.tag_visibility.end()) return override_it->second;
+    const auto& defaults = acp_tag_visibility_defaults();
+    auto default_it = defaults.find(tag);
+    // 真源在缺省时 throw；这里返回 false（保守：不投递未知 tag）以免拖垮 relay 线程。
+    return default_it != defaults.end() ? default_it->second : false;
+}
+
+// Aligned with openclaw: shouldRelayAcpStatusProgress (acp-spawn-parent-stream.ts:184-194)
+bool should_relay_acp_status_progress(const std::string& event_type,
+                                     const std::string& tag,
+                                     const std::string& text,
+                                     const RelayProjectionSettings& settings) {
+    if (event_type != "status" || text.empty()) return false;
+    return is_acp_tag_visible(settings, tag);
+}
+
+// Aligned with openclaw: resolveParentProgressCommentary (acp-spawn-parent-stream.ts:174-182)
+//   最终归结到 resolveChannelStreamingProgressCommentary(entry, /*fallback=*/true)
+//   → 缺配置时默认 true。这里读 streaming.progressCommentary 覆盖。
+bool resolve_parent_progress_commentary(const std::optional<json>& cfg) {
+    if (!cfg.has_value() || !cfg->is_object()) return true;
+    const json streaming = cfg->value("streaming", json::object());
+    if (streaming.is_object()) {
+        const auto it = streaming.find("progressCommentary");
+        if (it != streaming.end() && it->is_boolean()) return it->get<bool>();
+    }
+    return true;
+}
+
+// Aligned with openclaw: formatProxyEnvSummary
+std::string format_proxy_env_summary(const std::vector<std::string>& keys) {
+    if (keys.empty()) return "no proxy env";
+    std::string out = "proxy env: ";
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (i > 0) out += ", ";
+        out += keys[i];
+    }
+    return out;
+}
+
+// UTF-8 安全的尾部截取（保留最后 max_bytes 字节，不切断多字节字符）
+// Aligned with openclaw: sliceUtf16Safe(text, -STREAM_BUFFER_MAX_CHARS)
+std::string slice_tail_utf8_safe(const std::string& text, size_t max_bytes) {
+    if (text.size() <= max_bytes) return text;
+    size_t start = text.size() - max_bytes;
+    while (start < text.size() && (static_cast<unsigned char>(text[start]) & 0xC0) == 0x80) ++start;
+    return text.substr(start);
+}
 
 auto log() {
     static auto logger = spdlog::get("acp_spawn");
@@ -128,7 +236,8 @@ AcpSpawnParentRelayHandle start_acp_spawn_parent_stream_relay(
     int max_relay_lifetime_ms,
     bool emit_start_notice,
     const std::optional<json>& delivery_context,
-    bool surface_updates
+    bool surface_updates,
+    const std::optional<json>& cfg
 ) {
     if (run_id.empty() || parent_session_key.empty()) {
         return { [](){}, [](){} };
@@ -143,6 +252,12 @@ AcpSpawnParentRelayHandle start_acp_spawn_parent_stream_relay(
         ? "ACP child" : truncate_str(compact_whitespace(agent_id), 40);
     const std::string context_prefix = "acp-spawn:" + run_id;
 
+    // Aligned with openclaw: acp-spawn-parent-stream.ts:358-362
+    //   shouldRelayProgressCommentary = resolveParentProgressCommentary({ cfg, deliveryContext })
+    //   acpProjectionSettings         = resolveAcpProjectionSettings(cfg ?? {})
+    const bool should_relay_progress_commentary = resolve_parent_progress_commentary(cfg);
+    const RelayProjectionSettings projection_settings = resolve_relay_projection_settings(cfg);
+
     // Shared relay state
     struct RelayState {
         std::atomic<bool> disposed{false};
@@ -150,6 +265,34 @@ AcpSpawnParentRelayHandle start_acp_spawn_parent_stream_relay(
         std::mutex text_mutex;
         std::atomic<int64_t> last_progress_at{0};
         std::atomic<bool> stall_notified{false};
+
+        // Aligned with openclaw: pendingProgressKind
+        // 当前 pending_text 归属的进度来源（"assistant:xxx" / "item:<id>" / "acp:status"）。
+        // kind 切换时必须先 flush，避免不同来源的文本被拼成一条。
+        // 与 pending_text 共用 text_mutex。
+        std::string pending_progress_kind;
+
+        // Aligned with openclaw: replaceableAssistantSnapshot
+        // 可替换的 assistant 快照（后续快照覆盖前一份），落地时才走 append_visible_progress。
+        std::optional<std::string> replaceable_assistant_snapshot;
+        std::mutex replaceable_mutex;
+
+        // Aligned with openclaw: itemProgressTextById
+        // item 进度快照按 itemId 累积，用于计算增量（前缀更新只发新增部分）。
+        std::map<std::string, std::string> item_progress_text_by_id;
+        std::mutex item_mutex;
+
+        // ── stall 分级诊断所需状态 ──────────────────────────────────────────
+        // Aligned with openclaw: promptSubmittedAt / firstRuntimeEventAt /
+        //   firstVisibleOutputAt / lastRuntimeEventType / proxyEnvKeysAtPrompt
+        // buildNoOutputNotice 靠这四项区分「没提交 prompt」「提交了但没 runtime 事件」
+        // 「有 runtime 活动但无可见输出」「有过输出后卡住」四种停滞原因。
+        std::atomic<int64_t> prompt_submitted_at{0};
+        std::atomic<int64_t> first_runtime_event_at{0};
+        std::atomic<int64_t> first_visible_output_at{0};
+        std::string last_runtime_event_type;
+        std::vector<std::string> proxy_env_keys_at_prompt;
+        std::mutex diag_mutex;
 
         // Aligned with openclaw: scheduleFlush timer
         // A background thread wakes every streamFlushMs to flush pending text
@@ -207,8 +350,11 @@ AcpSpawnParentRelayHandle start_acp_spawn_parent_stream_relay(
     // Helper: wake parent heartbeat
     auto wake = [parent_session_key, surface_updates]() {
         if (!surface_updates) return;
-        // Aligned with openclaw: requestHeartbeatNow(scopedHeartbeatWakeOptions(parentSessionKey, {reason:"acp:spawn:stream"}))
-        infra::request_heartbeat_now("acp:spawn:stream", std::nullopt, parent_session_key);
+        // Aligned with openclaw: requestHeartbeat(scopedHeartbeatWakeOptionsForPolicy(
+        //   parentSessionKey, { source: "acp-spawn", intent: "event", reason: "acp:spawn:stream" }))
+        infra::request_heartbeat_now("acp:spawn:stream", std::nullopt, parent_session_key,
+                                     infra::HeartbeatWakeIntent::Event,
+                                     infra::HeartbeatWakeSource::AcpSpawn);
     };
 
     // Helper: emit system event to parent
@@ -242,17 +388,132 @@ AcpSpawnParentRelayHandle start_acp_spawn_parent_stream_relay(
     };
 
     // Helper: flush pending text
+    // Aligned with openclaw: flushPending — 同时清空 pendingProgressKind
     auto flush_pending = [state, relay_label, context_prefix, emit]() {
         std::string text_to_flush;
         {
             std::lock_guard<std::mutex> lock(state->text_mutex);
             text_to_flush = std::move(state->pending_text);
             state->pending_text.clear();
+            state->pending_progress_kind.clear();
         }
         if (text_to_flush.empty()) return;
         std::string snippet = truncate_str(compact_whitespace(text_to_flush), STREAM_SNIPPET_MAX_CHARS);
         if (snippet.empty()) return;
         emit(relay_label + ": " + snippet, context_prefix + ":progress");
+    };
+
+    // ── append_visible_progress ──────────────────────────────────────────────
+    // Aligned with openclaw: appendVisibleProgress (acp-spawn-parent-stream.ts:466-494)
+    //
+    // 三个 stream 分支（assistant / item / acp）共用的唯一进度累积入口。职责：
+    //   1. stall 恢复通知（stallNotified 复位 + recordTaskRunProgress + emit）
+    //   2. 刷新 lastProgressAt，首次记录 firstVisibleOutputAt
+    //   3. kind 切换时先 flush 旧内容，避免不同来源文本被拼接
+    //   4. 累积并按 STREAM_BUFFER_MAX_CHARS 做 UTF-8 安全尾部截断
+    //   5. 达到 snippet 阈值或遇到段落分隔（\n\n）立即 flush，否则交由定时线程
+    auto append_visible_progress = [state, relay_label, context_prefix, run_id,
+                                    emit, flush_pending, child_session_key](
+        const std::string& delta, const std::string& kind
+    ) {
+        // 1. stall 恢复
+        if (state->stall_notified.exchange(false)) {
+            try {
+                tasks::get_task_executor().record_task_progress_by_run_id(
+                    run_id, "Resumed output.");
+            } catch (...) {}
+            emit(relay_label + " resumed output.", context_prefix + ":resumed");
+        }
+
+        const int64_t now_ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+
+        // 2. 进度时间戳
+        state->last_progress_at.store(now_ts);
+        int64_t expected_visible = 0;
+        state->first_visible_output_at.compare_exchange_strong(expected_visible, now_ts);
+
+        // 3~5. kind 隔离 + 累积 + flush 判定
+        bool need_flush_previous = false;
+        bool should_flush_now = false;
+        {
+            std::lock_guard<std::mutex> lock(state->text_mutex);
+            if (!state->pending_text.empty() &&
+                !state->pending_progress_kind.empty() &&
+                state->pending_progress_kind != kind) {
+                need_flush_previous = true;
+            }
+        }
+        if (need_flush_previous) {
+            flush_pending();
+        }
+        {
+            std::lock_guard<std::mutex> lock(state->text_mutex);
+            state->pending_progress_kind = kind;
+            state->pending_text += delta;
+            if (state->pending_text.size() > STREAM_BUFFER_MAX_CHARS) {
+                state->pending_text =
+                    slice_tail_utf8_safe(state->pending_text, STREAM_BUFFER_MAX_CHARS);
+            }
+            should_flush_now =
+                state->pending_text.size() >= STREAM_SNIPPET_MAX_CHARS ||
+                delta.find("\n\n") != std::string::npos;
+        }
+        if (should_flush_now) flush_pending();
+        // 未达阈值时由 flush 定时线程兜底（对齐 scheduleFlush）
+    };
+
+    // ── flush_replaceable_assistant_snapshot ─────────────────────────────────
+    // Aligned with openclaw: flushReplaceableAssistantSnapshot (:496-503)
+    auto flush_replaceable_assistant_snapshot = [state, append_visible_progress]() {
+        std::optional<std::string> snapshot;
+        {
+            std::lock_guard<std::mutex> lock(state->replaceable_mutex);
+            snapshot = std::move(state->replaceable_assistant_snapshot);
+            state->replaceable_assistant_snapshot.reset();
+        }
+        if (!snapshot.has_value()) return;
+        if (snapshot->find_first_not_of(" \t\r\n") == std::string::npos) return;
+        append_visible_progress(*snapshot, "assistant:replaceable");
+    };
+
+    // ── append_item_progress_snapshot ────────────────────────────────────────
+    // Aligned with openclaw: appendItemProgressSnapshot (:505-519)
+    //
+    // item 进度是「快照」而非增量：同一 itemId 的后续文本通常是前一份的前缀扩展。
+    //   - 文本未变         → 丢弃
+    //   - 是前缀扩展       → 只投递新增部分
+    //   - 非前缀（被重写） → 丢弃同 kind 的未 flush 内容，整份重投
+    auto append_item_progress_snapshot = [state, append_visible_progress](
+        const std::string& item_id, const std::string& text
+    ) {
+        std::string previous;
+        {
+            std::lock_guard<std::mutex> lock(state->item_mutex);
+            auto it = state->item_progress_text_by_id.find(item_id);
+            if (it != state->item_progress_text_by_id.end()) previous = it->second;
+        }
+        if (text == previous) return;
+
+        const std::string kind = "item:" + item_id;
+        const bool is_prefix_update =
+            !previous.empty() && text.rfind(previous, 0) == 0;
+
+        if (!previous.empty() && !is_prefix_update) {
+            // Aligned with openclaw: 快照被重写时丢弃同 kind 的 pending，避免重复文本
+            std::lock_guard<std::mutex> lock(state->text_mutex);
+            if (state->pending_progress_kind == kind && !state->pending_text.empty()) {
+                state->pending_text.clear();
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(state->item_mutex);
+            state->item_progress_text_by_id[item_id] = text;
+        }
+        const std::string delta =
+            is_prefix_update ? text.substr(previous.size()) : text;
+        if (delta.empty()) return;
+        append_visible_progress(delta, kind);
     };
 
     // Emit start notice if requested
@@ -280,64 +541,174 @@ AcpSpawnParentRelayHandle start_acp_spawn_parent_stream_relay(
     auto unsubscribe = infra::on_agent_event([
         state, run_id, relay_label, context_prefix,
         emit, flush_pending, write_log_line,
-        no_output_notice_ms, child_session_key
+        no_output_notice_ms, child_session_key,
+        append_visible_progress, append_item_progress_snapshot,
+        flush_replaceable_assistant_snapshot,
+        should_relay_progress_commentary, projection_settings
     ](const infra::AgentEvent& event) {
         if (state->disposed.load()) return;
         if (event.run_id != run_id) return;
 
-        if (event.stream == "assistant") {
-            // Aligned with openclaw: delta accumulation + flush
-            std::string delta = event.delta();
-            if (delta.empty()) return;
+        const int64_t now_ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
 
-            // Aligned with openclaw: assistantPhase === "commentary" → update lastProgressAt but skip text relay
-            std::string assistant_phase = event.assistant_phase();
+        // ── stream === "assistant" ───────────────────────────────────────────
+        // Aligned with openclaw: acp-spawn-parent-stream.ts:593-635
+        if (event.stream == "assistant") {
+            const std::string assistant_phase = event.assistant_phase();
+
+            // Aligned with openclaw: snapshot = text ?? delta；replaceable 优先
+            const std::string text_candidate  = event.data.value("text", std::string{});
+            const std::string delta_candidate = event.data.value("delta", std::string{});
+            const std::string snapshot =
+                !text_candidate.empty() ? text_candidate : delta_candidate;
+
+            // Aligned with openclaw: data.replaceable === true → 存快照，不立即投递
+            const bool replaceable =
+                event.data.contains("replaceable") &&
+                event.data["replaceable"].is_boolean() &&
+                event.data["replaceable"].get<bool>();
+            if (replaceable) {
+                if (!snapshot.empty() &&
+                    snapshot.find_first_not_of(" \t\r\n") != std::string::npos) {
+                    {
+                        std::lock_guard<std::mutex> lock(state->replaceable_mutex);
+                        state->replaceable_assistant_snapshot = snapshot;
+                    }
+                    state->last_progress_at.store(now_ts);
+                    write_log_line({
+                        {"ts", now_ts},
+                        {"kind", "assistant_replaceable_snapshot"},
+                        {"text", snapshot},
+                        {"phase", assistant_phase.empty() ? json(nullptr) : json(assistant_phase)}
+                    });
+                }
+                return;
+            }
+
+            // Aligned with openclaw: delta = deltaCandidate ?? snapshot
+            const std::string delta =
+                !delta_candidate.empty() ? delta_candidate : snapshot;
+            if (delta.empty() ||
+                delta.find_first_not_of(" \t\r\n") == std::string::npos) {
+                return;
+            }
+
             write_log_line({
-                {"ts", std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count()},
+                {"ts", now_ts},
                 {"kind", "assistant_delta"},
                 {"delta", delta},
                 {"phase", assistant_phase.empty() ? json(nullptr) : json(assistant_phase)}
             });
 
-            if (assistant_phase == "commentary") {
-                // Aligned with openclaw: commentary phase → update lastProgressAt only, no relay
-                state->last_progress_at.store(
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch()
-                    ).count()
-                );
+            // Aligned with openclaw: commentary 且旁白关闭 → 只刷新进度，不投递
+            if (assistant_phase == "commentary" && !should_relay_progress_commentary) {
+                state->last_progress_at.store(now_ts);
                 return;
             }
 
-            // Reset stall notifier
-            if (state->stall_notified.exchange(false)) {
-                // Aligned with openclaw: recordTaskRunProgressByRunId + emit "resumed output"
-                try { tasks::get_task_executor().record_task_progress_by_run_id(run_id, relay_label + " resumed output."); } catch (...) {}
-                emit(relay_label + " resumed output.", context_prefix + ":resumed");
-            }
-
-            state->last_progress_at.store(
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()
-                ).count()
-            );
-
+            // Aligned with openclaw: replaceableAssistantSnapshot = undefined
+            // 真实 delta 到来后废弃暂存快照，避免重复投递。
             {
-                std::lock_guard<std::mutex> lock(state->text_mutex);
-                state->pending_text += delta;
-                if (state->pending_text.size() > STREAM_BUFFER_MAX_CHARS) {
-                    state->pending_text = state->pending_text.substr(
-                        state->pending_text.size() - STREAM_BUFFER_MAX_CHARS
-                    );
-                }
-                // Flush immediately if buffer is large or contains double newline
-                bool should_flush_now =
-                    state->pending_text.size() >= STREAM_SNIPPET_MAX_CHARS ||
-                    delta.find("\n\n") != std::string::npos;
-                if (!should_flush_now) return;
+                std::lock_guard<std::mutex> lock(state->replaceable_mutex);
+                state->replaceable_assistant_snapshot.reset();
             }
-            flush_pending();
+            append_visible_progress(
+                delta,
+                "assistant:" + (assistant_phase.empty() ? std::string("unknown") : assistant_phase)
+            );
+            return;
+        }
+
+        // ── stream === "item" ────────────────────────────────────────────────
+        // Aligned with openclaw: acp-spawn-parent-stream.ts:637-655
+        // 只有 kind == "preamble" 且带 progressText 的 item 参与父会话进度回传。
+        if (event.stream == "item") {
+            const std::string item_id       = event.data.value("itemId", std::string{});
+            const std::string item_kind     = event.data.value("kind", std::string{});
+            const std::string progress_text = event.data.value("progressText", std::string{});
+
+            write_log_line({
+                {"ts", now_ts},
+                {"kind", "item"},
+                {"itemKind", item_kind.empty() ? json(nullptr) : json(item_kind)},
+                {"itemId", item_id.empty() ? json(nullptr) : json(item_id)},
+                {"data", event.data}
+            });
+
+            if (item_kind == "preamble" && !progress_text.empty()) {
+                state->last_progress_at.store(now_ts);
+                if (should_relay_progress_commentary && !item_id.empty()) {
+                    append_item_progress_snapshot(item_id, progress_text);
+                }
+            }
+            return;
+        }
+
+        // Aligned with openclaw: acp-spawn-parent-stream.ts:657-698 (stream === "acp")
+        //
+        // ACP 路径的事件全部走 stream=="acp"（由 gateway agent.cc 的
+        // emit_acp_runtime_event / emit_acp_prompt_submitted 桥接而来），
+        // 不是 "assistant"。缺这个分支时 ACP 子会话进度会被整体忽略，
+        // relay 只会在 no_output_notice_ms 后误报 stall。
+        if (event.stream == "acp") {
+            const std::string phase = event.phase();
+            write_log_line({
+                {"ts", now_ts},
+                {"kind", "acp"},
+                {"phase", phase.empty() ? "unknown" : phase},
+                {"data", event.data}
+            });
+
+            if (phase == "prompt_submitted") {
+                // Aligned with openclaw: promptSubmittedAt ??= at;
+                //   proxyEnvKeysAtPrompt = data.proxyEnvKeys; lastProgressAt = Date.now()
+                int64_t at = now_ts;
+                if (event.data.contains("at") && event.data["at"].is_number()) {
+                    at = event.data["at"].get<int64_t>();
+                }
+                int64_t expected = 0;
+                state->prompt_submitted_at.compare_exchange_strong(expected, at);
+                if (event.data.contains("proxyEnvKeys") && event.data["proxyEnvKeys"].is_array()) {
+                    std::vector<std::string> keys;
+                    for (const auto& k : event.data["proxyEnvKeys"]) {
+                        if (k.is_string()) keys.push_back(k.get<std::string>());
+                    }
+                    std::lock_guard<std::mutex> lock(state->diag_mutex);
+                    state->proxy_env_keys_at_prompt = std::move(keys);
+                }
+                state->last_progress_at.store(now_ts);
+                return;
+            }
+
+            if (phase == "runtime_event") {
+                const std::string event_type = event.data.value("eventType", std::string{});
+                const std::string text       = event.data.value("text", std::string{});
+                const std::string tag        = event.data.value("tag", std::string{});
+
+                // Aligned with openclaw: firstRuntimeEventAt ??= now;
+                //   lastRuntimeEventType = eventType
+                int64_t expected_first = 0;
+                state->first_runtime_event_at.compare_exchange_strong(expected_first, now_ts);
+                {
+                    std::lock_guard<std::mutex> lock(state->diag_mutex);
+                    state->last_runtime_event_type = event_type;
+                }
+
+                // Aligned with openclaw: shouldRelayProgressCommentary &&
+                //   shouldRelayAcpStatusProgress({ eventType, tag, text, projectionSettings })
+                if (should_relay_progress_commentary &&
+                    should_relay_acp_status_progress(event_type, tag, text, projection_settings)) {
+                    // Aligned with openclaw: appendVisibleProgress(`${text}\n\n`, "acp:status")
+                    append_visible_progress(text + "\n\n", "acp:status");
+                    return;
+                }
+
+                // 其余 runtime_event（text_delta / tool_call / done / error / 隐藏 tag 的
+                // status）只刷新进度时间戳——对齐真源 `lastProgressAt = Date.now(); return;`
+                state->last_progress_at.store(now_ts);
+                return;
+            }
             return;
         }
 
@@ -353,6 +724,9 @@ AcpSpawnParentRelayHandle start_acp_spawn_parent_stream_relay(
         });
 
         if (phase == "end") {
+            // Aligned with openclaw: flushReplaceableAssistantSnapshot() 先于 flushPending()
+            // 未落地的可替换快照必须在收尾前投递，否则最后一段进度会丢。
+            flush_replaceable_assistant_snapshot();
             flush_pending();
             // Aligned with openclaw: emit "run completed in Xs"
             int64_t started_at = 0, ended_at = 0;
@@ -377,6 +751,8 @@ AcpSpawnParentRelayHandle start_acp_spawn_parent_stream_relay(
         }
 
         if (phase == "error") {
+            // Aligned with openclaw: flushReplaceableAssistantSnapshot() 先于 flushPending()
+            flush_replaceable_assistant_snapshot();
             flush_pending();
             std::string error_text;
             if (event.data.contains("error") && event.data["error"].is_string())
@@ -453,11 +829,62 @@ AcpSpawnParentRelayHandle start_acp_spawn_parent_stream_relay(
                 int64_t last = state->last_progress_at.load();
                 if ((now - last) >= no_output_notice_ms) {
                     state->stall_notified.store(true);
-                    int64_t secs = std::max((int64_t)1, (int64_t)no_output_notice_ms / 1000);
-                    std::string stall_text = relay_label + " has produced no output for " +
-                         std::to_string(secs) + "s. It may be waiting for interactive input.";
-                    // Aligned with openclaw: recordTaskRunProgressByRunId on stall
-                    try { tasks::get_task_executor().record_task_progress_by_run_id(run_id, stall_text); } catch (...) {}
+                    const int64_t secs =
+                        std::max((int64_t)1, (int64_t)llround(no_output_notice_ms / 1000.0));
+                    const std::string secs_str = std::to_string(secs);
+
+                    // ── buildNoOutputNotice ──────────────────────────────────
+                    // Aligned with openclaw: acp-spawn-parent-stream.ts:521-547
+                    // 按停滞发生的阶段给出四级诊断，而非一句笼统的「无输出」。
+                    std::string summary;   // 记入 task run progress
+                    std::string stall_text; // 投递给父会话
+                    if (state->prompt_submitted_at.load() == 0) {
+                        // 阶段 1：子会话起来了，但从未观测到 prompt 提交
+                        summary = "No prompt submission observed for " + secs_str +
+                                  "s after child start.";
+                        stall_text = relay_label + " session started but no prompt submission "
+                                     "was observed for " + secs_str + "s.";
+                    } else if (state->first_runtime_event_at.load() == 0) {
+                        // 阶段 2：prompt 提交了，但上游一个 runtime 事件都没回
+                        std::vector<std::string> keys;
+                        {
+                            std::lock_guard<std::mutex> lock(state->diag_mutex);
+                            keys = state->proxy_env_keys_at_prompt;
+                        }
+                        const std::string proxy_summary = format_proxy_env_summary(keys);
+                        summary = "Prompt submitted but no ACP runtime event for " + secs_str +
+                                  "s (" + proxy_summary + ").";
+                        stall_text = relay_label + " prompt was submitted but no ACP runtime "
+                                     "event arrived for " + secs_str + "s (" + proxy_summary +
+                                     "). Check upstream connectivity, auth, or proxy/network "
+                                     "access in the gateway child environment.";
+                    } else if (state->first_visible_output_at.load() == 0) {
+                        // 阶段 3：runtime 有活动，但从未产出可见输出
+                        std::string last_type;
+                        {
+                            std::lock_guard<std::mutex> lock(state->diag_mutex);
+                            last_type = state->last_runtime_event_type;
+                        }
+                        const std::string last_event =
+                            last_type.empty() ? "" : (" Last ACP event: " + last_type + ".");
+                        summary = "ACP runtime active but no visible assistant output for " +
+                                  secs_str + "s." + last_event;
+                        stall_text = relay_label + " has ACP runtime activity but no visible "
+                                     "assistant output for " + secs_str + "s." + last_event +
+                                     " It may be working, blocked on a tool, or failing before "
+                                     "visible output.";
+                    } else {
+                        // 阶段 4：曾有可见输出后卡住 —— 最可能在等交互输入
+                        summary = "No visible output for " + secs_str +
+                                  "s. It may be waiting for input.";
+                        stall_text = relay_label + " has produced no visible output for " +
+                                     secs_str + "s. It may be waiting for interactive input.";
+                    }
+
+                    // Aligned with openclaw: recordTaskRunProgressByRunId(summary) + emit(text)
+                    try {
+                        tasks::get_task_executor().record_task_progress_by_run_id(run_id, summary);
+                    } catch (...) {}
                     emit(stall_text, context_prefix + ":stall");
                 }
             }
@@ -997,7 +1424,9 @@ SpawnAcpResult spawn_acp_direct(
             6 * 60 * 60 * 1000, // max_relay_lifetime_ms
             false,             // emit_start_notice (will call notifyStarted after dispatch)
             parent_delivery_ctx, // deliveryContext (json)
-            true               // surfaceUpdates
+            true,              // surfaceUpdates
+            // Aligned with openclaw: cfg — progressCommentary / acp.projection.tagVisibility
+            cfg.raw_config.is_null() ? std::nullopt : std::optional<json>(cfg.raw_config)
         );
     }
 
@@ -1079,7 +1508,9 @@ SpawnAcpResult spawn_acp_direct(
                 target_agent_id,
                 stream_log_path,
                 2500, 60000, 15000, 6 * 60 * 60 * 1000, false,
-                parent_delivery_ctx, true  // delivery_context (json), surface_updates
+                parent_delivery_ctx, true,  // delivery_context (json), surface_updates
+                // Aligned with openclaw: cfg 与首次创建保持一致
+                cfg.raw_config.is_null() ? std::nullopt : std::optional<json>(cfg.raw_config)
             );
         }
         // Aligned with openclaw: parentRelay.notifyStarted()

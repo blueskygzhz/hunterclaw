@@ -55,12 +55,25 @@ inline AcpErrorCode error_code_from_string(const std::string& s) {
 class AcpRuntimeError : public std::runtime_error {
 public:
     AcpErrorCode code;
+    // Backend-specific structured failure code (e.g. acpx "SESSION_RESUME_REQUIRED",
+    // "TURN_TIMEOUT"), preserved so recovery decisions key on the failure kind rather
+    // than parsing the human-readable message.
+    // Aligned with openclaw: AcpRuntimeError.detailCode
+    std::optional<std::string> detail_code;
 
     AcpRuntimeError(AcpErrorCode code, const std::string& message)
         : std::runtime_error(message), code(code) {}
 
+    AcpRuntimeError(AcpErrorCode code, const std::string& message,
+                    const std::optional<std::string>& detail_code)
+        : std::runtime_error(message), code(code), detail_code(detail_code) {}
+
     std::string code_string() const { return error_code_to_string(code); }
 };
+
+// ── Detail codes ─────────────────────────────────────────────────────────────
+// Aligned with openclaw: ACP_TURN_TIMEOUT_DETAIL_CODE (manager.turn-timeout.ts:13)
+inline constexpr const char* ACP_TURN_TIMEOUT_DETAIL_CODE = "TURN_TIMEOUT";
 
 // ── toAcpRuntimeError ────────────────────────────────────────────────────────
 // Aligned with openclaw: toAcpRuntimeError

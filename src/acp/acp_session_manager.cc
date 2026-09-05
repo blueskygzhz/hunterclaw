@@ -4,6 +4,10 @@
 // ============================================================================
 
 #include "hunterclaw/acp/acp_session_manager.h"
+#include "hunterclaw/acp/acp_background_task.h"
+#include "hunterclaw/acp/acp_turn_timeout.h"
+#include "hunterclaw/acp/acp_backend_failover.h"
+#include "hunterclaw/acp/acp_active_turns.h"
 #include <algorithm>
 
 namespace hunterclaw {
@@ -155,18 +159,215 @@ void AcpSessionManager::run_turn(const AcpRunTurnInput& input) {
     }
 
     actor_queue_.run(normalize_actor_key(input.session_key), [&]() {
-        auto resolution = resolve_session(input.session_key);
-        if (resolution.kind != AcpSessionResolution::Kind::Ready) {
-            if (resolution.error) throw *resolution.error;
+        int64_t turn_started_at = now_ms();
+
+        // ── Background task mirror ───────────────────────────────────────────
+        // Aligned with openclaw: manager.turn-runner.ts:77-89
+        // ACP 子会话不进 SubagentRegistry（OC 原注释："ACP children bypass the
+        // subagent registry"），父侧只能靠这份 detached task 镜像感知子会话结果。
+        // 仅 Prompt 模式镜像（OC: input.mode === "prompt"）。
+        std::optional<AcpBackgroundTaskContext> task_context;
+        if (input.mode == AcpRuntimePromptMode::Prompt) {
+            task_context = resolve_background_task_context(
+                input.session_key, input.request_id, input.text);
+        }
+        if (task_context) {
+            create_background_task_record(*task_context, turn_started_at);
+        }
+        std::string task_progress_summary;
+
+        auto initial_resolution = resolve_session(input.session_key);
+        if (initial_resolution.kind != AcpSessionResolution::Kind::Ready) {
+            // 对齐 OC recordBackendFailure：ready 校验失败也要写终态，
+            // 否则 task 永远停在 running，父侧一直等不到结果。
+            if (task_context) {
+                MarkBackgroundTaskTerminalParams terminal;
+                terminal.status = tasks::TaskStatus::FAILED;
+                terminal.ended_at = now_ms();
+                terminal.error = initial_resolution.error
+                    ? std::string(initial_resolution.error->what())
+                    : ("Session is not ACP-enabled: " + input.session_key);
+                terminal.progress_summary = std::nullopt;
+                mark_background_task_terminal(task_context->run_id, terminal);
+            }
+            if (initial_resolution.error) throw *initial_resolution.error;
             throw AcpRuntimeError(AcpErrorCode::ACP_SESSION_INIT_FAILED,
                 "Session is not ACP-enabled: " + input.session_key);
         }
 
-        auto ensured = ensure_runtime_handle(input.session_key, *resolution.meta);
-        apply_runtime_controls(input.session_key, *ensured.runtime, ensured.handle, ensured.meta);
-
-        int64_t turn_started_at = now_ms();
         std::string actor_key = normalize_actor_key(input.session_key);
+
+        // ── Backend candidate plan ───────────────────────────────────────────
+        // 对齐 OC: resolveBackendCandidatePlan (manager.turn-runner.ts:109-113)
+        // 未配置 fallbacks 时候选只有一项（可能是空串＝registry 自选默认），
+        // 循环退化为单次执行，与对齐前行为一致。
+        const auto backend_plan = resolve_backend_candidate_plan(
+            configured_backend_, initial_resolution.meta->backend, fallback_backends_);
+        const auto& candidate_backends = backend_plan.candidate_backends;
+
+        // 对齐 OC: backendAttempts (manager.turn-runner.ts:114)
+        std::vector<BackendAttempt> backend_attempts;
+
+        // 对齐 OC: markAcpTurnActive (manager.turn-runner.ts:160-167)
+        // 存活标记覆盖整个任务而非单次 attempt：ready 校验通过后标一次，
+        // 所有出口（含重试与清理阶段的意外失败）清一次。
+        // 用 RAII 而非 finally —— C++ 异常路径必须靠析构保证摘除。
+        struct ActiveTurnMarkerGuard {
+            std::string key;
+            bool armed = false;
+            ~ActiveTurnMarkerGuard() {
+                if (armed) {
+                    try { clear_acp_turn_active(key); } catch (...) {}
+                }
+            }
+        } marker_guard;
+        if (task_context) {
+            mark_acp_turn_active(input.session_key);
+            marker_guard.key = input.session_key;
+            marker_guard.armed = true;
+        }
+
+        // 对齐 OC recordBackendFailure：把失败统一写进 task 终态。
+        // ensure/controls/turn 三个阶段的异常都要经过它，否则 task 泄漏在 running。
+        // 多 backend 都失败时聚合成一条错误，便于诊断到底试了哪些。
+        auto fail_background_task = [&](const std::string& error_text,
+                                        const std::optional<std::string>& detail_code) {
+            if (!task_context) return;
+            AcpRuntimeError probe(AcpErrorCode::ACP_TURN_FAILED, error_text, detail_code);
+            MarkBackgroundTaskTerminalParams terminal;
+            terminal.status = resolve_background_task_failure_status(probe);
+            terminal.ended_at = now_ms();
+            terminal.error = error_text;
+            terminal.progress_summary =
+                task_progress_summary.empty() ? std::nullopt
+                                              : std::optional<std::string>(task_progress_summary);
+            terminal.terminal_summary = std::nullopt;
+            mark_background_task_terminal(task_context->run_id, terminal);
+        };
+
+        // 对齐 OC recordBackendFailure 的错误聚合部分
+        auto aggregate_backend_error = [&](const AcpRuntimeError& error) -> AcpRuntimeError {
+            if (backend_attempts.size() <= 1) {
+                return error;
+            }
+            std::string failed;
+            for (size_t i = 0; i < backend_attempts.size(); ++i) {
+                if (i > 0) failed += " | ";
+                failed += backend_attempts[i].backend + ": " + backend_attempts[i].error;
+            }
+            return AcpRuntimeError(error.code,
+                                   "All ACP backends failed (" +
+                                       std::to_string(backend_attempts.size()) + "): " + failed,
+                                   error.detail_code);
+        };
+
+        // 对齐 OC: for (backendIndex) { for (attempt) } (manager.turn-runner.ts:169-455)
+        // 外层换 backend，内层用新 handle 重试一次。completed 为真即整体成功退出。
+        bool completed = false;
+
+        for (size_t backend_idx = 0; backend_idx < candidate_backends.size() && !completed;
+             ++backend_idx) {
+        const std::string& current_backend = candidate_backends[backend_idx];
+
+        if (backend_idx > 0) {
+            // 对齐 OC: runtimeHandles.close({ reason: "backend-failover" })
+            // 必须先关掉上一个 backend 的 handle，否则旧连接泄漏。
+            try {
+                auto* stale = runtime_cache_.peek(actor_key);
+                if (stale && stale->runtime) {
+                    stale->runtime->close(stale->handle, "backend-failover");
+                }
+            } catch (...) {
+                // 关闭失败不阻断切换 —— 目标是尽快换到可用 backend
+            }
+            runtime_cache_.clear(actor_key);
+            log()->info("acp-manager: switching backend for {} from {} to {}",
+                        input.session_key,
+                        backend_plan.describe_backend_candidate(
+                            candidate_backends[backend_idx - 1]),
+                        backend_plan.describe_backend_candidate(current_backend));
+        }
+
+        for (int attempt = 0; attempt < 2 && !completed; ++attempt) {
+        // 对齐 OC：仅首个 backend 的首次尝试复用 initialResolution，
+        // 其余都要重查（resume 状态可能刚被清）。
+        AcpSessionResolution resolution;
+        if (backend_idx == 0 && attempt == 0) {
+            resolution = initial_resolution;
+        } else {
+            resolution = resolve_session(input.session_key);
+            if (resolution.kind != AcpSessionResolution::Kind::Ready) {
+                AcpRuntimeError err =
+                    resolution.error
+                        ? *resolution.error
+                        : AcpRuntimeError(AcpErrorCode::ACP_SESSION_INIT_FAILED,
+                                          "Session is not ACP-enabled: " + input.session_key);
+                const auto aggregated = aggregate_backend_error(err);
+                record_turn_completion(turn_started_at, true);
+                fail_background_task(aggregated.what(), aggregated.detail_code);
+                set_session_state(input.session_key, "error", std::string(aggregated.what()));
+                throw aggregated;
+            }
+        }
+
+        // 对齐 OC: metaWithBackend —— 空 backend 表示让 registry 自选默认
+        AcpSessionMeta meta_with_backend = *resolution.meta;
+        if (!current_backend.empty()) {
+            meta_with_backend.backend = current_backend;
+        }
+
+        // 对齐 OC: sawTurnOutput / retryFreshHandle
+        bool saw_turn_output = false;
+        bool retry_fresh_handle = false;
+        bool active_turn_started = false;
+
+        AcpSessionManager::EnsuredRuntime ensured;
+        bool has_ensured = false;
+        try {
+            ensured = ensure_runtime_handle(input.session_key, meta_with_backend);
+            has_ensured = true;
+            apply_runtime_controls(input.session_key, *ensured.runtime, ensured.handle, ensured.meta);
+        } catch (const std::exception& e) {
+            // 对齐 OC toAcpRuntimeError：turn 尚未启动 → ACP_SESSION_INIT_FAILED
+            const auto* typed = dynamic_cast<const AcpRuntimeError*>(&e);
+            AcpRuntimeError acp_error =
+                typed ? *typed
+                      : AcpRuntimeError(AcpErrorCode::ACP_SESSION_INIT_FAILED, e.what());
+
+            // 对齐 OC: prepareFreshManagerRuntimeHandleRetry —— ensure 阶段也可重试
+            const auto retry_decision = prepare_fresh_runtime_handle_retry(
+                attempt, acp_error, /*saw_turn_output=*/false, has_ensured,
+                meta_with_backend.mode == AcpRuntimeSessionMode::Persistent);
+            if (retry_decision.should_retry) {
+                bool ok = true;
+                if (retry_decision.needs_clear_resume_state) {
+                    ok = clear_persisted_resume_state(input.session_key);
+                }
+                if (ok) {
+                    runtime_cache_.clear(actor_key);
+                    log()->info("acp-manager: retrying {} with a fresh runtime handle after "
+                                "early init failure: {}",
+                                input.session_key, acp_error.what());
+                    continue;
+                }
+            }
+
+            BackendAttempt failed_attempt;
+            failed_attempt.backend = backend_plan.describe_backend_candidate(current_backend);
+            failed_attempt.error = acp_error.what();
+            failed_attempt.code = acp_error.code;
+            failed_attempt.saw_output = false;
+            backend_attempts.push_back(failed_attempt);
+
+            if (is_failover_worthy_backend_error(failed_attempt) &&
+                should_attempt_backend_failover(backend_idx, candidate_backends)) {
+                break;  // 换下一个 backend
+            }
+            const auto aggregated = aggregate_backend_error(acp_error);
+            fail_background_task(aggregated.what(), aggregated.detail_code);
+            set_session_state(input.session_key, "error", std::string(aggregated.what()));
+            throw aggregated;
+        }
 
         // setSessionState("running")
         set_session_state(input.session_key, "running", std::nullopt, true);
@@ -179,8 +380,22 @@ void AcpSessionManager::run_turn(const AcpRunTurnInput& input) {
             std::lock_guard<std::mutex> lock(active_turns_mutex_);
             active_turns_[actor_key] = active_turn;
         }
+        active_turn_started = true;
+        (void)active_turn_started;
 
-        AcpRuntimeError* stream_error = nullptr;
+        // 对齐 OC：用 optional 而非裸指针。原实现连续两个 Error 事件会让第一个
+        // new 出的对象泄漏，且三处 delete 易漏。
+        std::optional<AcpRuntimeError> stream_error;
+
+        // 对齐 OC: const eventGate = { open: true } (manager.turn-runner.ts:252)
+        // 超时后置 false，抑制迟到事件。C++ 差异：turn 线程杀不掉，超时后它仍会
+        // 继续投事件，必须 shared_ptr + atomic 才能既不 UAF 也不 data race。
+        auto event_gate = std::make_shared<AcpTurnEventGate>();
+
+        // 对齐 OC: skipPostTurnCleanup —— 超时路径已在 cleanupTimedOutTurn 里
+        // 做过 cancel/close，turn 尾部不可再 close 一次（会 double-close）。
+        bool skip_post_turn_cleanup = false;
+
         try {
             AcpRuntimeTurnInput turn_input;
             turn_input.handle = ensured.handle;
@@ -189,38 +404,144 @@ void AcpSessionManager::run_turn(const AcpRunTurnInput& input) {
             turn_input.mode = input.mode;
             turn_input.request_id = input.request_id;
 
-            ensured.runtime->run_turn(turn_input, [&](const AcpRuntimeEvent& event) {
-                if (active_turn->cancelled.load()) return;
-                if (input.cancel_signal && input.cancel_signal->load()) {
-                    active_turn->cancelled.store(true);
-                    return;
-                }
+            // 对齐 OC: consumeAcpTurnStream —— 统计 sawOutput 与 terminalStatus
+            auto run_turn_body = [&]() -> AcpTurnStreamOutcome {
+                AcpTurnStreamOutcome outcome;
+                ensured.runtime->run_turn(turn_input, [&](const AcpRuntimeEvent& event) {
+                    // 对齐 OC: if (!eventGate.open) continue
+                    if (!event_gate->open.load()) return;
+                    if (active_turn->cancelled.load()) return;
+                    if (input.cancel_signal && input.cancel_signal->load()) {
+                        active_turn->cancelled.store(true);
+                        return;
+                    }
 
-                if (event.type == AcpRuntimeEvent::Type::Error) {
-                    stream_error = new AcpRuntimeError(
-                        event.code ? error_code_from_string(*event.code) : AcpErrorCode::ACP_TURN_FAILED,
-                        event.message.value_or("ACP turn failed before completion.")
-                    );
-                }
-                if (input.on_event) {
-                    input.on_event(event);
-                }
-            });
+                    AcpRuntimeEvent forwarded = event;
 
-            if (stream_error) {
-                AcpRuntimeError err = *stream_error;
-                delete stream_error;
-                throw err;
+                    if (event.type == AcpRuntimeEvent::Type::Done) {
+                        // 对齐 OC: 旧适配器可能只给 stopReason 不给 status
+                        outcome.terminal_status = resolve_acp_turn_terminal_status(event);
+                        forwarded.status = outcome.terminal_status;
+                    } else if (event.type == AcpRuntimeEvent::Type::Error) {
+                        // 保留首个错误：后续错误多为级联噪音，首个最接近根因
+                        if (!stream_error) {
+                            stream_error.emplace(
+                                event.code ? error_code_from_string(*event.code)
+                                           : AcpErrorCode::ACP_TURN_FAILED,
+                                event.message.value_or("ACP turn failed before completion."),
+                                event.detail_code);
+                        }
+                    } else if (event.type == AcpRuntimeEvent::Type::TextDelta ||
+                               event.type == AcpRuntimeEvent::Type::ToolCall) {
+                        // 对齐 OC onOutputEvent (manager.turn-runner.ts:268-283)
+                        // sawTurnOutput 一旦为真就禁止 failover / fresh-handle 重试，
+                        // 否则用户会看到同一问题被回答两遍。
+                        outcome.saw_output = true;
+                        saw_turn_output = true;
+                        if (event.type == AcpRuntimeEvent::Type::TextDelta &&
+                            (!event.stream || *event.stream != "thought") &&
+                            !event.text.empty()) {
+                            task_progress_summary = append_background_task_progress_summary(
+                                task_progress_summary, event.text);
+                        }
+                        if (task_context) {
+                            mark_background_task_running(
+                                task_context->run_id,
+                                task_progress_summary.empty()
+                                    ? std::nullopt
+                                    : std::optional<std::string>(task_progress_summary));
+                        }
+                    }
+
+                    if (input.on_event) {
+                        input.on_event(forwarded);
+                    }
+                });
+
+                // 对齐 OC: if (eventGate.open && streamError) throw streamError
+                if (event_gate->open.load() && stream_error) {
+                    throw *stream_error;
+                }
+                return outcome;
+            };
+
+            // 对齐 OC: resolveTurnTimeoutMs + ACP_TURN_TIMEOUT_GRACE_MS
+            const auto runtime_options = normalize_runtime_options(ensured.meta.runtime_options);
+            const int64_t turn_timeout_ms = resolve_turn_timeout_ms(runtime_options);
+            const AcpRuntimeSessionMode session_mode = ensured.meta.mode;
+
+            auto await_result = await_turn_with_timeout(
+                input.session_key,
+                turn_timeout_ms + ACP_TURN_TIMEOUT_GRACE_MS,
+                turn_timeout_ms,
+                run_turn_body);
+
+            if (await_result.kind == AwaitTurnResult::Kind::TimedOut) {
+                // 对齐 OC onTimeout (manager.turn-runner.ts:296-313)
+                event_gate->open.store(false);
+                skip_post_turn_cleanup = true;
+                active_turn->cancelled.store(true);
+                const std::string cache_key = normalize_actor_key(input.session_key);
+                const AcpRuntimeHandle timed_out_handle = ensured.handle;
+                cleanup_timed_out_turn(
+                    input.session_key, ensured.runtime, ensured.handle, session_mode,
+                    [this, cache_key, timed_out_handle]() {
+                        // 对齐 OC: clearIfHandleMatches —— 只清仍指向这个 handle 的缓存，
+                        // 否则会误删后续 turn 新建的 handle。
+                        auto* cached = runtime_cache_.peek(cache_key);
+                        if (cached && cached->handle.runtime_session_name ==
+                                          timed_out_handle.runtime_session_name) {
+                            runtime_cache_.clear(cache_key);
+                        }
+                    });
+                throw make_turn_timeout_error(turn_timeout_ms);
             }
 
-            record_turn_completion(turn_started_at, false);
-            set_session_state(input.session_key, "idle", std::nullopt, true);
+            if (await_result.kind == AwaitTurnResult::Kind::Failed) {
+                throw *await_result.error;
+            }
 
-        } catch (const AcpRuntimeError& e) {
-            delete stream_error;
-            record_turn_completion(turn_started_at, true);
-            set_session_state(input.session_key, "error", std::string(e.what()));
-            // Cleanup active turn
+            // 对齐 OC (manager.turn-runner.ts:315-320)：没有 done 事件即视为失败。
+            // 这条闸门很关键 —— 缺了它，runtime 静默断流会被当成成功。
+            if (!await_result.outcome.terminal_status) {
+                throw AcpRuntimeError(AcpErrorCode::ACP_TURN_FAILED,
+                                      "ACP turn ended without a terminal done event.");
+            }
+
+            const bool turn_cancelled = *await_result.outcome.terminal_status == "cancelled";
+
+            record_turn_completion(turn_started_at, false);
+
+            // 对齐 OC (manager.turn-runner.ts:324-344)：成功终态 + blocked 推断
+            if (task_context) {
+                const auto terminal_result =
+                    resolve_background_task_terminal_result(task_progress_summary);
+                MarkBackgroundTaskTerminalParams terminal;
+                // 对齐 OC：终态取自 done 事件的 terminalStatus，而非本地 cancelled 标志
+                terminal.status = turn_cancelled ? tasks::TaskStatus::CANCELLED
+                                                 : tasks::TaskStatus::SUCCEEDED;
+                terminal.ended_at = now_ms();
+                terminal.progress_summary =
+                    task_progress_summary.empty()
+                        ? std::nullopt
+                        : std::optional<std::string>(task_progress_summary);
+                terminal.terminal_summary = terminal_result.terminal_summary;
+                terminal.terminal_outcome = terminal_result.terminal_outcome;
+                mark_background_task_terminal(task_context->run_id, terminal);
+            }
+
+            set_session_state(input.session_key, "idle", std::nullopt, true);
+            completed = true;
+
+        } catch (const std::exception& e) {
+            event_gate->open.store(false);
+
+            // 对齐 OC toAcpRuntimeError：turn 已启动 → ACP_TURN_FAILED
+            const auto* typed = dynamic_cast<const AcpRuntimeError*>(&e);
+            AcpRuntimeError acp_error =
+                typed ? *typed : AcpRuntimeError(AcpErrorCode::ACP_TURN_FAILED, e.what());
+
+            // Cleanup active turn（先摘除，重试时会重新注册）
             {
                 std::lock_guard<std::mutex> lock(active_turns_mutex_);
                 auto it = active_turns_.find(actor_key);
@@ -228,16 +549,47 @@ void AcpSessionManager::run_turn(const AcpRunTurnInput& input) {
                     active_turns_.erase(it);
                 }
             }
-            throw;
-        } catch (...) {
-            delete stream_error;
-            record_turn_completion(turn_started_at, true);
-            set_session_state(input.session_key, "error", "ACP turn failed.");
-            {
-                std::lock_guard<std::mutex> lock(active_turns_mutex_);
-                active_turns_.erase(actor_key);
+
+            // 对齐 OC: prepareFreshManagerRuntimeHandleRetry (manager.turn-runner.ts:363-386)
+            // 仅 attempt==0 且无可见输出时生效；needs_clear 时先把 identity 退回 pending。
+            const auto retry_decision = prepare_fresh_runtime_handle_retry(
+                attempt, acp_error, saw_turn_output, has_ensured,
+                ensured.meta.mode == AcpRuntimeSessionMode::Persistent);
+            if (retry_decision.should_retry) {
+                retry_fresh_handle = true;
+                if (retry_decision.needs_clear_resume_state &&
+                    !clear_persisted_resume_state(input.session_key)) {
+                    retry_fresh_handle = false;
+                }
+                if (retry_fresh_handle) {
+                    runtime_cache_.clear(actor_key);
+                    log()->info("acp-manager: retrying {} with a fresh runtime handle after "
+                                "early turn failure: {}",
+                                input.session_key, acp_error.what());
+                    continue;  // 同一 backend 的 attempt=1
+                }
             }
-            throw AcpRuntimeError(AcpErrorCode::ACP_TURN_FAILED, "ACP turn failed before completion.");
+            (void)retry_fresh_handle;
+
+            // 对齐 OC: backendAttempts.push (manager.turn-runner.ts:404-410)
+            BackendAttempt failed_attempt;
+            failed_attempt.backend = backend_plan.describe_backend_candidate(current_backend);
+            failed_attempt.error = acp_error.what();
+            failed_attempt.code = acp_error.code;
+            failed_attempt.saw_output = saw_turn_output;
+            backend_attempts.push_back(failed_attempt);
+
+            if (is_failover_worthy_backend_error(failed_attempt) &&
+                should_attempt_backend_failover(backend_idx, candidate_backends)) {
+                break;  // 换下一个 backend（不写终态，留给最终失败时聚合）
+            }
+
+            // 对齐 OC recordBackendFailure：所有候选耗尽，写终态并抛聚合错误
+            record_turn_completion(turn_started_at, true);
+            const auto aggregated = aggregate_backend_error(acp_error);
+            fail_background_task(aggregated.what(), aggregated.detail_code);
+            set_session_state(input.session_key, "error", std::string(aggregated.what()));
+            throw aggregated;
         }
 
         // Cleanup active turn
@@ -247,6 +599,11 @@ void AcpSessionManager::run_turn(const AcpRunTurnInput& input) {
             if (it != active_turns_.end() && it->second == active_turn) {
                 active_turns_.erase(it);
             }
+        }
+
+        // 对齐 OC: skipPostTurnCleanup —— 超时路径已做过 cancel/close
+        if (skip_post_turn_cleanup) {
+            break;
         }
 
         // Reconcile identity (persistent mode only)
@@ -261,9 +618,136 @@ void AcpSessionManager::run_turn(const AcpRunTurnInput& input) {
             } catch (...) {
                 log()->debug("acp-manager: oneshot close failed for {}", input.session_key);
             }
-            runtime_cache_.clear(normalize_actor_key(input.session_key));
+            runtime_cache_.clear(actor_key);
         }
+        }  // attempt loop
+        }  // backend loop
     });
+}
+
+// ── resolveBackgroundTaskContext ─────────────────────────────────────────────
+// Aligned with openclaw: resolveBackgroundTaskContext (manager.background-task.ts:99-128)
+
+// ── clearPersistedRuntimeResumeState ─────────────────────────────────────────
+// Aligned with openclaw: clearPersistedRuntimeResumeState
+// (manager.runtime-resume-state.ts:101-149)
+//
+// 把 identity 退回 pending 并抹掉 acpxSessionId / agentSessionId，
+// 但**保留 acpxRecordId** —— 记录本身还在，只是 backend 侧的可 resume 会话没了；
+// 保留它能让下次 ensure 继续复用同一条 acpx 记录。
+
+bool AcpSessionManager::clear_persisted_resume_state(const std::string& session_key) {
+    if (!write_meta_) {
+        return false;
+    }
+    auto current = read_meta_ ? read_meta_(session_key) : std::nullopt;
+    if (!current) {
+        // 对齐 OC: mutate 收到 entry==null 或 current==null 时返回 null → updated 为假
+        return false;
+    }
+
+    // 对齐 OC: 没有任何 resume 标识时原样返回（视为已清理成功）
+    const bool has_resume_ids =
+        current->identity.has_value() &&
+        (current->identity->acpx_session_id.has_value() ||
+         current->identity->agent_session_id.has_value());
+    if (!has_resume_ids) {
+        return true;
+    }
+
+    const int64_t now = now_ms();
+    AcpSessionMeta next = *current;
+    AcpSessionMeta::Identity next_identity;
+    next_identity.state = "pending";
+    // 只带回 acpxRecordId，其余两个 id 刻意留空
+    next_identity.acpx_record_id = current->identity->acpx_record_id;
+    next_identity.source = current->identity->source;
+    next_identity.last_updated_at = now;
+    next.identity = next_identity;
+    next.last_activity_at = now;
+
+    try {
+        write_meta_(session_key, next);
+    } catch (...) {
+        log()->warn("acp-manager: unable to clear persisted runtime resume state for {}",
+                    session_key);
+        return false;
+    }
+    return true;
+}
+
+std::optional<AcpBackgroundTaskContext> AcpSessionManager::resolve_background_task_context(
+    const std::string& session_key,
+    const std::string& request_id,
+    const std::string& text)
+{
+    // 未注入血缘加载器 → 无法确定 requester，整体关闭镜像
+    // （对齐 OC：拿不到 requesterSessionKey 就 return null）
+    if (!session_lineage_loader_) {
+        return std::nullopt;
+    }
+    if (request_id.empty()) {
+        // run_id 是 task 的主键，缺了写不进 registry
+        return std::nullopt;
+    }
+
+    std::optional<AcpSessionLineage> child_entry;
+    try {
+        child_entry = session_lineage_loader_(session_key);
+    } catch (...) {
+        return std::nullopt;
+    }
+    if (!child_entry) {
+        return std::nullopt;
+    }
+
+    // 对齐 OC: normalizeText(entry?.spawnedBy) ?? normalizeText(entry?.parentSessionKey)
+    auto pick = [](const std::optional<std::string>& v) -> std::optional<std::string> {
+        if (!v) return std::nullopt;
+        std::string s = *v;
+        size_t b = 0;
+        while (b < s.size() && static_cast<unsigned char>(s[b]) <= 0x20) ++b;
+        size_t e = s.size();
+        while (e > b && static_cast<unsigned char>(s[e - 1]) <= 0x20) --e;
+        if (e <= b) return std::nullopt;
+        return s.substr(b, e - b);
+    };
+
+    auto requester = pick(child_entry->spawned_by);
+    if (!requester) {
+        requester = pick(child_entry->parent_session_key);
+    }
+    if (!requester) {
+        // 非 spawn 出来的会话（如用户直接绑定的 ACP 会话）没有 requester，
+        // 不做镜像 —— 对齐 OC。
+        return std::nullopt;
+    }
+
+    std::optional<AcpSessionLineage> parent_entry;
+    try {
+        parent_entry = session_lineage_loader_(*requester);
+    } catch (...) {
+        parent_entry = std::nullopt;
+    }
+
+    AcpBackgroundTaskContext ctx;
+    ctx.requester_session_key = *requester;
+    // 对齐 OC: deliveryContextFromSession(parentEntry) ?? deliveryContextFromSession(childEntry)
+    // 父会话的投递上下文优先 —— 结果要回到发起者所在频道，而非子会话的。
+    const AcpSessionLineage* origin =
+        (parent_entry && parent_entry->last_channel) ? &*parent_entry
+        : (child_entry->last_channel ? &*child_entry : nullptr);
+    if (origin) {
+        ctx.requester_channel = origin->last_channel;
+        ctx.requester_to = origin->last_to;
+        ctx.requester_account_id = origin->last_account_id;
+        ctx.requester_thread_id = origin->last_thread_id;
+    }
+    ctx.child_session_key = session_key;
+    ctx.run_id = request_id;
+    ctx.label = pick(child_entry->label);
+    ctx.task = summarize_background_task_text(text);
+    return ctx;
 }
 
 // ── cancelSession ────────────────────────────────────────────────────────────
