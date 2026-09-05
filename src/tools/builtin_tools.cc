@@ -929,8 +929,10 @@ void BuiltinTools::register_all(ToolManager& manager, const ToolContext& context
         sess_ctx.raw_config        = context.raw_config;
         // Aligned with openclaw: cfg.acp.* — 此前这些字段从未被填充，
         // 导致 allowedAgents / defaultAgent / maxConcurrentSessions 配置全部失效。
-        if (context.raw_config.is_object()) {
-            const auto acp = context.raw_config.value("acp", nlohmann::json::object());
+        // 注：本文件顶部有 `class json;` 前向声明，与 nlohmann::json 别名同名，
+        // 因此此处避免书写 nlohmann::json，改为直接取引用。
+        if (context.raw_config.is_object() && context.raw_config.contains("acp")) {
+            const auto& acp = context.raw_config["acp"];
             if (acp.is_object()) {
                 if (acp.contains("enabled") && acp["enabled"].is_boolean())
                     sess_ctx.acp_enabled = acp["enabled"].get<bool>();

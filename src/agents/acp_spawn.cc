@@ -5,6 +5,7 @@
 
 #include "hunterclaw/agents/acp_spawn.h"
 #include "hunterclaw/agents/subagent.h"
+#include "hunterclaw/agents/inherited_tool_deny.h"  // ✅ 继承工具策略两道闸
 #include "hunterclaw/acp/acp_session_manager.h"
 #include "hunterclaw/gateway/client.h"
 #include "hunterclaw/infra/agent_events.h"
@@ -12,6 +13,8 @@
 #include "hunterclaw/infra/heartbeat_wake.h"
 #include "hunterclaw/core/types.h"
 #include "hunterclaw/tasks/task_executor.h"
+#include "hunterclaw/routing/session_key.h"          // ✅ build_agent_main_session_key / parse
+#include "hunterclaw/sessions/session_key_utils.h"   // ✅ is_cron_run_session_key
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
 #include <thread>
@@ -119,15 +122,34 @@ bool resolve_parent_progress_commentary(const std::optional<json>& cfg) {
     return true;
 }
 
-// Aligned with openclaw: formatProxyEnvSummary
+// Aligned with openclaw: formatProxyEnvSummary (acp-spawn-parent-stream.ts:71-76)
 std::string format_proxy_env_summary(const std::vector<std::string>& keys) {
-    if (keys.empty()) return "no proxy env";
+    if (keys.empty()) return "proxy env: none";
     std::string out = "proxy env: ";
     for (size_t i = 0; i < keys.size(); ++i) {
         if (i > 0) out += ", ";
         out += keys[i];
     }
     return out;
+}
+
+// ── 事件会话路由 ─────────────────────────────────────────────────────────────
+// Aligned with openclaw: resolveEventSessionKey (routing/session-key.ts:71-86)
+//
+// cron 触发的 spawn，父 session key 形如 `agent:<id>:cron:<job>:run:<uuid>`。
+// 该 key 对应的队列没有心跳在 peek，事件投进去就会滞留，因此必须重映射：
+//   - scope == "global"  → 字面量 "global" 队列
+//   - 否则               → agent-main 队列
+// 非 cron key 原样返回。
+std::string resolve_event_session_key(const std::string& session_key,
+                                     const std::string& main_key,
+                                     const std::string& scope) {
+    auto parsed = routing::parse_agent_session_key(session_key);
+    if (!parsed || !sessions::is_cron_run_session_key(session_key)) {
+        return session_key;
+    }
+    if (scope == "global") return "global";
+    return routing::build_agent_main_session_key(parsed->agent_id, main_key);
 }
 
 // UTF-8 安全的尾部截取（保留最后 max_bytes 字节，不切断多字节字符）
@@ -237,7 +259,9 @@ AcpSpawnParentRelayHandle start_acp_spawn_parent_stream_relay(
     bool emit_start_notice,
     const std::optional<json>& delivery_context,
     bool surface_updates,
-    const std::optional<json>& cfg
+    const std::optional<json>& cfg,
+    const std::string& main_key,
+    const std::string& session_scope
 ) {
     if (run_id.empty() || parent_session_key.empty()) {
         return { [](){}, [](){} };
@@ -347,18 +371,25 @@ AcpSpawnParentRelayHandle start_acp_spawn_parent_stream_relay(
         } catch (...) {}
     };
 
+    // Aligned with openclaw: resolveEventSessionKeyForPolicy(parentSessionKey, eventRouting)
+    //
+    // 路由结果在 relay 启动时快照一次（与真源一致：长时 relay 不跟随配置热更），
+    // emit 与 wake 共用同一目标 key，避免事件与心跳落到不同队列。
+    const std::string event_session_key =
+        resolve_event_session_key(parent_session_key, main_key, session_scope);
+
     // Helper: wake parent heartbeat
-    auto wake = [parent_session_key, surface_updates]() {
+    auto wake = [event_session_key, surface_updates]() {
         if (!surface_updates) return;
         // Aligned with openclaw: requestHeartbeat(scopedHeartbeatWakeOptionsForPolicy(
         //   parentSessionKey, { source: "acp-spawn", intent: "event", reason: "acp:spawn:stream" }))
-        infra::request_heartbeat_now("acp:spawn:stream", std::nullopt, parent_session_key,
+        infra::request_heartbeat_now("acp:spawn:stream", std::nullopt, event_session_key,
                                      infra::HeartbeatWakeIntent::Event,
                                      infra::HeartbeatWakeSource::AcpSpawn);
     };
 
     // Helper: emit system event to parent
-    auto emit = [state, parent_session_key, context_prefix, wake, write_log_line,
+    auto emit = [state, event_session_key, context_prefix, wake, write_log_line,
                  delivery_context, surface_updates](
         const std::string& text, const std::string& context_key
     ) {
@@ -381,9 +412,11 @@ AcpSpawnParentRelayHandle start_acp_spawn_parent_stream_relay(
 
         if (!surface_updates) return;
 
-        // Aligned with openclaw: enqueueSystemEvent(cleaned, { sessionKey, contextKey, trusted: false })
+        // Aligned with openclaw: enqueueSystemEvent(cleaned, {
+        //   sessionKey: resolveEventSessionKeyForPolicy(parentSessionKey, eventRouting),
+        //   contextKey, deliveryContext })
         // Note: delivery_context routing is handled by the gateway layer in HunterClaw
-        infra::enqueue_system_event(cleaned, parent_session_key, context_key);
+        infra::enqueue_system_event(cleaned, event_session_key, context_key);
         wake();
     };
 
@@ -1047,6 +1080,24 @@ SpawnAcpResult spawn_acp_direct(
         return make_failure("forbidden", "runtime_policy", *policy_error);
     }
 
+    // Aligned with openclaw: acp-spawn.ts:280-299 — 继承工具策略两道闸
+    //
+    // ACP 运行时依赖一批宿主工具（read/write/exec/edit/apply_patch/process ...）。
+    // 若调用方自身的策略把它们 deny 掉、或 allowlist 里没有它们，ACP 子会话必然
+    // 跑不起来 —— 与其等运行期失败，不如在 spawn 前拒绝并提示改用 subagent。
+    const auto unsupported_inherited_deny =
+        find_acp_unsupported_inherited_tool_deny(ctx.inherited_tool_denylist);
+    if (unsupported_inherited_deny.has_value()) {
+        return make_failure("forbidden", "runtime_policy",
+                            format_acp_inherited_tool_deny_error(*unsupported_inherited_deny));
+    }
+    const auto unsupported_inherited_allow =
+        find_acp_unsupported_inherited_tool_allow(ctx.inherited_tool_allowlist);
+    if (unsupported_inherited_allow.has_value()) {
+        return make_failure("forbidden", "runtime_policy",
+                            format_acp_inherited_tool_allow_error(*unsupported_inherited_allow));
+    }
+
     // ── Step 2: Resolve spawn mode ────────────────────────────────────────
     // Aligned with openclaw: resolveSpawnMode
     const bool request_thread_binding = params.thread;
@@ -1306,6 +1357,22 @@ SpawnAcpResult spawn_acp_direct(
             if (!child_caps.role.empty()) patch["subagentRole"] = child_caps.role;
             if (!child_caps.control_scope.empty()) patch["subagentControlScope"] = child_caps.control_scope;
         }
+        // Aligned with openclaw: acp-spawn.ts:525-527
+        //   inheritedToolPolicyVersion: 1
+        //   ...inheritedToolAllowPatch(ctx.inheritedToolAllowlist)
+        //   ...inheritedToolDenyPatch(ctx.inheritedToolDenylist)
+        //
+        // 两道闸只保证「ACP 必需工具没被掐掉」，子会话仍须继续受调用方策略约束，
+        // 因此策略要盖到子会话 meta 上。patch 语义：列表为空则不写该键。
+        patch["inheritedToolPolicyVersion"] = 1;
+        {
+            const auto inherited_allow =
+                normalize_inherited_tool_allowlist(ctx.inherited_tool_allowlist);
+            if (!inherited_allow.empty()) patch["inheritedToolAllow"] = inherited_allow;
+            const auto inherited_deny =
+                normalize_inherited_tool_denylist(ctx.inherited_tool_denylist);
+            if (!inherited_deny.empty()) patch["inheritedToolDeny"] = inherited_deny;
+        }
         auto patch_result = effective_gw->request("sessions.patch", patch);
         if (!patch_result.is_ok()) {
             if (remote_gw) remote_gw->stop();
@@ -1410,6 +1477,22 @@ SpawnAcpResult spawn_acp_direct(
         }
     }
 
+    // Aligned with openclaw: mainKey = cfg.session?.mainKey, sessionScope = cfg.session?.scope
+    //
+    // 在 spawn 时快照，供 relay 全生命周期使用（真源注释明确要求：配置中途变更
+    // 不影响已在流式输出的 relay）。仅在父 key 为 cron-run 形态时才生效。
+    std::string relay_main_key;
+    std::string relay_session_scope;
+    if (cfg.raw_config.is_object() && cfg.raw_config.contains("session")) {
+        const auto& session_cfg = cfg.raw_config["session"];
+        if (session_cfg.is_object()) {
+            if (session_cfg.contains("mainKey") && session_cfg["mainKey"].is_string())
+                relay_main_key = session_cfg["mainKey"].get<std::string>();
+            if (session_cfg.contains("scope") && session_cfg["scope"].is_string())
+                relay_session_scope = session_cfg["scope"].get<std::string>();
+        }
+    }
+
     AcpSpawnParentRelayHandle parent_relay;
     if (effective_stream_to_parent && !parent_session_key.empty()) {
         parent_relay = start_acp_spawn_parent_stream_relay(
@@ -1426,7 +1509,10 @@ SpawnAcpResult spawn_acp_direct(
             parent_delivery_ctx, // deliveryContext (json)
             true,              // surfaceUpdates
             // Aligned with openclaw: cfg — progressCommentary / acp.projection.tagVisibility
-            cfg.raw_config.is_null() ? std::nullopt : std::optional<json>(cfg.raw_config)
+            cfg.raw_config.is_null() ? std::nullopt : std::optional<json>(cfg.raw_config),
+            // Aligned with openclaw: mainKey / sessionScope — cron-run 事件路由
+            relay_main_key,
+            relay_session_scope
         );
     }
 
@@ -1509,8 +1595,10 @@ SpawnAcpResult spawn_acp_direct(
                 stream_log_path,
                 2500, 60000, 15000, 6 * 60 * 60 * 1000, false,
                 parent_delivery_ctx, true,  // delivery_context (json), surface_updates
-                // Aligned with openclaw: cfg 与首次创建保持一致
-                cfg.raw_config.is_null() ? std::nullopt : std::optional<json>(cfg.raw_config)
+                // Aligned with openclaw: cfg / mainKey / sessionScope 与首次创建保持一致
+                cfg.raw_config.is_null() ? std::nullopt : std::optional<json>(cfg.raw_config),
+                relay_main_key,
+                relay_session_scope
             );
         }
         // Aligned with openclaw: parentRelay.notifyStarted()

@@ -19,6 +19,9 @@
 #include <thread>
 #include <chrono>
 #include <filesystem>
+#include <cstdlib>   // ✅ std::getenv (resolve_present_proxy_env_keys)
+#include <vector>
+#include <string>
 
 using json = nlohmann::json;
 
@@ -106,6 +109,29 @@ void emit_acp_runtime_event(const std::string& run_id,
     hunterclaw::infra::emit_agent_event(bus_event);
 }
 
+// ── resolve_present_proxy_env_keys ───────────────────────────────────────────
+// Aligned with openclaw: ACP_PROXY_ENV_KEYS (attempt-execution.ts:1326-1333) +
+//   resolvePresentProxyEnvKeys (:1557-1562)
+//
+// 只上报「已设置且非空」的代理变量名（不含值，避免泄露凭据）。
+// relay 在「prompt 已提交但上游无任何 runtime 事件」时用它提示排查方向。
+std::vector<std::string> resolve_present_proxy_env_keys() {
+    static const char* kProxyEnvKeys[] = {
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+        "http_proxy", "https_proxy", "all_proxy",
+    };
+    std::vector<std::string> present;
+    for (const char* key : kProxyEnvKeys) {
+        const char* value = std::getenv(key);
+        if (value == nullptr) continue;
+        std::string v(value);
+        // 对齐真源 value.trim().length > 0
+        if (v.find_first_not_of(" \t\r\n") == std::string::npos) continue;
+        present.emplace_back(key);
+    }
+    return present;
+}
+
 // ── emit_acp_prompt_submitted ────────────────────────────────────────────────
 // Aligned with openclaw: emitAcpPromptSubmitted (attempt-execution.ts:1607-1618)
 void emit_acp_prompt_submitted(const std::string& run_id, int64_t at_ms) {
@@ -116,6 +142,8 @@ void emit_acp_prompt_submitted(const std::string& run_id, int64_t at_ms) {
     bus_event.data = json{
         {"phase", "prompt_submitted"},
         {"at", at_ms},
+        // Aligned with openclaw: proxyEnvKeys: resolvePresentProxyEnvKeys()
+        {"proxyEnvKeys", resolve_present_proxy_env_keys()},
     };
     hunterclaw::infra::emit_agent_event(bus_event);
 }

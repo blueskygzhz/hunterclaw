@@ -100,6 +100,19 @@ struct SpawnAcpContext {
     /// Trusted provider role ids for the requester in this group turn.
     std::vector<std::string> agent_member_role_ids; // agentMemberRoleIds
     bool sandboxed = false;
+
+    /// ✅ 对齐 OC SpawnAcpContext.inheritedToolDenylist (acp-spawn.ts:143)
+    /// 调用方自身的工具 deny 策略。若其中命中 ACP 必需工具，spawn 前直接拒绝
+    /// （errorCode="runtime_policy"），提示改用 runtime="subagent"。
+    ///
+    /// ⚠ HunterClaw 尚无工具策略继承机制（真源由 skills/runtime/tool-dispatch.ts
+    ///   的 explicitDenylist 生产），当前恒为空 ⇒ 该闸不触发。
+    std::vector<std::string> inherited_tool_denylist;
+
+    /// ✅ 对齐 OC SpawnAcpContext.inheritedToolAllowlist
+    /// 调用方的工具 allow 策略。空表示不限制；非空且缺少 ACP 必需工具则拒绝。
+    /// 数据源现状同上。
+    std::vector<std::string> inherited_tool_allowlist;
 };
 
 // ============================================================================
@@ -206,7 +219,17 @@ AcpSpawnParentRelayHandle start_acp_spawn_parent_stream_relay(
     /// Aligned with openclaw: params.cfg — drives resolveParentProgressCommentary
     /// (streaming.progressCommentary, default true) and resolveAcpProjectionSettings
     /// (acp.projection.tagVisibility overrides for ACP status relay).
-    const std::optional<nlohmann::json>& cfg = std::nullopt
+    const std::optional<nlohmann::json>& cfg = std::nullopt,
+    /// Aligned with openclaw: params.mainKey (`cfg.session?.mainKey`)
+    /// Remaps cron-run parent session keys to the agent's main queue when
+    /// relaying events. Snapshotted at spawn time: long-running relays keep
+    /// using this value even if config changes mid-stream.
+    const std::string& main_key = "",
+    /// Aligned with openclaw: params.sessionScope (`cfg.session?.scope`)
+    /// "per-sender" | "global". Global-scope agents must route cron-run events
+    /// to the literal "global" queue instead of agent-main, otherwise the
+    /// heartbeat never peeks them.
+    const std::string& session_scope = ""
 );
 
 // ============================================================================
